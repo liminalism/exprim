@@ -1,6 +1,11 @@
 # Secondary plan: broader CPU vector and text rendering
 
-Date: 2026-11-10. Status: proposed; no production changes implemented by this plan.
+Date: 2026-11-10. Status: G0 done and the exact part of G1 done on 2026-11-10
+(branch `perf/generic-renderer-g0-g1`); G1's geometry-policy changes, G2, G3
+and G4 are open. Findings:
+[attribution report](../benchmarks/2026-11-10-attribution/README.md); changes
+and measurements:
+[performance-history entry](../../dev-notes/render-refinement/performance-history/optimization-dense-vector-20261110.md).
 
 Make exprim useful for general PDF rendering while retaining its strength on
 Lege's scanned and MRC documents. This is a secondary workstream: the scan/image

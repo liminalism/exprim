@@ -7,6 +7,27 @@ were internal and never published.
 
 ## 0.4.0 — Unreleased
 
+### Dense-vector rendering and a text fix, 2026-11-10
+
+- Fixed: composite (Type 0) fonts whose `/W`, `/W2`, `/DW` or `/DW2` hold
+  indirect references had no glyph widths, so every glyph advanced by the
+  default and words ran into each other. Acrobat's ClearScan output writes
+  `/W [0 n 0 R]`. Rendering and text extraction both use the corrected
+  advances.
+- Tiling-pattern fills no longer lower and rasterize tiles that cannot reach
+  the fill's shape (pattern-painted strokes especially). Output is
+  byte-identical; a dense map page renders about twice as fast.
+- Clip masks and clipped draws rasterize only the rows they keep. Output is
+  byte-identical; a page with thousands of small clips under page-sized clip
+  paths renders more than ten times faster.
+- `RenderStats` work counters (`commands`, `edges`, `rows_rasterized`,
+  `covered_pixels`) now count the work actually done, so they are lower on
+  pages where the two changes above skip work.
+- The `profiling` feature attributes render time to lowering, path drawing,
+  tiling, clip masks and the coverage kernel's phases, with
+  `profiling::ProfileDetail` selecting how much timing is collected and
+  `RenderSession::render_profiled` covering the session path.
+
 ### Renamed and consolidated, 2026-11-09
 
 - One package, `exprim`, replaces the 21 `pdf-*` engine crates and
