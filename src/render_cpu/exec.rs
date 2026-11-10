@@ -8581,7 +8581,7 @@ mod tiling_cull_tests {
             if culled_commands < reference_commands {
                 culled_cases += 1;
             }
-            if reference.chunks_exact(4).any(|px| px != [255, 255, 255, 255]) {
+            if reference.iter().any(|&byte| byte != 255) {
                 painted_cases += 1;
             }
         }

@@ -3341,9 +3341,12 @@ impl<'a> Interpreter<'a> {
             return crate::font::CidWidths::uniform(1000.0);
         };
 
+        let dict = dict.clone();
         let dw = dict
             .get(self.intern(b"DW"))
-            .and_then(PdfObject::as_number)
+            .cloned()
+            .and_then(|dw| self.resolve_obj(&dw))
+            .and_then(|dw| dw.as_number())
             .unwrap_or(1000.0) as f32;
         let ranges = match dict
             .get(self.intern(b"W"))
@@ -3351,12 +3354,43 @@ impl<'a> Interpreter<'a> {
             .and_then(|w| self.resolve_obj(&w))
         {
             Some(w) => match &*w {
-                PdfObject::Array(items) => parse_cid_w(items),
+                PdfObject::Array(items) => parse_cid_w(&self.resolve_metric_items(items)),
                 _ => Vec::new(),
             },
             None => Vec::new(),
         };
         crate::font::CidWidths::new(dw, ranges)
+    }
+
+    /// The elements of a `/W` or `/W2` array with their indirect references
+    /// resolved: the top-level entries, and the entries of each nested metrics
+    /// array. Acrobat's ClearScan fonts write `/W [0 885 0 R]`, the whole
+    /// per-CID width array behind a reference; left unresolved, the font has
+    /// no widths at all and every glyph takes `/DW`. A reference that does not
+    /// resolve is kept as it is, which the parsers skip.
+    fn resolve_metric_items(&mut self, items: &[PdfObject]) -> Vec<PdfObject> {
+        let mut resolve = |object: &PdfObject| -> PdfObject {
+            match object {
+                PdfObject::Reference(_) => self
+                    .resolve_obj(object)
+                    .map(|resolved| (*resolved).clone())
+                    .unwrap_or_else(|| object.clone()),
+                direct => direct.clone(),
+            }
+        };
+        items
+            .iter()
+            .map(|item| match resolve(item) {
+                PdfObject::Array(inner)
+                    if inner
+                        .iter()
+                        .any(|entry| matches!(entry, PdfObject::Reference(_))) =>
+                {
+                    PdfObject::Array(inner.iter().map(&mut resolve).collect())
+                }
+                other => other,
+            })
+            .collect()
     }
 
     /// Read the descendant CIDFont's `/DW2` + `/W2` into vertical metrics
@@ -3377,6 +3411,7 @@ impl<'a> Interpreter<'a> {
             .and_then(|d| self.resolve_obj(&d))
             && let PdfObject::Array(a) = &*dw2
         {
+            let a = self.resolve_metric_items(a);
             if let Some(v) = a.first().and_then(PdfObject::as_number) {
                 vy = v as f32;
             }
@@ -3390,7 +3425,7 @@ impl<'a> Interpreter<'a> {
             .and_then(|w| self.resolve_obj(&w))
         {
             Some(w) => match &*w {
-                PdfObject::Array(items) => parse_cid_w2(items),
+                PdfObject::Array(items) => parse_cid_w2(&self.resolve_metric_items(items)),
                 _ => Vec::new(),
             },
             None => Vec::new(),

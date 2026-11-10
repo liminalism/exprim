@@ -673,6 +673,49 @@ fn cid_identity_two_byte_advances() {
 }
 
 #[test]
+fn cid_widths_behind_indirect_references_are_read() {
+    // Acrobat's ClearScan fonts write the per-CID width array as an indirect
+    // object inside /W (`/W [0 885 0 R]`). With it unresolved the font had no
+    // widths, every glyph advanced by /DW (1000 when absent), and words ran
+    // into each other. Here: /W [1 7 0 R 10 12 8 0 R] with 7 = [500 9 0 R]
+    // (9 = 250) and 8 = 300, and /DW itself a reference to 600.
+    // CID1=500, CID2=250, CID3=/DW 600, CID10..12=300. At 10pt the glyphs sit
+    // at x = 0, 5, 7.5, 13.5, 16.5.
+    let mut b = PdfBuilder::new();
+    b.add_object(1, "<</Type/Catalog/Pages 2 0 R>>");
+    b.add_object(
+        2,
+        "<</Type/Pages/Kids[3 0 R]/Count 1/MediaBox[0 0 200 200]>>",
+    );
+    b.add_object(
+        3,
+        "<</Type/Page/Parent 2 0 R/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>",
+    );
+    b.add_stream(4, "", b"BT /F1 10 Tf 0 0 Td <00010002000300 0A000B> Tj ET");
+    b.add_object(
+        5,
+        "<</Type/Font/Subtype/Type0/BaseFont/C/Encoding/Identity-H/DescendantFonts[6 0 R]>>",
+    );
+    b.add_object(
+        6,
+        "<</Type/Font/Subtype/CIDFontType2/BaseFont/C/DW 10 0 R/W[1 7 0 R 10 12 8 0 R]>>",
+    );
+    b.add_object(7, "[500 9 0 R]");
+    b.add_object(8, "300");
+    b.add_object(9, "250");
+    b.add_object(10, "600");
+    b.finish_classic_xref("/Root 1 0 R");
+    let page = compile(&open(b.into_bytes()));
+
+    let g = &page.glyph_runs[0].glyphs;
+    assert_eq!(g.len(), 5, "five 2-byte codes");
+    let xs: Vec<f64> = g.iter().map(|glyph| glyph.x).collect();
+    for (got, want) in xs.iter().zip([0.0, 5.0, 7.5, 13.5, 16.5]) {
+        assert!((got - want).abs() < 1e-6, "glyph origins {xs:?}");
+    }
+}
+
+#[test]
 fn type0_embedded_cmap_decodes_variable_width_codes() {
     // A Type0 font whose /Encoding is an *embedded* CMap stream with a mixed
     // 1-/2-byte codespace and a distinguishable mapping: 1-byte 0x41 → CID 10,
