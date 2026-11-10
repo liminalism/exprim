@@ -7,6 +7,12 @@ were internal and never published.
 
 ## 0.4.0 — 2026-11-10
 
+### Dependencies, 2026-11-10
+
+- `jbig2enc-rust` 0.6.1 (the faster generic-region decoder) and `skrifa`
+  0.49. Page hashes are unchanged across the repository fixtures and the
+  local corpus.
+
 ### API documentation, 2026-11-10
 
 - Every public item at the crate root and in `print` is documented, and the

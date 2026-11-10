@@ -115,7 +115,7 @@ pub fn read_face_metrics(data: &[u8], index: u32) -> Option<FaceMetrics> {
 
     Some(FaceMetrics {
         units_per_em,
-        num_glyphs: metrics.glyph_count,
+        num_glyphs: u16::try_from(metrics.glyph_count).unwrap_or(u16::MAX),
         ascent,
         descent: to_design_units(metrics.descent),
         cap_height: metrics.cap_height.map(to_design_units).unwrap_or(ascent),
