@@ -63,3 +63,9 @@ docs/benchmarks/*/raw/
 docs/benchmarks/*/profiles/runs/
 docs/benchmarks/*/manifest.local.json
 dev-notes/render-refinement/scoping-20261108/harness/g0-corpus.local.json
+
+# AKR: a rebuildable cache and disposable agent notes.
+.akr/cache/
+.agent/scratch/
+.agent/handoffs/
+.akr/secrets/
