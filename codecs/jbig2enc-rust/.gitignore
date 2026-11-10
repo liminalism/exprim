@@ -6,3 +6,6 @@
 /decoded_symbol.pbm
 /fuzz/target
 /fuzz/Cargo.lock
+# Local jbig2dec build used as a test oracle (tests/common/oracle.rs). Not
+# distributed: jbig2dec is AGPL.
+/jbig2dec.exe

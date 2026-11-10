@@ -6,7 +6,7 @@ No C library, no system codec, no runtime assets. The same crate also builds
 the `jbig2enc` Python wheel.
 
 The canonical source is the
-[Lege monorepo](https://github.com/liminalism/lege/tree/main/lege-codecs/jbig2enc-rust).
+[exprim repository](https://github.com/liminalism/exprim/tree/main/codecs/jbig2enc-rust).
 
 ## 0.6.0 (unreleased)
 
@@ -18,7 +18,7 @@ binding ships inside the crate. The DjVu-derived component code and tests are
 replaced, leaving MIT project contributions plus retained Apache-2.0
 arithmetic-coder notices. Existing constructors and entry points remain; new
 configuration fields affect exhaustive struct literals only. The
-[changelog](https://github.com/liminalism/lege/blob/main/lege-codecs/jbig2enc-rust/CHANGELOG.md)
+[changelog](https://github.com/liminalism/exprim/blob/main/codecs/jbig2enc-rust/CHANGELOG.md)
 has the full list.
 
 ## What it does

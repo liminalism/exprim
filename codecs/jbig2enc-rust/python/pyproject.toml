@@ -18,8 +18,8 @@ classifiers = [
 dynamic = ["version"]
 
 [project.urls]
-Repository = "https://github.com/liminalism/lege"
-Source = "https://github.com/liminalism/lege/tree/main/lege-codecs/jbig2enc-rust"
+Repository = "https://github.com/liminalism/exprim"
+Source = "https://github.com/liminalism/exprim/tree/main/codecs/jbig2enc-rust"
 
 [tool.maturin]
 # The extension is the `python` feature of the crate one directory up; its
