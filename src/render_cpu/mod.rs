@@ -1993,24 +1993,7 @@ impl CpuBackend {
     ) -> Result<(HostPage, RenderStats, crate::profiling::ProfileReport), RenderError> {
         let total_start = std::time::Instant::now();
         let (host, stats) = self.render_with(request, ctx)?;
-        let mut profile = crate::profiling::ProfileReport::new();
-        profile.add_duration("render.lower", stats.lower);
-        profile.add_duration("render.surface", stats.prep);
-        profile.add_duration("render.execute", stats.raster);
-        profile.add_duration("render.output", stats.output);
-        profile.add_duration("render.total", total_start.elapsed());
-        profile.increment("render.operations", stats.ops_total as u64);
-        profile.increment("render.commands", stats.commands as u64);
-        profile.increment("render.painted_ops", stats.ops_painted as u64);
-        profile.increment("render.edges", stats.edges);
-        profile.increment("render.covered_pixels", stats.covered_pixels);
-        profile.increment(
-            "render.transparency_groups",
-            stats.transparency_groups as u64,
-        );
-        profile.increment("render.soft_masks", stats.soft_masks as u64);
-        profile.increment("render.output_bytes", stats.output_bytes);
-        profile.merge(&stats.profile);
+        let mut profile = profile_from_stats(&stats, total_start.elapsed());
         // RGBA output takes ownership of the surface allocation; it is no
         // longer a second simultaneously-live full-page buffer. Gray8 still
         // allocates its smaller output while reading the RGBA surface.
@@ -2329,6 +2312,36 @@ impl RenderBackend for CpuBackend {
         let _ = tx.send(result);
         Ok(ticket)
     }
+}
+
+
+/// The stage report for one render: the `RenderStats` stage timers and counters
+/// under their `render.*` names, plus everything the lowering and execution
+/// hot paths recorded.
+#[cfg(feature = "profiling")]
+pub(crate) fn profile_from_stats(
+    stats: &RenderStats,
+    total: std::time::Duration,
+) -> crate::profiling::ProfileReport {
+    let mut profile = crate::profiling::ProfileReport::new();
+    profile.add_duration("render.lower", stats.lower);
+    profile.add_duration("render.surface", stats.prep);
+    profile.add_duration("render.execute", stats.raster);
+    profile.add_duration("render.output", stats.output);
+    profile.add_duration("render.total", total);
+    profile.increment("render.operations", stats.ops_total as u64);
+    profile.increment("render.commands", stats.commands as u64);
+    profile.increment("render.painted_ops", stats.ops_painted as u64);
+    profile.increment("render.edges", stats.edges);
+    profile.increment("render.covered_pixels", stats.covered_pixels);
+    profile.increment(
+        "render.transparency_groups",
+        stats.transparency_groups as u64,
+    );
+    profile.increment("render.soft_masks", stats.soft_masks as u64);
+    profile.increment("render.output_bytes", stats.output_bytes);
+    profile.merge(&stats.profile);
+    profile
 }
 
 #[cfg(test)]

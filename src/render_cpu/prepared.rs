@@ -1366,12 +1366,341 @@ pub struct CpuPreparedPage {
     /// Optional warm-decode state used only by profiling experiments.
     #[cfg(feature = "profiling")]
     pub(crate) decode_cache: Option<DecodedImageCache>,
+    /// Lowering hot-path attribution, flushed into `profile` once per page.
+    #[cfg(feature = "profiling")]
+    pub(crate) lower_prof: LowerProf,
 }
 
 impl CpuPreparedPage {
     #[cfg(feature = "profiling")]
     pub(crate) fn profile_report(&self) -> crate::profiling::ProfileReport {
         self.profile.borrow().clone()
+    }
+}
+
+/// Exclusive lowering buckets for [`LowerProf::lap`]. The op loop laps at each
+/// operation boundary for the previous op's kind; `lower_fill` and the stroke
+/// expander lap at their internal boundaries, so every nanosecond of
+/// `render.lower.total` lands in exactly one bucket.
+#[cfg(feature = "profiling")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub(crate) enum LowerBucket {
+    State = 0,
+    Clip,
+    FillFlatten,
+    FillFinish,
+    StrokeFlatten,
+    StrokeExpand,
+    StrokeFinish,
+    Glyph,
+    Image,
+    Other,
+    /// Counting passes that exist only for this report.
+    Census,
+}
+
+#[cfg(feature = "profiling")]
+const LOWER_BUCKETS: usize = 11;
+
+/// Plain-field lowering attribution (feature `profiling`): exclusive stage
+/// time plus the geometry counts that predict what each candidate optimization
+/// could remove (curve device sizes, stroke polygon amplification, work done
+/// for draws that are then culled).
+#[cfg(feature = "profiling")]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LowerProf {
+    /// Set for tiling cells: a cell is lowered once per tile instance, often
+    /// tens of thousands of times, so it records nothing (the executor times
+    /// cell lowering as a whole).
+    disabled: bool,
+    lap: Option<crate::profiling::Lap>,
+    ns: [u64; LOWER_BUCKETS],
+    clock_reads: u64,
+    fill_ops: u64,
+    stroke_ops: u64,
+    clip_ops: u64,
+    // Fill and clip path geometry.
+    fill_lines: u64,
+    fill_curves: u64,
+    fill_points: u64,
+    /// Segments an error-bounded (1/8 px) flattener would emit for the fill
+    /// curves that today take 16 each.
+    fill_curve_segments_adaptive: u64,
+    /// Fill curves by predicted adaptive segment count: 1, 2, 3-4, 5-8,
+    /// 9-16, more than 16.
+    fill_curve_bins: [u64; 6],
+    clip_rects: u64,
+    clip_paths: u64,
+    clip_lines: u64,
+    clip_curves: u64,
+    clip_path_points: u64,
+    // Stroke geometry and polygon amplification.
+    stroke_dashed_ops: u64,
+    stroke_lines: u64,
+    stroke_curves: u64,
+    stroke_curve_segments_adaptive: u64,
+    stroke_polylines: u64,
+    stroke_centerline_points: u64,
+    stroke_dash_pieces: u64,
+    stroke_out_subpaths: u64,
+    stroke_out_points: u64,
+    stroke_quads: u64,
+    stroke_tris: u64,
+    stroke_disks: u64,
+    stroke_other_polys: u64,
+    stroke_join_round: u64,
+    stroke_join_miter: u64,
+    stroke_join_bevel: u64,
+    /// Strokes by device half-width: at most 0.5 px, 1.6 px, 6.5 px, wider.
+    stroke_hw_bins: [u64; 4],
+    /// Interior polyline vertices (each gets a join today), and the subset a
+    /// ribbon stroker could pass through within 1/8 px.
+    stroke_vertices_interior: u64,
+    stroke_vertices_smooth: u64,
+    // Work done for draws that were then dropped.
+    cull_fill_insane: u64,
+    cull_fill_clipped: u64,
+    cull_fill_clipped_points: u64,
+    cull_stroke_insane: u64,
+    cull_stroke_clipped: u64,
+    cull_stroke_clipped_points: u64,
+}
+
+#[cfg(feature = "profiling")]
+impl LowerProf {
+    /// Charge the time since the previous lap to `bucket`.
+    #[inline]
+    pub(crate) fn lap(&mut self, bucket: LowerBucket) {
+        if self.disabled {
+            return;
+        }
+        match self.lap.as_mut() {
+            Some(lap) => {
+                self.ns[bucket as usize] += lap.lap_ns();
+                self.clock_reads += 1;
+            }
+            None => self.lap = Some(crate::profiling::Lap::start()),
+        }
+    }
+
+    /// Device-space second-difference bound of a cubic, which fixes how many
+    /// uniform segments keep the chord error within a tolerance.
+    fn adaptive_segments(ctm: Matrix, p0: Point, c1: Point, c2: Point, p3: Point) -> u64 {
+        const TOLERANCE_PX: f64 = 0.125;
+        let dev = |dx: f64, dy: f64| {
+            let x = ctm.a * dx + ctm.c * dy;
+            let y = ctm.b * dx + ctm.d * dy;
+            (x * x + y * y).sqrt()
+        };
+        let d1 = dev(p0.x - 2.0 * c1.x + c2.x, p0.y - 2.0 * c1.y + c2.y);
+        let d2 = dev(c1.x - 2.0 * c2.x + p3.x, c1.y - 2.0 * c2.y + p3.y);
+        let d = d1.max(d2);
+        if !d.is_finite() {
+            return CURVE_SEGMENTS as u64;
+        }
+        ((0.75 * d / TOLERANCE_PX).sqrt().ceil() as u64).clamp(1, 256)
+    }
+
+    /// Count a path's lines and curves and the adaptive segment estimate.
+    fn path_census(path: &PathData, ctm: Matrix) -> (u64, u64, u64, [u64; 6]) {
+        let (mut lines, mut curves, mut adaptive) = (0u64, 0u64, 0u64);
+        let mut bins = [0u64; 6];
+        let mut pt = 0usize;
+        let mut last = Point::default();
+        for verb in path.verbs.iter() {
+            match verb {
+                PathVerb::MoveTo => {
+                    if let Some(p) = path.points.get(pt) {
+                        last = *p;
+                    }
+                    pt += 1;
+                }
+                PathVerb::LineTo => {
+                    lines += 1;
+                    if let Some(p) = path.points.get(pt) {
+                        last = *p;
+                    }
+                    pt += 1;
+                }
+                PathVerb::CurveTo => {
+                    curves += 1;
+                    if let (Some(c1), Some(c2), Some(p3)) = (
+                        path.points.get(pt),
+                        path.points.get(pt + 1),
+                        path.points.get(pt + 2),
+                    ) {
+                        let n = Self::adaptive_segments(ctm, last, *c1, *c2, *p3);
+                        adaptive += n;
+                        let bin = match n {
+                            1 => 0,
+                            2 => 1,
+                            3..=4 => 2,
+                            5..=8 => 3,
+                            9..=16 => 4,
+                            _ => 5,
+                        };
+                        bins[bin] += 1;
+                        last = *p3;
+                    }
+                    pt += 3;
+                }
+                PathVerb::Close => {}
+            }
+        }
+        (lines, curves, adaptive, bins)
+    }
+
+    /// Count the interior vertices of flattened stroke polylines and those a
+    /// ribbon stroker could pass through (turn small enough that a mitered
+    /// outline stays within 1/8 px of the round/bevel one, and the curvature
+    /// radius at least the half-width so inner offsets cannot cross).
+    fn vertex_census(&mut self, polylines: &[(Vec<[f32; 2]>, bool)], hw: f32) {
+        const TOLERANCE_PX: f64 = 0.125;
+        let hw = f64::from(hw);
+        for (poly, closed) in polylines {
+            let n = poly.len();
+            self.stroke_polylines += 1;
+            self.stroke_centerline_points += n as u64;
+            if n < 3 {
+                continue;
+            }
+            let range = if *closed { 0..n } else { 1..n - 1 };
+            for i in range {
+                let prev = poly[(i + n - 1) % n];
+                let v = poly[i];
+                let next = poly[(i + 1) % n];
+                let (ax, ay) = (f64::from(v[0] - prev[0]), f64::from(v[1] - prev[1]));
+                let (bx, by) = (f64::from(next[0] - v[0]), f64::from(next[1] - v[1]));
+                let (la, lb) = ((ax * ax + ay * ay).sqrt(), (bx * bx + by * by).sqrt());
+                self.stroke_vertices_interior += 1;
+                if la <= 1e-12 || lb <= 1e-12 {
+                    continue;
+                }
+                let c = ((ax * bx + ay * by) / (la * lb)).clamp(-1.0, 1.0);
+                let q = (1.0 + c) / 2.0;
+                let ratio = TOLERANCE_PX / hw.max(1e-9);
+                let spread_ok = (1.0 - q) * (1.0 - q) <= ratio * ratio * q;
+                let min_len = la.min(lb);
+                let radius_ok = c > -1.0 && hw * hw * (1.0 - c) / (1.0 + c) <= 0.25 * min_len * min_len;
+                if spread_ok && radius_ok {
+                    self.stroke_vertices_smooth += 1;
+                }
+            }
+        }
+    }
+
+    /// Classify the polygons a stroke expansion appended, by vertex count.
+    fn stroke_output_census(&mut self, subpaths: &[(usize, usize)]) {
+        for &(start, end) in subpaths {
+            let n = end - start;
+            self.stroke_out_subpaths += 1;
+            self.stroke_out_points += n as u64;
+            match n {
+                4 => self.stroke_quads += 1,
+                3 => self.stroke_tris += 1,
+                16 => self.stroke_disks += 1,
+                _ => self.stroke_other_polys += 1,
+            }
+        }
+    }
+
+    fn flush_into(&mut self, out: &mut crate::profiling::ProfileReport) {
+        const BUCKET_NAMES: [&str; LOWER_BUCKETS] = [
+            "lower.x.state",
+            "lower.x.clip",
+            "lower.x.fill_flatten",
+            "lower.x.fill_finish",
+            "lower.x.stroke_flatten",
+            "lower.x.stroke_expand",
+            "lower.x.stroke_finish",
+            "lower.x.glyph",
+            "lower.x.image",
+            "lower.x.other",
+            "lower.x.census",
+        ];
+        for (name, ns) in BUCKET_NAMES.iter().zip(self.ns) {
+            if ns != 0 {
+                out.add_duration(name, std::time::Duration::from_nanos(ns));
+            }
+        }
+        let counters: [(&'static str, u64); 45] = [
+            ("lower.clock_reads", self.clock_reads),
+            ("lower.in.fill_ops", self.fill_ops),
+            ("lower.in.stroke_ops", self.stroke_ops),
+            ("lower.in.clip_ops", self.clip_ops),
+            ("lower.fill.lines", self.fill_lines),
+            ("lower.fill.curves", self.fill_curves),
+            ("lower.fill.points", self.fill_points),
+            (
+                "lower.fill.curve_segments_adaptive",
+                self.fill_curve_segments_adaptive,
+            ),
+            ("lower.fill.curves_n1", self.fill_curve_bins[0]),
+            ("lower.fill.curves_n2", self.fill_curve_bins[1]),
+            ("lower.fill.curves_n3_4", self.fill_curve_bins[2]),
+            ("lower.fill.curves_n5_8", self.fill_curve_bins[3]),
+            ("lower.fill.curves_n9_16", self.fill_curve_bins[4]),
+            ("lower.fill.curves_n_gt16", self.fill_curve_bins[5]),
+            ("lower.clip.rects", self.clip_rects),
+            ("lower.clip.paths", self.clip_paths),
+            ("lower.clip.lines", self.clip_lines),
+            ("lower.clip.curves", self.clip_curves),
+            ("lower.clip.path_points", self.clip_path_points),
+            ("lower.stroke.dashed_ops", self.stroke_dashed_ops),
+            ("lower.stroke.lines", self.stroke_lines),
+            ("lower.stroke.curves", self.stroke_curves),
+            (
+                "lower.stroke.curve_segments_adaptive",
+                self.stroke_curve_segments_adaptive,
+            ),
+            ("lower.stroke.polylines", self.stroke_polylines),
+            (
+                "lower.stroke.centerline_points",
+                self.stroke_centerline_points,
+            ),
+            ("lower.stroke.dash_pieces", self.stroke_dash_pieces),
+            ("lower.stroke.out_subpaths", self.stroke_out_subpaths),
+            ("lower.stroke.out_points", self.stroke_out_points),
+            ("lower.stroke.quads", self.stroke_quads),
+            ("lower.stroke.tris", self.stroke_tris),
+            ("lower.stroke.disks", self.stroke_disks),
+            ("lower.stroke.other_polys", self.stroke_other_polys),
+            ("lower.stroke.join_round_ops", self.stroke_join_round),
+            ("lower.stroke.join_miter_ops", self.stroke_join_miter),
+            ("lower.stroke.join_bevel_ops", self.stroke_join_bevel),
+            ("lower.stroke.hw_le_0_5px_ops", self.stroke_hw_bins[0]),
+            ("lower.stroke.hw_le_1_6px_ops", self.stroke_hw_bins[1]),
+            ("lower.stroke.hw_le_6_5px_ops", self.stroke_hw_bins[2]),
+            ("lower.stroke.hw_gt_6_5px_ops", self.stroke_hw_bins[3]),
+            (
+                "lower.stroke.vertices_interior",
+                self.stroke_vertices_interior,
+            ),
+            ("lower.stroke.vertices_smooth", self.stroke_vertices_smooth),
+            ("lower.cull.fill_insane", self.cull_fill_insane),
+            ("lower.cull.fill_clipped", self.cull_fill_clipped),
+            (
+                "lower.cull.fill_clipped_points",
+                self.cull_fill_clipped_points,
+            ),
+            ("lower.cull.stroke_clipped", self.cull_stroke_clipped),
+        ];
+        for (name, count) in counters {
+            if count != 0 {
+                out.increment(name, count);
+            }
+        }
+        if self.cull_stroke_insane != 0 {
+            out.increment("lower.cull.stroke_insane", self.cull_stroke_insane);
+        }
+        if self.cull_stroke_clipped_points != 0 {
+            out.increment(
+                "lower.cull.stroke_clipped_points",
+                self.cull_stroke_clipped_points,
+            );
+        }
+        *self = Self::default();
     }
 }
 
@@ -1409,6 +1738,8 @@ pub fn lower(
         false,
         #[cfg(feature = "profiling")]
         None,
+        #[cfg(feature = "profiling")]
+        true,
     )
 }
 
@@ -1445,6 +1776,8 @@ pub(crate) fn lower_cell(
         false,
         #[cfg(feature = "profiling")]
         outer.decode_cache.clone(),
+        #[cfg(feature = "profiling")]
+        false,
     )
 }
 
@@ -1482,6 +1815,8 @@ pub(crate) fn lower_with_font_cache(
         false,
         #[cfg(feature = "profiling")]
         None,
+        #[cfg(feature = "profiling")]
+        true,
     )
 }
 
@@ -1520,6 +1855,8 @@ pub(crate) fn lower_for_external_raster(
         true,
         #[cfg(feature = "profiling")]
         None,
+        #[cfg(feature = "profiling")]
+        true,
     )
 }
 
@@ -1549,6 +1886,8 @@ pub fn lower_with_decode_cache(
         None,
         false,
         Some(decode_cache),
+        #[cfg(feature = "profiling")]
+        true,
     )
 }
 
@@ -1581,6 +1920,7 @@ pub fn decode_page(
         sanity_extent: 1.0,
         profile: std::cell::RefCell::new(crate::profiling::ProfileReport::new()),
         decode_cache: None,
+        lower_prof: Default::default(),
     };
     let mut seen = HashSet::new();
     decode_page_images(page, &out, &mut seen);
@@ -1699,6 +2039,7 @@ fn lower_impl(
     decode_floor: Option<Matrix>,
     split_glyph_draws: bool,
     #[cfg(feature = "profiling")] decode_cache: Option<DecodedImageCache>,
+    #[cfg(feature = "profiling")] prof_enabled: bool,
 ) -> CpuPreparedPage {
     #[cfg(feature = "profiling")]
     let lower_start = std::time::Instant::now();
@@ -1720,7 +2061,16 @@ fn lower_impl(
         profile: std::cell::RefCell::new(crate::profiling::ProfileReport::new()),
         #[cfg(feature = "profiling")]
         decode_cache,
+        #[cfg(feature = "profiling")]
+        lower_prof: LowerProf {
+            disabled: !prof_enabled,
+            ..LowerProf::default()
+        },
     };
+    #[cfg(feature = "profiling")]
+    let mut prof_bucket = LowerBucket::State;
+    #[cfg(feature = "profiling")]
+    out.lower_prof.lap(LowerBucket::State);
     let mut ctm = base;
     let mut ctm_stack: Vec<Matrix> = Vec::new();
     // The clip stack holds active clip ids; `Save`/`Restore` move the CTM,
@@ -1761,6 +2111,10 @@ fn lower_impl(
     // glyph bitmaps, and a per-font content-identity memo (one 128-bit hash per
     // font per page, not per run).
     let mut glyph_raster = crate::render_cpu::raster::RasterKernel::default();
+    #[cfg(feature = "profiling")]
+    {
+        glyph_raster.prof.class = crate::render_cpu::raster::RasterClass::Glyph;
+    }
     let mut glyph_font_ids: HashMap<u32, FontProgramKey> = HashMap::new();
 
     // Diagnostic attribution (see `crate::render_cpu::attribution`): the stack of enclosing
@@ -1775,6 +2129,20 @@ fn lower_impl(
         // the caller's post-lowering token check converts this to Cancelled.
         if out.decode_limits.is_cancelled() {
             break;
+        }
+        #[cfg(feature = "profiling")]
+        {
+            // Close the previous operation's bucket, then open this one's.
+            out.lower_prof.lap(prof_bucket);
+            prof_bucket = match op {
+                DisplayOp::PushClip { .. } | DisplayOp::PushClipText { .. } => LowerBucket::Clip,
+                DisplayOp::FillPath { .. } => LowerBucket::FillFinish,
+                DisplayOp::StrokePath { .. } => LowerBucket::StrokeFinish,
+                DisplayOp::DrawGlyphRun { .. } => LowerBucket::Glyph,
+                DisplayOp::DrawImage { .. } => LowerBucket::Image,
+                DisplayOp::DrawShading { .. } => LowerBucket::Other,
+                _ => LowerBucket::State,
+            };
         }
         let ops_before = out.ops.len();
         match op {
@@ -2379,12 +2747,21 @@ fn lower_impl(
         }
     }
     #[cfg(feature = "profiling")]
-    {
+    if prof_enabled {
+        out.lower_prof.lap(prof_bucket);
         let mut profile = out.profile.borrow_mut();
+        out.lower_prof.flush_into(&mut profile);
+        glyph_raster.prof.drain_into(&mut profile);
         profile.add_duration("render.lower.total", lower_start.elapsed());
         profile.increment("render.lower.operations", page.operations.len() as u64);
         profile.increment("render.lower.prepared_ops", out.ops.len() as u64);
         profile.increment("render.lower.points", out.points.len() as u64);
+        profile.increment("render.lower.subpaths", out.subpaths.len() as u64);
+        profile.increment(
+            "render.lower.arena_bytes",
+            (out.points.capacity() * std::mem::size_of::<[f32; 2]>()
+                + out.subpaths.capacity() * std::mem::size_of::<(usize, usize)>()) as u64,
+        );
     }
     if let Some(cache) = font_cache {
         cache.store_for_page(page, font_programs);
@@ -3435,6 +3812,8 @@ fn push_clip(
     let range_start = out.subpaths.len() as u32;
     flatten_into(path, ctm, &mut out.points, &mut out.subpaths);
     let range_end = out.subpaths.len() as u32;
+    #[cfg(feature = "profiling")]
+    let prof_clip_points = (out.points.len() - pt_start) as u64;
 
     let (bx0, by0, bx1, by1) = device_bounds(&out.points[pt_start..], out.size);
     let path_rect = DeviceRect {
@@ -3472,6 +3851,20 @@ fn push_clip(
             rule: krule,
         }
     };
+    #[cfg(feature = "profiling")]
+    if !out.lower_prof.disabled {
+        let prof = &mut out.lower_prof;
+        prof.clip_ops += 1;
+        if is_rect {
+            prof.clip_rects += 1;
+        } else {
+            let (lines, curves, _, _) = LowerProf::path_census(path, ctm);
+            prof.clip_paths += 1;
+            prof.clip_lines += lines;
+            prof.clip_curves += curves;
+            prof.clip_path_points += prof_clip_points;
+        }
+    }
     let has_mask = matches!(kind, ClipKind::Path { .. })
         || parent
             .map(|p| out.clips[p as usize].has_mask)
@@ -3509,7 +3902,28 @@ fn lower_fill(
 ) -> Option<DeviceRect> {
     let range_start = out.subpaths.len() as u32;
     let pt_start = out.points.len();
+    #[cfg(feature = "profiling")]
+    if !out.lower_prof.disabled {
+        // Everything since the op boundary is fill bookkeeping; the census is
+        // charged to its own bucket so it cannot inflate the flatten share.
+        out.lower_prof.lap(LowerBucket::FillFinish);
+        let (lines, curves, adaptive, bins) = LowerProf::path_census(path, ctm);
+        let prof = &mut out.lower_prof;
+        prof.fill_ops += 1;
+        prof.fill_lines += lines;
+        prof.fill_curves += curves;
+        prof.fill_curve_segments_adaptive += adaptive;
+        for (total, bin) in prof.fill_curve_bins.iter_mut().zip(bins) {
+            *total += bin;
+        }
+        prof.lap(LowerBucket::Census);
+    }
     flatten_into(path, ctm, &mut out.points, &mut out.subpaths);
+    #[cfg(feature = "profiling")]
+    {
+        out.lower_prof.lap(LowerBucket::FillFlatten);
+        out.lower_prof.fill_points += (out.points.len() - pt_start) as u64;
+    }
     let range_end = out.subpaths.len() as u32;
     if range_end == range_start {
         return None; // empty path
@@ -3519,6 +3933,10 @@ fn lower_fill(
     let Some((bx0, by0, bx1, by1)) =
         device_bounds_sane(&out.points[pt_start..], out.size, out.sanity_extent)
     else {
+        #[cfg(feature = "profiling")]
+        {
+            out.lower_prof.cull_fill_insane += 1;
+        }
         out.points.truncate(pt_start);
         out.subpaths.truncate(range_start as usize);
         return None;
@@ -3543,6 +3961,11 @@ fn lower_fill(
         bounds = intersect(bounds, stencil.bounds);
     }
     if bounds.width == 0 || bounds.height == 0 {
+        #[cfg(feature = "profiling")]
+        {
+            out.lower_prof.cull_fill_clipped += 1;
+            out.lower_prof.cull_fill_clipped_points += (out.points.len() - pt_start) as u64;
+        }
         out.points.truncate(pt_start);
         out.subpaths.truncate(range_start as usize);
         return None;
@@ -3937,9 +4360,50 @@ fn append_stroke_outline(
 
     let range_start = out.subpaths.len() as u32;
     let pt_start = out.points.len();
-    for (poly, closed) in flatten_polylines(path, m1) {
+    #[cfg(feature = "profiling")]
+    if !out.lower_prof.disabled {
+        out.lower_prof.lap(LowerBucket::StrokeFinish);
+        let (lines, curves, adaptive, _) = LowerProf::path_census(path, m1);
+        let prof = &mut out.lower_prof;
+        prof.stroke_ops += 1;
+        prof.stroke_lines += lines;
+        prof.stroke_curves += curves;
+        prof.stroke_curve_segments_adaptive += adaptive;
+        if dashed {
+            prof.stroke_dashed_ops += 1;
+        }
+        match style.join {
+            crate::page_ir::LineJoin::Round => prof.stroke_join_round += 1,
+            crate::page_ir::LineJoin::Miter => prof.stroke_join_miter += 1,
+            crate::page_ir::LineJoin::Bevel => prof.stroke_join_bevel += 1,
+        }
+        let device_hw = hw * pen_axis;
+        let bin = if device_hw <= 0.5 {
+            0
+        } else if device_hw <= 1.6 {
+            1
+        } else if device_hw <= 6.5 {
+            2
+        } else {
+            3
+        };
+        prof.stroke_hw_bins[bin] += 1;
+        prof.lap(LowerBucket::Census);
+    }
+    let polylines = flatten_polylines(path, m1);
+    #[cfg(feature = "profiling")]
+    if !out.lower_prof.disabled {
+        out.lower_prof.lap(LowerBucket::StrokeFlatten);
+        out.lower_prof.vertex_census(&polylines, hw);
+        out.lower_prof.lap(LowerBucket::Census);
+    }
+    for (poly, closed) in polylines {
         if dashed {
             for piece in stroke::dash_polyline(&poly, closed, &dash, phase) {
+                #[cfg(feature = "profiling")]
+                {
+                    out.lower_prof.stroke_dash_pieces += 1;
+                }
                 stroke::expand_stroke(
                     &piece,
                     false,
@@ -3965,6 +4429,13 @@ fn append_stroke_outline(
         }
     }
     let range_end = out.subpaths.len() as u32;
+    #[cfg(feature = "profiling")]
+    if !out.lower_prof.disabled {
+        out.lower_prof.lap(LowerBucket::StrokeExpand);
+        let appended = &out.subpaths[range_start as usize..];
+        out.lower_prof.stroke_output_census(appended);
+        out.lower_prof.lap(LowerBucket::Census);
+    }
     if range_end == range_start {
         return None;
     }
@@ -3988,6 +4459,10 @@ fn append_stroke_outline(
     let Some((bx0, by0, bx1, by1)) =
         device_bounds_sane(&out.points[pt_start..], out.size, out.sanity_extent)
     else {
+        #[cfg(feature = "profiling")]
+        {
+            out.lower_prof.cull_stroke_insane += 1;
+        }
         out.points.truncate(pt_start);
         out.subpaths.truncate(range_start as usize);
         return None;
@@ -4026,6 +4501,11 @@ fn lower_stroke(
         false
     };
     if bounds.width == 0 || bounds.height == 0 {
+        #[cfg(feature = "profiling")]
+        {
+            out.lower_prof.cull_stroke_clipped += 1;
+            out.lower_prof.cull_stroke_clipped_points += (out.points.len() - pt_start) as u64;
+        }
         out.points.truncate(pt_start);
         out.subpaths.truncate(range_start as usize);
         return None;
@@ -6803,6 +7283,8 @@ mod glyph_cache_tests {
             profile: std::cell::RefCell::new(crate::profiling::ProfileReport::new()),
             #[cfg(feature = "profiling")]
             decode_cache: None,
+            #[cfg(feature = "profiling")]
+            lower_prof: Default::default(),
         }
     }
 
@@ -7151,6 +7633,8 @@ mod image_cache_tests {
             false,
             #[cfg(feature = "profiling")]
             None,
+            #[cfg(feature = "profiling")]
+            true,
         )
     }
 

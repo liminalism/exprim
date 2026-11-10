@@ -76,6 +76,15 @@ impl CpuWorkerContext {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Choose how much timing profiled renders on this worker collect (see
+    /// [`crate::profiling::ProfileDetail`]). Counters are unaffected.
+    #[cfg(feature = "profiling")]
+    pub fn set_profile_detail(&mut self, detail: crate::profiling::ProfileDetail) {
+        use crate::profiling::ProfileDetail;
+        self.raster.prof.time_fills = matches!(detail, ProfileDetail::Fill | ProfileDetail::Row);
+        self.raster.prof.time_rows = matches!(detail, ProfileDetail::Row);
+    }
 }
 
 /// Execute a page into `surface`, rendering transparency groups into bounded
@@ -95,6 +104,12 @@ pub fn execute(
     // Region-local clip masks, built once per page and indexed by dense
     // ClipId (advice §8 — no hash map in the draw loop).
     let mut masks: Vec<Option<ClipMask>> = (0..page.clips.len()).map(|_| None).collect();
+    #[cfg(feature = "profiling")]
+    let mut lap = crate::profiling::Lap::start();
+    #[cfg(feature = "profiling")]
+    {
+        stats.hot.time_nested = raster.prof.time_fills;
+    }
     // Clip-dense pages (basin maps, music notation) spend nearly all their time
     // rasterizing hundreds of large independent path-clip masks. Each mask is a
     // pure function of the page and is byte-identical regardless of build order,
@@ -102,7 +117,22 @@ pub fn execute(
     // draw loop. The draw loop then finds them cached. Peak memory is unchanged
     // (every consumed mask is cached by page end anyway); this only front-loads
     // and parallelizes the build.
-    prebuild_masks(page, &mut masks);
+    prebuild_masks(
+        page,
+        &mut masks,
+        #[cfg(feature = "profiling")]
+        &mut raster.prof,
+    );
+    #[cfg(feature = "profiling")]
+    {
+        stats.hot.ns_prebuild_masks += lap.lap_ns();
+        stats.hot.n_clip_mask_prebuilt += masks.iter().flatten().count() as u64;
+        stats.hot.clip_mask_bytes += masks
+            .iter()
+            .flatten()
+            .map(|mask| mask.data.len() as u64)
+            .sum::<u64>();
+    }
     // Active soft masks (top = current); `None` entry = /SMask /None.
     let mut soft: Vec<Option<ClipMask>> = Vec::new();
     run_ops(
@@ -118,6 +148,10 @@ pub fn execute(
     );
     #[cfg(feature = "profiling")]
     {
+        stats.hot.ns_run_ops += lap.lap_ns();
+        stats.hot.clock_reads += 3;
+        stats.hot.flush_into(&mut stats.profile);
+        raster.prof.drain_into(&mut stats.profile);
         stats.raster += start.elapsed();
     }
 }
@@ -241,7 +275,11 @@ pub(crate) fn prepare_patterned_stencil(
 /// and byte-identical regardless of build order, so this is safe to parallelize
 /// and never changes output. Engaged only past a threshold where the fan-out
 /// pays for itself; below it the draw loop builds the few masks lazily.
-fn prebuild_masks(page: &CpuPreparedPage, masks: &mut [Option<ClipMask>]) {
+fn prebuild_masks(
+    page: &CpuPreparedPage,
+    masks: &mut [Option<ClipMask>],
+    #[cfg(feature = "profiling")] prof: &mut crate::render_cpu::raster::RasterProf,
+) {
     // Cooperative cancellation: skip the (bounded) pre-pass if already cancelled.
     if let Some(cancel) = &page.decode_limits.should_cancel
         && cancel()
@@ -276,15 +314,37 @@ fn prebuild_masks(page: &CpuPreparedPage, masks: &mut [Option<ClipMask>]) {
     // One reused scratch kernel per worker thread (grows on first fill).
     let geom = ClipGeom::of(page);
     let should_cancel = page.decode_limits.should_cancel.as_deref();
-    let built: Vec<(u32, ClipMask)> = ids
-        .par_iter()
-        .map_init(RasterKernel::default, |rk, &cid| {
-            build_clip_mask_cancellable(rk, geom, cid, should_cancel).map(|mask| (cid, mask))
-        })
-        .filter_map(|built| built)
-        .collect();
-    for (cid, m) in built {
-        masks[cid as usize] = Some(m);
+    #[cfg(feature = "profiling")]
+    {
+        // Each rayon worker's kernel carries its own attribution; hand it back
+        // with the mask and merge serially (summed CPU time, not wall time).
+        let built: Vec<(u32, Option<ClipMask>, crate::render_cpu::raster::RasterProf)> = ids
+            .par_iter()
+            .map_init(RasterKernel::default, |rk, &cid| {
+                rk.prof.class = crate::render_cpu::raster::RasterClass::Clip;
+                let mask = build_clip_mask_cancellable(rk, geom, cid, should_cancel);
+                (cid, mask, std::mem::take(&mut rk.prof))
+            })
+            .collect();
+        for (cid, mask, worker_prof) in built {
+            prof.merge(&worker_prof);
+            if let Some(mask) = mask {
+                masks[cid as usize] = Some(mask);
+            }
+        }
+    }
+    #[cfg(not(feature = "profiling"))]
+    {
+        let built: Vec<(u32, ClipMask)> = ids
+            .par_iter()
+            .map_init(RasterKernel::default, |rk, &cid| {
+                build_clip_mask_cancellable(rk, geom, cid, should_cancel).map(|mask| (cid, mask))
+            })
+            .filter_map(|built| built)
+            .collect();
+        for (cid, m) in built {
+            masks[cid as usize] = Some(m);
+        }
     }
 }
 
@@ -345,7 +405,15 @@ fn run_ops(
                 i += 1;
             }
             PreparedOp::TiledFill(t) => {
+                #[cfg(feature = "profiling")]
+                let tiling_start = Instant::now();
                 render_tiling(page, t, surface, raster, kernels, masks, stats);
+                #[cfg(feature = "profiling")]
+                {
+                    stats.hot.ns_tiling += tiling_start.elapsed().as_nanos() as u64;
+                    stats.hot.n_tiling_fills += 1;
+                    stats.hot.clock_reads += 2;
+                }
                 i += 1;
             }
             PreparedOp::Image(img) => {
@@ -532,12 +600,19 @@ fn build_render_clip_mask(
     cid: u32,
     stats: &mut RenderStats,
 ) -> Option<ClipMask> {
+    #[cfg(feature = "profiling")]
+    let caller_class =
+        std::mem::replace(&mut raster.prof.class, crate::render_cpu::raster::RasterClass::Clip);
     let mask = build_clip_mask_cancellable(
         raster,
         ClipGeom::of(page),
         cid,
         page.decode_limits.should_cancel.as_deref(),
     );
+    #[cfg(feature = "profiling")]
+    {
+        raster.prof.class = caller_class;
+    }
     if mask.is_none() {
         stats.cancelled = true;
     }
@@ -4214,6 +4289,12 @@ fn render_tiling(
     // are not translation-invariant, so a lower-once-translate-many cell
     // would not be byte-identical to per-instance lowering.
     let mut cell_fonts = crate::render_cpu::prepared::FontProgramCache::default();
+    #[cfg(feature = "profiling")]
+    let mut lap = crate::profiling::Lap::start();
+    #[cfg(feature = "profiling")]
+    {
+        stats.hot.tiling_surface_px += (w * h) as u64;
+    }
     for tile in &t.tiles {
         // A cancelled request stops between tile instances too — an
         // adversarial many-tile fill must not pin the worker.
@@ -4234,6 +4315,14 @@ fn render_tiling(
         let mut cmasks: Vec<Option<ClipMask>> =
             (0..cell_prepared.clips.len()).map(|_| None).collect();
         let mut csoft: Vec<Option<ClipMask>> = Vec::new();
+        #[cfg(feature = "profiling")]
+        {
+            stats.hot.ns_tiling_lower += lap.lap_ns();
+            stats.hot.n_tiles += 1;
+            stats.hot.tiling_cell_ops += cell_prepared.ops.len() as u64;
+            stats.hot.tiling_cell_points += cell_prepared.points.len() as u64;
+            stats.hot.tiling_depth += 1;
+        }
         run_ops(
             &cell_prepared,
             0,
@@ -4245,8 +4334,19 @@ fn render_tiling(
             &mut csoft,
             stats,
         );
+        #[cfg(feature = "profiling")]
+        {
+            stats.hot.tiling_depth -= 1;
+            stats.hot.ns_tiling_cells += lap.lap_ns();
+            stats.hot.clock_reads += 2;
+        }
         // A codec image dropped while lowering this tile cell counts too.
         stats.absorb_diagnostics(&cell_prepared.diagnostics);
+    }
+    #[cfg(feature = "profiling")]
+    {
+        lap.lap_ns();
+        raster.prof.class = crate::render_cpu::raster::RasterClass::Other;
     }
 
     // The fill shape as an Alpha8 coverage mask over the bounds.
@@ -4355,6 +4455,12 @@ fn render_tiling(
         }
     }
 
+    #[cfg(feature = "profiling")]
+    {
+        stats.hot.ns_tiling_fmask += lap.lap_ns();
+        stats.hot.tiling_mask_px += fmask.iter().filter(|&&c| c != 0).count() as u64;
+        lap.lap_ns();
+    }
     // Composite the tiled offscreen onto `surface`, masked by the fill shape
     // and scaled by the fill's constant alpha.
     let sox = surface.origin_x;
@@ -4419,6 +4525,11 @@ fn render_tiling(
             }
             dst[3] = (sa as u16 + mul_div_255(dst[3] as u16, ia)) as u8;
         }
+    }
+    #[cfg(feature = "profiling")]
+    {
+        stats.hot.ns_tiling_composite += lap.lap_ns();
+        stats.hot.clock_reads += 4;
     }
     stats.commands += 1;
     stats.ops_painted += 1;
@@ -4852,11 +4963,17 @@ fn paint_command(
     soft: Option<&ClipMask>,
     stats: &mut RenderStats,
 ) {
+    // Page-level commands are always timed; commands nested in tiling cells
+    // (often tens of thousands of tiny fills) only at `ProfileDetail::Fill`.
     #[cfg(feature = "profiling")]
-    let command_start = Instant::now();
+    let command_start =
+        (stats.hot.time_nested || stats.hot.tiling_depth == 0).then(Instant::now);
     stats.commands += 1;
+    // 0 = opaque rect, 1 = direct runs, 2 = clip-masked, 3 = otherwise modulated.
     #[cfg(feature = "profiling")]
-    let mut dispatch_elapsed = std::time::Duration::ZERO;
+    let mut path_kind = 0u8;
+    #[cfg(feature = "profiling")]
+    let mut rows_outside = 0u64;
     let mask_cid = if cmd.clip_has_mask {
         // Lowering guarantees a masked draw carries its clip id; skip the
         // draw (never panic a page) if that IR invariant broke upstream.
@@ -4868,15 +4985,36 @@ fn paint_command(
         // Share the nearest path-clip ancestor's mask across rect descendants.
         let cid = page.clips[cid as usize].mask_source.unwrap_or(cid) as usize;
         if masks[cid].is_none() {
+            #[cfg(feature = "profiling")]
+            let mask_start = Instant::now();
+            #[cfg(feature = "profiling")]
+            {
+                raster.prof.class = crate::render_cpu::raster::RasterClass::Clip;
+            }
             let Some(mask) = build_render_clip_mask(page, raster, cid as u32, stats) else {
                 return;
             };
+            #[cfg(feature = "profiling")]
+            {
+                stats.hot.ns_clip_mask_lazy += mask_start.elapsed().as_nanos() as u64;
+                stats.hot.n_clip_mask_lazy += 1;
+                stats.hot.clip_mask_bytes += mask.data.len() as u64;
+                stats.hot.clock_reads += 2;
+            }
             masks[cid] = Some(mask);
         }
         Some(cid)
     } else {
         None
     };
+    #[cfg(feature = "profiling")]
+    {
+        raster.prof.class = if stats.hot.tiling_depth > 0 {
+            crate::render_cpu::raster::RasterClass::Other
+        } else {
+            crate::render_cpu::raster::RasterClass::Path
+        };
+    }
 
     match cmd.class {
         DrawClass::OpaqueRect => {
@@ -4922,6 +5060,16 @@ fn paint_command(
                 && stencil.is_none()
                 && shading.is_none()
                 && matches!(blend, BlendChoice::Normal);
+            #[cfg(feature = "profiling")]
+            {
+                path_kind = if runs_direct {
+                    1
+                } else if mask.is_some() {
+                    2
+                } else {
+                    3
+                };
+            }
 
             if !raster.fill_runs_cancellable(
                 &page.points,
@@ -4932,11 +5080,13 @@ fn paint_command(
                 page.decode_limits.should_cancel.as_deref(),
                 |y, x0, x1, cov, runs| {
                     if y < by0 || y >= by1 {
+                        #[cfg(feature = "profiling")]
+                        {
+                            rows_outside += 1;
+                        }
                         return false;
                     }
-                    #[cfg(feature = "profiling")]
-                    let dispatch_start = Instant::now();
-                    let dirty = if runs_direct {
+                    if runs_direct {
                         dispatch_runs(
                             surface, kernels, y, x0, x1, cov, runs, bx0, bx1, rgb, alpha, opaque,
                             premul,
@@ -4953,12 +5103,7 @@ fn paint_command(
                             opaque, premul, blend, shading, stencil,
                         );
                         true
-                    };
-                    #[cfg(feature = "profiling")]
-                    {
-                        dispatch_elapsed += dispatch_start.elapsed();
                     }
-                    dirty
                 },
             ) {
                 stats.cancelled = true;
@@ -4972,21 +5117,40 @@ fn paint_command(
     }
     #[cfg(feature = "profiling")]
     {
-        let profile = &mut stats.profile;
-        let elapsed = command_start.elapsed();
-        profile.add_duration("render.path", elapsed);
+        // Plain-field accumulation; `ExecHot::flush_into` names these once
+        // per page. The kernel's own phases (edge build, deposit, sweep, and
+        // optionally the row callback) are in `raster.path.*`.
+        let elapsed = command_start.map_or(0, |start| start.elapsed().as_nanos() as u64);
+        let hot = &mut stats.hot;
+        hot.ns_path += elapsed;
+        hot.clock_reads += if command_start.is_some() { 2 } else { 0 };
+        hot.rows_outside_bounds += rows_outside;
+        if hot.tiling_depth > 0 {
+            hot.ns_path_in_tiling += elapsed;
+            hot.n_path_in_tiling += 1;
+        }
         match cmd.class {
             DrawClass::OpaqueRect => {
-                profile.add_duration("render.path.opaque_rects", elapsed);
-                profile.increment("render.opaque_rects", 1);
+                hot.ns_opaque_rects += elapsed;
+                hot.n_opaque_rects += 1;
             }
             DrawClass::SolidPath => {
-                // Span classification + kernel time inside the coverage
-                // callback; the remainder of `render.path.solid_paths` is
-                // edge build + coverage accumulation in `RasterKernel`.
-                profile.add_duration("render.path.solid_paths", elapsed);
-                profile.add_duration("render.path.solid_dispatch", dispatch_elapsed);
-                profile.increment("render.solid_paths", 1);
+                hot.ns_solid_paths += elapsed;
+                hot.n_solid_paths += 1;
+                match path_kind {
+                    1 => {
+                        hot.ns_path_direct += elapsed;
+                        hot.n_path_direct += 1;
+                    }
+                    2 => {
+                        hot.ns_path_masked += elapsed;
+                        hot.n_path_masked += 1;
+                    }
+                    _ => {
+                        hot.ns_path_modulated += elapsed;
+                        hot.n_path_modulated += 1;
+                    }
+                }
             }
         }
     }
@@ -7280,6 +7444,8 @@ mod rgb8_area_min_tests {
             profile: Default::default(),
             #[cfg(feature = "profiling")]
             decode_cache: None,
+            #[cfg(feature = "profiling")]
+            lower_prof: Default::default(),
         };
         let mut surface = Surface::new(side as usize, side as usize, Background::Transparent);
         let mut ctx = CpuWorkerContext::default();
@@ -7752,6 +7918,8 @@ mod cancel_tests {
             profile: Default::default(),
             #[cfg(feature = "profiling")]
             decode_cache: None,
+            #[cfg(feature = "profiling")]
+            lower_prof: Default::default(),
         }
     }
 

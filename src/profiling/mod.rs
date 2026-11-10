@@ -85,6 +85,77 @@ impl ProfileReport {
     }
 }
 
+/// A monotonic lap timer for exclusive stage attribution: each [`Lap::lap_ns`]
+/// returns the time since the previous lap (or the start) with one clock read,
+/// so consecutive buckets cannot double count and their sum is the stage's
+/// wall time. Hot paths add the result to a plain integer field and flush to a
+/// [`ProfileReport`] once per page, keeping map updates out of per-fill loops.
+#[derive(Debug, Clone, Copy)]
+pub struct Lap {
+    last: std::time::Instant,
+}
+
+impl Lap {
+    #[inline]
+    pub fn start() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+        }
+    }
+
+    /// Nanoseconds since the previous lap; restarts the lap.
+    #[inline]
+    pub fn lap_ns(&mut self) -> u64 {
+        let now = std::time::Instant::now();
+        let ns = now.duration_since(self.last).as_nanos() as u64;
+        self.last = now;
+        ns
+    }
+}
+
+/// Lap an optional timer; an absent timer (detail level off) costs nothing
+/// and reports zero.
+#[inline]
+pub fn lap_opt(lap: &mut Option<Lap>) -> u64 {
+    match lap.as_mut() {
+        Some(lap) => lap.lap_ns(),
+        None => 0,
+    }
+}
+
+/// How much timing a profiled render collects. Counters are always recorded;
+/// the levels differ only in clock reads, which on a page of very many tiny
+/// fills are a visible share of the work being measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProfileDetail {
+    /// Stage and per-operation timers only (page-level draws, tiling fills).
+    #[default]
+    Stage,
+    /// Also every kernel fill's phases and every nested tiling-cell draw.
+    Fill,
+    /// Also every coverage-row callback (span dispatch and compositing).
+    Row,
+}
+
+/// Measured cost of one clock read in nanoseconds (median of a few batches),
+/// so a report can state the instrumentation's own share: reads × this.
+pub fn clock_read_cost_ns() -> u64 {
+    const BATCH: u32 = 2_000;
+    let mut samples = [0u64; 9];
+    for sample in &mut samples {
+        let start = std::time::Instant::now();
+        let mut lap = Lap::start();
+        let mut sink = 0u64;
+        for _ in 0..BATCH {
+            sink = sink.wrapping_add(lap.lap_ns());
+        }
+        std::hint::black_box(sink);
+        *sample = start.elapsed().as_nanos() as u64 / u64::from(BATCH);
+    }
+    samples.sort_unstable();
+    samples[samples.len() / 2]
+}
+
 impl From<()> for ProfileReport {
     fn from(_: ()) -> Self {
         Self::new()

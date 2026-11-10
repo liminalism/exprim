@@ -1,0 +1,116 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<</Type/Catalog/Pages 2 0 R>>
+endobj
+2 0 obj
+<</Type/Pages/Kids[3 0 R]/Count 1/MediaBox[0 0 612 792]>>
+endobj
+3 0 obj
+<</Type/Page/Parent 2 0 R/Contents 4 0 R/Resources<</Pattern<</P1 10 0 R/P2 11 0 R/P3 12 0 R/P4 13 0 R>>/Shading<</Sh1 14 0 R/Sh2 15 0 R>>/ExtGState<</GS0<</SMask/None/ca 1/CA 1>>/GS1<</ca 0.5/CA 0.5>>/GS2<</SMask<</S/Luminosity/G 16 0 R>>>>/GS3<</ca 0.6>>>>/XObject<</Grp 17 0 R>>>>>>
+endobj
+4 0 obj
+<</Length 600>>
+stream
+/Pattern cs
+/P1 scn 40 650 160 100 re f
+/P2 scn 230 650 160 100 re f
+/P3 scn 420 650 160 100 re f
+q 40 510 250 110 re W n /Sh1 sh Q
+q 320 510 250 110 re W n /Sh2 sh Q
+/Pattern cs /P4 scn 40 390 250 100 re f
+/Pattern CS /P1 SCN 8 w 330 400 230 80 re S
+q /GS1 gs
+1 0 0 rg 60 260 120 90 re f
+0 0.7 0 rg 120 280 120 90 re f
+0 0 1 rg 180 250 120 90 re f
+0 G 14 w 330 260 m 560 360 l S 1 0.5 0 RG 330 360 m 560 260 l S
+Q
+0.8 0.8 0.2 rg 30 150 420 30 re f
+q /GS3 gs 1 0 0 1 40 130 cm /Grp Do Q
+q /GS3 gs 1 0 0 1 280 130 cm /Grp Do Q
+0.85 g 320 20 250 90 re f
+q /GS2 gs 1 0 0 rg 320 20 250 90 re f /GS0 gs Q
+
+endstream
+endobj
+10 0 obj
+<</Type/Pattern/PatternType 1/PaintType 1/TilingType 1/BBox[0 0 20 20]/XStep 20/YStep 20/Resources<<>>/Length 49>>
+stream
+1 0 0 rg 0 0 10 10 re f 0 0 1 rg 10 10 10 10 re f
+endstream
+endobj
+11 0 obj
+<</Type/Pattern/PatternType 1/PaintType 1/TilingType 1/BBox[0 0 12 12]/XStep 12/YStep 12/Resources<<>>/Length 62>>
+stream
+0.1 0.5 0.1 RG 1 w 0 0 m 12 12 l S 0.9 0.7 0.1 rg 8 2 3 3 re f
+endstream
+endobj
+12 0 obj
+<</Type/Pattern/PatternType 1/PaintType 1/TilingType 1/BBox[0 0 30 30]/XStep 34/YStep 34/Matrix[0.7 0.7 -0.7 0.7 0 0]/Resources<<>>/Length 545>>
+stream
+0.9 0.4 0.1 rg
+21 15 m 21 18.3 18.3 21 15 21 c 11.7 21 9 18.3 9 15 c 9 11.7 11.7 9 15 9 c 18.3 9 21 11.7 21 15 c h
+f
+0.2 0.6 0.9 rg
+19 24 m 19 26.2 17.2 28 15 28 c 12.8 28 11 26.2 11 24 c 11 21.8 12.8 20 15 20 c 17.2 20 19 21.8 19 24 c h
+f
+28 15 m 28 17.2 26.2 19 24 19 c 21.8 19 20 17.2 20 15 c 20 12.8 21.8 11 24 11 c 26.2 11 28 12.8 28 15 c h
+f
+19 6 m 19 8.2 17.2 10 15 10 c 12.8 10 11 8.2 11 6 c 11 3.8 12.8 2 15 2 c 17.2 2 19 3.8 19 6 c h
+f
+10 15 m 10 17.2 8.2 19 6 19 c 3.8 19 2 17.2 2 15 c 2 12.8 3.8 11 6 11 c 8.2 11 10 12.8 10 15 c h
+f
+
+endstream
+endobj
+13 0 obj
+<</Type/Pattern/PatternType 2/Shading 18 0 R>>
+endobj
+14 0 obj
+<</ShadingType 2/ColorSpace/DeviceRGB/Coords[40 0 290 0]/Extend[true true]/Function<</FunctionType 2/Domain[0 1]/C0[1 0 0]/C1[0 0 1]/N 1>>>>
+endobj
+15 0 obj
+<</ShadingType 3/ColorSpace/DeviceRGB/Coords[445 565 0 445 565 55]/Extend[false false]/Function<</FunctionType 2/Domain[0 1]/C0[1 1 0]/C1[0 0.5 0]/N 1>>>>
+endobj
+16 0 obj
+<</Type/XObject/Subtype/Form/BBox[0 0 612 792]/Group<</S/Transparency/CS/DeviceGray>>/Resources<</Shading<</ShM 19 0 R>>>>/Length 7>>
+stream
+/ShM sh
+endstream
+endobj
+17 0 obj
+<</Type/XObject/Subtype/Form/BBox[0 0 200 100]/Group<</S/Transparency/CS/DeviceRGB>>/Resources<<>>/Length 53>>
+stream
+1 0 0 rg 0 0 120 80 re f 0 0.6 0 rg 60 20 130 75 re f
+endstream
+endobj
+18 0 obj
+<</ShadingType 2/ColorSpace/DeviceRGB/Coords[40 390 290 490]/Extend[true true]/Function<</FunctionType 2/Domain[0 1]/C0[1 0.9 0]/C1[0.5 0 0.7]/N 1>>>>
+endobj
+19 0 obj
+<</ShadingType 2/ColorSpace/DeviceGray/Coords[320 0 570 0]/Extend[true true]/Function<</FunctionType 2/Domain[0 1]/C0[0]/C1[1]/N 1>>>>
+endobj
+xref
+0 5
+0000000000 65535 f
+0000000015 00000 n
+0000000060 00000 n
+0000000133 00000 n
+0000000434 00000 n
+10 10
+0000001083 00000 n
+0000001281 00000 n
+0000001492 00000 n
+0000002216 00000 n
+0000002279 00000 n
+0000002436 00000 n
+0000002607 00000 n
+0000002782 00000 n
+0000002980 00000 n
+0000003147 00000 n
+trailer
+<</Size 20/Root 1 0 R>>
+startxref
+3298
+%%EOF

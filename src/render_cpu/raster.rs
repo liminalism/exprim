@@ -24,6 +24,150 @@
 //! `tests::avx2_convert_matches_scalar_bit_exact`). All scratch lives on the
 //! kernel and is reused across fills; only touched cells are reset (advice §13).
 
+#[cfg(feature = "profiling")]
+pub(crate) use prof::{RasterClass, RasterProf};
+
+/// Feature-gated per-fill attribution for the kernel: plain integer fields
+/// updated in place, keyed by the caller's fill class, and drained into a
+/// `ProfileReport` once per page (never a map update per fill).
+#[cfg(feature = "profiling")]
+mod prof {
+    use crate::profiling::ProfileReport;
+    use std::time::Duration;
+
+    /// Who asked for the fill; set by the caller before filling.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub(crate) enum RasterClass {
+        /// A page draw command (`paint_command`).
+        #[default]
+        Path,
+        /// A clip-mask build.
+        Clip,
+        /// A glyph-cache miss bitmap.
+        Glyph,
+        /// Tiling fill masks and other callers.
+        Other,
+    }
+
+    macro_rules! raster_class_prof {
+        ($($field:ident),* $(,)?) => {
+            /// Counters (`u64` events/work) and `ns_*` durations for one class.
+            #[derive(Debug, Default, Clone, Copy)]
+            pub(crate) struct RasterClassProf {
+                $(pub(crate) $field: u64,)*
+            }
+
+            impl RasterClassProf {
+                fn merge(&mut self, other: &Self) {
+                    $(self.$field += other.$field;)*
+                }
+
+                fn drain_into(&self, class: RasterClass, out: &mut ProfileReport) {
+                    $(
+                        if self.$field != 0 {
+                            let name: &'static str = match class {
+                                RasterClass::Path => concat!("raster.path.", stringify!($field)),
+                                RasterClass::Clip => concat!("raster.clip.", stringify!($field)),
+                                RasterClass::Glyph => concat!("raster.glyph.", stringify!($field)),
+                                RasterClass::Other => concat!("raster.other.", stringify!($field)),
+                            };
+                            if stringify!($field).starts_with("ns_") {
+                                out.add_duration(name, Duration::from_nanos(self.$field));
+                            } else {
+                                out.increment(name, self.$field);
+                            }
+                        }
+                    )*
+                }
+            }
+        };
+    }
+
+    raster_class_prof!(
+        // Volume.
+        fills,
+        fills_no_edges,
+        fills_no_rows,
+        subpaths,
+        edges,
+        edge_rows,
+        // Routing.
+        route_accum,
+        route_aet_sparse,
+        route_aet_oversize,
+        accum_window_cells,
+        aet_window_cells,
+        // Rows and cells.
+        rows_window,
+        rows_emitted,
+        covered_span_px,
+        accum_cells_swept,
+        aet_rows_dense_many,
+        aet_rows_dense_short,
+        aet_rows_sparse,
+        aet_rows_repeated,
+        aet_dense_cells_swept,
+        aet_active_visits,
+        // Fill-size buckets (window rows), to expose fixed per-fill cost.
+        fills_rows_le4,
+        fills_rows_le32,
+        fills_rows_gt32,
+        ns_rows_le4,
+        ns_rows_le32,
+        ns_rows_gt32,
+        // Phases. `ns_total` includes the row callback (span dispatch and
+        // compositing); `ns_callback` is only measured with `time_rows`.
+        ns_total,
+        ns_edge_build,
+        ns_accum_deposit,
+        ns_accum_sweep,
+        ns_aet_setup,
+        ns_aet_sweep,
+        ns_callback,
+        clock_reads,
+    );
+
+    #[derive(Debug, Default, Clone)]
+    pub(crate) struct RasterProf {
+        /// Class charged for the next fills.
+        pub(crate) class: RasterClass,
+        /// Time each fill's phases (about six clock reads per fill).
+        pub(crate) time_fills: bool,
+        /// Time every row callback (two clock reads per emitted row).
+        pub(crate) time_rows: bool,
+        /// Window rows of the fill in progress (0 until known).
+        pub(crate) fill_rows: u64,
+        by_class: [RasterClassProf; 4],
+    }
+
+    impl RasterProf {
+        #[inline]
+        pub(crate) fn cur(&mut self) -> &mut RasterClassProf {
+            &mut self.by_class[self.class as usize]
+        }
+
+        pub(crate) fn merge(&mut self, other: &Self) {
+            for (mine, theirs) in self.by_class.iter_mut().zip(&other.by_class) {
+                mine.merge(theirs);
+            }
+        }
+
+        /// Move the accumulated counters into `out` and reset them.
+        pub(crate) fn drain_into(&mut self, out: &mut ProfileReport) {
+            const CLASSES: [RasterClass; 4] = [
+                RasterClass::Path,
+                RasterClass::Clip,
+                RasterClass::Glyph,
+                RasterClass::Other,
+            ];
+            for (class, counters) in CLASSES.iter().zip(&mut self.by_class) {
+                counters.drain_into(*class, out);
+                *counters = RasterClassProf::default();
+            }
+        }
+    }
+}
+
 /// Fill rule for coverage accumulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillRule {
@@ -129,6 +273,9 @@ pub struct RasterKernel {
     pub last_edges: u64,
     pub last_rows: u64,
     pub last_covered: u64,
+    /// Per-fill phase attribution (see [`prof`]).
+    #[cfg(feature = "profiling")]
+    pub(crate) prof: RasterProf,
 }
 
 impl RasterKernel {
@@ -229,6 +376,30 @@ impl RasterKernel {
             self.reset_cancelled_fill();
         }
         self.dirty = true;
+        #[cfg(feature = "profiling")]
+        let prof_start = self.prof.time_fills.then(std::time::Instant::now);
+        #[cfg(feature = "profiling")]
+        let time_rows = self.prof.time_rows;
+        #[cfg(feature = "profiling")]
+        let (mut callback_ns, mut callback_rows) = (0u64, 0u64);
+        #[cfg(feature = "profiling")]
+        let mut row = row;
+        #[cfg(feature = "profiling")]
+        let row = |y: usize, x0: usize, x1: usize, cov: &mut [u8], runs: &[CovRun]| -> bool {
+            callback_rows += 1;
+            if time_rows {
+                let start = std::time::Instant::now();
+                let dirty = row(y, x0, x1, cov, runs);
+                callback_ns += start.elapsed().as_nanos() as u64;
+                dirty
+            } else {
+                row(y, x0, x1, cov, runs)
+            }
+        };
+        #[cfg(feature = "profiling")]
+        {
+            self.prof.fill_rows = 0;
+        }
         let finished = self.fill_inner(
             points,
             subpaths,
@@ -239,6 +410,29 @@ impl RasterKernel {
             runs_mode,
             row,
         );
+        #[cfg(feature = "profiling")]
+        {
+            let total = prof_start.map_or(0, |start| start.elapsed().as_nanos() as u64);
+            let rows = self.prof.fill_rows;
+            let covered = if rows > 0 { self.last_covered } else { 0 };
+            let c = self.prof.cur();
+            c.ns_total += total;
+            c.ns_callback += callback_ns;
+            c.rows_emitted += callback_rows;
+            c.covered_span_px += covered;
+            c.clock_reads += if prof_start.is_some() { 2 } else { 0 }
+                + if time_rows { 2 * callback_rows } else { 0 };
+            if rows > 32 {
+                c.fills_rows_gt32 += 1;
+                c.ns_rows_gt32 += total;
+            } else if rows > 4 {
+                c.fills_rows_le32 += 1;
+                c.ns_rows_le32 += total;
+            } else if rows > 0 {
+                c.fills_rows_le4 += 1;
+                c.ns_rows_le4 += total;
+            }
+        }
         self.dirty = false;
         finished
     }
@@ -264,6 +458,10 @@ impl RasterKernel {
         if self.cov.len() < width {
             self.cov.resize(width, 0);
         }
+        #[cfg(feature = "profiling")]
+        let mut lap = self.prof.time_fills.then(crate::profiling::Lap::start);
+        #[cfg(feature = "profiling")]
+        let prof_timed = u64::from(self.prof.time_fills);
 
         // Build monotonic-in-y edges and the path's device-space bounds.
         self.edges.clear();
@@ -307,6 +505,20 @@ impl RasterKernel {
                 x_max = x_max.max(x_at_top.max(x_at_bot));
             }
         }
+        #[cfg(feature = "profiling")]
+        {
+            let edge_build = crate::profiling::lap_opt(&mut lap);
+            let edges = self.edges.len() as u64;
+            let c = self.prof.cur();
+            c.ns_edge_build += edge_build;
+            c.clock_reads += 2 * prof_timed;
+            c.fills += 1;
+            c.subpaths += subpaths.len() as u64;
+            c.edges += edges;
+            if edges == 0 {
+                c.fills_no_edges += 1;
+            }
+        }
         if self.edges.is_empty() {
             return true;
         }
@@ -317,6 +529,10 @@ impl RasterKernel {
         self.last_rows = row_end.saturating_sub(row_start) as u64;
         self.last_covered = 0;
         if row_end <= row_start {
+            #[cfg(feature = "profiling")]
+            {
+                self.prof.cur().fills_no_rows += 1;
+            }
             return true;
         }
 
@@ -334,6 +550,22 @@ impl RasterKernel {
         // (cache locality — see `CACHE_WINDOW_CELLS`). Both are byte-identical to
         // the fast path, so this only trades speed and never regresses output.
         let sparse = cells > CACHE_WINDOW_CELLS && self.edges.len().saturating_mul(8) < cells;
+        #[cfg(feature = "profiling")]
+        {
+            self.prof.fill_rows = bh as u64;
+            let c = self.prof.cur();
+            c.rows_window += bh as u64;
+            if cells > MAX_WINDOW_CELLS {
+                c.route_aet_oversize += 1;
+                c.aet_window_cells += cells as u64;
+            } else if sparse {
+                c.route_aet_sparse += 1;
+                c.aet_window_cells += cells as u64;
+            } else {
+                c.route_accum += 1;
+                c.accum_window_cells += cells as u64;
+            }
+        }
         if cells > MAX_WINDOW_CELLS || sparse {
             // The active-edge-table fallback: byte-identical to the naive
             // `fill_scanline_ref` (asserted by `aet_matches_reference_bit_exact`)
@@ -376,6 +608,10 @@ impl RasterKernel {
             let e = self.edges[edge_index];
             let er_start = (e.y_top.floor() as isize).max(row_start as isize) as usize;
             let er_end = (e.y_bot.ceil() as isize).min(row_end as isize).max(0) as usize;
+            #[cfg(feature = "profiling")]
+            {
+                self.prof.cur().edge_rows += er_end.saturating_sub(er_start) as u64;
+            }
             if e.dxdy == 0.0 {
                 // A2: vertical fast path. x is constant; precompute column split.
                 let xc = e.x_at_top.clamp(0.0, fwidth);
@@ -440,6 +676,14 @@ impl RasterKernel {
             }
         }
 
+        #[cfg(feature = "profiling")]
+        {
+            let deposit = crate::profiling::lap_opt(&mut lap);
+            let c = self.prof.cur();
+            c.ns_accum_deposit += deposit;
+            c.clock_reads += 1 * prof_timed;
+        }
+
         // --- Pass 2: per-row prefix-sum → coverage, emit spans, reset. ---
         // The scalar branch is a single fused pass (prefix-sum, convert, emit,
         // reset) — byte-identical to the reference inner loop and with no
@@ -459,6 +703,10 @@ impl RasterKernel {
                 continue;
             }
             let (cmin, cmax) = (cmin as usize, cmax as usize);
+            #[cfg(feature = "profiling")]
+            {
+                self.prof.cur().accum_cells_swept += (cmax - cmin + 1) as u64;
+            }
             let base = lr * stride;
             let mut first = width;
             let mut last = 0usize;
@@ -514,6 +762,13 @@ impl RasterKernel {
                     *c = 0;
                 }
             }
+        }
+        #[cfg(feature = "profiling")]
+        {
+            let sweep = crate::profiling::lap_opt(&mut lap);
+            let c = self.prof.cur();
+            c.ns_accum_sweep += sweep;
+            c.clock_reads += 1 * prof_timed;
         }
         true
     }
@@ -630,6 +885,10 @@ impl RasterKernel {
         }
         let fwidth = width as f32;
         let bh = row_end - row_start;
+        #[cfg(feature = "profiling")]
+        let mut lap = self.prof.time_fills.then(crate::profiling::Lap::start);
+        #[cfg(feature = "profiling")]
+        let prof_timed = u64::from(self.prof.time_fills);
 
         // --- CSR counting sort: bucket contributing edges by activation row. ---
         // An edge's row span is exactly the fast path's (raster.rs deposit loop):
@@ -641,6 +900,8 @@ impl RasterKernel {
             self.aet_erend.resize(self.edges.len(), 0);
         }
         let mut contributing = 0usize;
+        #[cfg(feature = "profiling")]
+        let mut prof_edge_rows = 0u64;
         for (edge_index, e) in self.edges.iter().enumerate() {
             if edge_index & 0xff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
                 return false;
@@ -653,6 +914,10 @@ impl RasterKernel {
             let lr = er_start as usize - row_start;
             self.aet_bucket_start[lr + 1] += 1; // count into [lr+1] for the scan
             contributing += 1;
+            #[cfg(feature = "profiling")]
+            {
+                prof_edge_rows += (er_end - er_start) as u64;
+            }
         }
         for lr in 0..bh {
             self.aet_bucket_start[lr + 1] += self.aet_bucket_start[lr];
@@ -697,6 +962,14 @@ impl RasterKernel {
         // releases the held cells and computes the row normally.
         let mut held: Option<(usize, usize)> = None;
         self.aet_active.clear();
+        #[cfg(feature = "profiling")]
+        {
+            let setup = crate::profiling::lap_opt(&mut lap);
+            let c = self.prof.cur();
+            c.ns_aet_setup += setup;
+            c.edge_rows += prof_edge_rows;
+            c.clock_reads += 2 * prof_timed;
+        }
         for lr in 0..bh {
             if lr & 0x0f == 0 && should_cancel.is_some_and(|cancel| cancel()) {
                 return false;
@@ -753,6 +1026,10 @@ impl RasterKernel {
                         .iter()
                         .all(|&ei| self.edges[ei as usize].y_bot >= yf + 1.0);
                 if repeat {
+                    #[cfg(feature = "profiling")]
+                    {
+                        self.prof.cur().aet_rows_repeated += 1;
+                    }
                     self.last_covered += (last - first + 1) as u64;
                     if row(y, first, last, &mut self.cov, &self.row_runs) {
                         for c in &mut self.cov[first..=last] {
@@ -816,8 +1093,27 @@ impl RasterKernel {
             }
             self.aet_active = active;
 
+            #[cfg(feature = "profiling")]
+            {
+                self.prof.cur().aet_active_visits += self.aet_active.len() as u64;
+            }
             if col_min > col_max {
                 continue;
+            }
+            #[cfg(feature = "profiling")]
+            {
+                let span = (col_max - col_min + 1) as u64;
+                let intervals = self.aet_touched.len();
+                let c = self.prof.cur();
+                if intervals > SPARSE_MAX_INTERVALS {
+                    c.aet_rows_dense_many += 1;
+                    c.aet_dense_cells_swept += span;
+                } else if (span as usize) < SPARSE_MIN_SPAN {
+                    c.aet_rows_dense_short += 1;
+                    c.aet_dense_cells_swept += span;
+                } else {
+                    c.aet_rows_sparse += 1;
+                }
             }
             self.row_runs.clear();
             let (first, last) = convert_row_sparse(
@@ -854,6 +1150,13 @@ impl RasterKernel {
                     self.cov[r.x0 as usize..r.x1 as usize].fill(0);
                 }
             }
+        }
+        #[cfg(feature = "profiling")]
+        {
+            let sweep = crate::profiling::lap_opt(&mut lap);
+            let c = self.prof.cur();
+            c.ns_aet_sweep += sweep;
+            c.clock_reads += 1 * prof_timed;
         }
         true
     }

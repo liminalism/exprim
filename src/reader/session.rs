@@ -523,6 +523,43 @@ impl RenderSession {
         product: &RasterProduct,
         cancellation: Option<&CancellationToken>,
     ) -> Result<RasterPlane, ReadError> {
+        self.render_inner(page, product, cancellation)
+            .map(|(plane, _stats)| plane)
+    }
+
+    /// [`Self::render`] plus the feature-gated stage report, so benchmark
+    /// tooling can attribute the public session path (worker reuse, the
+    /// shared caches, and the RGB packing pass) the same way as the low-level
+    /// backend path.
+    #[cfg(feature = "profiling")]
+    pub fn render_profiled(
+        &self,
+        page: &Arc<CompiledDocumentPage>,
+        product: &RasterProduct,
+    ) -> Result<(RasterPlane, crate::profiling::ProfileReport), ReadError> {
+        let start = std::time::Instant::now();
+        let (plane, stats) = self.render_inner(page, product, None)?;
+        let profile = crate::render_cpu::profile_from_stats(&stats, start.elapsed());
+        Ok((plane, profile))
+    }
+
+    /// Choose the timing detail of profiled renders on this thread's worker
+    /// (see `CpuWorkerContext::set_profile_detail`).
+    #[cfg(feature = "profiling")]
+    pub fn set_profile_detail(&self, detail: crate::profiling::ProfileDetail) {
+        WORKER_CONTEXTS.with(|worker| {
+            let mut worker = worker.borrow_mut();
+            worker.select_document(self.id);
+            worker.raster.set_profile_detail(detail);
+        });
+    }
+
+    fn render_inner(
+        &self,
+        page: &Arc<CompiledDocumentPage>,
+        product: &RasterProduct,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(RasterPlane, crate::render_cpu::RenderStats), ReadError> {
         if product.width == 0 || product.height == 0 {
             return Err(ReadError::InvalidRasterProduct(
                 "width and height must both be non-zero",
@@ -564,7 +601,6 @@ impl RenderSession {
                 worker.select_document(self.id);
                 self.backend
                     .render_with_options(&request, &options, &mut worker.raster)
-                    .map(|(page, _stats)| page)
             })
         }))
         .map_err(|payload| ReadError::Render {
@@ -578,6 +614,8 @@ impl RenderSession {
             page: page.page_index,
             message: error.to_string(),
         })?;
+        #[cfg_attr(not(feature = "profiling"), allow(unused_mut))]
+        let (rendered, mut stats) = rendered;
         if rendered.format != output_format {
             return Err(ReadError::Render {
                 page: page.page_index,
@@ -589,16 +627,25 @@ impl RenderSession {
         }
 
         match product.format {
-            RasterFormat::Gray8 => Ok(RasterPlane::Gray8(GraySurface {
-                width: rendered.width,
-                height: rendered.height,
-                stride: rendered.stride,
-                pixels: rendered.pixels,
-            })),
-            RasterFormat::Rgb8 => Ok(RasterPlane::Rgb8(rgb_surface_from_rgba(
-                &rendered,
-                page.page_index,
-            )?)),
+            RasterFormat::Gray8 => Ok((
+                RasterPlane::Gray8(GraySurface {
+                    width: rendered.width,
+                    height: rendered.height,
+                    stride: rendered.stride,
+                    pixels: rendered.pixels,
+                }),
+                stats,
+            )),
+            RasterFormat::Rgb8 => {
+                #[cfg(feature = "profiling")]
+                let pack_start = std::time::Instant::now();
+                let surface = rgb_surface_from_rgba(&rendered, page.page_index)?;
+                #[cfg(feature = "profiling")]
+                stats
+                    .profile
+                    .add_duration("session.rgb_pack", pack_start.elapsed());
+                Ok((RasterPlane::Rgb8(surface), stats))
+            }
         }
     }
 
