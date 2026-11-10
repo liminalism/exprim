@@ -31,6 +31,8 @@ include = [
 
 [package.metadata.docs.rs]
 features = ["print"]
+# The Windows spooler exists only on Windows and the CUPS one only on Unix.
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 
 [lib]
 # The integration tests are separate targets; `cargo test --lib` stays the
@@ -52,7 +54,7 @@ bitflags = "2.9.3"
 crossbeam-channel = "0.5"
 flate2 = { version = "1.1.9", features = ["zlib-rs"] }
 foldhash = "0.2.0"
-jbig2enc-rust = { version = "0.6.0", path = "codecs/jbig2enc-rust", default-features = false, features = ["decode"] }
+jbig2enc-rust = { version = "0.6.1", path = "codecs/jbig2enc-rust", default-features = false, features = ["decode"] }
 jp2lam = { version = "0.3.1", path = "codecs/jp2lam", default-features = false }
 jpeg-encoder = { version = "=0.7.1", features = ["simd"] }
 memmap2 = "0.9"

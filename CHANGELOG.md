@@ -5,7 +5,7 @@ exprim was developed inside the Lege repository as the renderer workspace
 `lege-pdf-print` and `lege-pdf-agent` crates over it. Versions below 0.4.0
 were internal and never published.
 
-## 0.4.0 — Unreleased
+## 0.4.0 — 2026-11-10
 
 ### API documentation, 2026-11-10
 

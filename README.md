@@ -8,6 +8,10 @@ page renders against an immutable document snapshot, and all execution state
 and scratch memory belong to the worker rendering that page. Many threads can
 render one document at once, and the output does not depend on how many.
 
+```sh
+cargo add exprim
+```
+
 ```rust
 use std::sync::Arc;
 
@@ -77,7 +81,7 @@ document, content, render) are public modules so that tools can be built on
 them, but they are hidden from the documentation and may change in any minor
 release before 1.0.
 
-MSRV: Rust 1.97.
+API documentation: <https://docs.rs/exprim>. MSRV: Rust 1.97.
 
 ## Licence
 
