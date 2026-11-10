@@ -2,10 +2,12 @@
 
 Date: 2026-11-10. Status: G0 done and the exact part of G1 done on 2026-11-10
 (branch `perf/generic-renderer-g0-g1`); G1's geometry-policy changes, G2, G3
-and G4 are open. Findings:
-[attribution report](../benchmarks/2026-11-10-attribution/README.md); changes
-and measurements:
-[performance-history entry](../../dev-notes/render-refinement/performance-history/optimization-dense-vector-20261110.md).
+and G4 are open. Findings, changes and measurements are in the project ledger
+(`exprim.renderer.attribution-20261110`, `exprim.renderer.g1-exact-speedups`,
+`exprim.renderer.next-levers`). The full attribution report, the benchmark
+results and the working notes this plan links to under `docs/benchmarks/` and
+`dev-notes/` are kept locally and not published, because they describe
+private documents; those links resolve only in a checkout that has them.
 
 Make exprim useful for general PDF rendering while retaining its strength on
 Lege's scanned and MRC documents. This is a secondary workstream: the scan/image

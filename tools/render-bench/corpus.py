@@ -5,18 +5,13 @@ import pymupdf
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT/'docs/benchmarks/2026-11-09'
-PDF = Path('{{secret:0cec3c4cdf5da2d1947072c580d8a8e9}}')
-CHOICES = [
-    ('jpeg-large', 'JPEG scan (large file)', PDF/'{{secret:85565cdf1a27ff0b324523252ad91553}}'),
-    ('mrc', 'JPX image + mask MRC', next((PDF/'{{secret:3e7b1520b09025c2126636c01d79a130}}').glob('{{secret:0fd0fa87cc7800c2dc3a0862de48f623}}*'))),
-    ('jp2', 'Full-page JPX (strict decoding)', PDF/'{{secret:a0c09e263074891fbb97ee5a473ede1f}}'),
-    ('vector-tables', 'Vector tables (long document)', PDF/'{{secret:eacdef0f8fda69194d89bad0b068d750}}'),
-    ('vector-map', 'Vector map (dense paths)', PDF/'{{secret:e32ef5391203ea1fd7a46224b3a3dd51}}'),
-    ('jbig2', 'JBIG2 bilevel scan', PDF/'{{secret:07d812097a0dd9c466ee4e9835b25b35}}'),
-    ('ccitt', 'CCITT bilevel scan', PDF/'{{secret:04cf4ec790db8420c2cdf50a5dae11d5}}'),
-    ('text', 'Born-digital Latin text', PDF/'{{secret:bf9aacddb937f5d74aaaaac78df9f361}}'),
-    ('mixed-cjk', 'CJK illustrated / soft masks', PDF/'{{secret:aa6a6a48aa819575fcaaad338afedc01}}'),
-]
+# The benchmark documents are private local files and are not named here.
+# List them in corpus.local.json beside this script (git-ignored):
+#   [{"id": "vector-map", "label": "Vector map (dense paths)", "path": "..."}]
+LOCAL = Path(__file__).resolve().parent/'corpus.local.json'
+if not LOCAL.exists():
+    raise SystemExit(f'{LOCAL} is missing: list the local benchmark documents there (id, label, path)')
+CHOICES = [(e['id'], e['label'], Path(e['path'])) for e in json.loads(LOCAL.read_text(encoding='utf-8'))]
 
 def main():
     manifest=[]; page_rows=[]

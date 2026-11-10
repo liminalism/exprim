@@ -20,7 +20,7 @@ build nor at run time.
 ## 2. Build
 
 ```sh
-cd {{secret:b40ab32d1cbe425c3467b158f9ce80bf}}/Rust-projects/exprim/agent   # Lege-ecosystem must sit beside exprim (lege-ocr)
+cd <your checkouts>/exprim/agent   # Lege-ecosystem must sit beside exprim (lege-ocr)
 cargo build --profile debug-fast --bin exprim
 ```
 

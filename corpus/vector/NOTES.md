@@ -1,14 +1,14 @@
 # corpus/vector: synthetic vector stress fixtures
 
 Synthetic, written from scratch by `probe synth` (the `lege-render-probe` harness,
-`dev-notes/render-refinement/scoping-20261108/harness/probe`), using exprim's
+`tools/render-probe/probe`), using exprim's
 `test_support` PDF builder with hand-written content-stream operators. No third-party
 content. Deterministic (fixed-seed xorshift generator): regenerating gives
 byte-identical files. Redistributable under the repository's MIT licence.
 
 Regenerate (from the repository root, with the probe built with `--features synth`):
 
-    cargo build --profile debug-fast --features synth --manifest-path dev-notes/render-refinement/scoping-20261108/harness/probe/Cargo.toml --target-dir <target>
+    cargo build --profile debug-fast --features synth --manifest-path tools/render-probe/probe/Cargo.toml --target-dir <target>
     <target>/debug-fast/lege-render-probe synth corpus
 
 All are single-page US Letter (612 x 792 pt). Op counts are from `pdfr dump <pdf> 0`.

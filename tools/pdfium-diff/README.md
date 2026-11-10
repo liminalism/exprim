@@ -139,12 +139,14 @@ recurses each directory (skipping `node_modules`/`.git`/`target`).
 ## The full sweep — three corpus roots
 
 `./run-sweep.sh` runs the whole corpus (day-plan "sweep 3"); `CORPUS_ROOT`
-defaults to `{{secret:b40ab32d1cbe425c3467b158f9ce80bf}}` (Linux; use `D:` on Windows). The roots:
+names the drive or mount holding the corpus and `CORPUS_DIRS` the
+`;`-separated corpus directories under it (both private, so neither is
+recorded here). The roots:
 
 | root | files | notes |
 |---|---:|---|
-| `$ROOT/{{secret:aceac0eb1f032f17450a66b191af885e}}` | 10,712 | main archive.org corpus |
-| `$ROOT/{{secret:3e7b1520b09025c2126636c01d79a130}}` | 494 | loose intake |
+| first `CORPUS_DIRS` entry | 10,712 | main archive.org corpus |
+| second `CORPUS_DIRS` entry | 494 | loose intake |
 | `$ROOT/Rust-projects/pdfium-port-plan/renderer-corpus` | 2,826 | pdfbox + pdf.js + hayro hand-picked regression PDFs |
 | **total** | **14,032** | |
 
@@ -196,7 +198,7 @@ path. Normal library and tool builds retain the system allocator.
 The permanent representative corpus can be run as a batch:
 
 ```sh
-PDF_RENDERER_CORPUS_ROOT={{secret:b40ab32d1cbe425c3467b158f9ce80bf}} \
+PDF_RENDERER_CORPUS_ROOT=<local corpus root> \
 ./run-corpus-profile.sh structured ../../corpus/perf/results/local/structured
 ./run-corpus-profile.sh remaining ../../corpus/perf/results/local/remaining
 ./run-corpus-profile.sh rss ../../corpus/perf/results/local/rss

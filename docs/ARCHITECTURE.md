@@ -8,6 +8,8 @@ backend consume.
 
 Design notes live in the repository's working-note archive:
 
+The `dev-notes/` files below are working notes kept locally and not published.
+
 - `../dev-notes/render-refinement/plans/expanded-rust-pdfrender-plan.md` — the original phased roadmap (CPU phases 0–6 complete, GPU phases 7–11 open) and the `CompiledPage` rendering contract.
 - `../dev-notes/render-refinement/plans/skeleton-blueprint.md` — repo-concrete decisions this engine encodes.
 - `../dev-notes/render-refinement/CURRENT-STATE.md` — the reconciled state of the engine and the sweep programme.

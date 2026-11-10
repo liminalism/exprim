@@ -86,7 +86,7 @@ $Root = if ([string]::IsNullOrWhiteSpace($env:CORPUS_ROOT)) {
         'D:\'
     }
     else {
-        '{{secret:b40ab32d1cbe425c3467b158f9ce80bf}}'
+        throw 'set CORPUS_ROOT to the drive or mount holding the local corpus'
     }
 }
 else {
@@ -141,11 +141,10 @@ if (-not $validScale -or $parsedScale -le 0.0) {
     throw "Scale must be a positive number using '.' as the decimal separator; received '$Scale'."
 }
 
-$Corpora = @(
-    (Join-Path -Path $Root -ChildPath '{{secret:aceac0eb1f032f17450a66b191af885e}}'),
-    (Join-Path -Path $Root -ChildPath '{{secret:3e7b1520b09025c2126636c01d79a130}}'),
-    (Join-Path -Path $ProjectDir -ChildPath 'renderer-corpus')
-)
+# The local corpus directories are private: name them in CORPUS_DIRS (`;`-separated,
+# relative to CORPUS_ROOT).
+$Corpora = @(@($env:CORPUS_DIRS -split ';' | Where-Object { $_ } | ForEach-Object { Join-Path -Path $Root -ChildPath $_ }) +
+    @(Join-Path -Path $ProjectDir -ChildPath 'renderer-corpus'))
 
 # Fail loudly if a corpus root is missing rather than silently sweeping less.
 $missingCorpora = @(

@@ -661,7 +661,10 @@ fn select_rerun_targets(csv: &Path, class: &str) -> Vec<PathBuf> {
         // Map the sweep's Linux corpus root to this box's drive if needed.
         let mapped = if Path::new(&path).is_file() {
             PathBuf::from(&path)
-        } else if let Some(tail) = path.strip_prefix("{{secret:b40ab32d1cbe425c3467b158f9ce80bf}}") {
+        } else if let Some(tail) = std::env::var("PDF_RENDERER_SWEEP_ROOT")
+            .ok()
+            .and_then(|root| path.strip_prefix(root.as_str()).map(str::to_owned))
+        {
             PathBuf::from(format!("D:{tail}"))
         } else {
             PathBuf::from(&path)

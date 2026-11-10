@@ -66,7 +66,7 @@ def main():
         return (geometric_mean(ratios),min(ratios),max(ratios),len(ratios)) if ratios else None
     lines=['# exprim renderer benchmark — run started 2026-11-09','',
            'exprim 0.4.0 versus PDFium 158.0.8125, MuPDF 1.28.6 (PyMuPDF 2.1), and hayro 0.9.0. '
-           'Nine preselected PDFs from `{{secret:0cec3c4cdf5da2d1947072c580d8a8e9}}`, **3,871 pages**, at 72 and 144 DPI, with 1 and 8 workers. '
+           'Nine preselected PDFs from a private local library, **3,871 pages**, at 72 and 144 DPI, with 1 and 8 workers. '
            'Three rotated repetitions per timing cell. Raw jobs, all-page agreement checks, and a rerunnable harness are retained here.','',
            '## Speed on the same accepted pages','',
            '**exprim speed multiple** is the geometric mean of exprim pages/s divided by the control pages/s, '

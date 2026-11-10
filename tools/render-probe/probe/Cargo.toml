@@ -1,0 +1,43 @@
+# Measurement probe for the exprim CPU renderer (own workspace; unpublished).
+[package]
+name = "lege-render-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+exprim = { path = "../../.." }
+
+[features]
+profiling = ["exprim/profiling"]
+# `probe synth`: builds the redistributable fixtures with exprim's test builders.
+synth = ["exprim/test-support"]
+# Counting global allocator for allocation-volume rows. Never time this build.
+alloc-count = []
+
+[workspace]
+
+# Mirror of the Lege root workspace profiles.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+opt-level = 3
+debug = false
+strip = "symbols"
+incremental = false
+overflow-checks = false
+
+[profile.debug-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug = true
+strip = false
+
+# Release codegen with symbols, for sampled profiles (flamegraph).
+[profile.release-sym]
+inherits = "release"
+debug = "line-tables-only"
+strip = false

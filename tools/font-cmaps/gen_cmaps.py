@@ -28,10 +28,9 @@ We deliberately DO NOT port:
 """
 import os, re, struct, sys
 
-REF = os.environ.get(
-    "PDFIUM_CMAPS",
-    "{{secret:b40ab32d1cbe425c3467b158f9ce80bf}}/Rust-projects/pdfium-port-plan/pdfium-reference-source/core/fpdfapi/cmaps",
-)
+REF = os.environ.get("PDFIUM_CMAPS")
+if not REF:
+    sys.exit("set PDFIUM_CMAPS to a PDFium checkout's core/fpdfapi/cmaps directory")
 OUT_DATA = os.path.join(os.path.dirname(__file__), "..", "src", "cmap_data")
 OUT_RS = os.path.join(os.path.dirname(__file__), "..", "src", "cmap_tables.rs")
 

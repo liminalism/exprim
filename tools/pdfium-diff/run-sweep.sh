@@ -2,8 +2,7 @@
 #
 # Full differential sweep (day-plan "sweep 3") over ALL corpus roots.
 #
-#   1. {{secret:aceac0eb1f032f17450a66b191af885e}}      (the main archive.org corpus)
-#   2. {{secret:3e7b1520b09025c2126636c01d79a130}}                  (loose intake)
+#   1., 2. the local corpus directories named in CORPUS_DIRS
 #   3. renderer-corpus          (pdfbox + pdf.js + hayro hand-picked regression
 #                                PDFs — small but curated: ~2.8k files)
 #
@@ -18,21 +17,22 @@
 # `workdir` (default: cwd) is where `pdfium-diff-out/results.csv` is written.
 #
 # Env:
-#   CORPUS_ROOT  Drive/mount holding the corpus. Default {{secret:b40ab32d1cbe425c3467b158f9ce80bf}}
-#                (Linux). On Windows set CORPUS_ROOT=D: (the same physical
-#                disk). The three roots below are resolved under it.
+#   CORPUS_ROOT  Drive or mount holding the corpus (required).
+#   CORPUS_DIRS  `;`-separated directories under it that hold the local
+#                corpus. Neither is recorded here: they are private.
 set -euo pipefail
 
-ROOT="${CORPUS_ROOT:-{{secret:b40ab32d1cbe425c3467b158f9ce80bf}}}"
+ROOT="${CORPUS_ROOT:?set CORPUS_ROOT to the drive or mount holding the local corpus}"
 LIB="${1:-$ROOT/Rust-projects/pdfium-port-plan/libpdfium.so}"
 SCALE="${2:-2.0}"
 WORKDIR="${3:-$(pwd)}"
 
-CORPORA=(
-    "$ROOT/{{secret:aceac0eb1f032f17450a66b191af885e}}"
-    "$ROOT/{{secret:3e7b1520b09025c2126636c01d79a130}}"
-    "$ROOT/Rust-projects/pdfium-port-plan/renderer-corpus"
-)
+CORPORA=()
+IFS=';' read -r -a _corpus_dirs <<< "${CORPUS_DIRS:-}"
+for d in "${_corpus_dirs[@]}"; do
+    [[ -n "$d" ]] && CORPORA+=("$ROOT/$d")
+done
+CORPORA+=("$ROOT/Rust-projects/pdfium-port-plan/renderer-corpus")
 
 # Fail loudly if a corpus root is missing rather than silently sweeping less.
 missing=0

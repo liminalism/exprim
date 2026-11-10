@@ -54,14 +54,18 @@ EXCLUDE=(
   "08-29-2021-mbta-system-brochure.pdf"
   "designated_basinmap"
   "bug1019475_1"
-  "{{secret:cbdc7880ab07f89f93a8568d4fee2981}}"
 )
+# Further local excludes: SWEEP_EXCLUDE, `;`-separated substrings.
+IFS=';' read -r -a _more_excludes <<< "${SWEEP_EXCLUDE:-}"
+for e in "${_more_excludes[@]}"; do [ -n "$e" ] && EXCLUDE+=("$e"); done
 
-ROOTS=(
-  "{{secret:b40ab32d1cbe425c3467b158f9ce80bf}}/{{secret:aceac0eb1f032f17450a66b191af885e}}"
-  "{{secret:b40ab32d1cbe425c3467b158f9ce80bf}}/{{secret:3e7b1520b09025c2126636c01d79a130}}"
-  "{{secret:b40ab32d1cbe425c3467b158f9ce80bf}}/Rust-projects/pdfium-port-plan/renderer-corpus"
-)
+# The corpus location is private: CORPUS_ROOT is the drive or mount,
+# CORPUS_DIRS the `;`-separated corpus directories under it.
+CORPUS_ROOT="${CORPUS_ROOT:?set CORPUS_ROOT to the drive or mount holding the local corpus}"
+ROOTS=()
+IFS=';' read -r -a _corpus_dirs <<< "${CORPUS_DIRS:-}"
+for d in "${_corpus_dirs[@]}"; do [ -n "$d" ] && ROOTS+=("$CORPUS_ROOT/$d"); done
+ROOTS+=("$CORPUS_ROOT/Rust-projects/pdfium-port-plan/renderer-corpus")
 
 if [ ! -x "$BIN" ]; then
   echo "missing $BIN — build first:" >&2

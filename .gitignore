@@ -69,3 +69,10 @@ dev-notes/render-refinement/scoping-20261108/harness/g0-corpus.local.json
 .agent/scratch/
 .agent/handoffs/
 .akr/secrets/
+
+# Working notes and benchmark results describe private local documents and
+# stay on this machine; so do the local document lists the tools read.
+/dev-notes/
+/docs/benchmarks/
+tools/render-bench/corpus.local.json
+tools/render-probe/g0-corpus.local.json

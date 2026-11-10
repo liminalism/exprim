@@ -1,7 +1,8 @@
 # Four-engine renderer benchmark
 
 This harness ports the ledger's 2026-11-06 head-to-head to the extracted `exprim`
-crate. Results are in [`docs/benchmarks/2026-11-09`](../../docs/benchmarks/2026-11-09/README.md).
+crate. Results are written to `docs/benchmarks/2026-11-09`, which is kept locally and not
+published (it describes private documents).
 It is an unpublished development tool; it changes no production rendering code.
 
 ## Setup on Windows x64

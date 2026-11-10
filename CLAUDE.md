@@ -18,7 +18,10 @@ and Liminaldoc consume it by path.
 | `agent/` | `exprim-agent`: the `exprim` CLI and MCP server. **Own workspace**: it links `lege-ocr` from `../../Lege-ecosystem` |
 | `fuzz/`, `tools/pdfium-diff`, `tools/pdfium-text-diff` | Own workspaces (cargo-fuzz; PDFium differential oracle) |
 | `codecs/` | `jp2lam`, `jbig2enc-rust`, `djvulibrust`: separately published codecs, excluded from the workspace |
-| `corpus/`, `dev-notes/`, `docs/` | Test PDFs, the renderer's working notes and sweep history, architecture and publication plan |
+| `corpus/`, `docs/` | Test PDFs; architecture and publication plan |
+| `tools/render-probe` | Measurement probe (`bench`, `census`, `diff`, `synth`), A/B hash gate and attribution scripts; own workspace |
+| `.akr/`, `docs/generated/` | Project ledger (decisions, observations, plans) and its generated views |
+| `dev-notes/`, `docs/benchmarks/` | Working notes, sweep history and benchmark results. **Local only, git-ignored**: they describe private documents |
 
 The wgpu image backend and GPU postprocess executor are **not** here: they
 need `lege-gpu` and live in Lege as `lege-render-wgpu`. exprim must never
@@ -54,4 +57,8 @@ release. `jp2lam` 0.3.1 must be on crates.io before `exprim` can publish
 - No global state: every page renders against an immutable snapshot with
   worker-owned scratch.
 - Performance changes must keep page hashes identical; the history is in
-  `dev-notes/render-refinement/performance-history/`.
+  `dev-notes/render-refinement/performance-history/` (local only); findings
+  that should be public go into the ledger.
+- Never name a private local document in a tracked file: no path, file name,
+  title or library directory. Cite an `akr secret` instead (ledger policy
+  `exprim.privacy.private-document-references`).

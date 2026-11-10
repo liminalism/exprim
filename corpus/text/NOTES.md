@@ -1,7 +1,7 @@
 # corpus/text: synthetic text fixtures
 
 Synthetic, written from scratch by `probe synth` (the `lege-render-probe` harness,
-`dev-notes/render-refinement/scoping-20261108/harness/probe`), using exprim's
+`tools/render-probe/probe`), using exprim's
 `test_support` PDF builder and its self-authored minimal fonts (`minimal_ttf`,
 `minimal_type1`: one triangle glyph for `A`). No third-party content or font data.
 Deterministic: regenerating gives byte-identical files. Redistributable under the
@@ -9,7 +9,7 @@ repository's MIT licence.
 
 Regenerate (from the repository root, with the probe built with `--features synth`):
 
-    cargo build --profile debug-fast --features synth --manifest-path dev-notes/render-refinement/scoping-20261108/harness/probe/Cargo.toml --target-dir <target>
+    cargo build --profile debug-fast --features synth --manifest-path tools/render-probe/probe/Cargo.toml --target-dir <target>
     <target>/debug-fast/lege-render-probe synth corpus
 
 All are single-page US Letter. Op counts are from `pdfr dump <pdf> 0`.
