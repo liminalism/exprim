@@ -53,3 +53,6 @@ corpus/perf/results/
 
 # Local agent tooling binary (was ignored in Lege too).
 **/agent-pack
+
+# Python bytecode caches from the harness scripts.
+__pycache__/

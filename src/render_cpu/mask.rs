@@ -173,12 +173,17 @@ pub fn build_clip_mask_cancellable(
             if path_seen == 1 {
                 // First (usually only) path: write coverage straight into `acc`,
                 // which is 0 everywhere the fill does not touch (correctly masked).
-                if !raster.fill_cancellable(
+                // Only the envelope's rows are kept, so only they are
+                // rasterized: a clip path far taller than its envelope (a
+                // page-sized path under a small rect ancestor) costs the
+                // envelope, not the page.
+                if !raster.fill_cancellable_in(
                     &geom.points,
                     subs,
                     ow,
                     oh,
                     rule,
+                    by..by + h,
                     should_cancel,
                     |y, x0, x1, cov| {
                         if y < by || y >= by + h {
@@ -187,8 +192,9 @@ pub fn build_clip_mask_cancellable(
                         let ly = y - by;
                         let lx0 = x0.max(bx);
                         let lx1 = x1.min(bx + w - 1);
-                        for x in lx0..=lx1 {
-                            acc[ly * w + (x - bx)] = cov[x];
+                        if lx0 <= lx1 {
+                            acc[ly * w + (lx0 - bx)..=ly * w + (lx1 - bx)]
+                                .copy_from_slice(&cov[lx0..=lx1]);
                         }
                     },
                 ) {
@@ -201,12 +207,13 @@ pub fn build_clip_mask_cancellable(
                 } else {
                     tmp.iter_mut().for_each(|t| *t = 0);
                 }
-                if !raster.fill_cancellable(
+                if !raster.fill_cancellable_in(
                     &geom.points,
                     subs,
                     ow,
                     oh,
                     rule,
+                    by..by + h,
                     should_cancel,
                     |y, x0, x1, cov| {
                         if y < by || y >= by + h {
@@ -215,8 +222,9 @@ pub fn build_clip_mask_cancellable(
                         let ly = y - by;
                         let lx0 = x0.max(bx);
                         let lx1 = x1.min(bx + w - 1);
-                        for x in lx0..=lx1 {
-                            tmp[ly * w + (x - bx)] = cov[x];
+                        if lx0 <= lx1 {
+                            tmp[ly * w + (lx0 - bx)..=ly * w + (lx1 - bx)]
+                                .copy_from_slice(&cov[lx0..=lx1]);
                         }
                     },
                 ) {

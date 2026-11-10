@@ -306,6 +306,39 @@ impl RasterKernel {
         height: usize,
         rule: FillRule,
         should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
+        row: impl FnMut(usize, usize, usize, &mut [u8]),
+    ) -> bool {
+        self.fill_cancellable_in(
+            points,
+            subpaths,
+            width,
+            height,
+            rule,
+            0..usize::MAX,
+            should_cancel,
+            row,
+        )
+    }
+
+    /// [`Self::fill_cancellable`] restricted to device rows `rows`: only rows
+    /// inside the range are rasterized and handed to `row`.
+    ///
+    /// The emitted rows are byte-identical to the same rows of an unrestricted
+    /// fill. A row's coverage is the prefix sum of the signed areas deposited
+    /// into that row alone, by the edges crossing it, in edge order; no other
+    /// row contributes. Skipping the rest therefore changes nothing in the
+    /// rows that are kept, and a caller that would have discarded them (a clip
+    /// mask's envelope, a draw's clipped bounds) saves their whole cost.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_cancellable_in(
+        &mut self,
+        points: &[[f32; 2]],
+        subpaths: &[(usize, usize)],
+        width: usize,
+        height: usize,
+        rule: FillRule,
+        rows: std::ops::Range<usize>,
+        should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
         mut row: impl FnMut(usize, usize, usize, &mut [u8]),
     ) -> bool {
         self.fill_impl(
@@ -314,6 +347,7 @@ impl RasterKernel {
             width,
             height,
             rule,
+            rows,
             should_cancel,
             false,
             |y, x0, x1, cov, _| {
@@ -334,6 +368,9 @@ impl RasterKernel {
     /// buffer is reset over the whole span; returning `false` promises `cov`
     /// was not written outside the `None` runs. The coverage is byte-identical
     /// to [`Self::fill_cancellable`]'s; only the hand-over differs.
+    // Production draws always pass their row bounds through the `_in` form;
+    // this unrestricted entry remains for the kernel's own tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn fill_runs_cancellable(
         &mut self,
@@ -345,12 +382,39 @@ impl RasterKernel {
         should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
         row: impl FnMut(usize, usize, usize, &mut [u8], &[CovRun]) -> bool,
     ) -> bool {
+        self.fill_runs_cancellable_in(
+            points,
+            subpaths,
+            width,
+            height,
+            rule,
+            0..usize::MAX,
+            should_cancel,
+            row,
+        )
+    }
+
+    /// [`Self::fill_runs_cancellable`] restricted to device rows `rows` (see
+    /// [`Self::fill_cancellable_in`] for why the kept rows are unchanged).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fill_runs_cancellable_in(
+        &mut self,
+        points: &[[f32; 2]],
+        subpaths: &[(usize, usize)],
+        width: usize,
+        height: usize,
+        rule: FillRule,
+        rows: std::ops::Range<usize>,
+        should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
+        row: impl FnMut(usize, usize, usize, &mut [u8], &[CovRun]) -> bool,
+    ) -> bool {
         self.fill_impl(
             points,
             subpaths,
             width,
             height,
             rule,
+            rows,
             should_cancel,
             true,
             row,
@@ -368,6 +432,7 @@ impl RasterKernel {
         width: usize,
         height: usize,
         rule: FillRule,
+        rows: std::ops::Range<usize>,
         should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
         runs_mode: bool,
         row: impl FnMut(usize, usize, usize, &mut [u8], &[CovRun]) -> bool,
@@ -406,6 +471,7 @@ impl RasterKernel {
             width,
             height,
             rule,
+            rows,
             should_cancel,
             runs_mode,
             row,
@@ -445,6 +511,7 @@ impl RasterKernel {
         width: usize,
         height: usize,
         rule: FillRule,
+        rows: std::ops::Range<usize>,
         should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
         runs_mode: bool,
         row: impl FnMut(usize, usize, usize, &mut [u8], &[CovRun]) -> bool,
@@ -536,6 +603,18 @@ impl RasterKernel {
             return true;
         }
 
+        // The rows the caller accepts, within the path's own rows. Everything
+        // below sizes and routes by the path's full window exactly as an
+        // unrestricted fill does (so the same kernel runs); only the rows
+        // deposited, converted and emitted are restricted.
+        let emit_start = row_start.max(rows.start);
+        let emit_end = row_end.min(rows.end);
+        if emit_end <= emit_start {
+            self.last_rows = 0;
+            return true;
+        }
+        self.last_rows = (emit_end - emit_start) as u64;
+
         // Device-clamped x-window for the local accumulation buffer.
         let fwidth = width as f32;
         let bx = (x_min.floor().clamp(0.0, (width - 1) as f32)) as usize;
@@ -577,6 +656,8 @@ impl RasterKernel {
                 rule,
                 row_start,
                 row_end,
+                emit_start,
+                emit_end,
                 should_cancel,
                 runs_mode,
                 row,
@@ -606,8 +687,10 @@ impl RasterKernel {
                 return false;
             }
             let e = self.edges[edge_index];
-            let er_start = (e.y_top.floor() as isize).max(row_start as isize) as usize;
-            let er_end = (e.y_bot.ceil() as isize).min(row_end as isize).max(0) as usize;
+            let er_start =
+                ((e.y_top.floor() as isize).max(row_start as isize) as usize).max(emit_start);
+            let er_end =
+                ((e.y_bot.ceil() as isize).min(row_end as isize).max(0) as usize).min(emit_end);
             #[cfg(feature = "profiling")]
             {
                 self.prof.cur().edge_rows += er_end.saturating_sub(er_start) as u64;
@@ -692,7 +775,7 @@ impl RasterKernel {
         // sequential sum); it is bit-for-bit identical to the scalar branch.
         let use_avx2 = coverage_use_avx2();
         let mut row = row;
-        for lr in 0..bh {
+        for lr in (emit_start - row_start)..(emit_end - row_start) {
             if lr & 0x1f == 0 && should_cancel.is_some_and(|cancel| cancel()) {
                 self.reset_cancelled_fill();
                 return false;
@@ -876,6 +959,8 @@ impl RasterKernel {
         rule: FillRule,
         row_start: usize,
         row_end: usize,
+        emit_start: usize,
+        emit_end: usize,
         should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
         runs_mode: bool,
         mut row: impl FnMut(usize, usize, usize, &mut [u8], &[CovRun]) -> bool,
@@ -894,6 +979,12 @@ impl RasterKernel {
         // An edge's row span is exactly the fast path's (raster.rs deposit loop):
         // the saturating `as` casts also fix NaN (→0) and out-of-range coords, so
         // the AET must reproduce them verbatim rather than "improve" on them.
+        //
+        // With a row window (`emit_start..emit_end`), an edge that starts above
+        // it is bucketed at the window's first row instead, and one that lies
+        // wholly outside is dropped. Buckets are still filled in edge-index
+        // order, so every row inside the window sees the same contributing
+        // edges in the same order as the unrestricted sweep.
         self.aet_bucket_start.clear();
         self.aet_bucket_start.resize(bh + 1, 0);
         if self.aet_erend.len() < self.edges.len() {
@@ -906,8 +997,13 @@ impl RasterKernel {
             if edge_index & 0xff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
                 return false;
             }
-            let er_start = (e.y_top.floor() as isize).max(row_start as isize);
-            let er_end = (e.y_bot.ceil() as isize).min(row_end as isize).max(0);
+            let er_start = (e.y_top.floor() as isize)
+                .max(row_start as isize)
+                .max(emit_start as isize);
+            let er_end = (e.y_bot.ceil() as isize)
+                .min(row_end as isize)
+                .max(0)
+                .min(emit_end as isize);
             if er_start >= er_end {
                 continue; // touches no row — a pure no-op in the reference too
             }
@@ -933,8 +1029,13 @@ impl RasterKernel {
             if i & 0xff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
                 return false;
             }
-            let er_start = (e.y_top.floor() as isize).max(row_start as isize);
-            let er_end = (e.y_bot.ceil() as isize).min(row_end as isize).max(0);
+            let er_start = (e.y_top.floor() as isize)
+                .max(row_start as isize)
+                .max(emit_start as isize);
+            let er_end = (e.y_bot.ceil() as isize)
+                .min(row_end as isize)
+                .max(0)
+                .min(emit_end as isize);
             if er_start >= er_end {
                 continue;
             }
@@ -970,7 +1071,7 @@ impl RasterKernel {
             c.edge_rows += prof_edge_rows;
             c.clock_reads += 2 * prof_timed;
         }
-        for lr in 0..bh {
+        for lr in (emit_start - row_start)..(emit_end - row_start) {
             if lr & 0x0f == 0 && should_cancel.is_some_and(|cancel| cancel()) {
                 return false;
             }
@@ -2221,6 +2322,8 @@ impl RasterKernel {
                 rule,
                 row_start,
                 row_end,
+                row_start,
+                row_end,
                 None,
                 false,
                 |y, x0, x1, cov, _| {
@@ -2255,5 +2358,208 @@ impl RasterKernel {
         row: impl FnMut(usize, usize, usize, &mut [u8]),
     ) {
         self.run_fallback(points, subpaths, width, height, rule, row, true);
+    }
+}
+
+#[cfg(test)]
+mod row_window_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    //! A row-restricted fill must emit exactly the rows an unrestricted fill
+    //! emits inside the window, byte for byte, on every kernel route and in
+    //! both hand-over modes.
+
+    use super::{CovRun, FillRule, RasterKernel};
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn range(&mut self, lo: f32, hi: f32) -> f32 {
+            lo + (hi - lo) * ((self.next() >> 40) as f32 / (1u64 << 24) as f32)
+        }
+        fn pick(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// One emitted row with every run materialized to bytes.
+    type Row = (usize, usize, usize, Vec<u8>);
+
+    fn materialize(first: usize, last: usize, cov: &[u8], runs: &[CovRun]) -> Vec<u8> {
+        let mut bytes = vec![0u8; last - first + 1];
+        for run in runs {
+            // A cell run may extend past the covered span (trailing zeros).
+            let (x0, x1) = ((run.x0 as usize).max(first), (run.x1 as usize).min(last + 1));
+            if x0 >= x1 {
+                continue;
+            }
+            match run.fill {
+                Some(value) => bytes[x0 - first..x1 - first].fill(value),
+                None => bytes[x0 - first..x1 - first].copy_from_slice(&cov[x0..x1]),
+            }
+        }
+        bytes
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect(
+        kernel: &mut RasterKernel,
+        points: &[[f32; 2]],
+        subpaths: &[(usize, usize)],
+        width: usize,
+        height: usize,
+        rule: FillRule,
+        rows: std::ops::Range<usize>,
+        runs_mode: bool,
+    ) -> Vec<Row> {
+        let mut out: Vec<Row> = Vec::new();
+        if runs_mode {
+            assert!(kernel.fill_runs_cancellable_in(
+                points,
+                subpaths,
+                width,
+                height,
+                rule,
+                rows,
+                None,
+                |y, first, last, cov, runs| {
+                    out.push((y, first, last, materialize(first, last, cov, runs)));
+                    false
+                },
+            ));
+        } else {
+            assert!(kernel.fill_cancellable_in(
+                points,
+                subpaths,
+                width,
+                height,
+                rule,
+                rows,
+                None,
+                |y, first, last, cov| out.push((y, first, last, cov[first..=last].to_vec())),
+            ));
+        }
+        out
+    }
+
+    /// Random geometry aimed at each route: `0` a small compact polygon, `1`
+    /// a few edges over a huge window (sparse AET), `2` many small polygons
+    /// spread over the surface (dense AET rows, like a stroke outline), `3`
+    /// axis-aligned frames (vertical-only rows, row repetition).
+    fn geometry(rng: &mut Rng, kind: u64, w: f32, h: f32) -> (Vec<[f32; 2]>, Vec<(usize, usize)>) {
+        let mut points = Vec::new();
+        let mut subpaths = Vec::new();
+        let mut polygon = |points: &mut Vec<[f32; 2]>, vertices: &[[f32; 2]]| {
+            let start = points.len();
+            points.extend_from_slice(vertices);
+            subpaths.push((start, points.len()));
+        };
+        match kind {
+            0 => {
+                let (cx, cy) = (rng.range(0.0, w), rng.range(0.0, h));
+                let n = 3 + rng.pick(6) as usize;
+                let vertices: Vec<[f32; 2]> = (0..n)
+                    .map(|_| [cx + rng.range(-25.0, 25.0), cy + rng.range(-25.0, 25.0)])
+                    .collect();
+                polygon(&mut points, &vertices);
+            }
+            1 => {
+                let n = 3 + rng.pick(3) as usize;
+                let vertices: Vec<[f32; 2]> = (0..n)
+                    .map(|_| [rng.range(-40.0, w + 40.0), rng.range(-40.0, h + 40.0)])
+                    .collect();
+                polygon(&mut points, &vertices);
+            }
+            2 => {
+                for _ in 0..(60 + rng.pick(200)) {
+                    let (cx, cy) = (rng.range(-5.0, w + 5.0), rng.range(-5.0, h + 5.0));
+                    let r = rng.range(0.3, 6.0);
+                    let vertices: Vec<[f32; 2]> = (0..8)
+                        .map(|i| {
+                            let t = i as f32 / 8.0 * std::f32::consts::TAU;
+                            [cx + r * t.cos(), cy + r * t.sin()]
+                        })
+                        .collect();
+                    polygon(&mut points, &vertices);
+                }
+            }
+            _ => {
+                for _ in 0..(1 + rng.pick(4)) {
+                    let (x0, y0) = (rng.range(-10.0, w * 0.6), rng.range(-10.0, h * 0.6));
+                    let (x1, y1) = (x0 + rng.range(1.0, w * 0.6), y0 + rng.range(1.0, h * 0.6));
+                    // Half the frames are integer-aligned.
+                    let snap = |v: f32, on: bool| if on { v.round() } else { v };
+                    let on = rng.pick(2) == 0;
+                    let (x0, y0, x1, y1) = (snap(x0, on), snap(y0, on), snap(x1, on), snap(y1, on));
+                    polygon(&mut points, &[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]);
+                }
+            }
+        }
+        (points, subpaths)
+    }
+
+    #[test]
+    fn windowed_fill_equals_the_same_rows_of_a_full_fill() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let (width, height) = (700usize, 420usize);
+        let mut kernel = RasterKernel::default();
+        let mut reference_kernel = RasterKernel::default();
+        let mut nonempty = 0;
+        for case in 0..400 {
+            let kind = case % 4;
+            let (points, subpaths) = geometry(&mut rng, kind, width as f32, height as f32);
+            let rule = if rng.pick(2) == 0 {
+                FillRule::NonZero
+            } else {
+                FillRule::EvenOdd
+            };
+            let runs_mode = rng.pick(2) == 0;
+            let full = collect(
+                &mut reference_kernel,
+                &points,
+                &subpaths,
+                width,
+                height,
+                rule,
+                0..usize::MAX,
+                runs_mode,
+            );
+            // Windows inside, straddling, covering and outside the path's rows.
+            let a = rng.pick(height as u64 + 40) as usize;
+            let b = a + rng.pick(height as u64 / 2 + 2) as usize;
+            for rows in [a..b, 0..a, a..usize::MAX, b..b, 0..usize::MAX] {
+                let expected: Vec<Row> = full
+                    .iter()
+                    .filter(|row| rows.contains(&row.0))
+                    .cloned()
+                    .collect();
+                let got = collect(
+                    &mut kernel,
+                    &points,
+                    &subpaths,
+                    width,
+                    height,
+                    rule,
+                    rows.clone(),
+                    runs_mode,
+                );
+                assert!(
+                    got == expected,
+                    "case {case} kind {kind} rows {rows:?} runs_mode {runs_mode}: {} rows vs {}",
+                    got.len(),
+                    expected.len()
+                );
+                if !got.is_empty() && got.len() < full.len() {
+                    nonempty += 1;
+                }
+            }
+        }
+        assert!(nonempty > 300, "only {nonempty} windows actually restricted a fill");
     }
 }

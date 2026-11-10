@@ -4482,12 +4482,13 @@ fn render_tiling_impl(
     let mut fmask = vec![0u8; w * h];
     let dev_w = page.size.width as usize;
     let dev_h = page.size.height as usize;
-    if !raster.fill_cancellable(
+    if !raster.fill_cancellable_in(
         &page.points,
         subs,
         dev_w,
         dev_h,
         t.fill_rule,
+        by..by + h,
         page.decode_limits.should_cancel.as_deref(),
         |y, x0, x1, cov| {
             if y < by || y >= by + h {
@@ -4496,8 +4497,8 @@ fn render_tiling_impl(
             let ly = y - by;
             let lx0 = x0.max(bx);
             let lx1 = x1.min(bx + w - 1);
-            for x in lx0..=lx1 {
-                fmask[ly * w + (x - bx)] = cov[x];
+            if lx0 <= lx1 {
+                fmask[ly * w + (lx0 - bx)..=ly * w + (lx1 - bx)].copy_from_slice(&cov[lx0..=lx1]);
             }
         },
     ) {
@@ -5284,12 +5285,16 @@ fn paint_command(
                 };
             }
 
-            if !raster.fill_runs_cancellable(
+            // Rows outside the command's bounds are never painted, so they
+            // are not rasterized either (the callback's check stays as the
+            // guard it always was).
+            if !raster.fill_runs_cancellable_in(
                 &page.points,
                 subs,
                 width,
                 height,
                 cmd.rule,
+                by0..by1,
                 page.decode_limits.should_cancel.as_deref(),
                 |y, x0, x1, cov, runs| {
                     if y < by0 || y >= by1 {
