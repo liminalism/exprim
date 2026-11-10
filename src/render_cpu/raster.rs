@@ -213,6 +213,21 @@ const CACHE_WINDOW_CELLS: usize = 1 << 13; // 8 Ki cells (32 KiB f32) ≈ L1
 /// this constant; the sequential prefix-sum precludes a bit-exact SIMD sum.
 const AVX2_MIN_SPAN: usize = usize::MAX;
 
+/// Shortest run of untouched accumulation cells that the compact window hands
+/// over as one constant run (run-aware mode) instead of as coverage bytes.
+/// Below it a constant run costs the consumer more than the bytes it saves.
+const COMPACT_RUN_MIN: usize = 16;
+
+/// Rows narrower than this take the plain per-cell sweep: there is no room
+/// for a gap worth finding, and small curved fills (the common case) should
+/// not pay a zero test per cell.
+const COMPACT_GAP_MIN_SPAN: usize = 32;
+
+/// How many consecutive untouched cells start a gap. Fewer are converted like
+/// any other cell (adding their zeros changes nothing), which keeps
+/// edge-dense rows on the straight path.
+const COMPACT_GAP_PROBE: usize = 4;
+
 /// One run of an emitted coverage row, over device columns `[x0, x1)`, for
 /// the run-aware fill entry [`RasterKernel::fill_runs_cancellable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -793,6 +808,12 @@ impl RasterKernel {
             let base = lr * stride;
             let mut first = width;
             let mut last = 0usize;
+            // Wide rows look for untouched gaps and, in run-aware mode, hand
+            // the row over as runs; narrow rows (small curved fills, steep
+            // hairlines) keep the plain per-cell sweep and a single run, with
+            // no per-row bookkeeping.
+            let find_gaps = cmax - cmin + 1 >= COMPACT_GAP_MIN_SPAN;
+            let mut emit_runs = false;
 
             // `AVX2_MIN_SPAN == usize::MAX` is the documented "disabled"
             // sentinel (see its doc comment), making this deliberately
@@ -815,7 +836,7 @@ impl RasterKernel {
                     acc[c] = 0.0;
                 }
                 acc[cmax + 1] = 0.0;
-            } else {
+            } else if !find_gaps {
                 let acc = &mut self.acc[base..base + stride];
                 let mut running = 0.0f32;
                 for c in cmin..=cmax {
@@ -830,19 +851,112 @@ impl RasterKernel {
                     }
                 }
                 acc[cmax + 1] = 0.0;
+            } else {
+                // A cell no edge touched holds zero, and adding zero leaves the
+                // running sum (up to the sign of a zero, which `coverage_byte`
+                // does not see) and so the coverage byte unchanged. A stretch
+                // of such cells is therefore one constant: its byte is
+                // computed once and written with a `fill`, or, in run-aware
+                // mode when long enough and fully covered, handed over as a
+                // constant run without touching the buffer at all. The bytes, `first` and
+                // `last` are exactly those of converting every cell; a
+                // rectangle's row costs its two edge cells instead of its
+                // width.
+                let acc = &mut self.acc[base..base + stride];
+                let mut running = 0.0f32;
+                self.row_runs.clear();
+                // Local column where the pending run of written cells starts.
+                let mut cells_from = cmin;
+                let mut c = cmin;
+                emit_runs = runs_mode;
+                while c <= cmax {
+                    let v = acc[c];
+                    if v == 0.0
+                        && c + COMPACT_GAP_PROBE <= cmax + 1
+                        && acc[c + 1..c + COMPACT_GAP_PROBE]
+                            .iter()
+                            .all(|&cell| cell == 0.0)
+                    {
+                        let gap = acc[c..=cmax]
+                            .iter()
+                            .position(|&cell| cell != 0.0)
+                            .unwrap_or(cmax + 1 - c);
+                        let end = c + gap;
+                        let byte = coverage_byte(running, rule);
+                        // Only empty and fully covered gaps become runs: a
+                        // constant *partial* run would take the consumer's
+                        // scalar constant blend, slower than the vectorized
+                        // mask blend its bytes get.
+                        if runs_mode && gap >= COMPACT_RUN_MIN && (byte == 0 || byte == 255) {
+                            if cells_from < c {
+                                self.row_runs.push(CovRun {
+                                    x0: (bx + cells_from) as u32,
+                                    x1: (bx + c) as u32,
+                                    fill: None,
+                                });
+                            }
+                            if byte != 0 {
+                                self.row_runs.push(CovRun {
+                                    x0: (bx + c) as u32,
+                                    x1: (bx + end) as u32,
+                                    fill: Some(byte),
+                                });
+                                first = first.min(bx + c);
+                                last = bx + end - 1;
+                            }
+                            cells_from = end;
+                        } else if byte != 0 {
+                            self.cov[bx + c..bx + end].fill(byte);
+                            first = first.min(bx + c);
+                            last = bx + end - 1;
+                        }
+                        c = end;
+                        continue;
+                    }
+                    running += v;
+                    acc[c] = 0.0;
+                    let byte = coverage_byte(running, rule);
+                    let x = bx + c;
+                    self.cov[x] = byte;
+                    if byte != 0 {
+                        first = first.min(x);
+                        last = x;
+                    }
+                    c += 1;
+                }
+                acc[cmax + 1] = 0.0;
+                if cells_from <= cmax {
+                    self.row_runs.push(CovRun {
+                        x0: (bx + cells_from) as u32,
+                        x1: (bx + cmax + 1) as u32,
+                        fill: None,
+                    });
+                }
             }
 
             if first <= last {
                 self.last_covered += (last - first + 1) as u64;
                 let y = row_start + lr;
-                let whole = [CovRun {
-                    x0: first as u32,
-                    x1: last as u32 + 1,
-                    fill: None,
-                }];
-                row(y, first, last, &mut self.cov, &whole);
-                for c in &mut self.cov[first..=last] {
-                    *c = 0;
+                if emit_runs {
+                    // Constant runs were not written into the buffer; a
+                    // consumer that wrote them itself reports the row dirty.
+                    if row(y, first, last, &mut self.cov, &self.row_runs) {
+                        self.cov[first..=last].fill(0);
+                    } else {
+                        for run in &self.row_runs {
+                            if run.fill.is_none() {
+                                self.cov[run.x0 as usize..run.x1 as usize].fill(0);
+                            }
+                        }
+                    }
+                } else {
+                    let whole = [CovRun {
+                        x0: first as u32,
+                        x1: last as u32 + 1,
+                        fill: None,
+                    }];
+                    row(y, first, last, &mut self.cov, &whole);
+                    self.cov[first..=last].fill(0);
                 }
             }
         }
@@ -2451,7 +2565,9 @@ mod row_window_tests {
     /// Random geometry aimed at each route: `0` a small compact polygon, `1`
     /// a few edges over a huge window (sparse AET), `2` many small polygons
     /// spread over the surface (dense AET rows, like a stroke outline), `3`
-    /// axis-aligned frames (vertical-only rows, row repetition).
+    /// axis-aligned frames (vertical-only rows, row repetition), `4` thin
+    /// rules and small boxes that stay in the compact window with long
+    /// untouched interiors (constant runs), some overlapping.
     fn geometry(rng: &mut Rng, kind: u64, w: f32, h: f32) -> (Vec<[f32; 2]>, Vec<(usize, usize)>) {
         let mut points = Vec::new();
         let mut subpaths = Vec::new();
@@ -2489,6 +2605,30 @@ mod row_window_tests {
                     polygon(&mut points, &vertices);
                 }
             }
+            4 => {
+                for _ in 0..(1 + rng.pick(3)) {
+                    let wide = rng.pick(2) == 0;
+                    let (rw, rh) = if wide {
+                        (rng.range(20.0, w * 0.95), rng.range(0.2, 9.0))
+                    } else {
+                        (rng.range(0.2, 9.0), rng.range(20.0, h * 0.95))
+                    };
+                    let (x0, y0) = (rng.range(-5.0, w - rw), rng.range(-5.0, h - rh));
+                    let snap = |v: f32, on: bool| if on { v.round() } else { v };
+                    let on = rng.pick(3) == 0;
+                    let (x0, y0, x1, y1) =
+                        (snap(x0, on), snap(y0, on), snap(x0 + rw, on), snap(y0 + rh, on));
+                    polygon(&mut points, &[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]);
+                    if rng.pick(4) == 0 {
+                        // A slanted sliver across the rule: partial coverage
+                        // inside an otherwise constant row.
+                        polygon(
+                            &mut points,
+                            &[[x0 + 3.3, y0 - 1.0], [x0 + 9.1, y0 - 1.0], [x0 + 30.7, y1 + 1.0]],
+                        );
+                    }
+                }
+            }
             _ => {
                 for _ in 0..(1 + rng.pick(4)) {
                     let (x0, y0) = (rng.range(-10.0, w * 0.6), rng.range(-10.0, h * 0.6));
@@ -2511,8 +2651,8 @@ mod row_window_tests {
         let mut kernel = RasterKernel::default();
         let mut reference_kernel = RasterKernel::default();
         let mut nonempty = 0;
-        for case in 0..400 {
-            let kind = case % 4;
+        for case in 0..500 {
+            let kind = case % 5;
             let (points, subpaths) = geometry(&mut rng, kind, width as f32, height as f32);
             let rule = if rng.pick(2) == 0 {
                 FillRule::NonZero
@@ -2530,6 +2670,18 @@ mod row_window_tests {
                 0..usize::MAX,
                 runs_mode,
             );
+            // The two hand-over modes describe the same rows.
+            let other_mode = collect(
+                &mut reference_kernel,
+                &points,
+                &subpaths,
+                width,
+                height,
+                rule,
+                0..usize::MAX,
+                !runs_mode,
+            );
+            assert!(full == other_mode, "case {case} kind {kind}: runs and bytes disagree");
             // Windows inside, straddling, covering and outside the path's rows.
             let a = rng.pick(height as u64 + 40) as usize;
             let b = a + rng.pick(height as u64 / 2 + 2) as usize;
@@ -2560,6 +2712,6 @@ mod row_window_tests {
                 }
             }
         }
-        assert!(nonempty > 300, "only {nonempty} windows actually restricted a fill");
+        assert!(nonempty > 400, "only {nonempty} windows actually restricted a fill");
     }
 }
