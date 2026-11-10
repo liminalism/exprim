@@ -80,6 +80,8 @@ the form `tools/render-probe/g0-corpus.local.json` expects:
 [*]
 Restore it with `akr secret get <citation> --reveal > g0-corpus.local.json`.
 
+> **Stale** — `watches "tools/render-probe/g0_manifest.py"` was matched by `e75ca9f8`, which touched `tools/render-probe/g0_manifest.py`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#attribution-corpus-of-2026-11-10-which-local-document-each-id-stands-for).
+
 ### Four-renderer benchmark corpus of 2026-11-09: which local document each id stands for
 
 `verified` · `@exprim.corpus.benchmark-20261109/1`
@@ -100,6 +102,8 @@ local path.
     vector-tables = [*]
 
 Library roots these documents and the sweep corpus live under: [*], [*], [*], [*], [*], [*], [*], [*], [*], [*], [*]
+
+> **Stale** — `watches "tools/render-bench/corpus.py"` was matched by `e75ca9f8`, which touched `tools/render-bench/corpus.py`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#four-renderer-benchmark-corpus-of-2026-11-09-which-local-document-each-id-stands-for).
 
 ### Where CPU render time goes on dense vectors, tables and text (G0)
 
@@ -130,6 +134,8 @@ Absolute times drifted with machine load during the session; shares and
 paired ratios are the reliable figures.
 
 **supersedes** `@exprim.renderer.attribution-20261110/1`
+
+> **Stale** — `watches "src/render_cpu/**"` was matched by `e75ca9f8`, which touched `src/render_cpu/attribution.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#where-cpu-render-time-goes-on-dense-vectors-tables-and-text-g0).
 
 ## Assessments
 

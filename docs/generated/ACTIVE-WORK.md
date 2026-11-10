@@ -11,7 +11,7 @@ Live work, grouped by parent in `ROADMAP.md` order. Blocked work names its block
 
 ### Next renderer levers after G1's exact part
 
-`proposed` · `@exprim.renderer.next-levers/1`
+`proposed` · `@exprim.renderer.next-levers/1` · **at risk**
 
 Candidates ranked by measured share, none started:
 1. Stroke outlines as ribbons with fewer join polygons (changes pixels;
@@ -28,3 +28,5 @@ Candidates ranked by measured share, none started:
 8. Masked draws under a mostly opaque clip mask: needs a row-detail
    profile first.
 Dropped on evidence: exact floor/ceil replacements, a trig table.
+
+> **At risk** at depth 1 via `supported_by` → `@exprim.renderer.attribution-20261110/2` (stale: `watches "src/render_cpu/**"` was matched by `e75ca9f8`, which touched `src/render_cpu/attribution.rs`.). See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#next-renderer-levers-after-g1s-exact-part).
