@@ -5,8 +5,7 @@ build {
     tool "akr 0.6.5"
     grammar "0.1"
     vocabulary "0.2"
-    commit git:3e8798654cb40b5435a6479ac7221fe654499680
-    source_graph "sha256:224c4ca36aac2c6572e2d03041c41b6c8d9aab4b867739813f1c6519f076cfb5"
+    source_graph "sha256:a8301aaa708525cba90eb061f296003e7b234a208b6db9e7c454160065cc65c4"
 }
 
 source ".akr/project.akr" {
@@ -20,8 +19,8 @@ source ".akr/records/exprim/evidence.akr" {
 }
 
 source ".akr/records/exprim/observations.akr" {
-    hash "sha256:c6ff3fb520fbb352b5c630a1112f9e16f455648a2ce05ef1fa3f9422a5e56e4d"
-    records 4
+    hash "sha256:a83092ce6eb4fa0cf950cae8f3fb89da0ba9538c65c7ce6f20a2183cc38b8561"
+    records 7
 }
 
 source ".akr/records/exprim/policies.akr" {
@@ -41,8 +40,8 @@ source ".akr/records/exprim/work.akr" {
 
 resolution @exprim.renderer.g1-exact-speedups/1 {
     slot supported_by
-    to @exprim.renderer.attribution-20261110/2
-    hash "sha256:5261a737a0ca44a9c9832fe5516f81e2d28154dccd16316716b927a217614903"
+    to @exprim.renderer.attribution-20261110/3
+    hash "sha256:f24b3966477263b509526b08c6b064ebc0cb7449756f7243c846f9be6db8bacc"
 }
 
 resolution @exprim.renderer.g1-exact-speedups/1 {
@@ -59,18 +58,28 @@ resolution @exprim.renderer.next-levers/1 {
 
 resolution @exprim.renderer.next-levers/1 {
     slot supported_by
-    to @exprim.renderer.attribution-20261110/2
-    hash "sha256:5261a737a0ca44a9c9832fe5516f81e2d28154dccd16316716b927a217614903"
+    to @exprim.renderer.attribution-20261110/3
+    hash "sha256:f24b3966477263b509526b08c6b064ebc0cb7449756f7243c846f9be6db8bacc"
 }
 
 seal @exprim.corpus.attribution-20261110/1 {
+    state superseded
+    hash "sha256:22e80dcf70b5aac7e42c9c589b4e7e80323bb09ddc5198abf22373d71e4b1203"
+}
+
+seal @exprim.corpus.attribution-20261110/2 {
     state verified
-    hash "sha256:5d0e01d7853495b7ca38ac7eb5d162f1e93374f2ad84f6c5ed711333b059ba27"
+    hash "sha256:0a09cc6159648a8f50f01004d3987fb1b59c89e901eb2a3836897eb8c99bd075"
 }
 
 seal @exprim.corpus.benchmark-20261109/1 {
+    state superseded
+    hash "sha256:e1583c26141fc8e2a71a0cd9ef6f3a745adfc08e4cd18e9c6fee14595a931ff6"
+}
+
+seal @exprim.corpus.benchmark-20261109/2 {
     state verified
-    hash "sha256:17774f6dabe2ef1e47f9694f2ba5cbf477474afb2cf0b5dc7906b0a28110d0f9"
+    hash "sha256:c7c569fb1d784ad06e01cef47f9ff6a6264d4ae38632a8b0aef59d1e9f2651da"
 }
 
 seal @exprim.privacy.residual-document-mentions/1 {
@@ -84,8 +93,13 @@ seal @exprim.renderer.attribution-20261110/1 {
 }
 
 seal @exprim.renderer.attribution-20261110/2 {
+    state superseded
+    hash "sha256:3cdcf93a82f4e4a26d7425f3796a1aa15f904d5c74b0160f33cbc3b8648f4adb"
+}
+
+seal @exprim.renderer.attribution-20261110/3 {
     state verified
-    hash "sha256:5261a737a0ca44a9c9832fe5516f81e2d28154dccd16316716b927a217614903"
+    hash "sha256:f24b3966477263b509526b08c6b064ebc0cb7449756f7243c846f9be6db8bacc"
 }
 
 seal @exprim.renderer.g1-exact-speedups/1 {
