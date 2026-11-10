@@ -1,0 +1,40 @@
+[package]
+name = "exprim-cli"
+description = "Development driver for the exprim renderer (`pdfr`): render, trace and time pages"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "pdfr"
+path = "src/main.rs"
+
+# Standalone performance demonstrator, shipped to evaluators as a single exe.
+# Optional (`--features demo`) so ordinary builds of this crate skip it.
+[[bin]]
+name = "exprim-demo"
+path = "src/bin/exprim-demo.rs"
+required-features = ["demo"]
+
+[dependencies]
+anyhow = { version = "1.0.103", features = ["backtrace"] }
+exprim = { path = ".." }
+png = "0.18"
+# `demo` binary only.
+chrono = { version = "0.4.45", optional = true }
+crossbeam-channel = { version = "0.5", optional = true }
+flate2 = { version = "1.1.9", features = ["zlib-rs"], optional = true }
+
+[features]
+demo = ["dep:chrono", "dep:crossbeam-channel", "dep:flate2"]
+profiling = ["exprim/profiling"]
+
+[dev-dependencies]
+exprim = { path = "..", features = ["test-support"] }
+jp2lam = { version = "0.3.1", path = "../codecs/jp2lam", default-features = false }
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

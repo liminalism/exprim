@@ -1,0 +1,9 @@
+# build.rs checks the SHA-256 of the vendored PDFium sources byte for byte, so
+# no checkout may convert their line endings (core.autocrlf=true would).
+upstream/** -text
+# Binary data embedded with include_bytes!.
+*.otf binary
+src/font/cmap_data/** binary
+*.pdf binary
+*.jpg binary
+*.bin binary
