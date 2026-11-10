@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.1 — Unreleased
+## 0.6.1 — 2026-11-10
 
 Changes since 0.6.0. Decoded bitmaps, decoder state and context states are
 bit-identical to 0.6.0; the public API and the `decode`-only feature build
