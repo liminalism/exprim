@@ -15,7 +15,7 @@
 //!
 //! # The table is verbatim
 //! [`ADOBE_CMYK`] below is PDFium's `kCMYK` **byte for byte**, still in C++
-//! brace-initialiser syntax. [`cmyk_table!`] re-templates it into a Rust
+//! brace-initialiser syntax. `cmyk_table!` re-templates it into a Rust
 //! array at compile time, so 6561 hand-transcribed entries are impossible to
 //! get subtly wrong and re-syncing with upstream is a copy-paste and a diff.
 //! Resist the urge to "tidy" it into Rust literals.

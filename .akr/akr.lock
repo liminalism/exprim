@@ -5,7 +5,7 @@ build {
     tool "akr 0.6.5"
     grammar "0.1"
     vocabulary "0.2"
-    source_graph "sha256:7900bf18b1598d3a3be75ce7595ee1420edf603ce979ccaa10f7fc3be7c9c86b"
+    source_graph "sha256:224c4ca36aac2c6572e2d03041c41b6c8d9aab4b867739813f1c6519f076cfb5"
 }
 
 source ".akr/project.akr" {
@@ -19,8 +19,8 @@ source ".akr/records/exprim/evidence.akr" {
 }
 
 source ".akr/records/exprim/observations.akr" {
-    hash "sha256:680dc6aa9e42d5ee526157211760657e8d27cbc7c70e30ecafcaeb13e2464fea"
-    records 3
+    hash "sha256:c6ff3fb520fbb352b5c630a1112f9e16f455648a2ce05ef1fa3f9422a5e56e4d"
+    records 4
 }
 
 source ".akr/records/exprim/policies.akr" {
@@ -40,8 +40,8 @@ source ".akr/records/exprim/work.akr" {
 
 resolution @exprim.renderer.g1-exact-speedups/1 {
     slot supported_by
-    to @exprim.renderer.attribution-20261110/1
-    hash "sha256:36b6f0bd0348c1afd182a5e8778df6ffd7182401d1e83c21577aa90ab6bf9bd2"
+    to @exprim.renderer.attribution-20261110/2
+    hash "sha256:5261a737a0ca44a9c9832fe5516f81e2d28154dccd16316716b927a217614903"
 }
 
 resolution @exprim.renderer.g1-exact-speedups/1 {
@@ -58,8 +58,8 @@ resolution @exprim.renderer.next-levers/1 {
 
 resolution @exprim.renderer.next-levers/1 {
     slot supported_by
-    to @exprim.renderer.attribution-20261110/1
-    hash "sha256:36b6f0bd0348c1afd182a5e8778df6ffd7182401d1e83c21577aa90ab6bf9bd2"
+    to @exprim.renderer.attribution-20261110/2
+    hash "sha256:5261a737a0ca44a9c9832fe5516f81e2d28154dccd16316716b927a217614903"
 }
 
 seal @exprim.corpus.attribution-20261110/1 {
@@ -78,8 +78,13 @@ seal @exprim.privacy.residual-document-mentions/1 {
 }
 
 seal @exprim.renderer.attribution-20261110/1 {
+    state superseded
+    hash "sha256:cf940d524bfac99af6532fbc7f0434b8dd9aaafac1eae57724c0f68aa58e0775"
+}
+
+seal @exprim.renderer.attribution-20261110/2 {
     state verified
-    hash "sha256:36b6f0bd0348c1afd182a5e8778df6ffd7182401d1e83c21577aa90ab6bf9bd2"
+    hash "sha256:5261a737a0ca44a9c9832fe5516f81e2d28154dccd16316716b927a217614903"
 }
 
 seal @exprim.renderer.g1-exact-speedups/1 {

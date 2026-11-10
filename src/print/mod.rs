@@ -12,8 +12,87 @@
 //!                          (Windows always; anywhere we impose or N-up)
 //! ```
 //!
-//! Prepress — CMYK separations, output ICC profiles, overprint simulation,
-//! PDF/X — is deliberately out of scope; see `dev-notes/print-PLAN.md` §7 in the repository.
+//! # Printing a document
+//!
+//! Describe the job with [`PrintOptions`], pick a spooler, and call
+//! [`print_document`]:
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use exprim::print::{self, Duplex, NUp, PaperSize, PrintOptions, spool};
+//!
+//! let spooler = spool::platform_spooler();
+//! let Some(printer) = spooler.default_printer()? else {
+//!     return Ok(());
+//! };
+//! let options = PrintOptions {
+//!     paper: PaperSize::A4,
+//!     n_up: NUp::Two,
+//!     duplex: Duplex::LongEdge,
+//!     ..PrintOptions::default()
+//! };
+//! let bytes: Arc<[u8]> = std::fs::read("document.pdf")?.into();
+//! let job = print::print_document(&*spooler, &printer, "document.pdf", bytes, &options)?;
+//! println!("job {} took the {} route", job.id, job.route.kind());
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! [`print_document_with`] takes a [`PrintRequest`] for the rest: a document
+//! password and explicit composition settings.
+//!
+//! # The two routes
+//!
+//! - **Pass-through** spools the original PDF bytes. It is taken when nothing
+//!   in the job changes page geometry
+//!   ([`PrintOptions::is_pass_through_capable`]) and the queue accepts PDF.
+//! - **Composed** imposes the pages onto sheets ([`impose`]), rasterizes each
+//!   sheet ([`compose_sheet`]) and spools bitmaps. N-up, booklets, margins,
+//!   scaling other than shrink-to-fit or actual size, and every Windows job
+//!   take this route.
+//!
+//! [`route_for`] answers which route a job would take without submitting it.
+//!
+//! # Previewing without a printer
+//!
+//! Impose with no hardware margins and render the sheets to PNG:
+//!
+//! ```no_run
+//! use exprim::RenderSession;
+//! use exprim::print::{self, Margins, PreviewOptions, PrintJob, PrintOptions};
+//! # let bytes: std::sync::Arc<[u8]> = std::fs::read("document.pdf")?.into();
+//!
+//! let session = RenderSession::open(bytes, None)?;
+//! let job = PrintJob::from_session(&session, PrintOptions::default())?;
+//! let sheets = print::impose(&job, Margins::ZERO)?;
+//! for (index, png) in print::preview_sheets(&session, &sheets, PreviewOptions::default()).enumerate() {
+//!     std::fs::write(format!("sheet-{index}.png"), png?)?;
+//! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! To preview what a particular printer will do, plan with its margins
+//! instead: [`Spooler::capabilities`], then [`Spooler::plan_sheets`]. Neither
+//! submits a job.
+//!
+//! # Units and conventions
+//!
+//! Lengths are PostScript points (1/72 inch) with `y` up, as in PDF.
+//! [`PageRange`] is one-based and inclusive, because users type it;
+//! [`SourcePage::index`] and [`Placement::source_page`] are zero-based.
+//!
+//! # Platform notes
+//!
+//! - Linux and macOS print through the CUPS command-line tools.
+//! - Windows spooling is experimental: it has not been verified against a
+//!   physical printer queue. A Windows job uses one sheet orientation, chosen
+//!   from all selected pages; a failed job is aborted, not committed in part.
+//! - [`FileSpooler`] writes sheets as PNG files, for tests and for platforms
+//!   with no spooler.
+//! - Booklets fold along the vertical centre of the sheet. Automatic duplex
+//!   needs short-edge binding on landscape sheets and long-edge on portrait
+//!   ones; a mismatch is an error before anything is submitted.
+//! - Prepress (CMYK separations, output ICC profiles, overprint simulation,
+//!   PDF/X) is out of scope.
 
 pub mod compose;
 pub mod job;
@@ -55,7 +134,12 @@ pub enum PrintError {
     #[error(
         "imageable area is empty: paper {paper_w:.1}x{paper_h:.1}pt is smaller than its margins"
     )]
-    EmptyImageableArea { paper_w: f64, paper_h: f64 },
+    EmptyImageableArea {
+        /// Paper width in points.
+        paper_w: f64,
+        /// Paper height in points.
+        paper_h: f64,
+    },
     /// Reading or rasterizing the source document failed.
     #[error("document error: {0}")]
     Read(#[from] crate::reader::ReadError),
@@ -65,8 +149,11 @@ pub enum PrintError {
     /// A sheet raster would exceed the configured pixel budget.
     #[error("sheet raster too large: {width}x{height} exceeds {max_pixels} pixels")]
     SheetTooLarge {
+        /// Width the sheet raster would have, in pixels.
         width: u32,
+        /// Height the sheet raster would have, in pixels.
         height: u32,
+        /// The budget that was exceeded.
         max_pixels: u64,
     },
     /// The platform spooler rejected the job or is unavailable.
@@ -91,15 +178,22 @@ pub enum PrintError {
 /// dependency.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Matrix {
+    /// X scale.
     pub a: f64,
+    /// Y shear: how much `x` contributes to the output `y`.
     pub b: f64,
+    /// X shear: how much `y` contributes to the output `x`.
     pub c: f64,
+    /// Y scale.
     pub d: f64,
+    /// X translation.
     pub e: f64,
+    /// Y translation.
     pub f: f64,
 }
 
 impl Matrix {
+    /// The transform that leaves every point where it is.
     pub const IDENTITY: Self = Self {
         a: 1.0,
         b: 0.0,
@@ -109,16 +203,19 @@ impl Matrix {
         f: 0.0,
     };
 
+    /// A matrix from its six coefficients, in PDF order.
     #[must_use]
     pub const fn new(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) -> Self {
         Self { a, b, c, d, e, f }
     }
 
+    /// A translation by `(tx, ty)`.
     #[must_use]
     pub const fn translate(tx: f64, ty: f64) -> Self {
         Self::new(1.0, 0.0, 0.0, 1.0, tx, ty)
     }
 
+    /// A scale by `sx` horizontally and `sy` vertically, about the origin.
     #[must_use]
     pub const fn scale(sx: f64, sy: f64) -> Self {
         Self::new(sx, 0.0, 0.0, sy, 0.0, 0.0)
@@ -154,6 +251,7 @@ impl Matrix {
         }
     }
 
+    /// Map the point `(x, y)` through this transform.
     #[must_use]
     pub fn apply(self, x: f64, y: f64) -> (f64, f64) {
         (
@@ -198,12 +296,18 @@ pub enum Scaling {
 /// Sheets per side of paper, or a saddle-stitched booklet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NUp {
+    /// One page per side.
     #[default]
     One,
+    /// Two pages per side.
     Two,
+    /// Four pages per side, 2 x 2.
     Four,
+    /// Six pages per side.
     Six,
+    /// Nine pages per side, 3 x 3.
     Nine,
+    /// Sixteen pages per side, 4 x 4.
     Sixteen,
     /// Two pages per side, ordered so that folding the stack in half
     /// reproduces the reading order.
@@ -245,13 +349,19 @@ pub enum NUpOrder {
     /// Left to right, then top to bottom.
     #[default]
     RightThenDown,
+    /// Right to left, then top to bottom.
     LeftThenDown,
+    /// Top to bottom, then left to right.
     DownThenRight,
+    /// Top to bottom, then right to left.
     DownThenLeft,
 }
 
+/// Whether both sides of the paper are printed, and which edge the sheet
+/// flips about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Duplex {
+    /// One side only.
     #[default]
     None,
     /// Flip about the long edge — the usual "book" binding.
@@ -261,6 +371,7 @@ pub enum Duplex {
 }
 
 impl Duplex {
+    /// Whether both sides are printed.
     #[must_use]
     pub const fn is_duplex(self) -> bool {
         !matches!(self, Self::None)
@@ -270,11 +381,14 @@ impl Duplex {
 /// A one-based, inclusive page selection.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PageRange {
+    /// Every page of the document.
     #[default]
     All,
     /// Inclusive one-based spans, in the order the user wrote them.
     Spans(Vec<(u32, u32)>),
+    /// Pages 1, 3, 5, and so on.
     Odd,
+    /// Pages 2, 4, 6, and so on.
     Even,
 }
 
@@ -362,21 +476,32 @@ fn parse_page_number(text: &str) -> Result<u32, PrintError> {
 /// Everything the user chose in the print dialog.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrintOptions {
+    /// The paper to print on. A4 by default.
     pub paper: PaperSize,
+    /// Sheet orientation. Chosen per job to suit the pages by default.
     pub orientation: Orientation,
     /// User margins, measured from the paper edge, in points.
     pub margins: Margins,
+    /// How each page is fitted to its area on the sheet.
     pub scaling: Scaling,
+    /// Pages per side of paper, or booklet imposition.
     pub n_up: NUp,
+    /// The order N-up cells are filled in.
     pub n_up_order: NUpOrder,
     /// Draw a hairline around each N-up cell. Off by default.
     pub n_up_border: bool,
+    /// One-sided or two-sided printing.
     pub duplex: Duplex,
+    /// Which pages to print.
     pub range: PageRange,
+    /// Number of copies, at least 1.
     pub copies: u16,
+    /// With several copies, print each copy complete before the next (1 2 3,
+    /// 1 2 3) rather than each page in turn (1 1, 2 2, 3 3). On by default.
     pub collate: bool,
     /// Print the selected pages last-to-first.
     pub reverse: bool,
+    /// The page box taken as each page's extent. The crop box by default.
     pub source_box: PageBoxKind,
     /// Render in grayscale. The composition path honours this; the
     /// pass-through path forwards it as a spooler option.
@@ -453,6 +578,7 @@ pub struct SourcePage {
 }
 
 impl SourcePage {
+    /// A source page from its zero-based index and displayed size in points.
     #[must_use]
     pub const fn new(index: u32, width: f64, height: f64) -> Self {
         Self {
@@ -462,6 +588,7 @@ impl SourcePage {
         }
     }
 
+    /// Whether the page is wider than it is tall.
     #[must_use]
     pub fn is_landscape(self) -> bool {
         self.width > self.height
@@ -483,11 +610,16 @@ impl fmt::Display for SourcePage {
 /// A print job as [`layout::impose`] sees it: source geometry plus options.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrintJob {
+    /// Every page of the source document, in document order. The page range in
+    /// `options` selects from these.
     pub pages: Vec<SourcePage>,
+    /// What the user asked for.
     pub options: PrintOptions,
 }
 
 impl PrintJob {
+    /// A job from page geometry gathered by the caller.
+    /// [`from_session`](Self::from_session) gathers it from an open document.
     #[must_use]
     pub fn new(pages: Vec<SourcePage>, options: PrintOptions) -> Self {
         Self { pages, options }

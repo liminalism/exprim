@@ -20,11 +20,13 @@ use crate::print::{ComposeOptions, PrintError, PrintOptions, Sheet};
 pub struct PrinterId(pub String);
 
 impl PrinterId {
+    /// An id from a queue name.
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
 
+    /// The queue name.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -40,11 +42,15 @@ impl std::fmt::Display for PrinterId {
 /// What the system says about one queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrinterInfo {
+    /// The identifier to submit jobs with.
     pub id: PrinterId,
     /// Human-readable name, when the system offers one distinct from the id.
     pub description: Option<String>,
+    /// Where the system says the printer is, when it says.
     pub location: Option<String>,
+    /// Whether this is the system's default printer.
     pub is_default: bool,
+    /// Whether the queue is accepting jobs.
     pub accepting_jobs: bool,
 }
 
@@ -54,7 +60,9 @@ pub struct DeviceCapabilities {
     /// The unprintable border. Falls back to
     /// [`DEFAULT_HARDWARE_MARGIN_PT`](crate::print::paper::DEFAULT_HARDWARE_MARGIN_PT).
     pub hardware_margins: Margins,
+    /// Whether the device can print on both sides by itself.
     pub supports_duplex: bool,
+    /// Whether the device prints in colour.
     pub supports_color: bool,
     /// Native device resolution in DPI, when known.
     pub resolution_dpi: Option<f64>,
@@ -83,18 +91,25 @@ pub enum SpoolPayload<'a> {
     /// Sheets to rasterize and spool. Composition is the spooler's call, so
     /// that a backend able to stream bands never holds a whole sheet.
     Sheets {
+        /// The open document the sheets draw their pages from.
         session: &'a crate::reader::RenderSession,
+        /// The sheets to print, in order.
         sheets: &'a [Sheet],
+        /// Resolution and colour settings for composing each sheet.
         compose: ComposeOptions,
     },
 }
 
 /// One submission.
 pub struct SpoolJob<'a> {
+    /// The queue to print on.
     pub printer: PrinterId,
     /// Job title as it appears in the queue.
     pub title: String,
+    /// The user's options. Backends read spooler-side settings such as copies
+    /// and duplex from here.
     pub options: &'a PrintOptions,
+    /// What to print.
     pub payload: SpoolPayload<'a>,
 }
 
@@ -138,12 +153,18 @@ impl std::fmt::Display for JobId {
     }
 }
 
+/// Where a submitted job stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
+    /// Queued, not yet printing.
     Pending,
+    /// Being printed.
     Processing,
+    /// Finished.
     Completed,
+    /// Cancelled by a user or by [`Spooler::cancel`].
     Cancelled,
+    /// Stopped by the system after an error.
     Aborted,
     /// The backend cannot report on this job — a normal answer for the CLI
     /// spooler once the job has left the queue.
@@ -152,7 +173,9 @@ pub enum JobStatus {
 
 /// The platform seam.
 pub trait Spooler: Send + Sync {
+    /// Every print queue the system knows.
     fn printers(&self) -> Result<Vec<PrinterInfo>, PrintError>;
+    /// The system's default printer, if it has one.
     fn default_printer(&self) -> Result<Option<PrinterId>, PrintError> {
         Ok(self
             .printers()?
@@ -160,6 +183,8 @@ pub trait Spooler: Send + Sync {
             .find(|p| p.is_default)
             .map(|p| p.id))
     }
+    /// What `printer` can do: margins, duplex, colour, resolution, and whether it
+    /// takes PDF directly.
     fn capabilities(&self, printer: &PrinterId) -> Result<DeviceCapabilities, PrintError>;
     /// Plan without submitting. Backends may apply job-wide geometry constraints
     /// and query margins for the requested paper and orientation here. The
@@ -172,8 +197,11 @@ pub trait Spooler: Send + Sync {
     ) -> Result<Vec<Sheet>, PrintError> {
         crate::print::plan_sheets(job, capabilities)
     }
+    /// Send a job to its printer and return the id the system gave it.
     fn submit(&self, job: SpoolJob<'_>) -> Result<JobId, PrintError>;
+    /// Ask the system where a submitted job stands.
     fn status(&self, job: &JobId) -> Result<JobStatus, PrintError>;
+    /// Ask the system to cancel a submitted job.
     fn cancel(&self, job: &JobId) -> Result<(), PrintError>;
 }
 

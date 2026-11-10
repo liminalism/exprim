@@ -12,10 +12,13 @@ const MAX_OUTLINE_NODES: usize = 100_000;
 /// One resolved source-outline node. Page indexes are zero-based source space.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OwnedBookmarkNode {
+    /// The bookmark's label.
     pub title: String,
+    /// Zero-based index of the page the bookmark points to.
     pub source_page: usize,
     /// Destination Y in PDF user space, when the destination form carries it.
     pub top: Option<f32>,
+    /// Nested bookmarks, in document order.
     pub children: Vec<OwnedBookmarkNode>,
 }
 
@@ -23,6 +26,26 @@ pub struct OwnedBookmarkNode {
 ///
 /// Malformed and unresolved nodes are omitted. Their resolvable children are
 /// promoted so one bad parent does not discard an otherwise useful subtree.
+///
+/// # Examples
+///
+/// Print the bookmarks as an indented list:
+///
+/// ```no_run
+/// use exprim::OwnedBookmarkNode;
+///
+/// fn print(nodes: &[OwnedBookmarkNode], depth: usize) {
+///     for node in nodes {
+///         println!("{}{} (page {})", "  ".repeat(depth), node.title, node.source_page + 1);
+///         print(&node.children, depth + 1);
+///     }
+/// }
+///
+/// # let bytes: std::sync::Arc<[u8]> = std::fs::read("document.pdf")?.into();
+/// let session = exprim::RenderSession::open(bytes, None)?;
+/// print(&exprim::extract_outline(&session), 0);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn extract_outline(session: &RenderSession) -> Vec<OwnedBookmarkNode> {
     OutlineReader::new(session).read()
 }

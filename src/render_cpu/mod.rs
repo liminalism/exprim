@@ -1079,10 +1079,10 @@ pub struct CpuBackendOptions {
     pub codecs: crate::image::CodecRegistry,
     /// Glyph grid-fitting (fonts.md Font Phase 4).
     ///
-    /// Defaults to [`HintingPolicy::None`]: this backend is the *normative*
+    /// Defaults to [`HintingPolicy::None`](crate::font::HintingPolicy::None): this backend is the *normative*
     /// implementation of the frozen surface contract, and hinting moves glyph
     /// geometry, so it is opt-in rather than a silent default. A screen-facing
-    /// caller wanting crisp small text sets [`HintingPolicy::Auto`], which
+    /// caller wanting crisp small text sets [`HintingPolicy::Auto`](crate::font::HintingPolicy::Auto), which
     /// hints only where it pays (axis-aligned, at or below
     /// `crate::font::AUTO_HINT_MAX_PPEM`).
     pub hinting: crate::font::HintingPolicy,

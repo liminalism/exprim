@@ -21,13 +21,18 @@ pub const DEFAULT_HARDWARE_MARGIN_PT: f64 = 6.35 * POINTS_PER_MM;
 /// An axis-aligned rectangle in points, `y` up, as PDF user space has it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
+    /// Left edge.
     pub x0: f64,
+    /// Bottom edge.
     pub y0: f64,
+    /// Right edge.
     pub x1: f64,
+    /// Top edge.
     pub y1: f64,
 }
 
 impl Rect {
+    /// The empty rectangle at the origin.
     pub const ZERO: Self = Self {
         x0: 0.0,
         y0: 0.0,
@@ -35,6 +40,7 @@ impl Rect {
         y1: 0.0,
     };
 
+    /// A rectangle from its left, bottom, right and top edges.
     #[must_use]
     pub const fn new(x0: f64, y0: f64, x1: f64, y1: f64) -> Self {
         Self { x0, y0, x1, y1 }
@@ -57,21 +63,25 @@ impl Rect {
         }
     }
 
+    /// Width, negative when the rectangle is not normalized.
     #[must_use]
     pub fn width(self) -> f64 {
         self.x1 - self.x0
     }
 
+    /// Height, negative when the rectangle is not normalized.
     #[must_use]
     pub fn height(self) -> f64 {
         self.y1 - self.y0
     }
 
+    /// Whether the rectangle has no area.
     #[must_use]
     pub fn is_empty(self) -> bool {
         !(self.width() > 0.0 && self.height() > 0.0)
     }
 
+    /// The centre point, `(x, y)`.
     #[must_use]
     pub fn center(self) -> (f64, f64) {
         ((self.x0 + self.x1) / 2.0, (self.y0 + self.y1) / 2.0)
@@ -88,6 +98,8 @@ impl Rect {
         }
     }
 
+    /// The area both rectangles cover. Empty (see [`is_empty`](Self::is_empty))
+    /// when they do not overlap.
     #[must_use]
     pub fn intersect(self, other: Self) -> Self {
         Self {
@@ -115,9 +127,12 @@ impl Rect {
     }
 }
 
+/// Which way the sheet is turned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Orientation {
+    /// Taller than wide.
     Portrait,
+    /// Wider than tall.
     Landscape,
     /// Rotate each page whichever way fits more of it on the sheet.
     #[default]
@@ -127,13 +142,18 @@ pub enum Orientation {
 /// Margins in points, one per paper edge.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Margins {
+    /// Left margin.
     pub left: f64,
+    /// Right margin.
     pub right: f64,
+    /// Top margin.
     pub top: f64,
+    /// Bottom margin.
     pub bottom: f64,
 }
 
 impl Margins {
+    /// No margin on any edge.
     pub const ZERO: Self = Self {
         left: 0.0,
         right: 0.0,
@@ -141,6 +161,7 @@ impl Margins {
         bottom: 0.0,
     };
 
+    /// The same margin, in points, on every edge.
     #[must_use]
     pub const fn uniform(points: f64) -> Self {
         Self {
@@ -151,11 +172,13 @@ impl Margins {
         }
     }
 
+    /// The same margin, in millimetres, on every edge.
     #[must_use]
     pub fn millimetres(mm: f64) -> Self {
         Self::uniform(mm * POINTS_PER_MM)
     }
 
+    /// The same margin, in inches, on every edge.
     #[must_use]
     pub fn inches(inches: f64) -> Self {
         Self::uniform(inches * POINTS_PER_INCH)
@@ -224,6 +247,7 @@ impl Margins {
         }
     }
 
+    /// Reject margins that are negative or not finite.
     pub fn validate(&self) -> Result<(), PrintError> {
         for (name, value) in [
             ("left", self.left),
@@ -254,18 +278,29 @@ impl Default for Margins {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum PaperSize {
+    /// ISO A3, 297 x 420 mm.
     A3,
+    /// ISO A4, 210 x 297 mm.
     A4,
+    /// ISO A5, 148 x 210 mm.
     A5,
+    /// ISO A6, 105 x 148 mm.
     A6,
+    /// ISO B5, 176 x 250 mm.
     B5,
+    /// US Letter, 8.5 x 11 in.
     Letter,
+    /// US Legal, 8.5 x 14 in.
     Legal,
+    /// Tabloid, 11 x 17 in.
     Tabloid,
+    /// Executive, 7.25 x 10.5 in.
     Executive,
     /// Explicit portrait dimensions in points.
     Custom {
+        /// Width in points.
         width: f64,
+        /// Height in points.
         height: f64,
     },
 }
@@ -290,11 +325,13 @@ impl PaperSize {
         }
     }
 
+    /// Portrait width in points.
     #[must_use]
     pub fn width(self) -> f64 {
         self.size().0
     }
 
+    /// Portrait height in points.
     #[must_use]
     pub fn height(self) -> f64 {
         self.size().1
@@ -377,6 +414,7 @@ impl PaperSize {
         Ok(paper)
     }
 
+    /// Reject a size that is not positive and finite.
     pub fn validate(&self) -> Result<(), PrintError> {
         let (w, h) = self.size();
         if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {

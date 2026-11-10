@@ -72,7 +72,7 @@ record exprim.corpus.benchmark-20261109/1 : observation {
 
 record exprim.renderer.attribution-20261110/1 : observation {
     title "Where CPU render time goes on dense vectors, tables and text (G0)"
-    state verified
+    state superseded
     statement """
         Measured on a 38-document corpus with stage timers, work counters and
         sampled profiles (full report kept locally, not published):
@@ -101,5 +101,40 @@ record exprim.renderer.attribution-20261110/1 : observation {
     observed_at git:44e10bc513f951f0e59f887f73e59939d2975ae3
     method instrumented
     watches [ "src/render_cpu/**" ]
+    author "dk"
+}
+
+record exprim.renderer.attribution-20261110/2 : observation {
+    title "Where CPU render time goes on dense vectors, tables and text (G0)"
+    state verified
+    statement """
+        Measured on a 38-document corpus with stage timers, work counters and
+        sampled profiles (full report kept locally, not published):
+
+        - Dense map anchor: 72% of render time was tiling patterns. 60
+          pattern-painted draws became 79,447 tile instances while 11% of the
+          tiled pixels were visible through the draws' shapes.
+        - Clip masks: one page spent 96% of 4.3 s rasterizing 27.5 million rows
+          to build 7,002 masks of about 6 KB each.
+        - Vector tables: 62% of render time was the compact kernel sweeping
+          every interior cell of plain rectangles.
+        - Strokes and curves: every cubic takes 16 segments and every round join
+          a 16-gon at every flattened vertex; on a stroke-heavy diagram 80% of
+          edges are join disks and 97% of interior vertices are smooth.
+        - Text: a warm page is 56% glyph-cache lookup during lowering and 30%
+          blits; through RenderSession 47% is RGBA to RGB packing.
+        - Compile is outside warm figures but is 36.5% of a first pass over
+          table pages and 22.4% over text pages.
+        - After the G1 changes the map is 55% coverage kernel and 24% lowering;
+          the tile cull test is 5.7%; about 10% of samples are under the
+          allocator; libm rounding is 1.5% and trig 0.1%.
+
+        Absolute times drifted with machine load during the session; shares and
+        paired ratios are the reliable figures.
+        """
+    observed_at git:c9fb988d5cb5d6da8f1999fcfd8ed09b9bbe9c8d
+    method instrumented
+    watches [ "src/render_cpu/**" ]
+    supersedes [ @exprim.renderer.attribution-20261110/1 ]
     author "dk"
 }

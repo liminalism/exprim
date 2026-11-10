@@ -7,6 +7,15 @@ were internal and never published.
 
 ## 0.4.0 — Unreleased
 
+### API documentation, 2026-11-10
+
+- Every public item at the crate root and in `print` is documented, and the
+  crate warns on new undocumented ones (`missing_docs`).
+- The crate front page has a quick start that runs as a test, a table of
+  entry points, and sections on units, repeated rendering, errors, threads
+  and memory, and encrypted files. `print` has a guide with a print and a
+  preview example. The main entry points carry examples.
+
 ### Dense-vector rendering and a text fix, 2026-11-10
 
 - Fixed: composite (Type 0) fonts whose `/W`, `/W2`, `/DW` or `/DW2` hold

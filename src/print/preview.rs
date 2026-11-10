@@ -8,7 +8,9 @@ use crate::print::{ComposeOptions, PrintError, Sheet};
 /// composition and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PreviewOptions {
+    /// Preview resolution in dots per inch. 96 by default.
     pub dpi: f64,
+    /// Render the preview in grayscale.
     pub grayscale: bool,
 }
 
@@ -22,6 +24,7 @@ impl Default for PreviewOptions {
 }
 
 impl PreviewOptions {
+    /// The composition settings this preview uses.
     #[must_use]
     pub fn to_compose(self) -> ComposeOptions {
         ComposeOptions {

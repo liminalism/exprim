@@ -54,7 +54,10 @@ pub enum ImageFormat {
     ///
     /// JPEG dimensions are 16-bit, so a page wider or taller than 65535
     /// pixels is rejected rather than silently truncated.
-    Jpeg { quality: u8 },
+    Jpeg {
+        /// Encoder quality, 1 (smallest) to 100 (best).
+        quality: u8,
+    },
 }
 
 /// Colour of the exported raster.
@@ -71,8 +74,12 @@ pub enum ExportColor {
 /// How to export one page.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExportOptions {
+    /// Resolution in dots per inch. A PDF point is 1/72 inch, so a page 612
+    /// points wide exports 1,275 pixels wide at 150 DPI.
     pub dpi: f64,
+    /// The file format to encode.
     pub format: ImageFormat,
+    /// RGB or grayscale.
     pub color: ExportColor,
     /// Reject the export when `width * height` exceeds this.
     pub max_pixels: u64,
@@ -108,11 +115,14 @@ impl ExportOptions {
         }
     }
 
+    /// The same export in a different colour mode.
     pub fn with_color(mut self, color: ExportColor) -> Self {
         self.color = color;
         self
     }
 
+    /// The same export with a different pixel budget (see
+    /// [`max_pixels`](Self::max_pixels)).
     pub fn with_max_pixels(mut self, max_pixels: u64) -> Self {
         self.max_pixels = max_pixels;
         self
@@ -187,6 +197,30 @@ impl RenderSession {
     /// `options.dpi` implies, encode. Callers holding a
     /// [`CompiledDocumentPage`] they intend to reuse should prefer
     /// [`RenderSession::export_compiled_page`] to skip recompiling.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::PageOutOfRange`], [`ReadError::InvalidExportOptions`] and
+    /// [`ReadError::ExportTooLarge`] before any rendering;
+    /// [`ReadError::Compile`], [`ReadError::Render`] or [`ReadError::Encode`]
+    /// after.
+    ///
+    /// # Examples
+    ///
+    /// Save every page as a grayscale JPEG at 200 DPI:
+    ///
+    /// ```no_run
+    /// use exprim::{ExportColor, ExportOptions};
+    /// # let bytes: std::sync::Arc<[u8]> = std::fs::read("document.pdf")?.into();
+    ///
+    /// let session = exprim::RenderSession::open(bytes, None)?;
+    /// let options = ExportOptions::jpeg(200.0, 85).with_color(ExportColor::Gray8);
+    /// for page in 0..session.page_count() {
+    ///     let jpeg = session.export_page(page, &options)?;
+    ///     std::fs::write(format!("page-{:04}.jpg", page + 1), jpeg)?;
+    /// }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn export_page(&self, page: u32, options: &ExportOptions) -> Result<Vec<u8>, ReadError> {
         self.export_page_cancellable(page, options, None)
     }
@@ -228,6 +262,22 @@ impl RenderSession {
 /// Split out from [`RenderSession::export_compiled_page`] so a caller that
 /// rendered through [`RenderSession::render_output_plan`] — or that wants one
 /// render encoded into two formats — does not have to rasterize twice.
+///
+/// # Examples
+///
+/// One render, two files:
+///
+/// ```no_run
+/// use exprim::{ImageFormat, RasterProduct, encode_plane};
+/// # let bytes: std::sync::Arc<[u8]> = std::fs::read("document.pdf")?.into();
+///
+/// let session = exprim::RenderSession::open(bytes, None)?;
+/// let page = session.compile(0)?;
+/// let plane = session.render(&page, &RasterProduct::rgb8(850, 1100))?;
+/// std::fs::write("page.png", encode_plane(&plane, ImageFormat::Png)?)?;
+/// std::fs::write("page.jpg", encode_plane(&plane, ImageFormat::Jpeg { quality: 85 })?)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn encode_plane(plane: &RasterPlane, format: ImageFormat) -> Result<Vec<u8>, ReadError> {
     match plane {
         RasterPlane::Rgb8(surface) => encode_rgb(surface, format),
