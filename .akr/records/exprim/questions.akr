@@ -1,0 +1,26 @@
+akr 0.1
+project exprim
+
+record exprim.privacy.residual-document-mentions/1 : question {
+    title "What in the published tree could still identify a private document?"
+    state open
+    scope [ path "codecs/**", path "corpus/perf/**" ]
+    question """
+        Paths, file names and library directories are citations; working notes,
+        benchmark results and review page images are no longer tracked; document
+        nicknames in the changelogs were replaced by descriptions. What remains,
+        to accept or remove:
+
+        1. Fingerprints: `corpus/perf/manifest.json` and `pages.tsv` publish
+           byte sizes, SHA-256 and per-page hashes of private documents. Anyone
+           holding the same file can recognise it.
+        2. The bundled codecs carry their own benchmark records
+           (`codecs/jbig2enc-rust/docs/benchmarks`, corpus specs) with short
+           corpus nicknames and citations in place of paths, and one test and
+           one example default to a nicknamed local directory.
+        3. Codec audit files record the home-directory checkout path of the
+           machine that produced them (a user name and project directory, no
+           document).
+        """
+    author "dk"
+}

@@ -1,0 +1,51 @@
+akr 0.1
+project exprim
+
+record exprim.renderer.g1-exact-speedups/1 : work {
+    title "G1 exact part: tile culling, row-window fills, compact sweep gaps"
+    state completed
+    scope [ path "src/content/interpret.rs", path "src/render_cpu/**" ]
+    intent """
+        Halve the dense map's 144 DPI render with byte-identical output, as the
+        first gate of docs/plans/generic-renderer-secondary-2026-11-10.md.
+        Three changes: skip tiling tiles that cannot reach the fill's shape mask
+        (57b412c); rasterize only the rows a clip mask or bounded draw keeps
+        (ff46f68); skip untouched cells in wide compact-kernel rows (c95ec54).
+        Also in the branch: composite-font widths behind indirect references
+        (7716d1a), a text-layout fix.
+        """
+    note """
+        Done on branch perf/generic-renderer-g0-g1. The geometry-policy options
+        (ribbon stroker, error-bounded flattening) were not entered because the
+        gate was met without them.
+        """
+    supported_by [ @exprim.renderer.attribution-20261110 ]
+    verified_by [ @exprim.renderer.g1-exact-speedups-ab ]
+    author "dk"
+}
+
+record exprim.renderer.next-levers/1 : work {
+    title "Next renderer levers after G1's exact part"
+    state proposed
+    scope [ path "src/content/**", path "src/reader/session.rs", path "src/render_cpu/**" ]
+    intent """
+        Candidates ranked by measured share, none started:
+        1. Stroke outlines as ribbons with fewer join polygons (changes pixels;
+           default on with a knob for old bytes, per the user's decision).
+        2. Error-bounded curve flattening for fills and clips (changes pixels,
+           same policy).
+        3. Per-tile fixed cost of tiling-cell lowering (exact; 40% of the map's
+           remaining time).
+        4. Constant-time tile cull test over the shape mask (exact; 5.7%).
+        5. Temporary allocations in stroke and tile lowering (exact; about 10%).
+        6. RenderSession RGB output without the packing pass (exact; 47% of a
+           warm session text page).
+        7. Compile cost on first renders of table and text pages.
+        8. Masked draws under a mostly opaque clip mask: needs a row-detail
+           profile first.
+        Dropped on evidence: exact floor/ceil replacements, a trig table.
+        """
+    after [ @exprim.renderer.g1-exact-speedups ]
+    supported_by [ @exprim.renderer.attribution-20261110 ]
+    author "dk"
+}

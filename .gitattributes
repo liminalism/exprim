@@ -7,3 +7,6 @@ src/font/cmap_data/** binary
 *.pdf binary
 *.jpg binary
 *.bin binary
+
+# The AKR ledger is LF-only (AKR-P003); keep autocrlf from rewriting it.
+.akr/** text eol=lf
