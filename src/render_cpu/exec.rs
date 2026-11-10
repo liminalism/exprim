@@ -4267,6 +4267,194 @@ fn render_tiling(
     masks: &mut [Option<ClipMask>],
     stats: &mut RenderStats,
 ) {
+    #[cfg(test)]
+    let cull_tiles = !RENDER_ALL_TILES.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let cull_tiles = true;
+    render_tiling_impl(page, t, surface, raster, kernels, masks, stats, cull_tiles);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only reference switch: render every tile instance, as before tile
+    /// culling existed, so `tiling_cull_tests` can compare bytes.
+    static RENDER_ALL_TILES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Everything a tiling cell can paint, bounded conservatively in pattern
+/// space, for tile culling (see [`cell_paint_extent`]).
+#[derive(Debug, Clone, Copy)]
+struct CellPaintExtent {
+    /// Bounding box of every path control point the cell fills or strokes.
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    /// Largest distance, in pattern units, that a stroke's outline can lie
+    /// from its centreline (0 without strokes).
+    stroke_reach: f64,
+    /// Largest join/cap reach factor of the cell's strokes, for the device
+    /// hairline floor (0 without strokes).
+    stroke_factor: f64,
+}
+
+/// Bound the paint of a tiling cell, or `None` when the cell contains anything
+/// this does not bound (text, images, shadings, nested patterns, groups, soft
+/// masks) or non-finite geometry; callers then cull nothing.
+///
+/// Only solid-paint path fills and strokes are bounded. A flattened curve
+/// lies inside the convex hull of its control points, so the box of all
+/// control points contains every fill vertex. A stroke outline lies within
+/// `half-width * max(miter limit, sqrt 2)` of its centreline (round and bevel
+/// joins and butt/round caps reach one half-width, a square cap's corner
+/// `sqrt 2`, and a miter apex is kept only within the miter limit), which is
+/// recorded separately because the half-width has a device-space floor.
+/// Clips inside the cell only remove paint and are ignored, as is the
+/// soft-mask reset (`ClearSoftMask`) that opens a cell.
+fn cell_paint_extent(cell: &crate::page_ir::CompiledPage) -> Option<CellPaintExtent> {
+    use crate::page_ir::{DisplayOp, Matrix, Paint};
+    let mut extent = CellPaintExtent {
+        x0: f64::INFINITY,
+        y0: f64::INFINITY,
+        x1: f64::NEG_INFINITY,
+        y1: f64::NEG_INFINITY,
+        stroke_reach: 0.0,
+        stroke_factor: 0.0,
+    };
+    let mut ctm = Matrix::IDENTITY;
+    let mut stack: Vec<Matrix> = Vec::new();
+    let include = |extent: &mut CellPaintExtent, ctm: Matrix, path: &crate::page_ir::PathData| {
+        for point in path.points.iter() {
+            let q = ctm.apply(*point);
+            if !(q.x.is_finite() && q.y.is_finite()) {
+                return false;
+            }
+            extent.x0 = extent.x0.min(q.x);
+            extent.y0 = extent.y0.min(q.y);
+            extent.x1 = extent.x1.max(q.x);
+            extent.y1 = extent.y1.max(q.y);
+        }
+        true
+    };
+    for op in cell.operations.iter() {
+        match op {
+            DisplayOp::Save => stack.push(ctm),
+            DisplayOp::Restore => {
+                if let Some(saved) = stack.pop() {
+                    ctm = saved;
+                }
+            }
+            DisplayOp::ConcatTransform(m) => ctm = m.then(ctm),
+            // State that can only restrict or leave paint unchanged: clips,
+            // the soft-mask reset every cell starts with, and attribution
+            // markers.
+            DisplayOp::PushClip { .. }
+            | DisplayOp::PopClip
+            | DisplayOp::ClearSoftMask
+            | DisplayOp::BeginPaintOrigin(_)
+            | DisplayOp::EndPaintOrigin => {}
+            DisplayOp::FillPath { path, paint, .. } => {
+                if !matches!(cell.paints.get(paint.index()), Some(Paint::Solid(_))) {
+                    return None;
+                }
+                if !include(&mut extent, ctm, cell.paths.get(path.index())?) {
+                    return None;
+                }
+            }
+            DisplayOp::StrokePath {
+                path, paint, style, ..
+            } => {
+                if !matches!(cell.paints.get(paint.index()), Some(Paint::Solid(_))) {
+                    return None;
+                }
+                if !include(&mut extent, ctm, cell.paths.get(path.index())?) {
+                    return None;
+                }
+                let style = cell.stroke_styles.get(style.index())?;
+                let factor = style.miter_limit.max(std::f64::consts::SQRT_2);
+                // The Frobenius norm bounds the largest stretch of the CTM.
+                let stretch = (ctm.a * ctm.a + ctm.b * ctm.b + ctm.c * ctm.c + ctm.d * ctm.d).sqrt();
+                let reach = 0.5 * style.width.abs() * stretch * factor;
+                if !(reach.is_finite() && factor.is_finite()) {
+                    return None;
+                }
+                extent.stroke_reach = extent.stroke_reach.max(reach);
+                extent.stroke_factor = extent.stroke_factor.max(factor);
+            }
+            _ => return None,
+        }
+    }
+    (extent.x0 <= extent.x1 && extent.y0 <= extent.y1).then_some(extent)
+}
+
+/// Whether a tile's content can reach a pixel the shape mask covers.
+/// `tile_to_local` maps pattern space to the mask's local pixel grid. The
+/// tile's content box is padded by the stroke reach in device space (never
+/// less than the 1.5 px a hairline-clamped pen can reach per reach factor)
+/// plus 2 px for anti-aliasing and float rounding; anything not provably
+/// clear of the mask is rendered.
+fn tile_reaches_mask(
+    extent: &CellPaintExtent,
+    tile_to_local: crate::page_ir::Matrix,
+    fmask: &[u8],
+    w: usize,
+    h: usize,
+) -> bool {
+    use crate::page_ir::Point;
+    let m = tile_to_local;
+    let stretch = (m.a * m.a + m.b * m.b + m.c * m.c + m.d * m.d).sqrt();
+    let stroke_pad = if extent.stroke_factor > 0.0 {
+        (extent.stroke_reach * stretch).max(1.5 * extent.stroke_factor)
+    } else {
+        0.0
+    };
+    let pad = stroke_pad + 2.0;
+    let corners = [
+        m.apply(Point { x: extent.x0, y: extent.y0 }),
+        m.apply(Point { x: extent.x1, y: extent.y0 }),
+        m.apply(Point { x: extent.x1, y: extent.y1 }),
+        m.apply(Point { x: extent.x0, y: extent.y1 }),
+    ];
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for corner in corners {
+        min_x = min_x.min(corner.x);
+        min_y = min_y.min(corner.y);
+        max_x = max_x.max(corner.x);
+        max_y = max_y.max(corner.y);
+    }
+    let (lo_x, lo_y, hi_x, hi_y) = (min_x - pad, min_y - pad, max_x + pad, max_y + pad);
+    if !(lo_x.is_finite() && lo_y.is_finite() && hi_x.is_finite() && hi_y.is_finite()) {
+        return true;
+    }
+    // Pixel columns `floor(lo)..=floor(hi)`, clamped to the mask.
+    let clamp = |v: f64, limit: usize| v.floor().clamp(-1.0, limit as f64) as i64;
+    let (x0, x1) = (clamp(lo_x, w).max(0), clamp(hi_x, w).min(w as i64 - 1));
+    let (y0, y1) = (clamp(lo_y, h).max(0), clamp(hi_y, h).min(h as i64 - 1));
+    if x0 > x1 || y0 > y1 {
+        return false;
+    }
+    let (x0, x1, y0, y1) = (x0 as usize, x1 as usize, y0 as usize, y1 as usize);
+    (y0..=y1).any(|y| fmask[y * w + x0..=y * w + x1].iter().any(|&c| c != 0))
+}
+
+/// [`render_tiling`] with tile culling switchable, so tests can compare the
+/// culled result against rendering every tile.
+#[allow(clippy::too_many_arguments)]
+fn render_tiling_impl(
+    page: &CpuPreparedPage,
+    t: &crate::render_cpu::prepared::PreparedTiling,
+    surface: &mut Surface,
+    raster: &mut RasterKernel,
+    kernels: &KernelSet,
+    masks: &mut [Option<ClipMask>],
+    stats: &mut RenderStats,
+    cull_tiles: bool,
+) {
     let b = t.bounds;
     let (w, h) = (b.width as usize, b.height as usize);
     let (bx, by) = (b.x as usize, b.y as usize);
@@ -4282,73 +4470,13 @@ fn render_tiling(
         height: b.height,
     };
     let shift = crate::page_ir::Matrix::translate(-(b.x as f64), -(b.y as f64));
-    // Tile-invariant state hoisted out of the instance loop (A3): one parsed-
-    // font residency shared by every tile instance of this fill. Geometry
-    // still lowers per instance — each tile's device transform differs by a
-    // generally-fractional translation, and floating-point point transforms
-    // are not translation-invariant, so a lower-once-translate-many cell
-    // would not be byte-identical to per-instance lowering.
-    let mut cell_fonts = crate::render_cpu::prepared::FontProgramCache::default();
     #[cfg(feature = "profiling")]
     let mut lap = crate::profiling::Lap::start();
     #[cfg(feature = "profiling")]
     {
         stats.hot.tiling_surface_px += (w * h) as u64;
-    }
-    for tile in &t.tiles {
-        // A cancelled request stops between tile instances too — an
-        // adversarial many-tile fill must not pin the worker.
-        if let Some(cancel) = &page.decode_limits.should_cancel
-            && cancel()
-        {
-            stats.cancelled = true;
-            return;
-        }
-        let cell_prepared = crate::render_cpu::prepared::lower_cell(
-            &t.cell,
-            tile.then(shift),
-            size,
-            page,
-            t.color_policy,
-            &mut cell_fonts,
-        );
-        let mut cmasks: Vec<Option<ClipMask>> =
-            (0..cell_prepared.clips.len()).map(|_| None).collect();
-        let mut csoft: Vec<Option<ClipMask>> = Vec::new();
-        #[cfg(feature = "profiling")]
-        {
-            stats.hot.ns_tiling_lower += lap.lap_ns();
-            stats.hot.n_tiles += 1;
-            stats.hot.tiling_cell_ops += cell_prepared.ops.len() as u64;
-            stats.hot.tiling_cell_points += cell_prepared.points.len() as u64;
-            stats.hot.tiling_depth += 1;
-        }
-        run_ops(
-            &cell_prepared,
-            0,
-            cell_prepared.ops.len(),
-            &mut pat,
-            raster,
-            kernels,
-            &mut cmasks,
-            &mut csoft,
-            stats,
-        );
-        #[cfg(feature = "profiling")]
-        {
-            stats.hot.tiling_depth -= 1;
-            stats.hot.ns_tiling_cells += lap.lap_ns();
-            stats.hot.clock_reads += 2;
-        }
-        // A codec image dropped while lowering this tile cell counts too.
-        stats.absorb_diagnostics(&cell_prepared.diagnostics);
-    }
-    #[cfg(feature = "profiling")]
-    {
-        lap.lap_ns();
         raster.prof.class = crate::render_cpu::raster::RasterClass::Other;
     }
-
     // The fill shape as an Alpha8 coverage mask over the bounds.
     let subs = &page.subpaths[t.fill_subpaths.0 as usize..t.fill_subpaths.1 as usize];
     let mut fmask = vec![0u8; w * h];
@@ -4461,6 +4589,91 @@ fn render_tiling(
         stats.hot.tiling_mask_px += fmask.iter().filter(|&&c| c != 0).count() as u64;
         lap.lap_ns();
     }
+
+    // Tile-invariant state hoisted out of the instance loop (A3): one parsed-
+    // font residency shared by every tile instance of this fill. Geometry
+    // still lowers per instance — each tile's device transform differs by a
+    // generally-fractional translation, and floating-point point transforms
+    // are not translation-invariant, so a lower-once-translate-many cell
+    // would not be byte-identical to per-instance lowering.
+    let mut cell_fonts = crate::render_cpu::prepared::FontProgramCache::default();
+    // Only pixels the shape mask covers are ever read back from `pat` (the
+    // composite below skips zero coverage), so a tile whose content cannot
+    // reach a covered pixel paints nothing visible and is not lowered or
+    // rasterized at all. Pattern-painted strokes make this the common case:
+    // the tiles span the stroke's bounding box, the mask a thin band of it.
+    let extent = if cull_tiles && fmask.iter().any(|&c| c != 0) {
+        cell_paint_extent(&t.cell)
+    } else {
+        None
+    };
+    let mask_is_empty = cull_tiles && fmask.iter().all(|&c| c == 0);
+    for tile in &t.tiles {
+        if mask_is_empty {
+            break;
+        }
+        if let Some(extent) = &extent
+            && !tile_reaches_mask(extent, tile.then(shift), &fmask, w, h)
+        {
+            #[cfg(feature = "profiling")]
+            {
+                stats.hot.n_tiles_culled += 1;
+            }
+            continue;
+        }
+        // A cancelled request stops between tile instances too — an
+        // adversarial many-tile fill must not pin the worker.
+        if let Some(cancel) = &page.decode_limits.should_cancel
+            && cancel()
+        {
+            stats.cancelled = true;
+            return;
+        }
+        let cell_prepared = crate::render_cpu::prepared::lower_cell(
+            &t.cell,
+            tile.then(shift),
+            size,
+            page,
+            t.color_policy,
+            &mut cell_fonts,
+        );
+        let mut cmasks: Vec<Option<ClipMask>> =
+            (0..cell_prepared.clips.len()).map(|_| None).collect();
+        let mut csoft: Vec<Option<ClipMask>> = Vec::new();
+        #[cfg(feature = "profiling")]
+        {
+            stats.hot.ns_tiling_lower += lap.lap_ns();
+            stats.hot.n_tiles += 1;
+            stats.hot.tiling_cell_ops += cell_prepared.ops.len() as u64;
+            stats.hot.tiling_cell_points += cell_prepared.points.len() as u64;
+            stats.hot.tiling_depth += 1;
+        }
+        run_ops(
+            &cell_prepared,
+            0,
+            cell_prepared.ops.len(),
+            &mut pat,
+            raster,
+            kernels,
+            &mut cmasks,
+            &mut csoft,
+            stats,
+        );
+        #[cfg(feature = "profiling")]
+        {
+            stats.hot.tiling_depth -= 1;
+            stats.hot.ns_tiling_cells += lap.lap_ns();
+            stats.hot.clock_reads += 2;
+        }
+        // A codec image dropped while lowering this tile cell counts too.
+        stats.absorb_diagnostics(&cell_prepared.diagnostics);
+    }
+    #[cfg(feature = "profiling")]
+    {
+        // The cull's own cost lands in `cells` with the tiles it spared.
+        stats.hot.ns_tiling_cells += lap.lap_ns();
+    }
+
     // Composite the tiled offscreen onto `surface`, masked by the fill shape
     // and scaled by the fill's constant alpha.
     let sox = surface.origin_x;
@@ -8053,5 +8266,349 @@ mod bilevel_sat_tests {
                 assert_eq!(got, want, "{width}x{height} window ({col_lo},{row_lo})");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tiling_cull_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    //! Tile culling must not change a byte: every case renders once with
+    //! culling and once rendering every tile instance, and compares pixels.
+
+    use std::sync::Arc;
+
+    use super::RENDER_ALL_TILES;
+    use crate::page_ir::{
+        BlendMode, Color, CompiledPage, DeviceSize, DisplayOp, FillRule, LineCap, LineJoin, Matrix,
+        PageBounds, PageComplexity, PageFeatures, Paint, PaintId, PathData, PathId, PathVerb,
+        Point, Rect, StrokeStyle, StrokeStyleId, TilingId, TilingPattern,
+    };
+    use crate::render_api::{
+        AnnotationMode, Background, OutputFormat, OutputResidency, PageTransform, RenderLimits,
+        RenderQuality, RenderRequest,
+    };
+    use crate::render_cpu::CpuBackend;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn range(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (hi - lo) * self.unit()
+        }
+        fn pick(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn polyline(points: &[(f64, f64)], close: bool) -> PathData {
+        let mut verbs = vec![PathVerb::MoveTo];
+        verbs.extend(std::iter::repeat_n(PathVerb::LineTo, points.len() - 1));
+        if close {
+            verbs.push(PathVerb::Close);
+        }
+        PathData {
+            verbs: Arc::from(verbs),
+            points: points.iter().map(|&(x, y)| Point { x, y }).collect(),
+        }
+    }
+
+    fn curve(points: [(f64, f64); 4]) -> PathData {
+        PathData {
+            verbs: Arc::from([PathVerb::MoveTo, PathVerb::CurveTo]),
+            points: points.iter().map(|&(x, y)| Point { x, y }).collect(),
+        }
+    }
+
+    fn page(
+        size: f64,
+        operations: Vec<DisplayOp>,
+        paths: Vec<PathData>,
+        paints: Vec<Paint>,
+        stroke_styles: Vec<StrokeStyle>,
+        tilings: Vec<TilingPattern>,
+    ) -> CompiledPage {
+        CompiledPage {
+            schema_version: crate::page_ir::IR_SCHEMA_VERSION,
+            content_bounds: None,
+            bounds: PageBounds {
+                crop: Rect {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: size,
+                    y1: size,
+                },
+                rotate: 0,
+            },
+            operations: Arc::from(operations),
+            paths: Arc::from(paths),
+            paints: Arc::from(paints),
+            stroke_styles: Arc::from(stroke_styles),
+            glyph_runs: Arc::from([]),
+            fonts: Arc::from([]),
+            images: Arc::from([]),
+            masks: Arc::from([]),
+            groups: Arc::from([]),
+            shadings: Arc::from([]),
+            tilings: Arc::from(tilings),
+            features: PageFeatures::BASIC_PATHS | PageFeatures::PATTERNS,
+            complexity: PageComplexity::default(),
+        }
+    }
+
+    fn style(rng: &mut Rng, width: f64) -> StrokeStyle {
+        StrokeStyle {
+            width,
+            cap: [LineCap::Butt, LineCap::Round, LineCap::Square][rng.pick(3) as usize],
+            join: [LineJoin::Miter, LineJoin::Round, LineJoin::Bevel][rng.pick(3) as usize],
+            miter_limit: rng.range(1.0, 12.0),
+            dash_pattern: Arc::from([]),
+            dash_phase: 0.0,
+        }
+    }
+
+    /// A random cell: one to three fills and strokes whose geometry may poke
+    /// well outside the cell's bounding box (cells are not clipped to it).
+    fn random_cell(rng: &mut Rng, cell: f64) -> CompiledPage {
+        let mut operations = Vec::new();
+        let mut paths = Vec::new();
+        let mut paints = Vec::new();
+        let mut styles = Vec::new();
+        for _ in 0..=rng.pick(3) {
+            let color = Color {
+                r: rng.unit() as f32,
+                g: rng.unit() as f32,
+                b: rng.unit() as f32,
+                a: 1.0,
+            };
+            paints.push(Paint::Solid(color));
+            let paint = PaintId(paints.len() as u32 - 1);
+            let alpha = if rng.pick(2) == 0 { 1.0 } else { 0.6 };
+            let p = |rng: &mut Rng| (rng.range(-0.4 * cell, 1.4 * cell), rng.range(-0.4 * cell, 1.4 * cell));
+            let path = match rng.pick(3) {
+                0 => polyline(&[p(rng), p(rng), p(rng)], true),
+                1 => polyline(&[p(rng), p(rng), p(rng), p(rng)], false),
+                _ => curve([p(rng), p(rng), p(rng), p(rng)]),
+            };
+            paths.push(path);
+            let path = PathId(paths.len() as u32 - 1);
+            if rng.pick(2) == 0 {
+                operations.push(DisplayOp::FillPath {
+                    path,
+                    paint,
+                    rule: if rng.pick(2) == 0 { FillRule::NonZero } else { FillRule::EvenOdd },
+                    alpha,
+                    blend: BlendMode::Normal,
+                });
+            } else {
+                // From sub-pixel hairlines to pens wider than the cell.
+                let width = [0.0, 0.05, 0.4, 1.0, 2.5][rng.pick(5) as usize] * cell.min(4.0);
+                styles.push(style(rng, width));
+                operations.push(DisplayOp::Save);
+                operations.push(DisplayOp::ConcatTransform(Matrix {
+                    a: rng.range(0.5, 2.0),
+                    b: rng.range(-0.3, 0.3),
+                    c: rng.range(-0.3, 0.3),
+                    d: rng.range(0.5, 2.0),
+                    e: 0.0,
+                    f: 0.0,
+                }));
+                operations.push(DisplayOp::StrokePath {
+                    path,
+                    paint,
+                    style: StrokeStyleId(styles.len() as u32 - 1),
+                    alpha,
+                    blend: BlendMode::Normal,
+                });
+                operations.push(DisplayOp::Restore);
+            }
+        }
+        page(cell, operations, paths, paints, styles, Vec::new())
+    }
+
+    fn render(page: &Arc<CompiledPage>, dim: u32, scale: f64) -> (Arc<[u8]>, u32) {
+        let request = RenderRequest {
+            page: Arc::clone(page),
+            transform: PageTransform {
+                matrix: Matrix {
+                    a: scale,
+                    b: 0.0,
+                    c: 0.0,
+                    d: scale,
+                    e: 0.0,
+                    f: 0.0,
+                },
+            },
+            crop: None,
+            output_size: DeviceSize {
+                width: dim,
+                height: dim,
+            },
+            output_format: OutputFormat::Rgba8PremultipliedSrgb,
+            background: Background::White,
+            annotations: AnnotationMode::None,
+            color_policy: crate::render_api::RenderColorPolicy::Original,
+            quality: RenderQuality::Normal,
+            limits: RenderLimits::default(),
+            residency: OutputResidency::HostRequired,
+        };
+        let (host, stats) = CpuBackend::default().render_to_host(&request).unwrap();
+        (host.pixels, stats.commands)
+    }
+
+    #[test]
+    fn culled_tiles_never_change_pixels() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut culled_cases = 0;
+        let mut painted_cases = 0;
+        for case in 0..160 {
+            let size = 96.0;
+            let cell = rng.range(1.5, 14.0);
+            let tiling = TilingPattern {
+                key: crate::page_ir::ResourceKey {
+                    object_number: case,
+                    generation: 0,
+                    variant: 0,
+                },
+                uncolored: rng.pick(4) == 0,
+                under_color: Color {
+                    r: 0.1,
+                    g: 0.5,
+                    b: 0.9,
+                    a: 1.0,
+                },
+                bbox: [0.0, 0.0, cell as f32, cell as f32],
+                // Steps below the cell size make neighbouring tiles overlap.
+                x_step: (cell * rng.range(0.6, 1.6)) as f32,
+                y_step: (cell * rng.range(0.6, 1.6)) as f32,
+                cell: Arc::new(random_cell(&mut rng, cell)),
+            };
+            let angle = rng.range(0.0, std::f64::consts::TAU);
+            let (sx, sy) = (rng.range(0.4, 2.2), rng.range(0.4, 2.2));
+            let matrix = Matrix {
+                a: sx * angle.cos(),
+                b: sx * angle.sin(),
+                c: -sy * angle.sin(),
+                d: sy * angle.cos(),
+                e: rng.range(-20.0, 20.0),
+                f: rng.range(-20.0, 20.0),
+            };
+            let paints = vec![Paint::Pattern {
+                tiling: TilingId(0),
+                matrix,
+            }];
+            let p = |rng: &mut Rng| (rng.range(-10.0, size + 10.0), rng.range(-10.0, size + 10.0));
+            // Pattern-painted strokes and slivers leave most of the tiled
+            // box uncovered; a full-page fill leaves nothing to cull.
+            let (operations, paths, styles) = match rng.pick(4) {
+                0 => {
+                    let line = polyline(&[p(&mut rng), p(&mut rng), p(&mut rng)], false);
+                    let width = rng.range(0.3, 5.0);
+                    (
+                        vec![DisplayOp::StrokePath {
+                            path: PathId(0),
+                            paint: PaintId(0),
+                            style: StrokeStyleId(0),
+                            alpha: 1.0,
+                            blend: BlendMode::Normal,
+                        }],
+                        vec![line],
+                        vec![style(&mut rng, width)],
+                    )
+                }
+                1 => (
+                    vec![DisplayOp::FillPath {
+                        path: PathId(0),
+                        paint: PaintId(0),
+                        rule: FillRule::EvenOdd,
+                        alpha: 0.8,
+                        blend: BlendMode::Multiply,
+                    }],
+                    vec![polyline(&[p(&mut rng), p(&mut rng), p(&mut rng), p(&mut rng)], true)],
+                    Vec::new(),
+                ),
+                2 => (
+                    vec![DisplayOp::FillPath {
+                        path: PathId(0),
+                        paint: PaintId(0),
+                        rule: FillRule::NonZero,
+                        alpha: 1.0,
+                        blend: BlendMode::Normal,
+                    }],
+                    vec![polyline(&[(0.0, 0.0), (size, 0.0), (size, size), (0.0, size)], true)],
+                    Vec::new(),
+                ),
+                _ => (
+                    vec![DisplayOp::FillPath {
+                        path: PathId(0),
+                        paint: PaintId(0),
+                        rule: FillRule::NonZero,
+                        alpha: 1.0,
+                        blend: BlendMode::Normal,
+                    }],
+                    vec![polyline(&[p(&mut rng), p(&mut rng), p(&mut rng)], true)],
+                    Vec::new(),
+                ),
+            };
+            let compiled = Arc::new(page(size, operations, paths, paints, styles, vec![tiling]));
+            let scale = [1.0, 0.37, 2.13][case as usize % 3];
+            let dim = (size * scale).ceil() as u32;
+
+            RENDER_ALL_TILES.with(|flag| flag.set(true));
+            let (reference, reference_commands) = render(&compiled, dim, scale);
+            RENDER_ALL_TILES.with(|flag| flag.set(false));
+            let (culled, culled_commands) = render(&compiled, dim, scale);
+
+            assert!(
+                reference == culled,
+                "case {case}: tile culling changed pixels (scale {scale})"
+            );
+            assert!(culled_commands <= reference_commands, "case {case}");
+            if culled_commands < reference_commands {
+                culled_cases += 1;
+            }
+            if reference.chunks_exact(4).any(|px| px != [255, 255, 255, 255]) {
+                painted_cases += 1;
+            }
+        }
+        // The comparison is vacuous unless tiles are really skipped and the
+        // pattern really paints.
+        assert!(culled_cases >= 40, "only {culled_cases} cases culled a tile");
+        assert!(painted_cases >= 100, "only {painted_cases} cases painted");
+    }
+
+    /// A cell this cannot bound (here, a nested pattern paint) is never culled.
+    #[test]
+    fn unbounded_cells_are_not_culled() {
+        let inner = page(
+            4.0,
+            vec![DisplayOp::FillPath {
+                path: PathId(0),
+                paint: PaintId(0),
+                rule: FillRule::NonZero,
+                alpha: 1.0,
+                blend: BlendMode::Normal,
+            }],
+            vec![polyline(&[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)], true)],
+            vec![Paint::Pattern {
+                tiling: TilingId(0),
+                matrix: Matrix::IDENTITY,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(super::cell_paint_extent(&inner).is_none());
+
+        let empty = page(4.0, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        assert!(super::cell_paint_extent(&empty).is_none());
     }
 }

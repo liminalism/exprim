@@ -102,6 +102,8 @@ pub(crate) struct ExecHot {
     pub(crate) ns_tiling: u64,
     pub(crate) n_tiling_fills: u64,
     pub(crate) n_tiles: u64,
+    /// Tile instances skipped because their content cannot reach the shape mask.
+    pub(crate) n_tiles_culled: u64,
     pub(crate) ns_tiling_lower: u64,
     pub(crate) ns_tiling_cells: u64,
     pub(crate) ns_tiling_fmask: u64,
@@ -145,7 +147,7 @@ impl ExecHot {
                 Duration::from_nanos(self.ns_tiling_composite),
             );
         }
-        let counters: [(&'static str, u64); 17] = [
+        let counters: [(&'static str, u64); 18] = [
             ("render.opaque_rects", self.n_opaque_rects),
             ("render.solid_paths", self.n_solid_paths),
             ("render.path.direct.count", self.n_path_direct),
@@ -158,6 +160,7 @@ impl ExecHot {
             ("render.clip.mask_bytes", self.clip_mask_bytes),
             ("render.tiling.fills", self.n_tiling_fills),
             ("render.tiling.tiles", self.n_tiles),
+            ("render.tiling.tiles_culled", self.n_tiles_culled),
             ("render.tiling.cell_ops", self.tiling_cell_ops),
             ("render.tiling.cell_points", self.tiling_cell_points),
             ("render.tiling.surface_px", self.tiling_surface_px),
