@@ -1,0 +1,105 @@
+akr 0.1
+project exprim
+
+record exprim.corpus.attribution-20261110/1 : observation {
+    title "Attribution corpus of 2026-11-10: which local document each id stands for"
+    state verified
+    statement """
+        The 22 private documents of the 2026-11-10 attribution corpus, by the
+        neutral id used in the locally kept attribution report and in the
+        ledger. Each value is the document's local path.
+
+            chart-a = {{secret:b7524f2ac6f9d10248bfe03bd4894c76}}
+            clip-heavy = {{secret:cbdc7880ab07f89f93a8568d4fee2981}}
+            curves-artwork = {{secret:1fc64cac2ecc7ddc9039106c0a8da378}}
+            diagram-a = {{secret:f8c2cd68fbc039bfc50e5b7f824d53f8}}
+            drawing-a = {{secret:551cfaea66a9a464567550a7f3c1b007}}
+            map = {{secret:e32ef5391203ea1fd7a46224b3a3dd51}}
+            map-b = {{secret:e74d0b420802104367ec0e40d0d64e01}}
+            map-c = {{secret:2bbe51a735abfd9d04cc4ccaf26c752f}}
+            map-d = {{secret:7a6d90dbcf11eee622cee96d72a43c07}}
+            map-e = {{secret:9a2262cba193e81c4f9cf7f668757fbc}}
+            plans-a = {{secret:7900d2e5d5263d5d2cef7a4e624297f6}}
+            scan-jpeg = {{secret:a8a6410995ba37b307be66cb69e1e41b}}
+            scan-mrc = {{secret:4520eb5c6ef5392b663300d88f3a037e}}
+            shading-a = {{secret:810a403d1782bc4fb41e6015710cfb91}}
+            shading-b = {{secret:ecefb2ecbf4ef4011eb1b203ee2bdb96}}
+            text = {{secret:bf9aacddb937f5d74aaaaac78df9f361}}
+            text-cjk = {{secret:66295e50f488a117fbaf00b74b4dc418}}
+            text-latin-b = {{secret:f2d9863ec313b1dc302f2d8eaadfebde}}
+            text-mixed = {{secret:4ab18fca04a69a2f965eea4f2e355e0a}}
+            text-type3 = {{secret:b93b86778a0b5c3737f11c688a2f3a38}}
+            tiling-a = {{secret:839ae0db1faaf45831ec1c5e01c3c3bc}}
+            vector-tables = {{secret:eacdef0f8fda69194d89bad0b068d750}}
+
+        The same list as one JSON document (id, role, path, page selection), in
+        the form `tools/render-probe/g0-corpus.local.json` expects:
+        {{secret:0a0704c3ef58fcaaf9e71e58b00fe52e}}
+        Restore it with `akr secret get <citation> --reveal > g0-corpus.local.json`.
+        """
+    observed_at git:44e10bc513f951f0e59f887f73e59939d2975ae3
+    method manual
+    watches [ "tools/render-probe/g0_manifest.py" ]
+    author "dk"
+}
+
+record exprim.corpus.benchmark-20261109/1 : observation {
+    title "Four-renderer benchmark corpus of 2026-11-09: which local document each id stands for"
+    state verified
+    statement """
+        The nine private documents of the 2026-11-09 four-renderer benchmark, by
+        the id used in the locally kept results and in
+        `tools/render-bench/corpus.local.json`. Each value is the document's
+        local path.
+
+            ccitt = {{secret:04cf4ec790db8420c2cdf50a5dae11d5}}
+            jbig2 = {{secret:07d812097a0dd9c466ee4e9835b25b35}}
+            jp2 = {{secret:a0c09e263074891fbb97ee5a473ede1f}}
+            jpeg-large = {{secret:85565cdf1a27ff0b324523252ad91553}}
+            mixed-cjk = {{secret:aa6a6a48aa819575fcaaad338afedc01}}
+            mrc = {{secret:f3968459a04a921c756032fbb14e8080}}
+            text = {{secret:bf9aacddb937f5d74aaaaac78df9f361}}
+            vector-map = {{secret:e32ef5391203ea1fd7a46224b3a3dd51}}
+            vector-tables = {{secret:eacdef0f8fda69194d89bad0b068d750}}
+
+        Library roots these documents and the sweep corpus live under: {{secret:00b86b15348271dd471ca1b5952dcef0}}, {{secret:06d6e0c693d2d651a85b329a3962d406}}, {{secret:0cec3c4cdf5da2d1947072c580d8a8e9}}, {{secret:3e7b1520b09025c2126636c01d79a130}}, {{secret:438e0bc58a829455f8ce3e0dc2ca2738}}, {{secret:46aa7c69d19da7e7b8f3598ece6d3356}}, {{secret:671ec7355739d056f2b6b73c27f7b9ff}}, {{secret:9fafe1a91a9b4814327b6af20362a695}}, {{secret:aa3e8e024ce7b0df3f919e64c63d6a3c}}, {{secret:aceac0eb1f032f17450a66b191af885e}}, {{secret:b40ab32d1cbe425c3467b158f9ce80bf}}
+        """
+    observed_at git:44e10bc513f951f0e59f887f73e59939d2975ae3
+    method manual
+    watches [ "tools/render-bench/corpus.py" ]
+    author "dk"
+}
+
+record exprim.renderer.attribution-20261110/1 : observation {
+    title "Where CPU render time goes on dense vectors, tables and text (G0)"
+    state verified
+    statement """
+        Measured on a 38-document corpus with stage timers, work counters and
+        sampled profiles (full report kept locally, not published):
+
+        - Dense map anchor: 72% of render time was tiling patterns. 60
+          pattern-painted draws became 79,447 tile instances while 11% of the
+          tiled pixels were visible through the draws' shapes.
+        - Clip masks: one page spent 96% of 4.3 s rasterizing 27.5 million rows
+          to build 7,002 masks of about 6 KB each.
+        - Vector tables: 62% of render time was the compact kernel sweeping
+          every interior cell of plain rectangles.
+        - Strokes and curves: every cubic takes 16 segments and every round join
+          a 16-gon at every flattened vertex; on a stroke-heavy diagram 80% of
+          edges are join disks and 97% of interior vertices are smooth.
+        - Text: a warm page is 56% glyph-cache lookup during lowering and 30%
+          blits; through RenderSession 47% is RGBA to RGB packing.
+        - Compile is outside warm figures but is 36.5% of a first pass over
+          table pages and 22.4% over text pages.
+        - After the G1 changes the map is 55% coverage kernel and 24% lowering;
+          the tile cull test is 5.7%; about 10% of samples are under the
+          allocator; libm rounding is 1.5% and trig 0.1%.
+
+        Absolute times drifted with machine load during the session; shares and
+        paired ratios are the reliable figures.
+        """
+    observed_at git:44e10bc513f951f0e59f887f73e59939d2975ae3
+    method instrumented
+    watches [ "src/render_cpu/**" ]
+    author "dk"
+}

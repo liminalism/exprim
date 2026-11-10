@@ -1,0 +1,19 @@
+[package]
+name = "exprim-chaos-tests"
+description = "Stable chaos/mutation regression gate for the never-panic invariant (dev/test-only)."
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The library half holds the deterministic PRNG + mutation engine so the
+# harness itself is unit-testable. No external crates: the stable chaos
+# suite must run on stable with zero new dependencies.
+
+[dev-dependencies]
+exprim = { path = "..", features = ["test-support"] }

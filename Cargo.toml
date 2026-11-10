@@ -1,0 +1,160 @@
+[package]
+name = "exprim"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+description = "A concurrent, memory-bounded PDF reader and renderer: parse, extract text, and rasterize pages on an immutable document snapshot"
+repository = "https://github.com/liminalism/exprim"
+readme = "README.md"
+keywords = ["pdf", "render", "rasterizer", "text-extraction", "document"]
+categories = ["graphics", "rendering", "parser-implementations", "text-processing"]
+build = "build.rs"
+# Allowlist, not denylist: the package carries the library, its build script
+# and the data both embed, and the notices; nothing else. Integration tests,
+# fixtures, benches, examples, the corpus, fuzz targets, differential tools,
+# dev notes and the codec checkouts stay in the repository.
+include = [
+    "/src/**/*.rs",
+    "/src/font/cmap_data/**",
+    "/build.rs",
+    "/fonts/*.otf",
+    "/fonts/README.md",
+    "/upstream/pdfium/LICENSE",
+    "/upstream/pdfium/README.md",
+    "/upstream/pdfium/core/**",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-MIT",
+    "/THIRD-PARTY-NOTICES.md",
+]
+
+[package.metadata.docs.rs]
+features = ["print"]
+
+[lib]
+# The integration tests are separate targets; `cargo test --lib` stays the
+# fast loop.
+doctest = true
+
+[features]
+default = []
+# Office printing: imposition, sheet composition, CUPS / winspool spooling.
+print = ["dep:windows"]
+# Per-stage timers (document, content, image, raster, scheduler).
+profiling = []
+# Synthetic PDF builders and the corpus locator used by this repository's
+# tests and by in-tree consumers' tests. No semver promise.
+test-support = []
+
+[dependencies]
+bitflags = "2.9.3"
+crossbeam-channel = "0.5"
+flate2 = { version = "1.1.9", features = ["zlib-rs"] }
+foldhash = "0.2.0"
+jbig2enc-rust = { version = "0.6.0", path = "codecs/jbig2enc-rust", default-features = false, features = ["decode"] }
+jp2lam = { version = "0.3.1", path = "codecs/jp2lam", default-features = false }
+jpeg-encoder = { version = "=0.7.1", features = ["simd"] }
+memmap2 = "0.9"
+png = "0.18"
+rayon = "1.11.0"
+skrifa = "0.44.0"
+thiserror = "2.0.18"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", default-features = false, optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Printing",
+    # StartDocW / StartPage / EndPage / EndDoc / DeviceCapabilitiesW live here
+    # in windows-rs rather than under Win32_Graphics_Printing.
+    "Win32_Storage_Xps",
+] }
+
+[dev-dependencies]
+# Turns on the test builders for this package's own integration tests.
+exprim = { path = ".", features = ["test-support"] }
+hayro-ccitt = "0.3"
+tempfile = "3.27.0"
+
+[[test]]
+name = "print_compose"
+required-features = ["print"]
+
+[[test]]
+name = "print_job"
+required-features = ["print"]
+
+[[test]]
+name = "print_layout"
+required-features = ["print"]
+
+[[test]]
+name = "print_spool"
+required-features = ["print"]
+
+[[bench]]
+name = "raster"
+harness = false
+
+[lints]
+workspace = true
+
+[workspace]
+resolver = "2"
+members = ["cli", "chaos-tests"]
+# Own build graphs: the MCP/CLI agent (links lege-ocr from the sibling
+# Lege-ecosystem checkout), cargo-fuzz targets, the PDFium differential
+# tools, and the codecs (published on their own).
+exclude = ["agent", "fuzz", "tools", "codecs"]
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_debug_implementations = "warn"
+unused_imports = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+# `panic = "unwind"` is load-bearing, not a default. The renderer contains the
+# panic from one poisoned page behind `catch_unwind` boundaries
+# (`render_api::submit_caught` / `render_blocking`, the scheduler's
+# `render_job`) so a malformed document degrades to a typed per-page
+# `RenderError` instead of taking down the host. Under `panic = "abort"` every
+# one of those guards is inert. The `chaos` mutation suite gates the same
+# invariant, so aborting here would mean the never-panic gate only ever ran in
+# a profile that never ships.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+opt-level = 3
+debug = false
+strip = "symbols"
+incremental = false
+
+[profile.dev]
+incremental = true
+codegen-units = 256
+split-debuginfo = "packed"
+
+# Release optimisation without fat LTO: the iteration and benchmarking build.
+[profile.debug-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug = true
+strip = false
+
+[profile.profiling]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug = true
+strip = false

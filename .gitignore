@@ -1,0 +1,78 @@
+/target
+**/target/
+.agent/
+**/.agent/
+**/*.rs.bk
+*.pdb
+/.claude/
+# The differential oracle: its build dir, its output, and the prebuilt
+# libpdfium it grades against (never a dependency of the engine).
+tools/*/target/
+tools/pdfium-diff/pdfium-diff-out/
+# Any sweep/rerun/dry-run output directory the oracle writes.
+tools/pdfium-diff/pdfium-diff-*/
+*.so
+tools/pdfium-diff/pdfium-diff-out.log
+# Third-party renderer checkouts used as differential controls: each keeps its
+# own VCS history and is never vendored here. (The sibling mupdf/poppler/
+# ghostscript/pdf.js checkouts likely want the same treatment.)
+tools/hayro/
+tools/mupdf/
+tools/poppler-*/
+tools/ghostscript-*/
+tools/pdf.js/
+tools/.renderer-build/
+tools/.renderer-bin/
+
+# Ad-hoc local sampling captures. Curated profiling artifacts live under
+# corpus/perf/results/ and are committed explicitly.
+/perf.data*
+/compiled-page.*
+/scan-prepared.*
+/text-compiled.*
+/text-prepared.*
+
+# Codec test corpora and generated visual outputs (dev artifacts)
+codecs/jp2lam/test-set/
+codecs/jp2lam/visual-output/
+codecs/jp2lam/lear.png
+corpus/perf/results/
+.claude/
+**/.claude/
+.codex
+**/.codex
+
+# Generated codec output samples; the JBIG2 fixtures under
+# tests/fixtures/original/ are tracked sources.
+*.jp2
+*.j2k
+*.jb2
+*.pbm
+!codecs/jbig2enc-rust/tests/fixtures/original/*.pbm
+*.rs.bk
+
+# Local agent tooling binary (was ignored in Lege too).
+**/agent-pack
+
+# Python bytecode caches from the harness scripts.
+__pycache__/
+
+# Attribution runs name private local documents: the raw timing rows, the
+# manifest with paths and the local corpus list stay on this machine.
+docs/benchmarks/*/raw/
+docs/benchmarks/*/profiles/runs/
+docs/benchmarks/*/manifest.local.json
+dev-notes/render-refinement/scoping-20261108/harness/g0-corpus.local.json
+
+# AKR: a rebuildable cache and disposable agent notes.
+.akr/cache/
+.agent/scratch/
+.agent/handoffs/
+.akr/secrets/
+
+# Working notes and benchmark results describe private local documents and
+# stay on this machine; so do the local document lists the tools read.
+/dev-notes/
+/docs/benchmarks/
+tools/render-bench/corpus.local.json
+tools/render-probe/g0-corpus.local.json

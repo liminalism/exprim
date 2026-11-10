@@ -1,0 +1,74 @@
+[package]
+name = "exprim-agent"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+description = "Agent-facing structured PDF CLI and MCP server over exprim"
+readme = "README.md"
+# OCR links lege-ocr from the sibling Lege-ecosystem checkout, which is not on
+# crates.io; this binary stays in the repository.
+publish = false
+
+[[bin]]
+name = "exprim"
+path = "src/main.rs"
+
+[lib]
+name = "exprim_agent"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { version = "1.0.103", features = ["backtrace"] }
+clap = { version = "4.5.60", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+png = "0.18"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tiff", "pnm", "bmp", "webp", "rayon"] }
+jpeg-encoder = { version = "=0.7.1", features = ["simd"] }
+base64 = "0.22"
+regex = "1"
+exprim = { path = "..", features = ["print"] }
+# PP-OCR (pure Rust, on lege-gpu) is the Linux/macOS backend `default_engine()`
+# already prefers; Windows uses the system WinRT OCR. This crate only calls
+# `default_engine()`, so it never names a backend beyond `paddle-ocr`.
+lege-ocr = { path = "../../Lege-ecosystem/lege-ocr", features = ["paddle-ocr"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+exprim = { path = "..", features = ["print", "test-support"] }
+
+[workspace]
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_debug_implementations = "warn"
+unused_imports = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[lints]
+workspace = true
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+opt-level = 3
+debug = false
+strip = "symbols"
+incremental = false
+
+[profile.debug-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug = true
+strip = false

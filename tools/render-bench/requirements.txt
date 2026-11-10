@@ -1,0 +1,4 @@
+psutil==7.2.2
+pymupdf==2.1
+numpy==2.5.4
+pillow==13.0.0

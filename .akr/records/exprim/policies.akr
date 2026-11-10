@@ -1,0 +1,33 @@
+akr 0.1
+project exprim
+
+record exprim.privacy.private-document-references/1 : policy {
+    title "Local documents are cited as secrets, never named in tracked files"
+    state proposed
+    scope [ all ]
+    rule """
+        No tracked file, commit message or ledger record names a private local
+        document: not its path, its file name, its title, or the directory it
+        lives in. Where a document or directory must be referred to, register the
+        value with `akr secret put` and write the returned citation instead.
+        Published corpus manifests identify a private document by a neutral id
+        (`map-b`, `shading-a`), its size and its SHA-256 only.
+
+        Working notes (`dev-notes/`) and benchmark results (`docs/benchmarks/`)
+        stay on the machine, git-ignored: they describe private documents by
+        nickname, title and page image. Findings that should be public go into
+        this ledger or the changelog, with documents described by kind.
+
+        Files that need real paths at run time stay untracked:
+        `tools/render-probe/g0-corpus.local.json` and
+        `tools/render-bench/corpus.local.json`. Scripts take directories from
+        the environment or from those local files.
+        """
+    rationale """
+        The repository is published. Benchmark notes, manifests and harness
+        scripts had accumulated full local paths and book titles. Citations keep
+        the notes readable and the mapping recoverable on the machine that holds
+        `.akr/secrets/`, which Git ignores.
+        """
+    author "dk"
+}

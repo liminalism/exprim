@@ -1,0 +1,19 @@
+//! Agent-facing structured PDF service used by the `exprim` binary and
+//! `exprim serve --stdio`.
+
+pub mod bounds;
+pub mod cache;
+pub mod commands;
+pub mod deadline;
+pub mod objects;
+pub mod open;
+pub mod pages;
+pub mod parallel;
+pub mod schema;
+pub mod views;
+
+pub use bounds::Bounds;
+pub use cache::SnapshotCache;
+pub use open::{DocumentIdentity, open_document};
+pub use pages::{PageZero, parse_page_range};
+pub use schema::{Envelope, OutputMode, SCHEMA_ID, Status};

@@ -1,0 +1,16 @@
+[package]
+name = "bench-exprim"
+version = "0.0.0"
+edition = "2024"
+publish = false
+[workspace]
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+[dependencies]
+exprim = { path = "../../.." }
+anyhow = "1"
+serde_json = "1"
+png = "0.18"

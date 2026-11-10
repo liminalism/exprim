@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+vendor/
+hayro/fonts/
+*.dll
+*.lib
+*.exp

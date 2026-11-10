@@ -1,0 +1,11 @@
+[package]
+name = "pdfium-text-diff"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libloading = "0.8"
+exprim = { path = "../.." }
+
+[workspace]

@@ -1,0 +1,23 @@
+akr 0.1
+project exprim
+
+record exprim.renderer.g1-exact-speedups-ab/1 : evidence {
+    title "Nine-round paired release A/B of the three exact G1 changes"
+    state verified
+    result pass
+    method command
+    observed_at git:44e10bc513f951f0e59f887f73e59939d2975ae3
+    command "tools/render-probe/g0-ab.sh <baseline probe> <new probe> out 9 <id> <pdf> --scenario rerender --repeat 4 --warmup 1"
+    artifact "CHANGELOG.md"
+    summary """
+        Baseline 104f9d8 against c95ec54, release builds, process cycle time, nine
+        order-swapped rounds per case, identical page hashes in every case.
+        Dense map 271 ms to 132 ms (ratio 0.49, 9 of 9 rounds); the same through
+        RenderSession 0.48; clip-heavy page 2,609 ms to 200 ms (0.078); vector
+        tables 0.75; text 0.98 to 1.00; JPEG scan control 0.98; MRC scan control
+        1.02 (inside the 3% line, 2 of 9 rounds faster; re-run on an idle machine).
+        A/B hash gate against the baseline binary: 840 configurations, 0 differ.
+        Workspace tests: 1,228 passed, 0 failed.
+        """
+    author "dk"
+}

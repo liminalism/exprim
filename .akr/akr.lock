@@ -1,0 +1,93 @@
+akr-lock 0.1
+project exprim
+
+build {
+    tool "akr 0.6.5"
+    grammar "0.1"
+    vocabulary "0.2"
+    source_graph "sha256:7900bf18b1598d3a3be75ce7595ee1420edf603ce979ccaa10f7fc3be7c9c86b"
+}
+
+source ".akr/project.akr" {
+    hash "sha256:790ca5b181bdc9fdb56dcac2671aaf997bcdadb065881d3350418fdbee31bfcb"
+    records 0
+}
+
+source ".akr/records/exprim/evidence.akr" {
+    hash "sha256:ec05b4700f7057c8d7254b9864513dcac41c5bfdb292e34636f267426f26b641"
+    records 1
+}
+
+source ".akr/records/exprim/observations.akr" {
+    hash "sha256:680dc6aa9e42d5ee526157211760657e8d27cbc7c70e30ecafcaeb13e2464fea"
+    records 3
+}
+
+source ".akr/records/exprim/policies.akr" {
+    hash "sha256:686f947af02e5c62e0b0f9be0392954ce95165db38bc8b081b34b1908f2fb6ce"
+    records 1
+}
+
+source ".akr/records/exprim/questions.akr" {
+    hash "sha256:665137ccf19afdaaeb43c606263d320dd2c062d5ea8035e2dd34813d4f818f6f"
+    records 1
+}
+
+source ".akr/records/exprim/work.akr" {
+    hash "sha256:42cc24572673111112c24b5685d6fd4733b474b3ee6b334f2fc34361408c14d0"
+    records 2
+}
+
+resolution @exprim.renderer.g1-exact-speedups/1 {
+    slot supported_by
+    to @exprim.renderer.attribution-20261110/1
+    hash "sha256:36b6f0bd0348c1afd182a5e8778df6ffd7182401d1e83c21577aa90ab6bf9bd2"
+}
+
+resolution @exprim.renderer.g1-exact-speedups/1 {
+    slot verified_by
+    to @exprim.renderer.g1-exact-speedups-ab/1
+    hash "sha256:3ef284fbf3676dc2abf1906572136a4c8ba0b460c2519782ae2c9ad1150c7c99"
+}
+
+resolution @exprim.renderer.next-levers/1 {
+    slot after
+    to @exprim.renderer.g1-exact-speedups/1
+    hash "sha256:a7ea576862cd91a890cecb78182a51ba916842bf4013bade4b9dcff1cb2d1bf1"
+}
+
+resolution @exprim.renderer.next-levers/1 {
+    slot supported_by
+    to @exprim.renderer.attribution-20261110/1
+    hash "sha256:36b6f0bd0348c1afd182a5e8778df6ffd7182401d1e83c21577aa90ab6bf9bd2"
+}
+
+seal @exprim.corpus.attribution-20261110/1 {
+    state verified
+    hash "sha256:5d0e01d7853495b7ca38ac7eb5d162f1e93374f2ad84f6c5ed711333b059ba27"
+}
+
+seal @exprim.corpus.benchmark-20261109/1 {
+    state verified
+    hash "sha256:17774f6dabe2ef1e47f9694f2ba5cbf477474afb2cf0b5dc7906b0a28110d0f9"
+}
+
+seal @exprim.privacy.residual-document-mentions/1 {
+    state open
+    hash "sha256:b8582cca6b7d2dda08127a27cde6e43a5caabbb71dcc0d4ba2e5d888875b1bc2"
+}
+
+seal @exprim.renderer.attribution-20261110/1 {
+    state verified
+    hash "sha256:36b6f0bd0348c1afd182a5e8778df6ffd7182401d1e83c21577aa90ab6bf9bd2"
+}
+
+seal @exprim.renderer.g1-exact-speedups/1 {
+    state completed
+    hash "sha256:a7ea576862cd91a890cecb78182a51ba916842bf4013bade4b9dcff1cb2d1bf1"
+}
+
+seal @exprim.renderer.g1-exact-speedups-ab/1 {
+    state verified
+    hash "sha256:3ef284fbf3676dc2abf1906572136a4c8ba0b460c2519782ae2c9ad1150c7c99"
+}
