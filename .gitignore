@@ -56,3 +56,10 @@ corpus/perf/results/
 
 # Python bytecode caches from the harness scripts.
 __pycache__/
+
+# Attribution runs name private local documents: the raw timing rows, the
+# manifest with paths and the local corpus list stay on this machine.
+docs/benchmarks/*/raw/
+docs/benchmarks/*/profiles/runs/
+docs/benchmarks/*/manifest.local.json
+dev-notes/render-refinement/scoping-20261108/harness/g0-corpus.local.json
