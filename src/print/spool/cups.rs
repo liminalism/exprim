@@ -31,6 +31,8 @@ pub struct CupsSpooler {
 }
 
 impl CupsSpooler {
+    /// A handle to the CUPS tools (`lp`, `lpstat`, `lpoptions`). Nothing runs
+    /// until a method is called.
     #[must_use]
     pub fn new() -> Self {
         Self { _private: () }

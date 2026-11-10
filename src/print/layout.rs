@@ -68,7 +68,9 @@ const EPSILON: f64 = 1e-9;
 /// Which side of a sheet a placement is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
+    /// The front of a sheet. Every side of a one-sided job.
     Front,
+    /// The back of a sheet in a two-sided job.
     Back,
 }
 
@@ -122,7 +124,9 @@ pub struct Sheet {
     pub bounds: Rect,
     /// Paper minus hardware and user margins.
     pub imageable: Rect,
+    /// Front or back.
     pub side: Side,
+    /// The pages on this side, each with its transform and clip.
     pub placements: Vec<Placement>,
 }
 

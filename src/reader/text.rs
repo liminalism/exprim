@@ -9,6 +9,7 @@ use crate::reader::{PageGeometry, ReadError, RenderSession};
 /// A word and its exact bounding box in source-render pixel space.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeTextWord {
+    /// The word's text.
     pub text: String,
     /// `[left, top, right, bottom]` in a top-left-origin pixel space.
     pub bbox: [f32; 4],
@@ -17,32 +18,53 @@ pub struct NativeTextWord {
 /// OCR-relevant page classification derived from one semantic compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageContentKind {
+    /// The page has a usable text layer and no images.
     NativeText,
+    /// The page has images and no text: a scan that needs text recognition.
     ScannedImage,
+    /// The page has both a usable text layer and images.
     Hybrid,
+    /// The text layer is missing, too short or unreliable, and the page is not a
+    /// plain scan. Render the page to decide.
     RenderRequired,
 }
 
 /// Native text and image evidence used to decide whether OCR is necessary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageTextEvidence {
+    /// The classification the fields below add up to.
     pub kind: PageContentKind,
+    /// The page's text in reading order.
     pub text: String,
+    /// The page's words with their boxes in the requested pixel space.
     pub words: Vec<NativeTextWord>,
+    /// Number of non-whitespace characters in `text`.
     pub character_count: usize,
+    /// Number of U+FFFD characters in `text`: glyphs whose font gave no Unicode
+    /// mapping.
     pub replacement_character_count: usize,
+    /// Number of images on the page.
     pub image_count: usize,
+    /// Pixel count of the largest image, in its own resolution.
     pub largest_image_pixels: u64,
+    /// Whether the text layer can stand in for text recognition: at least eight
+    /// characters, at most 1% of them unmapped, and at least two words whose
+    /// boxes lie on the page.
     pub trustworthy: bool,
     /// Original DCT payload for a simple one-image scan page. Callers can
     /// decode it directly and avoid a full-page render.
     pub direct_scan: Option<DirectScanImage>,
 }
 
+/// The embedded JPEG of a page that is nothing but one full-page image, as
+/// stored in the PDF.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectScanImage {
+    /// The JPEG file bytes.
     pub jpeg: SharedBytes,
+    /// Image width in pixels.
     pub width: u32,
+    /// Image height in pixels.
     pub height: u32,
 }
 
@@ -159,14 +181,65 @@ fn direct_scan_image(page: &crate::content::SemanticPage) -> Option<DirectScanIm
     })
 }
 
+/// Whether `page` (zero-based) has any extractable text.
+///
+/// A scanned page without a text layer returns `false`.
+///
+/// # Errors
+///
+/// [`ReadError::PageOutOfRange`] or [`ReadError::Compile`].
 pub fn has_text_layer(session: &RenderSession, page: u32) -> Result<bool, ReadError> {
     Ok(build_text_page(session, page)?.has_text())
 }
 
+/// The text of `page` (zero-based) in reading order.
+///
+/// Characters the font gives no Unicode mapping for come out as U+FFFD. A
+/// page without a text layer returns an empty string. The page is compiled
+/// once and shared with rendering, so reading text and then rendering costs
+/// one interpretation.
+///
+/// # Errors
+///
+/// [`ReadError::PageOutOfRange`] or [`ReadError::Compile`].
+///
+/// # Examples
+///
+/// ```no_run
+/// # let bytes: std::sync::Arc<[u8]> = std::fs::read("document.pdf")?.into();
+/// let session = exprim::RenderSession::open(bytes, None)?;
+/// for page in 0..session.page_count() {
+///     println!("{}", exprim::page_text(&session, page)?);
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn page_text(session: &RenderSession, page: u32) -> Result<String, ReadError> {
     Ok(build_text_page(session, page)?.all_text())
 }
 
+/// The words of `page` with their bounding boxes, mapped onto a rendering of
+/// the page that is `source_width` x `source_height` pixels.
+///
+/// Boxes are `[left, top, right, bottom]` with the origin at the top left,
+/// so they can be drawn straight onto a raster of that size (the page's
+/// rotation is applied). Each box is the union of the word's glyph boxes.
+///
+/// # Errors
+///
+/// [`ReadError::PageOutOfRange`] or [`ReadError::Compile`].
+///
+/// # Examples
+///
+/// ```no_run
+/// # let bytes: std::sync::Arc<[u8]> = std::fs::read("document.pdf")?.into();
+/// let session = exprim::RenderSession::open(bytes, None)?;
+/// let (width, height) = session.page_pixel_size(0, 150.0)?;
+/// for word in exprim::positioned_words(&session, 0, width, height)? {
+///     let [left, top, right, bottom] = word.bbox;
+///     println!("{:?} at {left},{top} to {right},{bottom}", word.text);
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn positioned_words(
     session: &RenderSession,
     page: u32,

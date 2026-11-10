@@ -2,7 +2,7 @@
 //! composition, impose, and hand the result to a spooler.
 //!
 //! This is the orchestration seam. It owns exactly one decision — which of
-//! the two pipelines in `print-PLAN.md` §2 a job takes — and then delegates: to the
+//! the two pipelines (pass-through or composed) a job takes — and then delegates: to the
 //! spooler for pass-through, and to [`layout::impose`](crate::print::layout::impose)
 //! plus the spooler for composition. Nothing here knows about paper geometry
 //! or about any operating system.
@@ -59,10 +59,14 @@ pub enum PrintRoute {
     /// The original PDF bytes went to the spooler unmodified.
     PassThrough,
     /// Sheets were composed here.
-    Composed { sheets: u32 },
+    Composed {
+        /// Number of sheet sides that were composed and spooled.
+        sheets: u32,
+    },
 }
 
 impl PrintRoute {
+    /// Which pipeline this was, without the sheet count.
     #[must_use]
     pub const fn kind(&self) -> RouteKind {
         match self {
@@ -85,7 +89,9 @@ impl PrintRoute {
 /// The outcome of a submission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmittedJob {
+    /// The id the spooler gave the job.
     pub id: JobId,
+    /// Which pipeline the job took.
     pub route: PrintRoute,
 }
 
@@ -96,6 +102,7 @@ pub struct SubmittedJob {
 /// document password.
 #[derive(Debug)]
 pub struct PrintRequest<'a> {
+    /// The queue to print on.
     pub printer: &'a PrinterId,
     /// Job title as it appears in the queue.
     pub title: &'a str,
@@ -104,6 +111,7 @@ pub struct PrintRequest<'a> {
     pub pdf_bytes: Arc<[u8]>,
     /// Password for an encrypted document. Never logged, never spooled.
     pub password: Option<&'a str>,
+    /// What the user asked for.
     pub options: &'a PrintOptions,
     /// Composition settings. `None` derives them from the device — see
     /// [`compose_options_for`].

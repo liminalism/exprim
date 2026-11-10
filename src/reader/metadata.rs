@@ -14,11 +14,27 @@ const AUTHOR_PLACEHOLDERS: &[&str] = &["author", "unknown"];
 /// Credible document identity carried by the source PDF's Info dictionary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DocumentMetadata {
+    /// The `/Title` entry, when present and not a producer placeholder such as
+    /// "untitled".
     pub title: Option<String>,
+    /// The `/Author` entry, when present and not a placeholder.
     pub author: Option<String>,
 }
 
 /// Extract `/Title` and `/Author` without rendering a page.
+///
+/// Missing entries, entries that cannot be decoded and producer placeholders
+/// all come back as `None`; this never fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// # let bytes: std::sync::Arc<[u8]> = std::fs::read("document.pdf")?.into();
+/// let session = exprim::RenderSession::open(bytes, None)?;
+/// let metadata = exprim::extract_metadata(&session);
+/// println!("{}", metadata.title.as_deref().unwrap_or("(no title)"));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn extract_metadata(session: &RenderSession) -> DocumentMetadata {
     let Some(info_id) = session.snapshot.structure().trailer.info else {
         return DocumentMetadata::default();

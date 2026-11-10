@@ -18,8 +18,11 @@ pub const FILE_PRINTER: &str = "file";
 /// What a `FileSpooler` recorded about one submission.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordedJob {
+    /// The id the backend returned for the job.
     pub id: JobId,
+    /// The queue the job named.
     pub printer: PrinterId,
+    /// The job title.
     pub title: String,
     /// Files written for this job, in sheet order.
     pub files: Vec<PathBuf>,
@@ -47,6 +50,7 @@ pub struct FileSpooler {
 }
 
 impl FileSpooler {
+    /// A spooler that writes into `dir`.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -56,6 +60,7 @@ impl FileSpooler {
         }
     }
 
+    /// The directory jobs are written to.
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir

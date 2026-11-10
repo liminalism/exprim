@@ -54,14 +54,18 @@ impl WorkerContexts {
 pub struct CancellationToken(crate::render_api::CancellationToken);
 
 impl CancellationToken {
+    /// A token that is not cancelled.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Request cancellation. Work holding this token or a clone of it stops at
+    /// its next checkpoint and returns an error. Calling it again has no effect.
     pub fn cancel(&self) {
         self.0.cancel();
     }
 
+    /// Whether [`cancel`](Self::cancel) has been called on this token or a clone.
     pub fn is_cancelled(&self) -> bool {
         self.0.is_cancelled()
     }
@@ -70,24 +74,61 @@ impl CancellationToken {
 /// Errors at the document API. Renderer error types do not escape.
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
+    /// The bytes are not a PDF this crate can open: damaged beyond recovery,
+    /// encrypted with a missing or wrong password, or over a document limit.
+    /// The string describes the cause.
     #[error("failed to open PDF document: {0}")]
     Open(String),
+
+    /// The page index is not below [`RenderSession::page_count`].
     #[error("page index {page} is out of range (document has {page_count} pages)")]
-    PageOutOfRange { page: u32, page_count: u32 },
+    PageOutOfRange {
+        /// The zero-based index that was asked for.
+        page: u32,
+        /// Number of pages in the document.
+        page_count: u32,
+    },
+
+    /// The page's content could not be interpreted, or the compilation was
+    /// cancelled.
     #[error("failed to compile PDF page {page}: {message}")]
-    Compile { page: u32, message: String },
+    Compile {
+        /// Zero-based index of the page.
+        page: u32,
+        /// What went wrong.
+        message: String,
+    },
+    /// A [`RasterProduct`] that cannot be rendered, such as one with a zero
+    /// width or height.
     #[error("invalid raster product: {0}")]
     InvalidRasterProduct(&'static str),
+
+    /// Rendering failed, was cancelled, or hit a render limit. A panic inside
+    /// the renderer is caught and reported here.
     #[error("failed to render PDF page {page}: {message}")]
-    Render { page: u32, message: String },
+    Render {
+        /// Zero-based index of the page.
+        page: u32,
+        /// What went wrong.
+        message: String,
+    },
+    /// [`ExportOptions`](crate::ExportOptions) that cannot be used, such as a resolution that is zero,
+    /// negative, not finite or above 10,000 DPI.
     #[error("invalid export options: {0}")]
     InvalidExportOptions(&'static str),
+    /// The page at the requested resolution has more pixels than
+    /// [`ExportOptions::max_pixels`](crate::ExportOptions::max_pixels) allows.
     #[error("exporting a {width}x{height} image exceeds the {max_pixels}-pixel budget")]
     ExportTooLarge {
+        /// Width the export would have, in pixels.
         width: u32,
+        /// Height the export would have, in pixels.
         height: u32,
+        /// The budget that was exceeded.
         max_pixels: u64,
     },
+    /// The PNG or JPEG encoder rejected the image, for example a JPEG wider or
+    /// taller than 65,535 pixels.
     #[error("failed to encode image: {0}")]
     Encode(String),
 }
@@ -102,6 +143,8 @@ pub enum ReadError {
 /// omits it, so they are always populated and never degenerate on their own.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PageGeometry {
+    /// The visible page as `[x0, y0, x1, y1]` in PDF points (1/72 inch), origin
+    /// at the bottom left. The other boxes use the same layout.
     pub crop_box: [f64; 4],
     /// The physical sheet the page was authored for.
     pub media_box: [f64; 4],
@@ -112,6 +155,8 @@ pub struct PageGeometry {
     /// The author-declared meaningful content extent; equals `crop_box` when
     /// absent.
     pub art_box: [f64; 4],
+    /// The page's `/Rotate` entry: clockwise degrees, a multiple of 90, applied
+    /// when the page is displayed.
     pub rotate: u16,
 }
 
@@ -168,10 +213,13 @@ pub struct CompiledDocumentPage {
 }
 
 impl CompiledDocumentPage {
+    /// Zero-based index of the page this was compiled from.
     pub fn page_index(&self) -> u32 {
         self.page_index
     }
 
+    /// Number of drawing operations in the compiled page. Zero means the page
+    /// paints nothing.
     pub fn operation_count(&self) -> usize {
         self.raster.operations.len()
     }
@@ -191,6 +239,8 @@ impl CompiledDocumentPage {
         bilevel_raster_height(&self.raster)
     }
 
+    /// How faithfully this page renders straight to grayscale, judged from the
+    /// features it uses. See [`GraySuitability`].
     pub fn gray_suitability(&self) -> GraySuitability {
         let risky = PageFeatures::TRANSPARENCY
             | PageFeatures::SOFT_MASKS
@@ -214,30 +264,64 @@ impl CompiledDocumentPage {
 /// Pixel format requested from a compiled document page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RasterFormat {
+    /// 8-bit RGB: three bytes per pixel, composited over white.
     Rgb8,
+    /// 8-bit grayscale: one byte per pixel, composited over white.
     Gray8,
 }
 
+/// A rectangle cut out of a full-page raster, in that raster's pixels.
+///
+/// Pass it to [`RasterProduct::with_crop`] to render one region of a page (a
+/// tile, or a zoomed detail) without rendering the rest. The product's `width`
+/// and `height` are the output size of the region; when they differ from the
+/// crop's own, the region is scaled to fit.
+///
+/// ```
+/// use exprim::{DeviceCrop, RasterProduct};
+///
+/// // The top-left quarter of a page rendered at 1700 x 2200, at that scale.
+/// let crop = DeviceCrop {
+///     x: 0,
+///     y: 0,
+///     width: 850,
+///     height: 1100,
+///     page_width: 1700,
+///     page_height: 2200,
+/// };
+/// let product = RasterProduct::rgb8(850, 1100).with_crop(crop);
+/// assert_eq!(product.crop, Some(crop));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceCrop {
+    /// Left edge of the region, in pixels from the left of the full-page raster.
     pub x: i32,
+    /// Top edge of the region, in pixels from the top of the full-page raster.
     pub y: i32,
+    /// Width of the region, in full-page pixels.
     pub width: u32,
+    /// Height of the region, in full-page pixels.
     pub height: u32,
     /// Full-page raster size the crop coordinates are expressed in. The render
     /// matrix must scale the page to THIS size before translating by (x, y);
     /// it cannot be inferred from the crop rect (that only works for a crop
     /// anchored at the page's bottom-right corner).
     pub page_width: u32,
+    /// Height of that full-page raster.
     pub page_height: u32,
 }
 
 /// One final-size raster requested by a document processing pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RasterProduct {
+    /// Output width in pixels.
     pub width: u32,
+    /// Output height in pixels.
     pub height: u32,
+    /// Pixel format of the output.
     pub format: RasterFormat,
+    /// Render only this region of the page. `None` renders the whole page,
+    /// scaled to fill `width` x `height`.
     pub crop: Option<DeviceCrop>,
     /// Decode images at no less than the resolution this full-page raster
     /// needs; see [`DecodeReference`]. `None`: each image decodes for its own
@@ -264,6 +348,11 @@ pub struct DecodeReference {
 }
 
 impl RasterProduct {
+    /// A whole-page RGB raster of `width` x `height` pixels.
+    ///
+    /// The page is scaled to fill the raster exactly, so choose a size with the
+    /// page's aspect ratio; [`RenderSession::page_pixel_size`] gives one for a
+    /// resolution in DPI.
     pub fn rgb8(width: u32, height: u32) -> Self {
         Self {
             width,
@@ -274,6 +363,8 @@ impl RasterProduct {
         }
     }
 
+    /// A whole-page grayscale raster of `width` x `height` pixels. Sizing works as
+    /// for [`rgb8`](Self::rgb8).
     pub fn gray8(width: u32, height: u32) -> Self {
         Self {
             width,
@@ -284,6 +375,7 @@ impl RasterProduct {
         }
     }
 
+    /// Render only `crop` instead of the whole page. See [`DeviceCrop`].
     pub fn with_crop(mut self, crop: DeviceCrop) -> Self {
         self.crop = Some(crop);
         self
@@ -297,75 +389,134 @@ impl RasterProduct {
     }
 }
 
+/// Whether rendering a page straight to grayscale matches rendering it in
+/// colour and converting afterwards.
+///
+/// Reported by [`CompiledDocumentPage::gray_suitability`] from the features
+/// the page uses, without rendering it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraySuitability {
+    /// The page has only plain fills, strokes and text. A direct grayscale
+    /// render is equivalent.
     Exact,
+    /// The page has images, patterns or shadings. A direct grayscale render can
+    /// differ slightly, which does not matter when the result is thresholded to
+    /// black and white.
     AcceptableForBilevel,
+    /// The page uses transparency, soft masks, ICC colour, non-separable blend
+    /// modes or overprint. Render in colour and convert.
     ColorFallback,
 }
 
+/// The raster a pipeline inspects to decide how to process a page. Part of a
+/// [`PageOutputPlan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalysisTarget {
+    /// The raster to render.
     pub product: RasterProduct,
 }
 
+/// The main raster of a page in a [`PageOutputPlan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseTarget {
+    /// The raster to render.
     pub product: RasterProduct,
+    /// The page's grayscale suitability, recorded by the planner for later
+    /// stages.
     pub gray_suitability: GraySuitability,
 }
 
+/// One extra region of a page in a [`PageOutputPlan`], usually a crop at its
+/// own resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionTarget {
+    /// The raster to render.
     pub product: RasterProduct,
 }
 
+/// The raster of a page handed to text recognition. Part of a
+/// [`PageOutputPlan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OcrTarget {
+    /// The raster to render.
     pub product: RasterProduct,
 }
 
+/// Every raster a processing pipeline wants from one page, rendered together
+/// by [`RenderSession::render_output_plan`].
+///
+/// Most callers need only [`RenderSession::render`] or
+/// [`RenderSession::export_page`]. A plan is for pipelines that take several
+/// products from the same compiled page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageOutputPlan {
+    /// Raster for analysis, if the pipeline wants one. It is carried for the
+    /// caller: `render_output_plan` does not render it.
     pub analysis: Option<AnalysisTarget>,
+    /// The main page raster.
     pub base: BaseTarget,
+    /// Extra regions, rendered in this order.
     pub regions: Vec<RegionTarget>,
+    /// Raster for text recognition, if wanted.
     pub ocr: Option<OcrTarget>,
 }
 
+/// An owned 8-bit RGB raster: three bytes per pixel, rows top to bottom, no
+/// alpha. Cloning shares the pixel buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RgbSurface {
+    /// Width in pixels.
     pub width: u32,
+    /// Height in pixels.
     pub height: u32,
+    /// Bytes from the start of one row to the start of the next: `width * 3`.
     pub stride: usize,
+    /// Pixel bytes; row `y` starts at `y * stride`.
     pub pixels: Arc<[u8]>,
 }
 
+/// An owned 8-bit grayscale raster: one byte per pixel, rows top to bottom.
+/// Cloning shares the pixel buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraySurface {
+    /// Width in pixels.
     pub width: u32,
+    /// Height in pixels.
     pub height: u32,
+    /// Bytes from the start of one row to the start of the next. At least
+    /// `width`; a row may carry padding after its pixels.
     pub stride: usize,
+    /// Pixel bytes; row `y` starts at `y * stride`.
     pub pixels: Arc<[u8]>,
 }
 
 /// Host raster owned by this API. Renderer surface types do not leave this crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RasterPlane {
+    /// An RGB raster, from a product with [`RasterFormat::Rgb8`].
     Rgb8(RgbSurface),
+    /// A grayscale raster, from a product with [`RasterFormat::Gray8`].
     Gray8(GraySurface),
 }
 
+/// One rendered region of a [`PageOutputPlan`], with the target it was
+/// rendered for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedRegion {
+    /// The plan entry this raster answers.
     pub target: RegionTarget,
+    /// The rendered pixels.
     pub plane: RasterPlane,
 }
 
+/// The rasters [`RenderSession::render_output_plan`] produced for one page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageRasterProducts {
+    /// The main page raster.
     pub base: RasterPlane,
+    /// The plan's regions, in plan order.
     pub regions: Vec<RenderedRegion>,
+    /// The raster for text recognition, when the plan asked for one.
     pub ocr: Option<RasterPlane>,
 }
 
@@ -374,7 +525,9 @@ pub struct PageRasterProducts {
 /// source `/Decode [0 1]` becomes an output stencil `/Decode [1 0]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Jbig2StencilPolarity {
+    /// Samples of 0 are painted.
     PaintZero,
+    /// Samples of 1 are painted.
     PaintOne,
 }
 
@@ -384,11 +537,17 @@ pub enum Jbig2StencilPolarity {
 /// and analysis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreservedJbig2Smask {
+    /// The mask's embedded JBIG2 stream, as stored in the PDF.
     pub page_data: Arc<[u8]>,
+    /// The stream's `/JBIG2Globals` data. Empty when it has none.
     pub global_data: Arc<[u8]>,
+    /// Width of the mask in its own pixels.
     pub native_width: u32,
+    /// Height of the mask in its own pixels.
     pub native_height: u32,
+    /// Which sample value paints when the stream is written back as a stencil.
     pub stencil_polarity: Jbig2StencilPolarity,
+    /// The mask's opacity resampled to the requested target size.
     pub working_coverage: GraySurface,
 }
 
@@ -405,6 +564,32 @@ pub struct RenderSession {
 }
 
 impl RenderSession {
+    /// Open a PDF held in memory.
+    ///
+    /// `password` is the user or owner password of an encrypted document; pass
+    /// `None` otherwise. Opening parses the document structure only. Pages are
+    /// interpreted when first compiled, and up to eight compiled pages are kept
+    /// (see [`open_with_cache_capacity`](Self::open_with_cache_capacity)).
+    ///
+    /// A session is `Send` and `Sync`: share it by reference or in an `Arc` and
+    /// render different pages from different threads.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::Open`] when the bytes cannot be opened as a PDF, including a
+    /// missing or wrong password. [`examine_document`](crate::examine_document) tells those cases apart
+    /// without failing.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    ///
+    /// let bytes: Arc<[u8]> = std::fs::read("document.pdf")?.into();
+    /// let session = exprim::RenderSession::open(bytes, None)?;
+    /// println!("{} pages", session.page_count());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn open(bytes: Arc<[u8]>, password: Option<&str>) -> Result<Self, ReadError> {
         Self::open_with_cache_capacity(bytes, password, 8)
     }
@@ -439,10 +624,18 @@ impl RenderSession {
         self.id
     }
 
+    /// Number of pages in the document.
     pub fn page_count(&self) -> u32 {
         self.snapshot.page_count()
     }
 
+    /// The page boxes and rotation of `page` (zero-based), read from the page
+    /// dictionary without interpreting its content.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::PageOutOfRange`] when `page` is not below
+    /// [`page_count`](Self::page_count).
     pub fn page_geometry(&self, page: u32) -> Result<PageGeometry, ReadError> {
         let page_ref = self
             .snapshot
@@ -458,6 +651,18 @@ impl RenderSession {
         })
     }
 
+    /// Interpret `page` (zero-based) and return a handle that can be rendered at
+    /// any size, any number of times.
+    ///
+    /// The result is cached in the session, so compiling the same page again is
+    /// cheap, and the text functions ([`page_text`](crate::page_text) and the
+    /// rest) reuse the same compilation. This is
+    /// [`compile_cancellable`](Self::compile_cancellable) without a token.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::PageOutOfRange`] for a bad index and [`ReadError::Compile`]
+    /// when the page cannot be interpreted. A failure affects that page only.
     pub fn compile(&self, page: u32) -> Result<Arc<CompiledDocumentPage>, ReadError> {
         self.compile_cancellable(page, None)
     }
@@ -509,6 +714,34 @@ impl RenderSession {
         self.pages.clear();
     }
 
+    /// Rasterize a compiled page into `product`.
+    ///
+    /// The output is composited over white with the page's annotations drawn.
+    /// Call it from any thread; each thread keeps its own scratch memory.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::InvalidRasterProduct`] for a zero-sized product and
+    /// [`ReadError::Render`] when rendering fails.
+    ///
+    /// # Examples
+    ///
+    /// Render the first page at 150 DPI and read its pixels:
+    ///
+    /// ```no_run
+    /// use exprim::{RasterPlane, RasterProduct, RenderSession};
+    /// # let bytes: std::sync::Arc<[u8]> = std::fs::read("document.pdf")?.into();
+    ///
+    /// let session = RenderSession::open(bytes, None)?;
+    /// let page = session.compile(0)?;
+    /// let (width, height) = session.page_pixel_size(0, 150.0)?;
+    /// let plane = session.render(&page, &RasterProduct::rgb8(width, height))?;
+    /// if let RasterPlane::Rgb8(surface) = plane {
+    ///     let first_row = &surface.pixels[..surface.width as usize * 3];
+    ///     assert_eq!(first_row.len(), width as usize * 3);
+    /// }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn render(
         &self,
         page: &Arc<CompiledDocumentPage>,
@@ -517,6 +750,8 @@ impl RenderSession {
         self.render_cancellable(page, product, None)
     }
 
+    /// [`render`](Self::render) with cooperative cancellation: when the token is
+    /// cancelled the render stops at its next checkpoint and returns an error.
     pub fn render_cancellable(
         &self,
         page: &Arc<CompiledDocumentPage>,
@@ -649,6 +884,9 @@ impl RenderSession {
         }
     }
 
+    /// Render the base raster, every region and the text-recognition raster of
+    /// `plan` from one compiled page, in that order. The first error ends the
+    /// call.
     pub fn render_output_plan(
         &self,
         page: &Arc<CompiledDocumentPage>,

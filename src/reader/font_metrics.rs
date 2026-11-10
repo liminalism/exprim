@@ -20,9 +20,13 @@ use skrifa::raw::types::NameId;
 /// A font's global bounding box in design units (`head`'s `xMin`..`yMax`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FaceBBox {
+    /// Left edge.
     pub x_min: i16,
+    /// Bottom edge.
     pub y_min: i16,
+    /// Right edge.
     pub x_max: i16,
+    /// Top edge.
     pub y_max: i16,
 }
 
@@ -32,6 +36,8 @@ pub struct FaceBBox {
 /// [`Self::units_per_em`]), which is what a `FontDescriptor` wants.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FaceMetrics {
+    /// Design units per em, the grid every other distance is measured on
+    /// (commonly 1000 or 2048).
     pub units_per_em: u16,
     /// `maxp`'s glyph count.
     pub num_glyphs: u16,
@@ -44,6 +50,7 @@ pub struct FaceMetrics {
     pub cap_height: i16,
     /// Counter-clockwise degrees from vertical; 0 for upright faces.
     pub italic_angle: f32,
+    /// The font's global bounding box.
     pub bbox: FaceBBox,
     /// name ID 6, when present.
     pub post_script_name: Option<String>,

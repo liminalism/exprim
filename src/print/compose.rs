@@ -115,10 +115,13 @@ impl ComposeOptions {
 /// A composed sheet raster, top-down, tightly packed.
 #[derive(Debug, Clone)]
 pub struct SheetRaster {
+    /// Width in pixels.
     pub width: u32,
+    /// Height in pixels.
     pub height: u32,
     /// 1 for grayscale, 3 for RGB.
     pub channels: u8,
+    /// Pixel bytes, `width * height * channels` long, rows top to bottom.
     pub pixels: Vec<u8>,
 }
 

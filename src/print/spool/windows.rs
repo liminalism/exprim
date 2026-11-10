@@ -53,12 +53,18 @@ const JOB_STATUS_PRINTING: u32 = 0x0000_0010;
 const JOB_STATUS_PRINTED: u32 = 0x0000_0080;
 const JOB_STATUS_DELETED: u32 = 0x0000_0100;
 
+/// The Windows print spooler (winspool and GDI).
+///
+/// Experimental: it compiles and is exercised by tests, but has not been
+/// verified against a physical printer queue. Jobs are always composed to
+/// bitmaps; a failed job is aborted, never committed as a partial document.
 #[derive(Debug, Default)]
 pub struct WindowsSpooler {
     _private: (),
 }
 
 impl WindowsSpooler {
+    /// A handle to the Windows spooler. Holds no system resources until used.
     #[must_use]
     pub fn new() -> Self {
         Self { _private: () }
