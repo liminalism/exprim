@@ -993,7 +993,7 @@ fn decode_new_significant(
     vertical_causal: bool,
 ) {
     let lu = sign_lut_index(*word, s.mid[x], s.mid[x + 2], shift);
-    let sign = u32::from(decoder.decode_with_ctx(LUT_CTXNO_SC[lu]) ^ LUT_SPB[lu]);
+    let sign = u32::from(decoder.decode_unpredictable(LUT_CTXNO_SC[lu]) ^ LUT_SPB[lu]);
     *s.sample(x, shift) = if sign != 0 {
         -one_plus_half
     } else {
@@ -1029,7 +1029,9 @@ fn sigpass_decode(
                 let shift = pending.trailing_zeros();
                 let ctx = lut[((word >> shift) & T1_SIGMA_NEIGHBOURS) as usize];
                 word |= T1_PI_0 << shift;
-                if decoder.decode_with_ctx(ctx) != 0 {
+                // Next to a significant neighbour, significance is anyone's
+                // guess; the cleanup pass's leftovers mostly stay zero.
+                if decoder.decode_unpredictable(ctx) != 0 {
                     decode_new_significant(
                         decoder,
                         &mut s,
@@ -1149,7 +1151,8 @@ fn refpass_decode(
             let mut pending = refined;
             loop {
                 let shift = pending.trailing_zeros();
-                let bit = decoder.decode_with_ctx(magnitude_context(word, shift));
+                // A refinement bit is close to a coin flip.
+                let bit = decoder.decode_unpredictable(magnitude_context(word, shift));
                 refine_sample(s.sample(x, shift), bit, one);
                 pending &= pending - 1;
                 if pending == 0 {

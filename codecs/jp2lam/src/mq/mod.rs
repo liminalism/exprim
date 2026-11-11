@@ -1,4 +1,5 @@
 pub(crate) const MQC_NUMCTXS: usize = 19;
+
 pub(crate) const BYPASS_CT_INIT: u32 = 0xDEAD_BEEF;
 
 pub(crate) const T1_CTXNO_ZC: u8 = 0;
@@ -67,11 +68,6 @@ pub(crate) struct MqDecoder<'a> {
     a: u32,
     c: u64,
     ct: u32,
-    /// `max(Chigh + 1, 0x8000)`: a decision is an MPS with no
-    /// renormalisation exactly when the reduced interval `A - Qe` is still at
-    /// least this, which makes the common case one subtraction and one
-    /// compare. `C` only changes on the other path, which refreshes it.
-    fast_floor: u32,
     ctxs: MqDecoderContexts,
 }
 
@@ -88,14 +84,12 @@ impl<'a> MqDecoder<'a> {
             a: 0x8000,
             c: u64::from(first ^ 0xff) << 48,
             ct: 0,
-            fast_floor: 0,
             ctxs: [MQ_DECODE_STATES[0]; MQC_NUMCTXS],
         };
         decoder.reset_contexts();
         decoder.fill();
         decoder.c <<= 7;
         decoder.ct -= 7;
-        decoder.fast_floor = decoder.fast_floor_for_c();
         decoder
     }
 
@@ -111,20 +105,18 @@ impl<'a> MqDecoder<'a> {
         self.ctxs
     }
 
-    #[inline(always)]
-    fn fast_floor_for_c(&self) -> u32 {
-        ((self.c >> 48) as u32 + 1).max(0x8000)
-    }
-
-    /// DECODE (C.3.2, T.88 Figure G.2): one binary decision in context `ctx`.
+    /// DECODE (C.3.2, T.88 Figure G.2): one binary decision in context `ctx`,
+    /// for decisions that mostly come out as the MPS — the cleanup pass's
+    /// run-length and isolated-sample decisions. An MPS that needs no
+    /// renormalisation is one subtraction and one test, a branch that is
+    /// then usually right; the rest is computed without branches.
+    ///
+    /// Where decisions are close to coin flips that test mispredicts about
+    /// as often as not, and [`Self::decode_unpredictable`] is the faster way
+    /// to the same result. The two are interchangeable decision by decision.
+    ///
     /// Inlined into the Tier-1 pass loops, where the decoder registers then
     /// stay in machine registers across consecutive decisions.
-    ///
-    /// Everything but the common case — an MPS that needs no
-    /// renormalisation — is computed without branches: which sub-interval the
-    /// code value fell in and whether the conditional exchange applies are
-    /// close to coin flips on the bit-planes that carry most of a codeword,
-    /// and a mispredicted branch costs more than the whole decision.
     #[inline(always)]
     pub(crate) fn decode_with_ctx(&mut self, ctx: u8) -> u8 {
         let ctx_index = ctx as usize;
@@ -132,13 +124,14 @@ impl<'a> MqDecoder<'a> {
         let mps = state & 1;
         let qe = state >> 16;
         let a = self.a.wrapping_sub(qe);
-        if a >= self.fast_floor {
+        let chigh = (self.c >> 48) as u32;
+        if (a >= 0x8000) & (a > chigh) {
             self.a = a;
             return mps as u8;
         }
 
         // The code value is in the LPS sub-interval when `Chigh >= A`.
-        let lps = u32::from((self.c >> 48) as u32 >= a);
+        let lps = u32::from(chigh >= a);
         let lps_mask = lps.wrapping_neg();
         self.c = self.c.wrapping_sub(u64::from(a & lps_mask) << 48);
         // MPS_EXCHANGE / LPS_EXCHANGE: the sub-intervals swap meaning when
@@ -155,9 +148,42 @@ impl<'a> MqDecoder<'a> {
         self.c <<= shift;
         self.ct -= shift;
         if self.ct < MQ_MAX_RENORM_SHIFT {
-            self.fill();
+            self.refill();
         }
-        self.fast_floor = self.fast_floor_for_c();
+        (mps ^ is_lps_symbol) as u8
+    }
+
+    /// [`Self::decode_with_ctx`] with no fast path: every decision runs the
+    /// same branch-free sequence, whichever sub-interval the code value is
+    /// in and whether or not it renormalises. For decisions a branch
+    /// predictor cannot learn — refinement bits, signs, and the significance
+    /// of samples that already have significant neighbours — where a
+    /// mispredicted branch costs more than the whole decision.
+    #[inline(always)]
+    pub(crate) fn decode_unpredictable(&mut self, ctx: u8) -> u8 {
+        let ctx_index = ctx as usize;
+        let state = self.ctxs[ctx_index];
+        let mps = state & 1;
+        let qe = state >> 16;
+        let a = self.a.wrapping_sub(qe);
+        let lps = u32::from((self.c >> 48) as u32 >= a);
+        let lps_mask = lps.wrapping_neg();
+        self.c = self.c.wrapping_sub(u64::from(a & lps_mask) << 48);
+        let is_lps_symbol = lps ^ u32::from(a < qe);
+        let next = MQ_DECODE_STATES[((state >> (8 * is_lps_symbol)) & 0x7f) as usize];
+        let a = (a & !lps_mask) | (qe & lps_mask);
+        // The state moves on only when the decision renormalises. Written as
+        // a plain `if`, this select is compiled to a jump over the table
+        // load above, which puts back the branch this method exists to avoid.
+        self.ctxs[ctx_index] = core::hint::select_unpredictable(a < 0x8000, next, state);
+        // RENORMD (C.3.3): no shift when `a` is still normalised.
+        let shift = a.leading_zeros() - 16;
+        self.a = a << shift;
+        self.c <<= shift;
+        self.ct -= shift;
+        if self.ct < MQ_MAX_RENORM_SHIFT {
+            self.refill();
+        }
         (mps ^ is_lps_symbol) as u8
     }
 
@@ -182,13 +208,33 @@ impl<'a> MqDecoder<'a> {
         self.set_state(T1_CTXNO_ZC, 0, 4);
     }
 
+    /// Buffer more input once fewer bits are left than a renormalisation
+    /// may shift out. Away from 0xff bytes, which carry the bit stuffing, and
+    /// from the end of the segment, the next two BYTEINs are one addition:
+    /// each adds its byte's complement eight bits below the one before.
+    #[inline(always)]
+    fn refill(&mut self) {
+        if let Some(&[current, next, after]) =
+            self.bytes[self.bp.min(self.bytes.len())..].first_chunk()
+            && current != 0xff
+            && next != 0xff
+        {
+            let pair = u64::from(!u16::from_be_bytes([next, after]));
+            self.c = self.c.wrapping_add(pair << (32 - self.ct));
+            self.ct += 16;
+            self.bp += 2;
+        } else {
+            self.fill();
+        }
+    }
+
     /// BYTEIN (T.88 Figure G.3), repeated until at least 25 bits are
     /// buffered. A byte that the standard adds at bit 8 of its 32-bit
     /// register once the buffer has run dry is added `ct` bits early, so
     /// `ct` places further down. Past the end of the segment the decoder
     /// sees 0xff bytes (D.4.1), which add nothing to the complemented
     /// register.
-    #[inline(always)]
+    #[inline(never)]
     fn fill(&mut self) {
         while self.ct <= 24 {
             let position = 32 - self.ct;
@@ -827,6 +873,51 @@ mod reference {
 #[cfg(test)]
 mod tests {
     use super::{MqCoder, MqDecoder, T1_CTXNO_AGG, T1_CTXNO_UNI, T1_CTXNO_ZC};
+
+    /// The fast-path and branch-free decisions are the same decision: any
+    /// mix of the two decodes the coded bits and leaves the same decoder.
+    #[test]
+    fn unpredictable_decode_matches_fast_path_decode() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for skew in [1u64, 2, 5, 40] {
+            let symbols: Vec<(u8, u8)> = (0..20_000)
+                .map(|_| {
+                    let ctx = (next() % super::MQC_NUMCTXS as u64) as u8;
+                    // Per-context bias, so some contexts adapt to skewed
+                    // states and others stay near one half.
+                    let bit = u8::from(next() % (skew + u64::from(ctx % 3)) == 0);
+                    (ctx, bit)
+                })
+                .collect();
+            let mut coder = MqCoder::new();
+            for &(ctx, bit) in &symbols {
+                coder.encode_with_ctx(ctx, bit);
+            }
+            let bytes = coder.finish();
+
+            let mut fast = MqDecoder::new(&bytes);
+            let mut branch_free = MqDecoder::new(&bytes);
+            let mut mixed = MqDecoder::new(&bytes);
+            for (index, &(ctx, bit)) in symbols.iter().enumerate() {
+                assert_eq!(fast.decode_with_ctx(ctx), bit, "skew {skew} symbol {index}");
+                assert_eq!(branch_free.decode_unpredictable(ctx), bit);
+                let decoded = if next() & 1 == 0 {
+                    mixed.decode_with_ctx(ctx)
+                } else {
+                    mixed.decode_unpredictable(ctx)
+                };
+                assert_eq!(decoded, bit);
+            }
+            assert_eq!(format!("{fast:?}"), format!("{branch_free:?}"));
+            assert_eq!(format!("{fast:?}"), format!("{mixed:?}"));
+        }
+    }
 
     #[test]
     fn reset_initializes_special_contexts() {
