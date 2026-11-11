@@ -65,7 +65,7 @@ pub(super) fn decode_codeblock_segments_reference(
         .checked_sub(zero_bitplanes)
         .ok_or_else(|| invalid("zero-bitplane count exceeds subband bit-plane count"))?;
     if magnitude_bitplanes == 0 {
-        return Err(invalid("non-empty code-block has no magnitude bit-planes"));
+        return Ok(scratch.coefficients.clone());
     }
     // Coefficients are represented as signed i32 magnitudes throughout this
     // decoder. A 32nd magnitude bit would make `1i32 << bitplane` negative,
@@ -78,11 +78,7 @@ pub(super) fn decode_codeblock_segments_reference(
         )));
     }
     let max_passes = 1u32 + 3u32 * u32::from(magnitude_bitplanes.saturating_sub(1));
-    if pass_count > max_passes {
-        return Err(invalid(format!(
-            "code-block pass count {pass_count} exceeds maximum {max_passes} for {magnitude_bitplanes} magnitude bit-planes"
-        )));
-    }
+    let pass_limit = pass_count.min(max_passes);
 
     let top = magnitude_bitplanes - 1;
     let mut pass_index = 0u32;
@@ -97,6 +93,9 @@ pub(super) fn decode_codeblock_segments_reference(
         if style.pass_is_raw(pass_index) {
             let mut raw = RawDecoder::new(&segment.data);
             for _ in 0..segment.passes {
+                if pass_index == pass_limit {
+                    return Ok(scratch.coefficients.clone());
+                }
                 let (pass_kind, bitplane) = pass_kind_and_bitplane(pass_index, top)?;
                 let pass_start = stats.start();
                 match pass_kind {
@@ -144,6 +143,9 @@ pub(super) fn decode_codeblock_segments_reference(
         };
 
         for _ in 0..segment.passes {
+            if pass_index == pass_limit {
+                return Ok(scratch.coefficients.clone());
+            }
             let (pass_kind, bitplane) = pass_kind_and_bitplane(pass_index, top)?;
             if style.pass_is_raw(pass_index) {
                 return Err(invalid("bypass-coded pass inside an MQ codeword segment"));
