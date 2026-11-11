@@ -1,0 +1,19 @@
+# Standalone measurement crate for the multi-stream MQ experiment (README.md).
+# Not part of the jp2lam package or workspace; it compiles the production
+# `src/mq/mod.rs` directly, so it measures the decoder that ships.
+[package]
+name = "mq-interleave-experiment"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[profile.release]
+debug = true
+lto = "fat"
+codegen-units = 1

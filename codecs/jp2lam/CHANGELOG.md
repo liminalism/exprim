@@ -7,10 +7,15 @@ Decoded output is bit-identical to 0.3.1 on every stream 0.3.1 decoded.
 ### Decoding performance
 
 - MQ decoder in the software-conventions form (ITU-T T.88 Annex G) with a
-  64-bit code register that buffers input a few bytes ahead: an MPS that
-  needs no renormalisation is one subtraction and one compare, and the
-  exchange and renormalisation path has no data-dependent branches. A
-  context holds its whole probability state, so a decision is one load.
+  64-bit code register that buffers input ahead, two plain bytes at a time
+  away from 0xff bytes. A context holds its whole probability state, so a
+  decision is one load.
+- Two forms of the MQ decision. `decode_with_ctx` tests first for an MPS
+  that needs no renormalisation, one subtraction and one compare; the
+  cleanup pass and the run-length symbols, which mostly come out that way,
+  use it. `decode_unpredictable` runs every decision through one
+  branch-free sequence; refinement bits, signs and significance-pass
+  decisions, which a branch predictor cannot learn, use that.
 - The three Tier-1 passes derive, from each stripe column's flag word, the
   set of samples they code and visit only those, instead of testing every
   sample in every pass. Block scratch is kept in coding order (the four
@@ -18,11 +23,17 @@ Decoded output is bit-identical to 0.3.1 on every stream 0.3.1 decoded.
 - Gray output runs in row bands across the worker budget: the finest 9/7
   level with its conversion to bytes, and the 5/3 and planar 9/7 writers.
   The eight-bit conversion loop is separate from the rescaling one so the
-  compiler vectorises it (about 3% of a 9/7 gray decode).
-- Measured on 11-megapixel OpenJPEG-encoded streams, single thread, against
-  0.3.1: lossless 5/3 RGB 3260 → about 2000-2300 ms, lossless gray scan
-  1130 → 650 ms, 9/7 gray 276 → about 200 ms, 9/7 RGB 499 → 415 ms. With
-  four workers 9/7 gray goes 107 → 62 ms.
+  compiler vectorises it.
+- Measured against 0.3.1 on 9 to 11 megapixel OpenJPEG-encoded streams, the
+  two builds run alternately on one pinned core: lossless 5/3 gray scan
+  1275 → 715 ms, lossless 5/3 RGB 3745 → 2311 ms, 9/7 RGB 636 → 471 ms,
+  9/7 gray photograph 298 → 212 ms, 9/7 gray scan 144 → 108 ms. With four
+  workers: 347 → 213, 1057 → 705, 177 → 133, 108 → 61 and 65 → 35 ms.
+- Not adopted: decoding two code blocks at a time on one core, a stripe
+  column of each in turn, so that their arithmetic decoders overlap. It
+  works in isolation and is 3 to 8 % slower in the decoder. Method,
+  numbers, benchmark and prototype are in
+  `decode-fix-plan/mq-interleave-experiment/`.
 
 ### Decoding robustness
 

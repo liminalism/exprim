@@ -1,0 +1,174 @@
+diff --git a/codecs/jp2lam/Cargo.toml b/codecs/jp2lam/Cargo.toml
+index dfc1c8f..8b81ba4 100644
+--- a/codecs/jp2lam/Cargo.toml
++++ b/codecs/jp2lam/Cargo.toml
+@@ -49,6 +49,7 @@ image        = ["dep:image"]
+ profile = []
+ counters = []
+ simd = ["dep:wide"]
++mq-trace = []
+ 
+ [dependencies]
+ chrono = { version = "0.4", optional = true, default-features = false, features = ["clock"] }
+diff --git a/codecs/jp2lam/decode-fix-plan/mq-interleave-experiment/Cargo.toml b/codecs/jp2lam/decode-fix-plan/mq-interleave-experiment/Cargo.toml
+index 688b087..9c88450 100644
+--- a/codecs/jp2lam/decode-fix-plan/mq-interleave-experiment/Cargo.toml
++++ b/codecs/jp2lam/decode-fix-plan/mq-interleave-experiment/Cargo.toml
+@@ -9,10 +9,17 @@ publish = false
+ 
+ [workspace]
+ 
++[dependencies]
++jp2lam = { path = "../..", features = ["mq-trace"] }
++
+ [[bin]]
+ name = "bench"
+ path = "src/bin/bench.rs"
+ 
++[[bin]]
++name = "record"
++path = "src/bin/record.rs"
++
+ [profile.release]
+ debug = true
+ lto = "fat"
+diff --git a/codecs/jp2lam/decode-fix-plan/mq-interleave-experiment/src/bin/record.rs b/codecs/jp2lam/decode-fix-plan/mq-interleave-experiment/src/bin/record.rs
+new file mode 100644
+index 0000000..b9983ac
+--- /dev/null
++++ b/codecs/jp2lam/decode-fix-plan/mq-interleave-experiment/src/bin/record.rs
+@@ -0,0 +1,33 @@
++//! record <in.jp2|in.j2k> <out.trace>: decode on the calling thread and dump
++//! every MQ codeword segment as
++//! `u32 byte count, u32 symbol count, bytes, contexts, bits` (little endian).
++use jp2lam::{DecodeConcurrency, DecodeRequest, Jp2Decoder};
++use std::io::Write;
++
++fn main() {
++    let args: Vec<String> = std::env::args().collect();
++    let bytes = std::fs::read(&args[1]).unwrap();
++    let request = DecodeRequest {
++        concurrency: DecodeConcurrency::Serial,
++        ..Default::default()
++    };
++    Jp2Decoder::new().decode(&bytes, &request).unwrap();
++    let segments = jp2lam::mq::trace::SEGMENTS.with(|s| std::mem::take(&mut *s.borrow_mut()));
++    let mut out = std::io::BufWriter::new(std::fs::File::create(&args[2]).unwrap());
++    let (mut kept, mut symbols, mut skipped) = (0u64, 0u64, 0u64);
++    for segment in &segments {
++        // The replay starts every decoder from the initial context states.
++        if !segment.fresh || segment.contexts.is_empty() {
++            skipped += 1;
++            continue;
++        }
++        out.write_all(&(segment.bytes.len() as u32).to_le_bytes()).unwrap();
++        out.write_all(&(segment.contexts.len() as u32).to_le_bytes()).unwrap();
++        out.write_all(&segment.bytes).unwrap();
++        out.write_all(&segment.contexts).unwrap();
++        out.write_all(&segment.bits).unwrap();
++        kept += 1;
++        symbols += segment.contexts.len() as u64;
++    }
++    eprintln!("{}: {kept} segments, {symbols} symbols, {skipped} skipped", args[1]);
++}
+diff --git a/codecs/jp2lam/src/lib.rs b/codecs/jp2lam/src/lib.rs
+index 42aa434..e6a74c5 100644
+--- a/codecs/jp2lam/src/lib.rs
++++ b/codecs/jp2lam/src/lib.rs
+@@ -9,6 +9,9 @@ mod image_encoder;
+ mod j2k;
+ mod jp2;
+ mod model;
++#[cfg(feature = "mq-trace")]
++pub mod mq;
++#[cfg(not(feature = "mq-trace"))]
+ mod mq;
+ mod perceptual;
+ mod plan;
+diff --git a/codecs/jp2lam/src/mq/mod.rs b/codecs/jp2lam/src/mq/mod.rs
+index b7a1635..14a3799 100644
+--- a/codecs/jp2lam/src/mq/mod.rs
++++ b/codecs/jp2lam/src/mq/mod.rs
+@@ -1,5 +1,31 @@
+ pub(crate) const MQC_NUMCTXS: usize = 19;
+ 
++/// Experiment support (decode-fix-plan/mq-interleave-experiment): records
++/// every decoder's bytes and every decision's context and bit.
++#[cfg(feature = "mq-trace")]
++pub mod trace {
++    use std::cell::RefCell;
++    #[derive(Default)]
++    pub struct Segment {
++        pub bytes: Vec<u8>,
++        pub contexts: Vec<u8>,
++        pub bits: Vec<u8>,
++        /// Started from the initial context states (not a continuation).
++        pub fresh: bool,
++    }
++    thread_local! {
++        pub static SEGMENTS: RefCell<Vec<Segment>> = const { RefCell::new(Vec::new()) };
++    }
++    pub(crate) fn record(ctx: u8, bit: u8) {
++        SEGMENTS.with(|segments| {
++            let mut segments = segments.borrow_mut();
++            let segment = segments.last_mut().unwrap();
++            segment.contexts.push(ctx);
++            segment.bits.push(bit);
++        });
++    }
++}
++
+ pub(crate) const BYPASS_CT_INIT: u32 = 0xDEAD_BEEF;
+ 
+ pub(crate) const T1_CTXNO_ZC: u8 = 0;
+@@ -90,6 +116,14 @@ impl<'a> MqDecoder<'a> {
+         decoder.fill();
+         decoder.c <<= 7;
+         decoder.ct -= 7;
++        #[cfg(feature = "mq-trace")]
++        trace::SEGMENTS.with(|segments| {
++            segments.borrow_mut().push(trace::Segment {
++                bytes: bytes.to_vec(),
++                fresh: true,
++                ..Default::default()
++            })
++        });
+         decoder
+     }
+ 
+@@ -97,6 +131,8 @@ impl<'a> MqDecoder<'a> {
+     /// probability states from the preceding segment.
+     pub(crate) fn new_with_contexts(bytes: &'a [u8], contexts: MqDecoderContexts) -> Self {
+         let mut decoder = Self::new(bytes);
++        #[cfg(feature = "mq-trace")]
++        trace::SEGMENTS.with(|segments| segments.borrow_mut().last_mut().unwrap().fresh = false);
+         decoder.ctxs = contexts;
+         decoder
+     }
+@@ -127,6 +163,8 @@ impl<'a> MqDecoder<'a> {
+         let chigh = (self.c >> 48) as u32;
+         if (a >= 0x8000) & (a > chigh) {
+             self.a = a;
++            #[cfg(feature = "mq-trace")]
++            trace::record(ctx, mps as u8);
+             return mps as u8;
+         }
+ 
+@@ -150,6 +188,8 @@ impl<'a> MqDecoder<'a> {
+         if self.ct < MQ_MAX_RENORM_SHIFT {
+             self.refill();
+         }
++        #[cfg(feature = "mq-trace")]
++        trace::record(ctx, (mps ^ is_lps_symbol) as u8);
+         (mps ^ is_lps_symbol) as u8
+     }
+ 
+@@ -184,6 +224,8 @@ impl<'a> MqDecoder<'a> {
+         if self.ct < MQ_MAX_RENORM_SHIFT {
+             self.refill();
+         }
++        #[cfg(feature = "mq-trace")]
++        trace::record(ctx, (mps ^ is_lps_symbol) as u8);
+         (mps ^ is_lps_symbol) as u8
+     }
+ 

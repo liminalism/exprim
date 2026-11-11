@@ -1,0 +1,918 @@
+diff --git a/codecs/jp2lam/src/decode/mod.rs b/codecs/jp2lam/src/decode/mod.rs
+index 6f88268..91e7b11 100644
+--- a/codecs/jp2lam/src/decode/mod.rs
++++ b/codecs/jp2lam/src/decode/mod.rs
+@@ -318,7 +318,7 @@ pub enum DecodeResult {
+ }
+ 
+ struct DecodeScratch {
+-    tier1: t1::Tier1Scratch,
++    tier1: t1::Tier1Workspace,
+     /// Worker budget of the active request: the most Tier-1 tasks it
+     /// contributes to the shared executor, and whether the post-Tier-1 stages
+     /// (per-plane inverse DWT, fused packing) may fan out at all. A budget of
+@@ -333,7 +333,7 @@ struct DecodeScratch {
+ impl DecodeScratch {
+     fn new() -> Self {
+         Self {
+-            tier1: t1::Tier1Scratch::new(),
++            tier1: t1::Tier1Workspace::new(),
+             workers: 1,
+         }
+     }
+diff --git a/codecs/jp2lam/src/decode/t1.rs b/codecs/jp2lam/src/decode/t1.rs
+index 0156eb1..02aa901 100644
+--- a/codecs/jp2lam/src/decode/t1.rs
++++ b/codecs/jp2lam/src/decode/t1.rs
+@@ -136,6 +136,20 @@ impl Tier1Scratch {
+     }
+ }
+ 
++/// The block scratch of one Tier-1 worker: one [`Tier1Scratch`] per block
++/// it decodes at a time ([`decode_blocks`]).
++pub(crate) struct Tier1Workspace {
++    lanes: [Tier1Scratch; 2],
++}
++
++impl Tier1Workspace {
++    pub(crate) fn new() -> Self {
++        Self {
++            lanes: [Tier1Scratch::new(), Tier1Scratch::new()],
++        }
++    }
++}
++
+ #[cfg(test)]
+ pub(crate) fn decode_tile_components(
+     header: &CodestreamHeader,
+@@ -151,7 +165,7 @@ pub(crate) fn decode_tile_components_profiled(
+     packets: &DecodedTilePackets<'_>,
+     stats: &mut StatsSink<'_>,
+ ) -> Result<Vec<DecodedTileCoefficients>> {
+-    let mut scratch = Tier1Scratch::new();
++    let mut scratch = Tier1Workspace::new();
+     decode_tile_components_with_scratch(header, packets, stats, &mut scratch, 1)
+ }
+ 
+@@ -159,7 +173,7 @@ pub(crate) fn decode_tile_components_with_scratch(
+     header: &CodestreamHeader,
+     packets: &DecodedTilePackets<'_>,
+     stats: &mut StatsSink<'_>,
+-    scratch: &mut Tier1Scratch,
++    scratch: &mut Tier1Workspace,
+     worker_count: usize,
+ ) -> Result<Vec<DecodedTileCoefficients>> {
+     let component_count = header.siz.components.len();
+@@ -199,8 +213,9 @@ pub(crate) fn decode_tile_components_with_scratch(
+     // the active worker budget is one. Otherwise fan the code blocks across
+     // exactly the request's task budget on the shared executor; each block
+     // writes into its own disjoint plane rectangle.
+-    if stats.is_enabled() || worker_count <= 1 {
++    if stats.is_enabled() {
+         let planes = BlockPlanes::new(&mut components);
++        let scratch = &mut scratch.lanes[0];
+         for block in &packets.codeblocks {
+             let params = block_params(header, block)?;
+             decode_codeblock_segments_into(
+@@ -230,6 +245,12 @@ pub(crate) fn decode_tile_components_with_scratch(
+                 stats.tier1_block_output_ns = stats.tier1_block_output_ns.saturating_add(elapsed);
+             });
+         }
++    } else if worker_count <= 1 {
++        let planes = BlockPlanes::new(&mut components);
++        let mut order = 0..packets.codeblocks.len();
++        decode_blocks(header, &packets.codeblocks, &planes, scratch, || {
++            order.next()
++        })?;
+     } else {
+         decode_codeblocks_parallel(header, packets, &mut components, worker_count)?;
+     }
+@@ -412,7 +433,6 @@ fn decode_codeblocks_parallel(
+     worker_count: usize,
+ ) -> Result<()> {
+     let planes = BlockPlanes::new(components);
+-    let style = header.cod.code_block_style;
+     let blocks = &packets.codeblocks;
+ 
+     // Weighted largest-processing-time-first schedule. Code-block decode cost
+@@ -443,55 +463,17 @@ fn decode_codeblocks_parallel(
+     let results = (0..task_count)
+         .into_par_iter()
+         .map(|_| -> Result<()> {
+-            let mut scratch = Tier1Scratch::new();
+-            let mut sink = StatsSink::disabled();
+-            loop {
++            let mut scratch = Tier1Workspace::new();
++            let result = decode_blocks(header, blocks, &planes, &mut scratch, || {
+                 if failed.load(Ordering::Relaxed) {
+-                    return Ok(());
+-                }
+-                let next = cursor.fetch_add(1, Ordering::Relaxed);
+-                let Some(&index) = order.get(next) else {
+-                    return Ok(());
+-                };
+-                let block = &blocks[index];
+-                let params = match block_params(header, block) {
+-                    Ok(params) => params,
+-                    Err(error) => {
+-                        failed.store(true, Ordering::Relaxed);
+-                        return Err(error);
+-                    }
+-                };
+-                if let Err(error) = decode_codeblock_segments_into(
+-                    params.block_width,
+-                    params.block_height,
+-                    block.band,
+-                    params.max_bitplanes,
+-                    block.zero_bitplanes,
+-                    block.passes,
+-                    style,
+-                    &block.segments,
+-                    &mut scratch,
+-                    &mut sink,
+-                ) {
+-                    failed.store(true, Ordering::Relaxed);
+-                    return Err(error);
+-                }
+-                // SAFETY: code blocks tile pairwise-disjoint rectangles of each
+-                // component plane, so no two parallel writes overlap.
+-                let write = unsafe {
+-                    planes.write_block(
+-                        block.component,
+-                        block.x0 as usize,
+-                        block.y0 as usize,
+-                        &scratch,
+-                        params.step,
+-                    )
+-                };
+-                if let Err(error) = write {
+-                    failed.store(true, Ordering::Relaxed);
+-                    return Err(error);
++                    return None;
+                 }
++                order.get(cursor.fetch_add(1, Ordering::Relaxed)).copied()
++            });
++            if result.is_err() {
++                failed.store(true, Ordering::Relaxed);
+             }
++            result
+         })
+         .collect::<Vec<_>>();
+ 
+@@ -638,6 +620,39 @@ fn decode_codeblock_segments(
+     })
+ }
+ 
++/// The coding passes a non-empty block's signalling lets a decoder run: the
++/// index of its top magnitude bit-plane and the number of passes to decode,
++/// or `None` when there is nothing to decode.
++fn pass_plan(max_bitplanes: u8, zero_bitplanes: u32, pass_count: u32) -> Result<Option<(u8, u32)>> {
++    let zero_bitplanes = u8::try_from(zero_bitplanes)
++        .map_err(|_| invalid("zero-bitplane count exceeds supported range"))?;
++    let magnitude_bitplanes = max_bitplanes
++        .checked_sub(zero_bitplanes)
++        .ok_or_else(|| invalid("zero-bitplane count exceeds subband bit-plane count"))?;
++    // A block may be signalled with more coding passes than its bit-planes
++    // can hold (or with passes and no bit-planes at all): some encoders
++    // include every block of an empty region with a zero-length pass in each
++    // layer. There is nothing those passes could code, so decoding stops at
++    // the last bit-plane, as OpenJPEG's does, instead of rejecting the image.
++    if magnitude_bitplanes == 0 {
++        return Ok(None);
++    }
++    // Coefficients are represented as signed i32 magnitudes throughout this
++    // decoder. A 32nd magnitude bit would make `1i32 << bitplane` negative,
++    // and any still-higher bit would overflow the shift entirely. Reject such
++    // signaling before entering the coding passes instead of panicking or
++    // silently wrapping on malformed QCD/QCC metadata.
++    if magnitude_bitplanes > 31 {
++        return Err(invalid(format!(
++            "code-block magnitude bit-plane count {magnitude_bitplanes} exceeds the i32 decoder limit of 31"
++        )));
++    }
++    let max_passes = 1u32 + 3u32 * u32::from(magnitude_bitplanes.saturating_sub(1));
++    let pass_limit = pass_count.min(max_passes);
++
++    Ok(Some((magnitude_bitplanes - 1, pass_limit)))
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn decode_codeblock_segments_into(
+     width: usize,
+@@ -666,33 +681,9 @@ fn decode_codeblock_segments_into(
+         )));
+     }
+ 
+-    let zero_bitplanes = u8::try_from(zero_bitplanes)
+-        .map_err(|_| invalid("zero-bitplane count exceeds supported range"))?;
+-    let magnitude_bitplanes = max_bitplanes
+-        .checked_sub(zero_bitplanes)
+-        .ok_or_else(|| invalid("zero-bitplane count exceeds subband bit-plane count"))?;
+-    // A block may be signalled with more coding passes than its bit-planes
+-    // can hold (or with passes and no bit-planes at all): some encoders
+-    // include every block of an empty region with a zero-length pass in each
+-    // layer. There is nothing those passes could code, so decoding stops at
+-    // the last bit-plane, as OpenJPEG's does, instead of rejecting the image.
+-    if magnitude_bitplanes == 0 {
++    let Some((top, pass_limit)) = pass_plan(max_bitplanes, zero_bitplanes, pass_count)? else {
+         return Ok(());
+-    }
+-    // Coefficients are represented as signed i32 magnitudes throughout this
+-    // decoder. A 32nd magnitude bit would make `1i32 << bitplane` negative,
+-    // and any still-higher bit would overflow the shift entirely. Reject such
+-    // signaling before entering the coding passes instead of panicking or
+-    // silently wrapping on malformed QCD/QCC metadata.
+-    if magnitude_bitplanes > 31 {
+-        return Err(invalid(format!(
+-            "code-block magnitude bit-plane count {magnitude_bitplanes} exceeds the i32 decoder limit of 31"
+-        )));
+-    }
+-    let max_passes = 1u32 + 3u32 * u32::from(magnitude_bitplanes.saturating_sub(1));
+-    let pass_limit = pass_count.min(max_passes);
+-
+-    let top = magnitude_bitplanes - 1;
++    };
+     let mut pass_index = 0u32;
+     let mut contexts = None;
+ 
+@@ -762,36 +753,33 @@ fn decode_codeblock_segments_into(
+             if style.pass_is_raw(pass_index) {
+                 return Err(invalid("bypass-coded pass inside an MQ codeword segment"));
+             }
++            let consts = PassConsts::new(band, bitplane, style.vertical_causal);
+             let pass_start = stats.start();
+             match pass_kind {
+-                PassKind::Significance => sigpass_decode(
++                PassKind::Significance => run_pass::<SignificancePass>(
+                     &mut decoder,
+-                    band,
+-                    bitplane,
+                     &mut scratch.flags,
+                     &mut scratch.coefficients,
+                     width,
+                     height,
+-                    style.vertical_causal,
++                    &consts,
+                 ),
+-                PassKind::Refinement => refpass_decode(
++                PassKind::Refinement => run_pass::<RefinementPass>(
+                     &mut decoder,
+-                    bitplane,
+                     &mut scratch.flags,
+                     &mut scratch.coefficients,
+                     width,
+                     height,
++                    &consts,
+                 ),
+                 PassKind::Cleanup => {
+-                    cleanup_decode(
++                    run_pass::<CleanupPass>(
+                         &mut decoder,
+-                        band,
+-                        bitplane,
+                         &mut scratch.flags,
+                         &mut scratch.coefficients,
+                         width,
+                         height,
+-                        style.vertical_causal,
++                        &consts,
+                     );
+                     if style.segmentation_symbols {
+                         read_segmentation_symbol(&mut decoder, pass_index + 1 == pass_count)?;
+@@ -1002,61 +990,178 @@ fn decode_new_significant(
+     mark_significant(s, x, word, shift, sign, vertical_causal);
+ }
+ 
+-/// Significance propagation pass (D.3.1) over the whole block.
+-#[allow(clippy::too_many_arguments)]
+-fn sigpass_decode(
++/// The zero-coding context tables (Table D.1), one per subband orientation.
++static ZERO_CODING_LUTS: [[u8; 512]; 4] = LUT_CTXNO_ZC;
++
++/// What a coding pass needs to know besides the stripe it is walking.
++#[derive(Clone, Copy)]
++struct PassConsts {
++    lut: &'static [u8; 512],
++    /// `2^bitplane`.
++    one: i32,
++    /// The midpoint value of a sample that becomes significant in this
++    /// bit-plane.
++    one_plus_half: i32,
++    vertical_causal: bool,
++}
++
++impl PassConsts {
++    fn new(band: BandOrientation, bitplane: u8, vertical_causal: bool) -> Self {
++        let one = 1i32 << bitplane;
++        Self {
++            lut: &ZERO_CODING_LUTS[orientation_index(band)],
++            one,
++            one_plus_half: one | (one >> 1),
++            vertical_causal,
++        }
++    }
++}
++
++/// One MQ-coded pass, as the work it does on one stripe column. A pass over
++/// a block is this for every column of every stripe ([`run_pass`]); written
++/// per column so that two blocks' passes can also be advanced a column at a
++/// time each ([`pair_columns`]).
++trait ColumnKernel {
++    fn column(decoder: &mut MqDecoder<'_>, s: &mut Stripe<'_>, x: usize, k: &PassConsts);
++}
++
++/// Significance propagation pass (D.3.1).
++struct SignificancePass;
++/// Magnitude refinement pass (D.3.3).
++struct RefinementPass;
++/// Cleanup pass (D.3.4), with run-length coding of columns whose word is
++/// zero in a full stripe.
++struct CleanupPass;
++
++impl ColumnKernel for SignificancePass {
++    #[inline(always)]
++    fn column(decoder: &mut MqDecoder<'_>, s: &mut Stripe<'_>, x: usize, k: &PassConsts) {
++        let mut word = s.mid[x + 1];
++        let mut pending = significance_candidates(word) & s.rows;
++        if pending == 0 {
++            return;
++        }
++        loop {
++            let shift = pending.trailing_zeros();
++            let ctx = k.lut[((word >> shift) & T1_SIGMA_NEIGHBOURS) as usize];
++            word |= T1_PI_0 << shift;
++            // Next to a significant neighbour, significance is anyone's
++            // guess; the cleanup pass's leftovers mostly stay zero.
++            if decoder.decode_unpredictable(ctx) != 0 {
++                decode_new_significant(
++                    decoder,
++                    s,
++                    x,
++                    &mut word,
++                    shift,
++                    k.one_plus_half,
++                    k.vertical_causal,
++                );
++                // The sample below just gained a neighbour.
++                pending = significance_candidates(word) & s.rows;
++            }
++            // Only samples after this one in the scan remain.
++            pending &= !1 << shift;
++            if pending == 0 {
++                break;
++            }
++        }
++        s.mid[x + 1] = word;
++    }
++}
++
++impl ColumnKernel for RefinementPass {
++    #[inline(always)]
++    fn column(decoder: &mut MqDecoder<'_>, s: &mut Stripe<'_>, x: usize, k: &PassConsts) {
++        let word = s.mid[x + 1];
++        let refined = refinement_samples(word);
++        if refined == 0 {
++            return;
++        }
++        let mut pending = refined;
++        loop {
++            let shift = pending.trailing_zeros();
++            // A refinement bit is close to a coin flip.
++            let bit = decoder.decode_unpredictable(magnitude_context(word, shift));
++            refine_sample(s.sample(x, shift), bit, k.one);
++            pending &= pending - 1;
++            if pending == 0 {
++                break;
++            }
++        }
++        s.mid[x + 1] = word | (refined * T1_MU_0);
++    }
++}
++
++impl ColumnKernel for CleanupPass {
++    #[inline(always)]
++    fn column(decoder: &mut MqDecoder<'_>, s: &mut Stripe<'_>, x: usize, k: &PassConsts) {
++        let mut word = s.mid[x + 1];
++        let mut pending;
++        if word == 0 && s.rows == COLUMN_SAMPLES {
++            // Run-length mode: one symbol says the whole column stays
++            // insignificant; otherwise two more name the first sample
++            // that does not, and only its sign is left to read.
++            if decoder.decode_with_ctx(T1_CTXNO_AGG) == 0 {
++                return;
++            }
++            let hi = u32::from(decoder.decode_with_ctx(T1_CTXNO_UNI));
++            let lo = u32::from(decoder.decode_with_ctx(T1_CTXNO_UNI));
++            let shift = 3 * ((hi << 1) | lo);
++            decode_new_significant(
++                decoder,
++                s,
++                x,
++                &mut word,
++                shift,
++                k.one_plus_half,
++                k.vertical_causal,
++            );
++            pending = COLUMN_SAMPLES & (!1 << shift);
++        } else {
++            // Everything neither significant nor coded in this
++            // bit-plane's significance pass.
++            pending = !(word >> 4) & !(word >> 21) & s.rows;
++        }
++        while pending != 0 {
++            let shift = pending.trailing_zeros();
++            let ctx = k.lut[((word >> shift) & T1_SIGMA_NEIGHBOURS) as usize];
++            if decoder.decode_with_ctx(ctx) != 0 {
++                decode_new_significant(
++                    decoder,
++                    s,
++                    x,
++                    &mut word,
++                    shift,
++                    k.one_plus_half,
++                    k.vertical_causal,
++                );
++            }
++            pending &= pending - 1;
++        }
++        s.mid[x + 1] = word & !T1_PI_ALL;
++    }
++}
++
++/// One whole pass over a block.
++fn run_pass<K: ColumnKernel>(
+     decoder: &mut MqDecoder<'_>,
+-    band: BandOrientation,
+-    bitplane: u8,
+     flags: &mut StripeFlags,
+     data: &mut [i32],
+     width: usize,
+     height: usize,
+-    vertical_causal: bool,
++    k: &PassConsts,
+ ) {
+-    let one = 1i32 << bitplane;
+-    let one_plus_half = one | (one >> 1);
+-    let lut = &LUT_CTXNO_ZC[orientation_index(band)];
+     for stripe in 0..height.div_ceil(4) {
+         let mut s = Stripe::new(flags, data, stripe, width, height);
+         for x in 0..width {
+-            let mut word = s.mid[x + 1];
+-            let mut pending = significance_candidates(word) & s.rows;
+-            if pending == 0 {
+-                continue;
+-            }
+-            loop {
+-                let shift = pending.trailing_zeros();
+-                let ctx = lut[((word >> shift) & T1_SIGMA_NEIGHBOURS) as usize];
+-                word |= T1_PI_0 << shift;
+-                // Next to a significant neighbour, significance is anyone's
+-                // guess; the cleanup pass's leftovers mostly stay zero.
+-                if decoder.decode_unpredictable(ctx) != 0 {
+-                    decode_new_significant(
+-                        decoder,
+-                        &mut s,
+-                        x,
+-                        &mut word,
+-                        shift,
+-                        one_plus_half,
+-                        vertical_causal,
+-                    );
+-                    // The sample below just gained a neighbour.
+-                    pending = significance_candidates(word) & s.rows;
+-                }
+-                // Only samples after this one in the scan remain.
+-                pending &= !1 << shift;
+-                if pending == 0 {
+-                    break;
+-                }
+-            }
+-            s.mid[x + 1] = word;
++            K::column(decoder, &mut s, x, k);
+         }
+     }
+ }
+ 
+ /// Raw significance pass (D.6): the same traversal and membership test as
+-/// [`sigpass_decode`], with the significance bit and then the sign read as
++/// [`SignificancePass`], with the significance bit and then the sign read as
+ /// plain bits, no context and no sign prediction.
+ fn sigpass_decode_raw(
+     raw: &mut RawDecoder<'_>,
+@@ -1130,41 +1235,7 @@ fn magnitude_context(word: u32, shift: u32) -> u8 {
+     T1_CTXNO_MAG + (2 * u8::from(refined_before)).max(u8::from(has_neighbour))
+ }
+ 
+-/// Magnitude refinement pass (D.3.3) over the whole block.
+-fn refpass_decode(
+-    decoder: &mut MqDecoder<'_>,
+-    bitplane: u8,
+-    flags: &mut StripeFlags,
+-    data: &mut [i32],
+-    width: usize,
+-    height: usize,
+-) {
+-    let one = 1i32 << bitplane;
+-    for stripe in 0..height.div_ceil(4) {
+-        let mut s = Stripe::new(flags, data, stripe, width, height);
+-        for x in 0..width {
+-            let word = s.mid[x + 1];
+-            let refined = refinement_samples(word);
+-            if refined == 0 {
+-                continue;
+-            }
+-            let mut pending = refined;
+-            loop {
+-                let shift = pending.trailing_zeros();
+-                // A refinement bit is close to a coin flip.
+-                let bit = decoder.decode_unpredictable(magnitude_context(word, shift));
+-                refine_sample(s.sample(x, shift), bit, one);
+-                pending &= pending - 1;
+-                if pending == 0 {
+-                    break;
+-                }
+-            }
+-            s.mid[x + 1] = word | (refined * T1_MU_0);
+-        }
+-    }
+-}
+-
+-/// Raw magnitude refinement pass (D.6): [`refpass_decode`] with the
++/// Raw magnitude refinement pass (D.6): [`RefinementPass`] with the
+ /// refinement bit read as a plain bit.
+ fn refpass_decode_raw(
+     raw: &mut RawDecoder<'_>,
+@@ -1191,69 +1262,316 @@ fn refpass_decode_raw(
+     }
+ }
+ 
+-/// Cleanup pass (D.3.4) over the whole block, with run-length coding of
+-/// columns whose word is zero in a full stripe.
+-#[allow(clippy::too_many_arguments)]
+-fn cleanup_decode(
+-    decoder: &mut MqDecoder<'_>,
++/// Decode two code blocks at a time on one thread. With `false` the same
++/// driver decodes one block at a time through one lane.
++const INTERLEAVE_BLOCKS: bool = true;
++
++/// A code block being decoded, with the position its decoding has reached:
++/// which pass, which stripe, which column. Everything a pass keeps between
++/// two columns lives in the block's flags and samples and in its MQ decoder,
++/// so a block can be put down after any column and picked up again.
++struct Lane<'s, 'p> {
++    scratch: &'s mut Tier1Scratch,
++    decoder: MqDecoder<'p>,
++    /// The block held: decoding, or decoded and not yet written out.
++    block: Option<usize>,
++    step: Option<f32>,
+     band: BandOrientation,
+-    bitplane: u8,
+-    flags: &mut StripeFlags,
+-    data: &mut [i32],
+-    width: usize,
+-    height: usize,
+     vertical_causal: bool,
+-) {
+-    let one = 1i32 << bitplane;
+-    let one_plus_half = one | (one >> 1);
+-    let lut = &LUT_CTXNO_ZC[orientation_index(band)];
+-    for stripe in 0..height.div_ceil(4) {
+-        let mut s = Stripe::new(flags, data, stripe, width, height);
+-        for x in 0..width {
+-            let mut word = s.mid[x + 1];
+-            let mut pending;
+-            if word == 0 && s.rows == COLUMN_SAMPLES {
+-                // Run-length mode: one symbol says the whole column stays
+-                // insignificant; otherwise two more name the first sample
+-                // that does not, and only its sign is left to read.
+-                if decoder.decode_with_ctx(T1_CTXNO_AGG) == 0 {
+-                    continue;
++    top: u8,
++    /// The pass in progress; the lane is active while this is below
++    /// `pass_limit`.
++    pass_index: u32,
++    pass_limit: u32,
++    kind: PassKind,
++    consts: PassConsts,
++    stripe: usize,
++    x: usize,
++}
++
++impl<'s, 'p> Lane<'s, 'p> {
++    fn idle(scratch: &'s mut Tier1Scratch) -> Self {
++        Self {
++            scratch,
++            decoder: MqDecoder::new(&[]),
++            block: None,
++            step: None,
++            band: BandOrientation::Ll,
++            vertical_causal: false,
++            top: 0,
++            pass_index: 0,
++            pass_limit: 0,
++            kind: PassKind::Cleanup,
++            consts: PassConsts::new(BandOrientation::Ll, 0, false),
++            stripe: 0,
++            x: 0,
++        }
++    }
++
++    /// Whether the lane has columns left to decode.
++    #[inline(always)]
++    fn active(&self) -> bool {
++        self.pass_index < self.pass_limit
++    }
++
++    /// Take up `block`, whose codeword is one MQ segment.
++    fn begin(
++        &mut self,
++        index: usize,
++        block: &'p super::t2::DecodedCodeBlock<'p>,
++        params: &BlockParams,
++        style: CodeBlockStyle,
++    ) -> Result<()> {
++        self.scratch
++            .reset(params.block_width, params.block_height)?;
++        self.block = Some(index);
++        self.step = params.step;
++        self.band = block.band;
++        self.vertical_causal = style.vertical_causal;
++        self.pass_index = 0;
++        self.pass_limit = 0;
++        self.stripe = 0;
++        self.x = 0;
++        let segment = &block.segments[0];
++        if segment.passes != block.passes {
++            return Err(invalid(format!(
++                "codeword segments carry {} passes, expected {}",
++                segment.passes, block.passes
++            )));
++        }
++        if let Some((top, pass_limit)) =
++            pass_plan(params.max_bitplanes, block.zero_bitplanes, block.passes)?
++        {
++            self.top = top;
++            self.pass_limit = pass_limit;
++            self.decoder = MqDecoder::new(&segment.data);
++            self.enter_pass();
++        }
++        Ok(())
++    }
++
++    /// Set up the pass `pass_index` names: the first is the top bit-plane's
++    /// cleanup, then significance, refinement, cleanup for each plane below.
++    fn enter_pass(&mut self) {
++        let (kind, below_top) = match self.pass_index.checked_sub(1) {
++            None => (PassKind::Cleanup, 0),
++            Some(after_top) => (
++                match after_top % 3 {
++                    0 => PassKind::Significance,
++                    1 => PassKind::Refinement,
++                    _ => PassKind::Cleanup,
++                },
++                after_top / 3 + 1,
++            ),
++        };
++        let bitplane = u32::from(self.top).saturating_sub(below_top) as u8;
++        self.kind = kind;
++        self.consts = PassConsts::new(self.band, bitplane, self.vertical_causal);
++    }
++
++    /// Columns left in the current stripe.
++    #[inline(always)]
++    fn columns_left(&self) -> usize {
++        self.scratch.width - self.x
++    }
++
++    /// Move past `columns` decoded columns of the current stripe.
++    #[inline(always)]
++    fn advance(&mut self, columns: usize) {
++        self.x += columns;
++        if self.x == self.scratch.width {
++            self.x = 0;
++            self.stripe += 1;
++            if self.stripe == self.scratch.height.div_ceil(4) {
++                self.stripe = 0;
++                self.pass_index += 1;
++                if self.active() {
++                    self.enter_pass();
+                 }
+-                let hi = u32::from(decoder.decode_with_ctx(T1_CTXNO_UNI));
+-                let lo = u32::from(decoder.decode_with_ctx(T1_CTXNO_UNI));
+-                let shift = 3 * ((hi << 1) | lo);
+-                decode_new_significant(
+-                    decoder,
+-                    &mut s,
+-                    x,
+-                    &mut word,
+-                    shift,
+-                    one_plus_half,
+-                    vertical_causal,
+-                );
+-                pending = COLUMN_SAMPLES & (!1 << shift);
+-            } else {
+-                // Everything neither significant nor coded in this
+-                // bit-plane's significance pass.
+-                pending = !(word >> 4) & !(word >> 21) & s.rows;
+             }
+-            while pending != 0 {
+-                let shift = pending.trailing_zeros();
+-                let ctx = lut[((word >> shift) & T1_SIGMA_NEIGHBOURS) as usize];
+-                if decoder.decode_with_ctx(ctx) != 0 {
+-                    decode_new_significant(
+-                        decoder,
+-                        &mut s,
+-                        x,
+-                        &mut word,
+-                        shift,
+-                        one_plus_half,
+-                        vertical_causal,
+-                    );
++        }
++    }
++}
++
++/// Decode the rest of lane `a`'s current stripe.
++#[inline(never)]
++fn solo_columns<A: ColumnKernel>(a: &mut Lane<'_, '_>) {
++    let columns = a.columns_left();
++    let first = a.x;
++    let (width, height) = (a.scratch.width, a.scratch.height);
++    let mut stripe = Stripe::new(
++        &mut a.scratch.flags,
++        &mut a.scratch.coefficients,
++        a.stripe,
++        width,
++        height,
++    );
++    for x in first..first + columns {
++        A::column(&mut a.decoder, &mut stripe, x, &a.consts);
++    }
++    a.advance(columns);
++}
++
++/// Decode as many columns as both lanes have left in their current stripes,
++/// one column of each in turn. The two blocks' arithmetic decoders are
++/// independent, so a processor can overlap one block's decisions with the
++/// other's instead of waiting on a single chain of them.
++#[inline(never)]
++fn pair_columns<A: ColumnKernel, B: ColumnKernel>(a: &mut Lane<'_, '_>, b: &mut Lane<'_, '_>) {
++    let columns = a.columns_left().min(b.columns_left());
++    let (first_a, first_b) = (a.x, b.x);
++    let (width_a, height_a) = (a.scratch.width, a.scratch.height);
++    let (width_b, height_b) = (b.scratch.width, b.scratch.height);
++    let mut stripe_a = Stripe::new(
++        &mut a.scratch.flags,
++        &mut a.scratch.coefficients,
++        a.stripe,
++        width_a,
++        height_a,
++    );
++    let mut stripe_b = Stripe::new(
++        &mut b.scratch.flags,
++        &mut b.scratch.coefficients,
++        b.stripe,
++        width_b,
++        height_b,
++    );
++    // Local copies, so the optimiser is free to keep both decoders' registers
++    // in machine registers for the whole run.
++    let (mut decoder_a, mut decoder_b) = (a.decoder.clone(), b.decoder.clone());
++    let (consts_a, consts_b) = (a.consts, b.consts);
++    for i in 0..columns {
++        A::column(&mut decoder_a, &mut stripe_a, first_a + i, &consts_a);
++        B::column(&mut decoder_b, &mut stripe_b, first_b + i, &consts_b);
++    }
++    a.decoder = decoder_a;
++    b.decoder = decoder_b;
++    a.advance(columns);
++    b.advance(columns);
++}
++
++/// Advance one lane until its block is decoded.
++fn run_solo(a: &mut Lane<'_, '_>) {
++    while a.active() {
++        match a.kind {
++            PassKind::Significance => solo_columns::<SignificancePass>(a),
++            PassKind::Refinement => solo_columns::<RefinementPass>(a),
++            PassKind::Cleanup => solo_columns::<CleanupPass>(a),
++        }
++    }
++}
++
++/// Advance both lanes until either block is decoded.
++fn run_pair(a: &mut Lane<'_, '_>, b: &mut Lane<'_, '_>) {
++    use PassKind::{Cleanup, Refinement, Significance};
++    while a.active() && b.active() {
++        match (a.kind, b.kind) {
++            (Significance, Significance) => {
++                pair_columns::<SignificancePass, SignificancePass>(a, b)
++            }
++            (Significance, Refinement) => pair_columns::<SignificancePass, RefinementPass>(a, b),
++            (Significance, Cleanup) => pair_columns::<SignificancePass, CleanupPass>(a, b),
++            (Refinement, Significance) => pair_columns::<RefinementPass, SignificancePass>(a, b),
++            (Refinement, Refinement) => pair_columns::<RefinementPass, RefinementPass>(a, b),
++            (Refinement, Cleanup) => pair_columns::<RefinementPass, CleanupPass>(a, b),
++            (Cleanup, Significance) => pair_columns::<CleanupPass, SignificancePass>(a, b),
++            (Cleanup, Refinement) => pair_columns::<CleanupPass, RefinementPass>(a, b),
++            (Cleanup, Cleanup) => pair_columns::<CleanupPass, CleanupPass>(a, b),
++        }
++    }
++}
++
++/// Whether a block can be decoded a column at a time by a [`Lane`]: its
++/// codeword is a single MQ segment with nothing to do between passes. That
++/// is every block of a stream coded without the code-block style switches.
++fn lane_decodable(style: CodeBlockStyle, block: &super::t2::DecodedCodeBlock<'_>) -> bool {
++    block.segments.len() == 1
++        && !style.bypass
++        && !style.reset_contexts
++        && !style.terminate_each_pass
++        && !style.segmentation_symbols
++}
++
++/// Decode the blocks `next_block` hands out, writing each into its plane
++/// rectangle. Two blocks are in progress at a time where their coding
++/// allows; the others are decoded whole, one at a time.
++fn decode_blocks<'p>(
++    header: &CodestreamHeader,
++    blocks: &'p [super::t2::DecodedCodeBlock<'p>],
++    planes: &BlockPlanes,
++    scratch: &mut Tier1Workspace,
++    mut next_block: impl FnMut() -> Option<usize>,
++) -> Result<()> {
++    let style = header.cod.code_block_style;
++    let [scratch_a, scratch_b] = &mut scratch.lanes;
++    let mut a = Lane::idle(scratch_a);
++    let mut b = Lane::idle(scratch_b);
++    let mut exhausted = false;
++    loop {
++        for (lane, enabled) in [(&mut a, true), (&mut b, INTERLEAVE_BLOCKS)] {
++            while enabled && lane.block.is_none() && !exhausted {
++                let Some(index) = next_block() else {
++                    exhausted = true;
++                    break;
++                };
++                let block = &blocks[index];
++                let params = block_params(header, block)?;
++                if lane_decodable(style, block) {
++                    lane.begin(index, block, &params, style)?;
++                } else {
++                    decode_codeblock_segments_into(
++                        params.block_width,
++                        params.block_height,
++                        block.band,
++                        params.max_bitplanes,
++                        block.zero_bitplanes,
++                        block.passes,
++                        style,
++                        &block.segments,
++                        lane.scratch,
++                        &mut StatsSink::disabled(),
++                    )?;
++                    // SAFETY: as for the lanes' writes below.
++                    unsafe {
++                        planes.write_block(
++                            block.component,
++                            block.x0 as usize,
++                            block.y0 as usize,
++                            lane.scratch,
++                            params.step,
++                        )?;
++                    }
+                 }
+-                pending &= pending - 1;
+             }
+-            s.mid[x + 1] = word & !T1_PI_ALL;
++        }
++        if a.active() && b.active() {
++            run_pair(&mut a, &mut b);
++        } else if exhausted || !INTERLEAVE_BLOCKS {
++            run_solo(&mut a);
++            run_solo(&mut b);
++        }
++        for lane in [&mut a, &mut b] {
++            if let Some(index) = lane.block
++                && !lane.active()
++            {
++                let block = &blocks[index];
++                // SAFETY: code blocks tile pairwise-disjoint rectangles of
++                // each component plane, and every block is handed out once,
++                // so no two writes overlap, on this thread or another.
++                unsafe {
++                    planes.write_block(
++                        block.component,
++                        block.x0 as usize,
++                        block.y0 as usize,
++                        lane.scratch,
++                        lane.step,
++                    )?;
++                }
++                lane.block = None;
++            }
++        }
++        if exhausted && a.block.is_none() && b.block.is_none() {
++            return Ok(());
+         }
+     }
+ }
