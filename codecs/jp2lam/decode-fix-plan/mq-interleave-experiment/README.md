@@ -24,7 +24,7 @@ for the decisions Tier-1 cannot predict, it makes single-threaded decode
 | `src/bin/bench.rs` | Replay benchmark. Compiles the production `src/mq/mod.rs` by path. |
 | `record.patch` | Adds an `mq-trace` cargo feature and a `record` binary that dumps every MQ segment's bytes, contexts and decoded bits. |
 | `tier1-lanes-prototype.patch` | The resumable two-block Tier-1 that was measured and not adopted. |
-| `replay-results-2026-11-11.txt` | Full output of the replay runs summarised below. |
+| `replay-results-2026-11-11.log` | Full output of the replay runs summarised below. |
 
 Both patches apply from the repository root to the commit that added this
 directory (`git apply codecs/jp2lam/decode-fix-plan/mq-interleave-experiment/record.patch`).
