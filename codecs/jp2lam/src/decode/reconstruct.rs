@@ -808,13 +808,42 @@ fn reconstruct_gray_97_fused_into(
         let mut synth = prefix.final_level(kernel, sy + first_row);
         for out in band.chunks_mut(stride) {
             let row = synth.next_row();
-            for (dst, &sample) in out[x0..x0 + w].iter_mut().zip(&row[sx..sx + w]) {
-                let value = (sample + shift + 0.5).clamp(0.0, max_sample as f32) as u32;
-                *dst = scale_unsigned_to_u8(value, max_sample);
-            }
+            finalize_gray_row_f32(&mut out[x0..x0 + w], &row[sx..sx + w], shift, max_sample);
         }
     });
     Ok(())
+}
+
+/// Level-shift, round and clamp one row of centred 9/7 samples to bytes.
+/// Eight-bit components, nearly every image, need no rescaling, and that
+/// loop is kept free of the general case so the compiler vectorises it.
+#[inline]
+fn finalize_gray_row_f32(out: &mut [u8], row: &[f32], shift: f32, max_sample: u32) {
+    if max_sample == 255 {
+        for (dst, &sample) in out.iter_mut().zip(row) {
+            *dst = (sample + shift + 0.5).clamp(0.0, 255.0) as u8;
+        }
+    } else {
+        for (dst, &sample) in out.iter_mut().zip(row) {
+            let value = (sample + shift + 0.5).clamp(0.0, max_sample as f32) as u32;
+            *dst = scale_unsigned_to_u8(value, max_sample);
+        }
+    }
+}
+
+/// [`finalize_gray_row_f32`] for centred 5/3 samples.
+#[inline]
+fn finalize_gray_row_i32(out: &mut [u8], row: &[i32], shift: i32, max_sample: u32) {
+    if max_sample == 255 {
+        for (dst, &sample) in out.iter_mut().zip(row) {
+            *dst = sample.saturating_add(shift).clamp(0, 255) as u8;
+        }
+    } else {
+        for (dst, &sample) in out.iter_mut().zip(row) {
+            let value = sample.saturating_add(shift).clamp(0, max_sample as i32) as u32;
+            *dst = scale_unsigned_to_u8(value, max_sample);
+        }
+    }
 }
 
 fn write_gray_plane_i32(
@@ -830,10 +859,12 @@ fn write_gray_plane_i32(
     for_each_row_band(target, workers, |first_row, band| {
         for (row, out) in band.chunks_mut(stride).enumerate() {
             let source = (sy + first_row + row) * source_width + sx;
-            for (dst, &sample) in out[x0..x0 + w].iter_mut().zip(&samples[source..source + w]) {
-                let value = sample.saturating_add(shift).clamp(0, max_sample as i32) as u32;
-                *dst = scale_unsigned_to_u8(value, max_sample);
-            }
+            finalize_gray_row_i32(
+                &mut out[x0..x0 + w],
+                &samples[source..source + w],
+                shift,
+                max_sample,
+            );
         }
     });
 }
@@ -851,10 +882,12 @@ fn write_gray_plane_f32(
     for_each_row_band(target, workers, |first_row, band| {
         for (row, out) in band.chunks_mut(stride).enumerate() {
             let source = (sy + first_row + row) * source_width + sx;
-            for (dst, &sample) in out[x0..x0 + w].iter_mut().zip(&samples[source..source + w]) {
-                let value = (sample + shift + 0.5).clamp(0.0, max_sample as f32) as u32;
-                *dst = scale_unsigned_to_u8(value, max_sample);
-            }
+            finalize_gray_row_f32(
+                &mut out[x0..x0 + w],
+                &samples[source..source + w],
+                shift,
+                max_sample,
+            );
         }
     });
 }

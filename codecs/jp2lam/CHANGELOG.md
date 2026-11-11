@@ -17,6 +17,8 @@ Decoded output is bit-identical to 0.3.1 on every stream 0.3.1 decoded.
   samples of a column adjacent).
 - Gray output runs in row bands across the worker budget: the finest 9/7
   level with its conversion to bytes, and the 5/3 and planar 9/7 writers.
+  The eight-bit conversion loop is separate from the rescaling one so the
+  compiler vectorises it (about 3% of a 9/7 gray decode).
 - Measured on 11-megapixel OpenJPEG-encoded streams, single thread, against
   0.3.1: lossless 5/3 RGB 3260 → about 2000-2300 ms, lossless gray scan
   1130 → 650 ms, 9/7 gray 276 → about 200 ms, 9/7 RGB 499 → 415 ms. With
