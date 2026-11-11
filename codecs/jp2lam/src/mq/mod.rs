@@ -26,156 +26,189 @@ pub(crate) struct MqCoder {
     ctxs: [u8; MQC_NUMCTXS],
 }
 
+/// Decoder view of [`MQ_STATES`], and what a decoder context holds: the
+/// whole state, `qeval << 16 | nlps << 8 | nmps`, so a decision loads its
+/// probability estimate straight from the context with no second lookup.
+/// MPS transitions never switch the MPS, so the state's MPS is the low bit of
+/// `nmps`, and `nlps` already names the state with the switched MPS where
+/// Table C.2 sets SWITCH. Padded to a power of two so that a masked state
+/// index needs no bounds check.
+const MQ_DECODE_STATES: [u32; 128] = {
+    let mut table = [0u32; 128];
+    let mut index = 0;
+    while index < MQ_STATES.len() {
+        let state = MQ_STATES[index];
+        assert!(state.mps == state.nmps & 1 && state.mps as usize == index & 1);
+        table[index] =
+            ((state.qeval as u32) << 16) | ((state.nlps as u32) << 8) | state.nmps as u32;
+        index += 1;
+    }
+    table
+};
+
+/// The adaptive probability states of a decoder, carried from one codeword
+/// segment of a code block to the next.
+pub(crate) type MqDecoderContexts = [u32; MQC_NUMCTXS];
+
+/// MQ arithmetic decoder (Annex C.3) in the software-conventions form of
+/// ITU-T T.88 Annex G: the code register holds the complement of the coded
+/// bytes, so the MPS sub-interval is `Chigh < A` and the common decision
+/// leaves `C` untouched.
+///
+/// The code register is 64 bits wide with `Chigh` in its top 16. BYTEIN only
+/// ever *adds* a byte below the bits already there, so the bytes the next
+/// renormalisations will need can be added ahead of time, further down the
+/// register; `ct` counts the bits buffered below `Chigh`. Renormalisation is
+/// then a plain shift, and input is fetched a few bytes at a time.
 #[derive(Debug, Clone)]
 pub(crate) struct MqDecoder<'a> {
     bytes: &'a [u8],
     bp: usize,
     a: u32,
-    c: u32,
+    c: u64,
     ct: u32,
-    ctxs: [u8; MQC_NUMCTXS],
+    /// `max(Chigh + 1, 0x8000)`: a decision is an MPS with no
+    /// renormalisation exactly when the reduced interval `A - Qe` is still at
+    /// least this, which makes the common case one subtraction and one
+    /// compare. `C` only changes on the other path, which refreshes it.
+    fast_floor: u32,
+    ctxs: MqDecoderContexts,
 }
 
+/// A renormalisation shifts by at most 15 bits (`A >= 1`).
+const MQ_MAX_RENORM_SHIFT: u32 = 15;
+
 impl<'a> MqDecoder<'a> {
+    /// INITDEC (T.88 Figure G.1).
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        let first = bytes.first().copied().unwrap_or(0xff);
         let mut decoder = Self {
             bytes,
             bp: 0,
             a: 0x8000,
-            c: if bytes.is_empty() {
-                0xff << 16
-            } else {
-                u32::from(bytes[0]) << 16
-            },
+            c: u64::from(first ^ 0xff) << 48,
             ct: 0,
-            ctxs: [0; MQC_NUMCTXS],
+            fast_floor: 0,
+            ctxs: [MQ_DECODE_STATES[0]; MQC_NUMCTXS],
         };
         decoder.reset_contexts();
-        decoder.bytein();
+        decoder.fill();
         decoder.c <<= 7;
-        decoder.ct = decoder.ct.saturating_sub(7);
+        decoder.ct -= 7;
+        decoder.fast_floor = decoder.fast_floor_for_c();
         decoder
     }
 
     /// Start a new terminated codeword segment while preserving the adaptive
     /// probability states from the preceding segment.
-    pub(crate) fn new_with_contexts(bytes: &'a [u8], contexts: [u8; MQC_NUMCTXS]) -> Self {
+    pub(crate) fn new_with_contexts(bytes: &'a [u8], contexts: MqDecoderContexts) -> Self {
         let mut decoder = Self::new(bytes);
         decoder.ctxs = contexts;
         decoder
     }
 
-    pub(crate) fn contexts(&self) -> [u8; MQC_NUMCTXS] {
+    pub(crate) fn contexts(&self) -> MqDecoderContexts {
         self.ctxs
     }
 
-    /// DECODE (C.3.2): one binary decision in context `ctx`. Inlined into
-    /// the Tier-1 pass loops, where the decoder registers then stay in
-    /// machine registers across consecutive decisions.
+    #[inline(always)]
+    fn fast_floor_for_c(&self) -> u32 {
+        ((self.c >> 48) as u32 + 1).max(0x8000)
+    }
+
+    /// DECODE (C.3.2, T.88 Figure G.2): one binary decision in context `ctx`.
+    /// Inlined into the Tier-1 pass loops, where the decoder registers then
+    /// stay in machine registers across consecutive decisions.
+    ///
+    /// Everything but the common case — an MPS that needs no
+    /// renormalisation — is computed without branches: which sub-interval the
+    /// code value fell in and whether the conditional exchange applies are
+    /// close to coin flips on the bit-planes that carry most of a codeword,
+    /// and a mispredicted branch costs more than the whole decision.
     #[inline(always)]
     pub(crate) fn decode_with_ctx(&mut self, ctx: u8) -> u8 {
         let ctx_index = ctx as usize;
-        let state = MQ_STATES[self.ctxs[ctx_index] as usize];
-        self.a = self.a.wrapping_sub(u32::from(state.qeval));
-
-        let bit = if (self.c >> 16) < u32::from(state.qeval) {
-            self.lps_exchange(ctx_index, state)
-        } else {
-            self.c = self.c.wrapping_sub(u32::from(state.qeval) << 16);
-            if self.a & 0x8000 == 0 {
-                self.mps_exchange(ctx_index, state)
-            } else {
-                state.mps
-            }
-        };
-
-        if self.a & 0x8000 == 0 {
-            self.renormd();
+        let state = self.ctxs[ctx_index];
+        let mps = state & 1;
+        let qe = state >> 16;
+        let a = self.a.wrapping_sub(qe);
+        if a >= self.fast_floor {
+            self.a = a;
+            return mps as u8;
         }
-        bit
+
+        // The code value is in the LPS sub-interval when `Chigh >= A`.
+        let lps = u32::from((self.c >> 48) as u32 >= a);
+        let lps_mask = lps.wrapping_neg();
+        self.c = self.c.wrapping_sub(u64::from(a & lps_mask) << 48);
+        // MPS_EXCHANGE / LPS_EXCHANGE: the sub-intervals swap meaning when
+        // the MPS one is the smaller, so the decoded symbol is the LPS when
+        // exactly one of "LPS sub-interval" and "exchanged" holds.
+        let is_lps_symbol = lps ^ u32::from(a < qe);
+        let next = (state >> (8 * is_lps_symbol)) & 0x7f;
+        self.ctxs[ctx_index] = MQ_DECODE_STATES[next as usize];
+        let a = (a & !lps_mask) | (qe & lps_mask);
+        // RENORMD (C.3.3): this path always renormalises, by at least one
+        // bit, and the bits are already in the register.
+        let shift = a.leading_zeros() - 16;
+        self.a = a << shift;
+        self.c <<= shift;
+        self.ct -= shift;
+        if self.ct < MQ_MAX_RENORM_SHIFT {
+            self.fill();
+        }
+        self.fast_floor = self.fast_floor_for_c();
+        (mps ^ is_lps_symbol) as u8
     }
 
     pub(crate) fn set_state(&mut self, ctx: u8, msb: u8, prob: u8) {
         let index = msb as usize + ((prob as usize) << 1);
-        debug_assert!(index < MQ_STATES.len());
-        self.ctxs[ctx as usize] = index as u8;
+        self.ctxs[ctx as usize] = MQ_DECODE_STATES[index];
     }
 
     #[cfg(test)]
     pub(crate) fn state_index(&self, ctx: u8) -> u8 {
-        self.ctxs[ctx as usize]
+        let state = self.ctxs[ctx as usize];
+        MQ_DECODE_STATES
+            .iter()
+            .position(|&entry| entry == state)
+            .expect("context holds a table state") as u8
     }
 
     pub(crate) fn reset_contexts(&mut self) {
-        self.ctxs.fill(0);
+        self.ctxs.fill(MQ_DECODE_STATES[0]);
         self.set_state(T1_CTXNO_UNI, 0, 46);
         self.set_state(T1_CTXNO_AGG, 0, 3);
         self.set_state(T1_CTXNO_ZC, 0, 4);
     }
 
+    /// BYTEIN (T.88 Figure G.3), repeated until at least 25 bits are
+    /// buffered. A byte that the standard adds at bit 8 of its 32-bit
+    /// register once the buffer has run dry is added `ct` bits early, so
+    /// `ct` places further down. Past the end of the segment the decoder
+    /// sees 0xff bytes (D.4.1), which add nothing to the complemented
+    /// register.
     #[inline(always)]
-    fn mps_exchange(&mut self, ctx_index: usize, state: MqState) -> u8 {
-        if self.a < u32::from(state.qeval) {
-            self.ctxs[ctx_index] = state.nlps;
-            1 ^ state.mps
-        } else {
-            self.ctxs[ctx_index] = state.nmps;
-            state.mps
-        }
-    }
-
-    #[inline(always)]
-    fn lps_exchange(&mut self, ctx_index: usize, state: MqState) -> u8 {
-        let post_subtraction_a = self.a;
-        self.a = u32::from(state.qeval);
-        if post_subtraction_a < u32::from(state.qeval) {
-            self.ctxs[ctx_index] = state.nmps;
-            state.mps
-        } else {
-            self.ctxs[ctx_index] = state.nlps;
-            1 ^ state.mps
-        }
-    }
-
-    /// RENORMD (C.3.3). The one-bit-per-iteration loop of the standard is
-    /// batched: all shifts up to the next BYTEIN (or until `a` is
-    /// normalised) happen at once, which is the same sequence of register
-    /// values at every BYTEIN and the same final state.
-    #[inline(always)]
-    fn renormd(&mut self) {
-        loop {
-            if self.ct == 0 {
-                self.bytein();
-            }
-            // `a` is never zero here (at least `qeval >= 1`), so this is the
-            // shift count that brings bit 15 up, capped by the bits left in
-            // the current byte.
-            let shifts = (self.a.leading_zeros() - 16).min(self.ct);
-            self.a <<= shifts;
-            self.c <<= shifts;
-            self.ct -= shifts;
-            if self.a & 0x8000 != 0 {
-                break;
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn bytein(&mut self) {
-        let next = self.byte_at(self.bp + 1);
-        if self.byte_at(self.bp) == 0xff {
-            if next > 0x8f {
-                self.c = self.c.wrapping_add(0xff00);
-                self.ct = 8;
+    fn fill(&mut self) {
+        while self.ct <= 24 {
+            let position = 32 - self.ct;
+            let next = u64::from(self.byte_at(self.bp + 1));
+            if self.byte_at(self.bp) == 0xff {
+                if next > 0x8f {
+                    self.ct += 8;
+                } else {
+                    self.bp += 1;
+                    self.c = self
+                        .c
+                        .wrapping_add(0xfe00 << position)
+                        .wrapping_sub(next << (9 + position));
+                    self.ct += 7;
+                }
             } else {
                 self.bp += 1;
-                self.c = self.c.wrapping_add(u32::from(next) << 9);
-                self.ct = 7;
+                self.c = self.c.wrapping_add((0xff00 - (next << 8)) << position);
+                self.ct += 8;
             }
-        } else {
-            self.bp += 1;
-            self.c = self.c.wrapping_add(u32::from(next) << 8);
-            self.ct = 8;
         }
     }
 
