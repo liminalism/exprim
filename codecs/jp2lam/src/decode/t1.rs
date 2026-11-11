@@ -78,29 +78,59 @@ impl DecodedTileCoefficients {
 }
 
 pub(crate) struct Tier1Scratch {
-    /// Decoded (signed) coefficients, row-major `width × height`.
+    width: usize,
+    height: usize,
+    /// Decoded (signed) coefficients in coding order: the four samples of a
+    /// stripe column are adjacent, sample `(x, y)` at
+    /// `((y / 4) * width + x) * 4 + y % 4`. The passes walk columns, so each
+    /// column's samples share a cache line and need no row arithmetic.
     coefficients: Vec<i32>,
     flags: StripeFlags,
+    /// [`Self::coefficients`] output, filled on request.
+    row_major: Vec<i32>,
 }
 
 impl Tier1Scratch {
     pub(crate) fn new() -> Self {
         Self {
+            width: 0,
+            height: 0,
             coefficients: Vec::new(),
             flags: StripeFlags::new(),
+            row_major: Vec::new(),
         }
     }
 
-    pub(crate) fn coefficients(&self) -> &[i32] {
-        &self.coefficients
+    /// The decoded block, row-major `width × height`.
+    pub(crate) fn coefficients(&mut self) -> &[i32] {
+        let mut row_major = std::mem::take(&mut self.row_major);
+        row_major.clear();
+        for y in 0..self.height {
+            let (columns, ci) = self.row(y);
+            row_major.extend(columns.iter().map(|column| column[ci]));
+        }
+        self.row_major = row_major;
+        &self.row_major
+    }
+
+    /// Row `y` of the decoded block: the columns of its stripe and the
+    /// position of the row within each.
+    #[inline(always)]
+    fn row(&self, y: usize) -> (&[[i32; 4]], usize) {
+        let stripe = 4 * self.width * (y / 4);
+        let (columns, _) = self.coefficients[stripe..stripe + 4 * self.width].as_chunks::<4>();
+        (columns, y % 4)
     }
 
     fn reset(&mut self, width: usize, height: usize) -> Result<()> {
         let coefficient_count = width
-            .checked_mul(height)
+            .checked_mul(height.div_ceil(4))
+            .and_then(|columns| columns.checked_mul(4))
             .ok_or_else(|| invalid("code-block coefficient count overflow"))?;
+        self.width = width;
+        self.height = height;
+        self.coefficients.clear();
         self.coefficients.resize(coefficient_count, 0);
-        self.coefficients.fill(0);
         self.flags.reset(width, height);
         Ok(())
     }
@@ -170,6 +200,7 @@ pub(crate) fn decode_tile_components_with_scratch(
     // exactly the request's task budget on the shared executor; each block
     // writes into its own disjoint plane rectangle.
     if stats.is_enabled() || worker_count <= 1 {
+        let planes = BlockPlanes::new(&mut components);
         for block in &packets.codeblocks {
             let params = block_params(header, block)?;
             decode_codeblock_segments_into(
@@ -184,21 +215,17 @@ pub(crate) fn decode_tile_components_with_scratch(
                 scratch,
                 stats,
             )?;
-            let component = components
-                .get_mut(block.component)
-                .ok_or_else(|| invalid("decoded code-block references invalid component"))?;
-            let component_width = component.width;
             let output_start = stats.start();
-            write_block_into_plane(
-                &mut component.plane,
-                component_width,
-                block.x0,
-                block.y0,
-                params.block_width,
-                params.block_height,
-                &scratch.coefficients,
-                params.step,
-            )?;
+            // SAFETY: nothing else writes the planes while this loop runs.
+            unsafe {
+                planes.write_block(
+                    block.component,
+                    block.x0 as usize,
+                    block.y0 as usize,
+                    scratch,
+                    params.step,
+                )?;
+            }
             stats.finish(output_start, |stats, elapsed| {
                 stats.tier1_block_output_ns = stats.tier1_block_output_ns.saturating_add(elapsed);
             });
@@ -273,46 +300,6 @@ fn block_params(
     })
 }
 
-/// Write one decoded code block's magnitudes into its tile-component plane,
-/// applying fused dequantization for the irreversible (`Real`) plane.
-#[allow(clippy::too_many_arguments)]
-fn write_block_into_plane(
-    plane: &mut CoefficientPlane,
-    tile_width: usize,
-    x0: u32,
-    y0: u32,
-    block_width: usize,
-    block_height: usize,
-    coefficients: &[i32],
-    step: Option<f32>,
-) -> Result<()> {
-    match plane {
-        CoefficientPlane::Integer(values) => copy_block_to_tile(
-            tile_width,
-            values,
-            x0,
-            y0,
-            block_width,
-            block_height,
-            coefficients,
-        ),
-        CoefficientPlane::Real(values) => {
-            let step =
-                step.ok_or_else(|| invalid("irreversible plane write missing quantization step"))?;
-            dequantize_block_to_tile(
-                tile_width,
-                values,
-                x0,
-                y0,
-                block_width,
-                block_height,
-                coefficients,
-                step,
-            )
-        }
-    }
-}
-
 /// A `Send`/`Sync` view of every tile-component plane as raw base pointers, so
 /// the parallel Tier-1 loop can write each code block into its own disjoint
 /// rectangle without a per-block result allocation.
@@ -361,15 +348,12 @@ impl BlockPlanes {
     /// does not overlap any other rectangle written concurrently. Tier-1 code
     /// blocks tile disjoint subband rectangles of each component plane, so this
     /// invariant holds across the parallel loop.
-    #[allow(clippy::too_many_arguments)]
     unsafe fn write_block(
         &self,
         component: usize,
         x0: usize,
         y0: usize,
-        block_width: usize,
-        block_height: usize,
-        coefficients: &[i32],
+        block: &Tier1Scratch,
         step: Option<f32>,
     ) -> Result<()> {
         let plane = self
@@ -380,25 +364,27 @@ impl BlockPlanes {
             .dims
             .get(component)
             .ok_or_else(|| invalid("decoded code-block references invalid component"))?;
-        for y in 0..block_height {
+        for y in 0..block.height {
             let dst = (y0 + y)
                 .checked_mul(tile_width)
                 .and_then(|row| row.checked_add(x0))
                 .ok_or_else(|| invalid("block copy offset overflow"))?;
             if dst
-                .checked_add(block_width)
+                .checked_add(block.width)
                 .is_none_or(|end| end > tile_len)
             {
                 return Err(invalid("decoded block extends past tile"));
             }
-            let src_row = &coefficients[y * block_width..y * block_width + block_width];
+            let (columns, ci) = block.row(y);
             match *plane {
                 PlanePtr::Integer(ptr) => {
-                    // SAFETY: `dst..dst + block_width` is in-bounds (checked
+                    // SAFETY: `dst..dst + block.width` is in-bounds (checked
                     // above) and disjoint from every other task's rectangle.
                     let dst_slice =
-                        unsafe { std::slice::from_raw_parts_mut(ptr.add(dst), block_width) };
-                    dst_slice.copy_from_slice(src_row);
+                        unsafe { std::slice::from_raw_parts_mut(ptr.add(dst), block.width) };
+                    for (out, column) in dst_slice.iter_mut().zip(columns) {
+                        *out = column[ci];
+                    }
                 }
                 PlanePtr::Real(ptr) => {
                     let step = step.ok_or_else(|| {
@@ -406,9 +392,9 @@ impl BlockPlanes {
                     })?;
                     // SAFETY: as above.
                     let dst_slice =
-                        unsafe { std::slice::from_raw_parts_mut(ptr.add(dst), block_width) };
-                    for (out, &q) in dst_slice.iter_mut().zip(src_row) {
-                        *out = crate::simd::scalar::dequantize_i32_to_f32(q, step);
+                        unsafe { std::slice::from_raw_parts_mut(ptr.add(dst), block.width) };
+                    for (out, column) in dst_slice.iter_mut().zip(columns) {
+                        *out = crate::simd::scalar::dequantize_i32_to_f32(column[ci], step);
                     }
                 }
             }
@@ -497,9 +483,7 @@ fn decode_codeblocks_parallel(
                         block.component,
                         block.x0 as usize,
                         block.y0 as usize,
-                        params.block_width,
-                        params.block_height,
-                        &scratch.coefficients,
+                        &scratch,
                         params.step,
                     )
                 };
@@ -650,7 +634,7 @@ fn decode_codeblock_segments(
     Ok(DecodedCodeBlockCoefficients {
         width,
         height,
-        coefficients: scratch.coefficients,
+        coefficients: scratch.coefficients().to_vec(),
     })
 }
 
@@ -687,8 +671,13 @@ fn decode_codeblock_segments_into(
     let magnitude_bitplanes = max_bitplanes
         .checked_sub(zero_bitplanes)
         .ok_or_else(|| invalid("zero-bitplane count exceeds subband bit-plane count"))?;
+    // A block may be signalled with more coding passes than its bit-planes
+    // can hold (or with passes and no bit-planes at all): some encoders
+    // include every block of an empty region with a zero-length pass in each
+    // layer. There is nothing those passes could code, so decoding stops at
+    // the last bit-plane, as OpenJPEG's does, instead of rejecting the image.
     if magnitude_bitplanes == 0 {
-        return Err(invalid("non-empty code-block has no magnitude bit-planes"));
+        return Ok(());
     }
     // Coefficients are represented as signed i32 magnitudes throughout this
     // decoder. A 32nd magnitude bit would make `1i32 << bitplane` negative,
@@ -701,11 +690,7 @@ fn decode_codeblock_segments_into(
         )));
     }
     let max_passes = 1u32 + 3u32 * u32::from(magnitude_bitplanes.saturating_sub(1));
-    if pass_count > max_passes {
-        return Err(invalid(format!(
-            "code-block pass count {pass_count} exceeds maximum {max_passes} for {magnitude_bitplanes} magnitude bit-planes"
-        )));
-    }
+    let pass_limit = pass_count.min(max_passes);
 
     let top = magnitude_bitplanes - 1;
     let mut pass_index = 0u32;
@@ -720,6 +705,9 @@ fn decode_codeblock_segments_into(
         if style.pass_is_raw(pass_index) {
             let mut raw = RawDecoder::new(&segment.data);
             for _ in 0..segment.passes {
+                if pass_index == pass_limit {
+                    return Ok(());
+                }
                 let (pass_kind, bitplane) = pass_kind_and_bitplane(pass_index, top)?;
                 let pass_start = stats.start();
                 match pass_kind {
@@ -767,6 +755,9 @@ fn decode_codeblock_segments_into(
         };
 
         for _ in 0..segment.passes {
+            if pass_index == pass_limit {
+                return Ok(());
+            }
             let (pass_kind, bitplane) = pass_kind_and_bitplane(pass_index, top)?;
             if style.pass_is_raw(pass_index) {
                 return Err(invalid("bypass-coded pass inside an MQ codeword segment"));
@@ -860,49 +851,40 @@ pub(super) fn pass_kind_and_bitplane(pass_index: u32, top: u8) -> Result<(PassKi
 
 /// The per-pass kernels below walk a code block stripe by stripe (four rows)
 /// and column by column, holding the column's packed flag word in a register
-/// and writing it back once. Sample `ci` of the column at `(x, 4 s + ci)` is
-/// `data[(4 s + ci) * width + x]`.
+/// and writing it back once.
+///
+/// Every sample is coded in exactly one of a bit-plane's three passes, so a
+/// pass that asked each sample in turn whether it belongs to it would spend
+/// most of its time on samples it then skips. Instead each kernel derives,
+/// from the column's flag word, the set of samples it has to code — one bit
+/// per sample at bit `3 * ci`, the same spacing the flag word uses — and
+/// visits only those. A column with nothing to code costs one test.
 ///
 /// Decoded values are stored signed: a newly significant sample at bit-plane
-/// `b` becomes `Â±(2^b | 2^(b-1))` (the midpoint of its uncertainty interval)
-/// and refinement moves it by `Â±2^(b-1)`, so the final magnitude is the same
+/// `b` becomes `±(2^b | 2^(b-1))` (the midpoint of its uncertainty interval)
+/// and refinement moves it by `±2^(b-1)`, so the final magnitude is the same
 /// as accumulating an unsigned magnitude and applying the sign at the end.
-#[inline(always)]
-fn zero_coding_context_packed(lut: &[u8; 512], word: u32, ci: u32) -> u8 {
-    lut[((word >> (3 * ci)) & T1_SIGMA_NEIGHBOURS) as usize]
-}
+///
+/// One bit per sample of a full stripe column, at bit `3 * ci`.
+const COLUMN_SAMPLES: u32 = 0o1111;
 
-/// Sign-coding LUT index (Table D.3 contribution bits) for sample `ci` from
-/// its column word and the west and east column words.
-#[inline(always)]
-fn sign_lut_index_packed(word: u32, west: u32, east: u32, ci: u32) -> usize {
-    let shift = 3 * ci;
-    let mut lu = (word >> shift) & (T1_SIGMA_N | T1_SIGMA_W | T1_SIGMA_E | T1_SIGMA_S);
-    lu |= (west >> (T1_CHI_1_I + shift)) & T1_LUT_SGN_W;
-    lu |= (east >> (T1_CHI_1_I - 2 + shift)) & T1_LUT_SGN_E;
-    lu |= if ci == 0 {
-        (word >> (T1_CHI_0_I - 4)) & T1_LUT_SGN_N
-    } else {
-        (word >> (T1_CHI_1_I - 4 + 3 * (ci - 1))) & T1_LUT_SGN_N
-    };
-    lu |= (word >> (T1_CHI_2_I - 6 + shift)) & T1_LUT_SGN_S;
-    (lu & 0xff) as usize
-}
-
-/// The flag words and samples one stripe's column walk touches, as slices
-/// whose lengths the compiler can see: the three flag rows (the stripe
-/// above, the stripe itself, the stripe below) are exactly `width + 2` words
-/// each and the four sample rows exactly `width` each (empty past the
-/// block's last row), so indexing column `x < width` and its neighbours
-/// needs no bounds checks in the full-stripe kernels.
-struct StripeRows<'a> {
+/// One four-row stripe of a code block: the three flag rows a column walk
+/// touches (the stripe above, the stripe itself, the stripe below), each
+/// exactly `width + 2` words, and the stripe's samples, one `[i32; 4]` per
+/// column, exactly `width` of them. With the lengths visible to the
+/// compiler, indexing column `x < width` and its neighbours needs no bounds
+/// checks.
+struct Stripe<'a> {
     north: &'a mut [u32],
     mid: &'a mut [u32],
     south: &'a mut [u32],
-    samples: [&'a mut [i32]; 4],
+    columns: &'a mut [[i32; 4]],
+    /// [`COLUMN_SAMPLES`] restricted to the rows this stripe has: the last
+    /// stripe of a block whose height is not a multiple of four is short.
+    rows: u32,
 }
 
-impl<'a> StripeRows<'a> {
+impl<'a> Stripe<'a> {
     #[inline(always)]
     fn new(
         flags: &'a mut StripeFlags,
@@ -918,68 +900,80 @@ impl<'a> StripeRows<'a> {
         let (north, rest) = rest.split_at_mut(stride);
         let (mid, rest) = rest.split_at_mut(stride);
         let south = &mut rest[..stride];
-        let rows = (height - 4 * stripe).min(4);
-        let samples = &mut data[4 * stripe * width..(4 * stripe + rows) * width];
-        let samples = if rows == 4 {
-            let (r0, rest) = samples.split_at_mut(width);
-            let (r1, rest) = rest.split_at_mut(width);
-            let (r2, r3) = rest.split_at_mut(width);
-            [r0, r1, r2, r3]
-        } else {
-            let (r0, rest) = samples.split_at_mut(width.min(samples.len()));
-            let (r1, rest) = rest.split_at_mut(width.min(rest.len()));
-            let (r2, r3) = rest.split_at_mut(width.min(rest.len()));
-            [r0, r1, r2, r3]
-        };
+        let (columns, _) = data[4 * stripe * width..].as_chunks_mut::<4>();
+        let rows = (height - 4 * stripe).min(4) as u32;
         Self {
             north,
             mid,
             south,
-            samples,
+            columns: &mut columns[..width],
+            rows: COLUMN_SAMPLES >> (3 * (4 - rows)),
         }
     }
 
-    /// The packed word of column `x`.
+    /// The sample of column `x` whose bit in a sample set is `shift`.
     #[inline(always)]
-    fn word(&self, x: usize) -> u32 {
-        self.mid[x + 1]
-    }
-
-    #[inline(always)]
-    fn set_word(&mut self, x: usize, word: u32) {
-        self.mid[x + 1] = word;
-    }
-
-    /// Sample `ci` of column `x`.
-    #[inline(always)]
-    fn sample(&mut self, ci: u32, x: usize) -> &mut i32 {
-        &mut self.samples[ci as usize][x]
+    fn sample(&mut self, x: usize, shift: u32) -> &mut i32 {
+        &mut self.columns[x][(shift / 3) as usize & 3]
     }
 }
 
-/// Record that sample `ci` of column `x` became significant with sign `sign`
-/// (1 = negative): its own word (kept in `word`) and the neighbouring
-/// columns' words learn about it. In vertically causal mode the stripe above
-/// never learns about row 0 (Annex D.7).
+/// The samples of a column the significance propagation pass codes: not yet
+/// significant, not already coded in this pass, and with at least one
+/// significant neighbour (D.3.1).
 #[inline(always)]
-fn mark_significant_packed(
-    s: &mut StripeRows<'_>,
+fn significance_candidates(word: u32) -> u32 {
+    // Bit `3 j` of `any_in_row` says row `j` of the 3 × 6 neighbourhood has
+    // a significant sample, and of `beside` that its west or east one is.
+    // Sample `ci` sits in row `ci + 1`: its neighbours are all of rows `ci`
+    // and `ci + 2` and the two beside it.
+    let any_in_row = word | (word >> 1) | (word >> 2);
+    let beside = word | (word >> 2);
+    let has_neighbour = any_in_row | (any_in_row >> 6) | (beside >> 3);
+    has_neighbour & !(word >> 4) & !(word >> 21) & COLUMN_SAMPLES
+}
+
+/// Sign-coding LUT index (Table D.3 contribution bits) for the sample at
+/// `shift` from its column word and the west and east column words.
+#[inline(always)]
+fn sign_lut_index(word: u32, west: u32, east: u32, shift: u32) -> usize {
+    let mut lu = (word >> shift) & (T1_SIGMA_N | T1_SIGMA_W | T1_SIGMA_E | T1_SIGMA_S);
+    lu |= (west >> (T1_CHI_1_I + shift)) & T1_LUT_SGN_W;
+    lu |= (east >> (T1_CHI_1_I - 2 + shift)) & T1_LUT_SGN_E;
+    // The sign above sample 0 is the stripe above's; above the others it is
+    // the previous sample's.
+    let north = if shift == 0 {
+        T1_CHI_0_I - 4
+    } else {
+        T1_CHI_1_I - 7 + shift
+    };
+    lu |= (word >> north) & T1_LUT_SGN_N;
+    lu |= (word >> (T1_CHI_2_I - 6 + shift)) & T1_LUT_SGN_S;
+    (lu & 0xff) as usize
+}
+
+/// Record that the sample at `shift` of column `x` became significant with
+/// sign `sign` (1 = negative): its own word (kept in `word`) and the
+/// neighbouring columns' words learn about it. In vertically causal mode the
+/// stripe above never learns about row 0 (Annex D.7).
+#[inline(always)]
+fn mark_significant(
+    s: &mut Stripe<'_>,
     x: usize,
     word: &mut u32,
-    ci: u32,
+    shift: u32,
     sign: u32,
     vertical_causal: bool,
 ) {
-    let shift = 3 * ci;
     s.mid[x] |= T1_SIGMA_E << shift;
     *word |= ((sign << T1_CHI_1_I) | T1_SIGMA_THIS) << shift;
     s.mid[x + 2] |= T1_SIGMA_W << shift;
-    if ci == 0 && !vertical_causal {
+    if shift == 0 && !vertical_causal {
         s.north[x + 1] |= (sign << T1_CHI_5_I) | T1_SIGMA_16;
         s.north[x] |= T1_SIGMA_17;
         s.north[x + 2] |= T1_SIGMA_15;
     }
-    if ci == 3 {
+    if shift == 9 {
         s.south[x + 1] |= (sign << T1_CHI_0_I) | T1_SIGMA_N;
         s.south[x] |= T1_SIGMA_NE;
         s.south[x + 2] |= T1_SIGMA_NW;
@@ -989,23 +983,23 @@ fn mark_significant_packed(
 /// Decode the sign of a sample that just became significant and store its
 /// midpoint value.
 #[inline(always)]
-fn decode_new_significant_packed(
+fn decode_new_significant(
     decoder: &mut MqDecoder<'_>,
-    s: &mut StripeRows<'_>,
+    s: &mut Stripe<'_>,
     x: usize,
     word: &mut u32,
-    ci: u32,
+    shift: u32,
     one_plus_half: i32,
     vertical_causal: bool,
 ) {
-    let lu = sign_lut_index_packed(*word, s.mid[x], s.mid[x + 2], ci);
+    let lu = sign_lut_index(*word, s.mid[x], s.mid[x + 2], shift);
     let sign = u32::from(decoder.decode_with_ctx(LUT_CTXNO_SC[lu]) ^ LUT_SPB[lu]);
-    *s.sample(ci, x) = if sign != 0 {
+    *s.sample(x, shift) = if sign != 0 {
         -one_plus_half
     } else {
         one_plus_half
     };
-    mark_significant_packed(s, x, word, ci, sign, vertical_causal);
+    mark_significant(s, x, word, shift, sign, vertical_causal);
 }
 
 /// Significance propagation pass (D.3.1) over the whole block.
@@ -1023,62 +1017,38 @@ fn sigpass_decode(
     let one = 1i32 << bitplane;
     let one_plus_half = one | (one >> 1);
     let lut = &LUT_CTXNO_ZC[orientation_index(band)];
-    let stripes = height.div_ceil(4);
-    #[inline(always)]
-    fn column(
-        decoder: &mut MqDecoder<'_>,
-        lut: &[u8; 512],
-        s: &mut StripeRows<'_>,
-        x: usize,
-        rows: u32,
-        one_plus_half: i32,
-        vertical_causal: bool,
-    ) {
-        let mut word = s.word(x);
-        if word == 0 {
-            return;
-        }
-        for ci in 0..rows {
-            let shift = 3 * ci;
-            if word & ((T1_SIGMA_THIS | T1_PI_0) << shift) == 0
-                && word & (T1_SIGMA_NEIGHBOURS << shift) != 0
-            {
-                let ctx = zero_coding_context_packed(lut, word, ci);
+    for stripe in 0..height.div_ceil(4) {
+        let mut s = Stripe::new(flags, data, stripe, width, height);
+        for x in 0..width {
+            let mut word = s.mid[x + 1];
+            let mut pending = significance_candidates(word) & s.rows;
+            if pending == 0 {
+                continue;
+            }
+            loop {
+                let shift = pending.trailing_zeros();
+                let ctx = lut[((word >> shift) & T1_SIGMA_NEIGHBOURS) as usize];
+                word |= T1_PI_0 << shift;
                 if decoder.decode_with_ctx(ctx) != 0 {
-                    decode_new_significant_packed(
+                    decode_new_significant(
                         decoder,
-                        s,
+                        &mut s,
                         x,
                         &mut word,
-                        ci,
+                        shift,
                         one_plus_half,
                         vertical_causal,
                     );
+                    // The sample below just gained a neighbour.
+                    pending = significance_candidates(word) & s.rows;
                 }
-                word |= T1_PI_0 << shift;
+                // Only samples after this one in the scan remain.
+                pending &= !1 << shift;
+                if pending == 0 {
+                    break;
+                }
             }
-        }
-        s.set_word(x, word);
-    }
-    for stripe in 0..stripes {
-        let rows = (height - 4 * stripe).min(4) as u32;
-        let mut s = StripeRows::new(flags, data, stripe, width, height);
-        if rows == 4 {
-            for x in 0..width {
-                column(decoder, lut, &mut s, x, 4, one_plus_half, vertical_causal);
-            }
-        } else {
-            for x in 0..width {
-                column(
-                    decoder,
-                    lut,
-                    &mut s,
-                    x,
-                    rows,
-                    one_plus_half,
-                    vertical_causal,
-                );
-            }
+            s.mid[x + 1] = word;
         }
     }
 }
@@ -1097,41 +1067,42 @@ fn sigpass_decode_raw(
 ) {
     let one = 1i32 << bitplane;
     let one_plus_half = one | (one >> 1);
-    let stripes = height.div_ceil(4);
-    for stripe in 0..stripes {
-        let rows = (height - 4 * stripe).min(4) as u32;
-        let mut s = StripeRows::new(flags, data, stripe, width, height);
+    for stripe in 0..height.div_ceil(4) {
+        let mut s = Stripe::new(flags, data, stripe, width, height);
         for x in 0..width {
-            let mut word = s.word(x);
-            if word != 0 {
-                for ci in 0..rows {
-                    let shift = 3 * ci;
-                    if word & ((T1_SIGMA_THIS | T1_PI_0) << shift) == 0
-                        && word & (T1_SIGMA_NEIGHBOURS << shift) != 0
-                    {
-                        if raw.decode_bit() != 0 {
-                            let sign = u32::from(raw.decode_bit());
-                            *s.sample(ci, x) = if sign != 0 {
-                                -one_plus_half
-                            } else {
-                                one_plus_half
-                            };
-                            mark_significant_packed(
-                                &mut s,
-                                x,
-                                &mut word,
-                                ci,
-                                sign,
-                                vertical_causal,
-                            );
-                        }
-                        word |= T1_PI_0 << shift;
-                    }
-                }
-                s.set_word(x, word);
+            let mut word = s.mid[x + 1];
+            let mut pending = significance_candidates(word) & s.rows;
+            if pending == 0 {
+                continue;
             }
+            loop {
+                let shift = pending.trailing_zeros();
+                word |= T1_PI_0 << shift;
+                if raw.decode_bit() != 0 {
+                    let sign = u32::from(raw.decode_bit());
+                    *s.sample(x, shift) = if sign != 0 {
+                        -one_plus_half
+                    } else {
+                        one_plus_half
+                    };
+                    mark_significant(&mut s, x, &mut word, shift, sign, vertical_causal);
+                    pending = significance_candidates(word) & s.rows;
+                }
+                pending &= !1 << shift;
+                if pending == 0 {
+                    break;
+                }
+            }
+            s.mid[x + 1] = word;
         }
     }
+}
+
+/// The samples of a column the magnitude refinement pass codes: significant
+/// before this bit-plane's significance pass (D.3.3).
+#[inline(always)]
+fn refinement_samples(word: u32) -> u32 {
+    (word >> 4) & !(word >> 21) & COLUMN_SAMPLES
 }
 
 /// Midpoint update for a refined sample. Entering MR at plane b the magnitude
@@ -1143,8 +1114,18 @@ fn sigpass_decode_raw(
 #[inline(always)]
 fn refine_sample(value: &mut i32, bit: u8, one: i32) {
     let half = one >> 1;
-    let delta = if bit != 0 { half } else { half - one };
-    *value += if *value < 0 { -delta } else { delta };
+    let delta = half - (one & (i32::from(bit) - 1));
+    // Apply the sample's sign to `delta` without a branch.
+    let sign = *value >> 31;
+    *value += (delta ^ sign) - sign;
+}
+
+/// Magnitude refinement context (Table D.4) of the sample at `shift`.
+#[inline(always)]
+fn magnitude_context(word: u32, shift: u32) -> u8 {
+    let refined_before = (word >> shift) & T1_MU_0 != 0;
+    let has_neighbour = (word >> shift) & T1_SIGMA_NEIGHBOURS != 0;
+    T1_CTXNO_MAG + (2 * u8::from(refined_before)).max(u8::from(has_neighbour))
 }
 
 /// Magnitude refinement pass (D.3.3) over the whole block.
@@ -1157,35 +1138,25 @@ fn refpass_decode(
     height: usize,
 ) {
     let one = 1i32 << bitplane;
-    let stripes = height.div_ceil(4);
-    #[inline(always)]
-    fn column(decoder: &mut MqDecoder<'_>, s: &mut StripeRows<'_>, x: usize, rows: u32, one: i32) {
-        let mut word = s.word(x);
-        if word == 0 {
-            return;
-        }
-        for ci in 0..rows {
-            let shift = 3 * ci;
-            if word & ((T1_SIGMA_THIS | T1_PI_0) << shift) == T1_SIGMA_THIS << shift {
-                let ctx = magnitude_context_packed(word, ci);
-                let bit = decoder.decode_with_ctx(ctx);
-                refine_sample(s.sample(ci, x), bit, one);
-                word |= T1_MU_0 << shift;
+    for stripe in 0..height.div_ceil(4) {
+        let mut s = Stripe::new(flags, data, stripe, width, height);
+        for x in 0..width {
+            let word = s.mid[x + 1];
+            let refined = refinement_samples(word);
+            if refined == 0 {
+                continue;
             }
-        }
-        s.set_word(x, word);
-    }
-    for stripe in 0..stripes {
-        let rows = (height - 4 * stripe).min(4) as u32;
-        let mut s = StripeRows::new(flags, data, stripe, width, height);
-        if rows == 4 {
-            for x in 0..width {
-                column(decoder, &mut s, x, 4, one);
+            let mut pending = refined;
+            loop {
+                let shift = pending.trailing_zeros();
+                let bit = decoder.decode_with_ctx(magnitude_context(word, shift));
+                refine_sample(s.sample(x, shift), bit, one);
+                pending &= pending - 1;
+                if pending == 0 {
+                    break;
+                }
             }
-        } else {
-            for x in 0..width {
-                column(decoder, &mut s, x, rows, one);
-            }
+            s.mid[x + 1] = word | (refined * T1_MU_0);
         }
     }
 }
@@ -1201,36 +1172,19 @@ fn refpass_decode_raw(
     height: usize,
 ) {
     let one = 1i32 << bitplane;
-    let stripes = height.div_ceil(4);
-    for stripe in 0..stripes {
-        let rows = (height - 4 * stripe).min(4) as u32;
-        let mut s = StripeRows::new(flags, data, stripe, width, height);
+    for stripe in 0..height.div_ceil(4) {
+        let mut s = Stripe::new(flags, data, stripe, width, height);
         for x in 0..width {
-            let mut word = s.word(x);
-            if word != 0 {
-                for ci in 0..rows {
-                    let shift = 3 * ci;
-                    if word & ((T1_SIGMA_THIS | T1_PI_0) << shift) == T1_SIGMA_THIS << shift {
-                        let bit = raw.decode_bit();
-                        refine_sample(s.sample(ci, x), bit, one);
-                        word |= T1_MU_0 << shift;
-                    }
-                }
-                s.set_word(x, word);
+            let word = s.mid[x + 1];
+            let refined = refinement_samples(word);
+            let mut pending = refined;
+            while pending != 0 {
+                let shift = pending.trailing_zeros();
+                refine_sample(s.sample(x, shift), raw.decode_bit(), one);
+                pending &= pending - 1;
             }
+            s.mid[x + 1] = word | (refined * T1_MU_0);
         }
-    }
-}
-
-#[inline(always)]
-fn magnitude_context_packed(word: u32, ci: u32) -> u8 {
-    let shift = 3 * ci;
-    if word & (T1_MU_0 << shift) != 0 {
-        T1_CTXNO_MAG + 2
-    } else if word & (T1_SIGMA_NEIGHBOURS << shift) != 0 {
-        T1_CTXNO_MAG + 1
-    } else {
-        T1_CTXNO_MAG
     }
 }
 
@@ -1250,163 +1204,55 @@ fn cleanup_decode(
     let one = 1i32 << bitplane;
     let one_plus_half = one | (one >> 1);
     let lut = &LUT_CTXNO_ZC[orientation_index(band)];
-    let stripes = height.div_ceil(4);
-    /// Code samples `first .. rows` of one column; with `run_length` the
-    /// sample `first` is already known significant (the run-length symbols
-    /// said so) and only its sign is read.
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    fn column(
-        decoder: &mut MqDecoder<'_>,
-        lut: &[u8; 512],
-        s: &mut StripeRows<'_>,
-        x: usize,
-        word: &mut u32,
-        first: u32,
-        rows: u32,
-        run_length: bool,
-        one_plus_half: i32,
-        vertical_causal: bool,
-    ) {
-        let mut first_is_significant = run_length;
-        for ci in first..rows {
-            let shift = 3 * ci;
-            let coded = if first_is_significant {
-                first_is_significant = false;
-                true
-            } else if *word & ((T1_SIGMA_THIS | T1_PI_0) << shift) == 0 {
-                let ctx = zero_coding_context_packed(lut, *word, ci);
-                decoder.decode_with_ctx(ctx) != 0
-            } else {
-                false
-            };
-            if coded {
-                decode_new_significant_packed(
-                    decoder,
-                    s,
-                    x,
-                    word,
-                    ci,
-                    one_plus_half,
-                    vertical_causal,
-                );
-            }
-        }
-    }
-    for stripe in 0..stripes {
-        let rows = (height - 4 * stripe).min(4) as u32;
-        let mut s = StripeRows::new(flags, data, stripe, width, height);
+    for stripe in 0..height.div_ceil(4) {
+        let mut s = Stripe::new(flags, data, stripe, width, height);
         for x in 0..width {
-            let mut word = s.word(x);
-            if word == 0 && rows == 4 {
+            let mut word = s.mid[x + 1];
+            let mut pending;
+            if word == 0 && s.rows == COLUMN_SAMPLES {
+                // Run-length mode: one symbol says the whole column stays
+                // insignificant; otherwise two more name the first sample
+                // that does not, and only its sign is left to read.
                 if decoder.decode_with_ctx(T1_CTXNO_AGG) == 0 {
                     continue;
                 }
                 let hi = u32::from(decoder.decode_with_ctx(T1_CTXNO_UNI));
                 let lo = u32::from(decoder.decode_with_ctx(T1_CTXNO_UNI));
-                let first = (hi << 1) | lo;
-                column(
+                let shift = 3 * ((hi << 1) | lo);
+                decode_new_significant(
                     decoder,
-                    lut,
                     &mut s,
                     x,
                     &mut word,
-                    first,
-                    4,
-                    true,
+                    shift,
                     one_plus_half,
                     vertical_causal,
                 );
-            } else if rows == 4 {
-                column(
-                    decoder,
-                    lut,
-                    &mut s,
-                    x,
-                    &mut word,
-                    0,
-                    4,
-                    false,
-                    one_plus_half,
-                    vertical_causal,
-                );
+                pending = COLUMN_SAMPLES & (!1 << shift);
             } else {
-                column(
-                    decoder,
-                    lut,
-                    &mut s,
-                    x,
-                    &mut word,
-                    0,
-                    rows,
-                    false,
-                    one_plus_half,
-                    vertical_causal,
-                );
+                // Everything neither significant nor coded in this
+                // bit-plane's significance pass.
+                pending = !(word >> 4) & !(word >> 21) & s.rows;
             }
-            s.set_word(x, word & !T1_PI_ALL);
+            while pending != 0 {
+                let shift = pending.trailing_zeros();
+                let ctx = lut[((word >> shift) & T1_SIGMA_NEIGHBOURS) as usize];
+                if decoder.decode_with_ctx(ctx) != 0 {
+                    decode_new_significant(
+                        decoder,
+                        &mut s,
+                        x,
+                        &mut word,
+                        shift,
+                        one_plus_half,
+                        vertical_causal,
+                    );
+                }
+                pending &= pending - 1;
+            }
+            s.mid[x + 1] = word & !T1_PI_ALL;
         }
     }
-}
-
-fn copy_block_to_tile(
-    tile_width: usize,
-    tile: &mut [i32],
-    block_x0: u32,
-    block_y0: u32,
-    block_width: usize,
-    block_height: usize,
-    coefficients: &[i32],
-) -> Result<()> {
-    let block_x0 = usize::try_from(block_x0).map_err(|_| invalid("block x0 exceeds usize"))?;
-    let block_y0 = usize::try_from(block_y0).map_err(|_| invalid("block y0 exceeds usize"))?;
-    for y in 0..block_height {
-        let dst = (block_y0 + y)
-            .checked_mul(tile_width)
-            .and_then(|row| row.checked_add(block_x0))
-            .ok_or_else(|| invalid("block copy offset overflow"))?;
-        let src = y * block_width;
-        let dst_end = dst + block_width;
-        let src_end = src + block_width;
-        let dst_slice = tile
-            .get_mut(dst..dst_end)
-            .ok_or_else(|| invalid("decoded block extends past tile"))?;
-        dst_slice.copy_from_slice(&coefficients[src..src_end]);
-    }
-    Ok(())
-}
-
-/// Write one code block's decoded magnitudes into the tile's `f32` subband
-/// plane, applying scalar dequantization in the same pass (fused Tier-1 output
-/// + dequantization for the irreversible 9/7 path).
-#[allow(clippy::too_many_arguments)]
-fn dequantize_block_to_tile(
-    tile_width: usize,
-    tile: &mut [f32],
-    block_x0: u32,
-    block_y0: u32,
-    block_width: usize,
-    block_height: usize,
-    coefficients: &[i32],
-    step: f32,
-) -> Result<()> {
-    let block_x0 = usize::try_from(block_x0).map_err(|_| invalid("block x0 exceeds usize"))?;
-    let block_y0 = usize::try_from(block_y0).map_err(|_| invalid("block y0 exceeds usize"))?;
-    for y in 0..block_height {
-        let dst = (block_y0 + y)
-            .checked_mul(tile_width)
-            .and_then(|row| row.checked_add(block_x0))
-            .ok_or_else(|| invalid("block copy offset overflow"))?;
-        let src = y * block_width;
-        let dst_slice = tile
-            .get_mut(dst..dst + block_width)
-            .ok_or_else(|| invalid("decoded block extends past tile"))?;
-        let src_slice = &coefficients[src..src + block_width];
-        for (out, &q) in dst_slice.iter_mut().zip(src_slice) {
-            *out = crate::simd::scalar::dequantize_i32_to_f32(q, step);
-        }
-    }
-    Ok(())
 }
 
 pub(super) fn invalid(message: impl Into<String>) -> Jp2LamError {
@@ -1514,12 +1360,21 @@ mod tests {
     }
 
     #[test]
-    fn impossible_pass_count_fails_fast() {
-        let err = decode_codeblock(1, 1, BandOrientation::Ll, 1, 0, 2, false, &[0])
-            .expect_err("too many passes for one bit-plane should fail")
-            .to_string();
+    fn passes_beyond_the_last_bit_plane_are_ignored() {
+        let mut coder = MqCoder::new();
+        coder.encode_with_ctx(T1_CTXNO_ZC, 1);
+        let sign_ctx = sign_context(0);
+        coder.encode_with_ctx(sign_ctx, sign_prediction_bit(0));
+        let bytes = coder.finish();
 
-        assert!(err.contains("exceeds maximum"), "{err}");
+        // One bit-plane holds one (cleanup) pass; a second signalled pass and
+        // passes signalled with no bit-plane at all code nothing.
+        let decoded = decode_codeblock(1, 1, BandOrientation::Ll, 1, 0, 2, false, &bytes)
+            .expect("extra pass is ignored");
+        assert_eq!(decoded.coefficients, vec![1]);
+        let decoded = decode_codeblock(1, 1, BandOrientation::Ll, 1, 1, 1, false, &bytes)
+            .expect("passes without bit-planes are ignored");
+        assert_eq!(decoded.coefficients, vec![0]);
     }
 
     #[test]

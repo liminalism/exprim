@@ -618,7 +618,7 @@ pub(crate) fn reconstruct_packed_u8_into(
     }
     match colorspace {
         ColorSpace::Gray if channels == 1 => {
-            reconstruct_grayscale_u8_into(header, tiles, target, stats)
+            reconstruct_grayscale_u8_into(header, tiles, target, workers, stats)
         }
         ColorSpace::Gray | ColorSpace::Srgb | ColorSpace::Cmyk => reconstruct_interleaved_u8_into(
             header,
@@ -644,6 +644,7 @@ fn reconstruct_grayscale_u8_into(
     header: &CodestreamHeader,
     mut tiles: Vec<DecodedTileCoefficients>,
     mut target: PackedWriteTarget<'_>,
+    workers: usize,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
     if tiles.len() != 1 {
@@ -679,7 +680,14 @@ fn reconstruct_grayscale_u8_into(
             )?;
             let shift = 1i32 << (component.precision - 1);
             let max_sample = (1i32 << component.precision) - 1;
-            write_gray_plane_i32(&centered, width, shift, max_sample as u32, &mut target);
+            write_gray_plane_i32(
+                &centered,
+                width,
+                shift,
+                max_sample as u32,
+                &mut target,
+                workers,
+            );
         }
         WaveletTransform::Irreversible97
             if header.cod.decomposition_levels >= 1 && use_common_even_dwt(header) =>
@@ -691,6 +699,7 @@ fn reconstruct_grayscale_u8_into(
                 height,
                 component.precision,
                 &mut target,
+                workers,
                 stats,
             )?;
         }
@@ -704,7 +713,7 @@ fn reconstruct_grayscale_u8_into(
             )?;
             let shift = (1u32 << (component.precision - 1)) as f32;
             let max_sample = (1u32 << component.precision) - 1;
-            write_gray_plane_f32(&centered, width, shift, max_sample, &mut target);
+            write_gray_plane_f32(&centered, width, shift, max_sample, &mut target, workers);
         }
     }
     record_finalize_time(stats, start);
@@ -716,6 +725,35 @@ fn reconstruct_grayscale_u8_into(
     Ok(())
 }
 
+/// Run `job(first_row, band)` over the rows of the target rectangle, split
+/// into bands of whole rows: `band` starts at the target row `first_row` and
+/// its rows are `target.stride` bytes apart. With a worker budget above one
+/// and an image large enough to pay for it the bands run across the decode
+/// executor; otherwise there is one band, on the calling thread. Each row is
+/// a pure function of its position, so the bytes do not depend on the split.
+fn for_each_row_band(
+    target: &mut PackedWriteTarget<'_>,
+    workers: usize,
+    job: impl Fn(usize, &mut [u8]) + Send + Sync,
+) {
+    let stride = target.stride;
+    let rows = target.height;
+    let start = target.origin_y * stride;
+    let end = (start + rows * stride).min(target.data.len());
+    let parallel = workers > 1 && target.width * rows >= FUSED_PACK_PARALLEL_SAMPLES;
+    let (rows_per_band, workers) = if parallel {
+        (rows.div_ceil(workers * 2).max(16), workers)
+    } else {
+        (rows, 1)
+    };
+    for_each_chunk_mut(
+        &mut target.data[start..end],
+        rows_per_band * stride,
+        workers,
+        |band, chunk| job(band * rows_per_band, chunk),
+    );
+}
+
 /// Irreversible 9/7 gray straight to bytes: every level but the finest runs
 /// into quarter-size buffers, then the finest level is synthesised row by row
 /// and each row is level-shifted, rounded and clamped into the target as it
@@ -723,7 +761,10 @@ fn reconstruct_grayscale_u8_into(
 /// planar path (`reconstruct_irreversible_97_centered` +
 /// `write_gray_plane_f32`), so the bytes are identical; the full-resolution
 /// `f32` plane is never written or read back (two plane-sized passes fewer).
+/// The finest level runs in row bands across the worker budget, each band
+/// with its own synthesis ring.
 /// Callers check `use_common_even_dwt` and at least one level first.
+#[allow(clippy::too_many_arguments)]
 fn reconstruct_gray_97_fused_into(
     header: &CodestreamHeader,
     data: Vec<f32>,
@@ -731,6 +772,7 @@ fn reconstruct_gray_97_fused_into(
     height: usize,
     precision: u8,
     target: &mut PackedWriteTarget<'_>,
+    workers: usize,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
     let levels = header.cod.decomposition_levels;
@@ -760,17 +802,48 @@ fn reconstruct_gray_97_fused_into(
 
     let shift = (1u32 << (precision - 1)) as f32;
     let max_sample = (1u32 << precision) - 1;
-    let (w, h, sx) = (target.width, target.height, target.source_x);
-    let mut synth = prefix.final_level(kernel, target.source_y);
-    for y in 0..h {
-        let row = synth.next_row();
-        let off = target.pixel_offset(0, y);
-        for (dst, &sample) in target.data[off..off + w].iter_mut().zip(&row[sx..sx + w]) {
+    let (w, sx, sy) = (target.width, target.source_x, target.source_y);
+    let (x0, stride) = (target.origin_x, target.stride);
+    for_each_row_band(target, workers, |first_row, band| {
+        let mut synth = prefix.final_level(kernel, sy + first_row);
+        for out in band.chunks_mut(stride) {
+            let row = synth.next_row();
+            finalize_gray_row_f32(&mut out[x0..x0 + w], &row[sx..sx + w], shift, max_sample);
+        }
+    });
+    Ok(())
+}
+
+/// Level-shift, round and clamp one row of centred 9/7 samples to bytes.
+/// Eight-bit components, nearly every image, need no rescaling, and that
+/// loop is kept free of the general case so the compiler vectorises it.
+#[inline]
+fn finalize_gray_row_f32(out: &mut [u8], row: &[f32], shift: f32, max_sample: u32) {
+    if max_sample == 255 {
+        for (dst, &sample) in out.iter_mut().zip(row) {
+            *dst = (sample + shift + 0.5).clamp(0.0, 255.0) as u8;
+        }
+    } else {
+        for (dst, &sample) in out.iter_mut().zip(row) {
             let value = (sample + shift + 0.5).clamp(0.0, max_sample as f32) as u32;
             *dst = scale_unsigned_to_u8(value, max_sample);
         }
     }
-    Ok(())
+}
+
+/// [`finalize_gray_row_f32`] for centred 5/3 samples.
+#[inline]
+fn finalize_gray_row_i32(out: &mut [u8], row: &[i32], shift: i32, max_sample: u32) {
+    if max_sample == 255 {
+        for (dst, &sample) in out.iter_mut().zip(row) {
+            *dst = sample.saturating_add(shift).clamp(0, 255) as u8;
+        }
+    } else {
+        for (dst, &sample) in out.iter_mut().zip(row) {
+            let value = sample.saturating_add(shift).clamp(0, max_sample as i32) as u32;
+            *dst = scale_unsigned_to_u8(value, max_sample);
+        }
+    }
 }
 
 fn write_gray_plane_i32(
@@ -779,21 +852,21 @@ fn write_gray_plane_i32(
     shift: i32,
     max_sample: u32,
     target: &mut PackedWriteTarget<'_>,
+    workers: usize,
 ) {
-    // target is mut for exclusive write access to data.
-    let w = target.width;
-    let h = target.height;
-    for y in 0..h {
-        for x in 0..w {
-            let sample = samples[target.source_index(x, y, source_width)];
-            let byte = scale_unsigned_to_u8(
-                sample.saturating_add(shift).clamp(0, max_sample as i32) as u32,
+    let (w, sx, sy) = (target.width, target.source_x, target.source_y);
+    let (x0, stride) = (target.origin_x, target.stride);
+    for_each_row_band(target, workers, |first_row, band| {
+        for (row, out) in band.chunks_mut(stride).enumerate() {
+            let source = (sy + first_row + row) * source_width + sx;
+            finalize_gray_row_i32(
+                &mut out[x0..x0 + w],
+                &samples[source..source + w],
+                shift,
                 max_sample,
             );
-            let off = target.pixel_offset(x, y);
-            target.data[off] = byte;
         }
-    }
+    });
 }
 
 fn write_gray_plane_f32(
@@ -802,18 +875,21 @@ fn write_gray_plane_f32(
     shift: f32,
     max_sample: u32,
     target: &mut PackedWriteTarget<'_>,
+    workers: usize,
 ) {
-    let w = target.width;
-    let h = target.height;
-    for y in 0..h {
-        for x in 0..w {
-            let sample = samples[target.source_index(x, y, source_width)];
-            let value = (sample + shift + 0.5).clamp(0.0, max_sample as f32) as u32;
-            let byte = scale_unsigned_to_u8(value, max_sample);
-            let off = target.pixel_offset(x, y);
-            target.data[off] = byte;
+    let (w, sx, sy) = (target.width, target.source_x, target.source_y);
+    let (x0, stride) = (target.origin_x, target.stride);
+    for_each_row_band(target, workers, |first_row, band| {
+        for (row, out) in band.chunks_mut(stride).enumerate() {
+            let source = (sy + first_row + row) * source_width + sx;
+            finalize_gray_row_f32(
+                &mut out[x0..x0 + w],
+                &samples[source..source + w],
+                shift,
+                max_sample,
+            );
         }
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2500,6 +2576,7 @@ mod tests {
                 128.0,
                 255,
                 &mut gray_target(&mut want, width, (0, 0), (0, 0), (width, height)),
+                1,
             );
             let mut got = vec![0u8; width * height];
             reconstruct_gray_97_fused_into(
@@ -2509,6 +2586,7 @@ mod tests {
                 height,
                 8,
                 &mut gray_target(&mut got, width, (0, 0), (0, 0), (width, height)),
+                1,
                 &mut stats,
             )
             .expect("fused");
@@ -2526,6 +2604,7 @@ mod tests {
                     128.0,
                     255,
                     &mut gray_target(&mut want, stride, (ox, oy), (sx, sy), (w, h)),
+                    1,
                 );
                 let mut got = vec![0xAAu8; stride * rows];
                 reconstruct_gray_97_fused_into(
@@ -2535,6 +2614,7 @@ mod tests {
                     height,
                     8,
                     &mut gray_target(&mut got, stride, (ox, oy), (sx, sy), (w, h)),
+                    1,
                     &mut stats,
                 )
                 .expect("fused window");
@@ -2543,6 +2623,52 @@ mod tests {
         }
     }
 
+    /// The banded gray writers produce the bytes of the single-band run: a
+    /// band boundary restarts the 9/7 synthesis ring mid-image, and each row
+    /// must still come out the same.
+    #[test]
+    fn banded_gray_output_matches_one_band() {
+        let (width, height, levels) = (640usize, 451usize, 4u8);
+        let header = gray_97_header(width, height, levels);
+        let plane = gray_plane(width, height);
+        let mut stats = StatsSink::disabled();
+        // A sub-rectangle into a wider, offset buffer, so band and row
+        // offsets all matter.
+        let (sx, sy, w, h) = (2usize, 3usize, width - 4, height - 5);
+        let (ox, oy, stride) = (3usize, 1usize, width + 5);
+        let decode = |workers: usize, stats: &mut StatsSink<'_>| {
+            let mut out = vec![0xAAu8; stride * (oy + h)];
+            reconstruct_gray_97_fused_into(
+                &header,
+                plane.clone(),
+                width,
+                height,
+                8,
+                &mut gray_target(&mut out, stride, (ox, oy), (sx, sy), (w, h)),
+                workers,
+                stats,
+            )
+            .expect("fused");
+            out
+        };
+        let one_band = decode(1, &mut stats);
+        assert_eq!(decode(3, &mut stats), one_band);
+
+        let integers: Vec<i32> = plane.iter().map(|&sample| sample as i32).collect();
+        let write = |workers: usize| {
+            let mut out = vec![0xAAu8; stride * (oy + h)];
+            write_gray_plane_i32(
+                &integers,
+                width,
+                128,
+                255,
+                &mut gray_target(&mut out, stride, (ox, oy), (sx, sy), (w, h)),
+                workers,
+            );
+            out
+        };
+        assert_eq!(write(3), write(1));
+    }
     #[test]
     fn fused_ict_pack_matches_staged_ict_then_finalize() {
         // Byte-identical to inverse_ict + centered_f32_to_u8 + sequential RGB interleave.

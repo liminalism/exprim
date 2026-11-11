@@ -604,28 +604,32 @@ impl<'a> TilePacketDecoder<'a> {
 
     /// Decode the complete compressed-data portion of one tile-part.
     ///
-    /// Tile-part boundaries are packet boundaries (ISO/IEC 15444-1 B.11), so
-    /// any non-empty trailing fragment is malformed rather than padding, and the
-    /// strict "bytes after the packet sequence" error below stands.
+    /// Tile-part boundaries are packet boundaries (ISO/IEC 15444-1 B.11), so a
+    /// conforming tile-part ends with its last packet. Bytes after the tile's
+    /// final packet are ignored all the same: some encoders leave data there
+    /// (the OpenJPEG conformance stream `kodak_2layers_lrcp.j2c` carries
+    /// several hundred kilobytes of it), and every packet the headers describe
+    /// has been read by then, so there is nothing the tail could change.
     ///
-    /// HISTORY: a `TPsot==TNsot` book scan (Prussian-Line-Infantry) once tripped
-    /// this error on exactly one of its 35 tiles, and simply tolerating the tail
-    /// left a 256-row garbage stripe. The real cause was NOT tile-part assembly
-    /// (every tile is structured identically) but a missing packet-header
-    /// byte-realignment: a packet header ending on 0xFF must consume the
-    /// following bit-stuff byte ([`PacketBioReader::inalign`], Annex B.10.1).
-    /// Without it that one header counted a byte short, sliced its body early,
-    /// and desynchronised the tile — surfacing as a spurious trailing byte here.
-    /// With `inalign` in place the whole stream decodes bit-close to OpenJPEG.
+    /// A tail is also what a packet-header desynchronisation looks like from
+    /// here. One such bug surfaced this way: a packet header ending on 0xFF
+    /// must consume the following bit-stuff byte
+    /// ([`PacketBioReader::inalign`], Annex B.10.1), and without that a
+    /// header counted a byte short and sliced its body early. When a stream
+    /// decodes to garbage, `JP2LAM_TRACE_T2` prints every packet's extent.
     pub(crate) fn push_tile_part(&mut self, payload: &'a [u8]) -> Result<()> {
+        let trace = packet_trace_enabled();
         let mut pos = 0usize;
         while pos < payload.len() {
             let Some(packet) = self.packet_positions.next()? else {
-                return Err(invalid(format!(
-                    "tile-part contains {} bytes after the tile's {}-packet sequence",
-                    payload.len() - pos,
-                    self.next_packet_index
-                )));
+                if trace {
+                    eprintln!(
+                        "t2 ignoring {} bytes after the tile's {}-packet sequence",
+                        payload.len() - pos,
+                        self.next_packet_index
+                    );
+                }
+                return Ok(());
             };
             let packet_start = pos;
             let sop_len = self.consume_sop(payload, packet_start)?;
@@ -686,7 +690,7 @@ impl<'a> TilePacketDecoder<'a> {
                 .get(pos..body_end)
                 .ok_or_else(|| invalid("packet body extends past tile-part payload"))?;
             let contribution_count = contributions.len();
-            if std::env::var_os("JP2LAM_TRACE_T2").is_some() {
+            if trace {
                 eprintln!(
                     "t2 packet={} L={} R={} C={} P={} start={} header={} body={} contributions={} payload={}",
                     self.next_packet_index,
@@ -952,6 +956,13 @@ impl<'a> TilePacketDecoder<'a> {
         debug_assert_eq!(body_pos, body.len());
         Ok(())
     }
+}
+
+/// Whether `JP2LAM_TRACE_T2` asks for a line per packet on stderr. Read once:
+/// a tile can hold many thousands of packets.
+fn packet_trace_enabled() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("JP2LAM_TRACE_T2").is_some())
 }
 
 /// Decode a single tile-part containing the complete packet sequence for one
