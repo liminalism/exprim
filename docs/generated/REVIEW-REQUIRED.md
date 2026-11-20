@@ -7,10 +7,108 @@
 
 What should not be trusted without re-checking: records the build flagged `stale` or `at_risk`. Neither flag means a record is wrong (D-003); both mean look at it. This view is generated on every successful build, including one that exits 0 with a long queue (D-024). An empty file on an active project is more often a sign the `watches` globs are wrong than a sign the knowledge is perfect.
 
-## Stale (0)
+## Stale (4)
 
-_(none)_
+### Peak memory after the 2026-11-20 fixes, same fixtures and method as the audit
 
-## At risk (0)
+`verified` · `@exprim.memory.peak-after-20261120/1` · observation · **stale** · [Peak memory after the 2026-11-20 fixes, same fixtures and method as the audit](CURRENT-STATE.md#peak-memory-after-the-2026-11-20-fixes-same-fixtures-and-method-as-the-audit)
 
-_(none)_
+**Cause** — `watches "src/render_cpu/mask.rs"` was matched by `92f9303a`, which touched `src/render_cpu/mask.rs`.
+
+### Where peak memory goes: clip masks, reorder window, compile-time image inflation, session RGB path
+
+`verified` · `@exprim.memory.peak-audit-20261120/1` · observation · **stale** · [Where peak memory goes: clip masks, reorder window, compile-time image inflation, session RGB path](CURRENT-STATE.md#where-peak-memory-goes-clip-masks-reorder-window-compile-time-image-inflation-session-rgb-path)
+
+**Cause** — `watches "src/render_cpu/exec.rs"` was matched by `92f9303a`, which touched `src/render_cpu/exec.rs`.
+
+### On large real scans the whole file is read at open; render-side changes are hash-identical there
+
+`verified` · `@exprim.memory.real-documents-20261120/1` · observation · **stale** · [On large real scans the whole file is read at open; render-side changes are hash-identical there](CURRENT-STATE.md#on-large-real-scans-the-whole-file-is-read-at-open-render-side-changes-are-hash-identical-there)
+
+**Cause** — `watches "src/structure/loader.rs"` was matched by `92f9303a`, which touched `src/structure/loader.rs`.
+
+### Where CPU render time goes on dense vectors, tables and text (G0)
+
+`verified` · `@exprim.renderer.attribution-20261110/3` · observation · **stale** · [Where CPU render time goes on dense vectors, tables and text (G0)](CURRENT-STATE.md#where-cpu-render-time-goes-on-dense-vectors-tables-and-text-g0)
+
+**Cause** — `watches "src/render_cpu/**"` was matched by `92f9303a`, which touched `src/render_cpu/attribution.rs`.
+
+## At risk (13)
+
+### A page is painted in chunks while it is lowered
+
+`proposed` · `@exprim.memory.chunked-lowering/1` · decision · **depth 1** · [A page is painted in chunks while it is lowered](DECISION-HISTORY.md#revision-1--a-page-is-painted-in-chunks-while-it-is-lowered)
+
+**Via** `supported_by` → `@exprim.memory.peak-after-20261120/1` (stale: `watches "src/render_cpu/mask.rs"` was matched by `92f9303a`, which touched `src/render_cpu/mask.rs`.)
+
+### Clip masks live in a planned per-page store: shared, released after last use, held under a budget
+
+`proposed` · `@exprim.memory.clip-mask-store/1` · decision · **depth 1** · [Clip masks live in a planned per-page store: shared, released after last use, held under a budget](DECISION-HISTORY.md#revision-1--clip-masks-live-in-a-planned-per-page-store-shared-released-after-last-use-held-under-a-budget)
+
+**Via** `supported_by` → `@exprim.memory.peak-audit-20261120/1` (stale: `watches "src/render_cpu/exec.rs"` was matched by `92f9303a`, which touched `src/render_cpu/exec.rs`.)
+
+### Peak-memory levers after the 2026-11-20 audit
+
+`proposed` · `@exprim.memory.next-levers/1` · work · **depth 1** · [Peak-memory levers after the 2026-11-20 audit](ACTIVE-WORK.md#peak-memory-levers-after-the-2026-11-20-audit)
+
+**Via** `supported_by` → `@exprim.memory.peak-audit-20261120/1` (stale: `watches "src/render_cpu/exec.rs"` was matched by `92f9303a`, which touched `src/render_cpu/exec.rs`.)
+
+### Peak-memory levers still open after the 2026-11-20 fixes
+
+`proposed` · `@exprim.memory.remaining-levers/1` · work · **depth 1** · [Peak-memory levers still open after the 2026-11-20 fixes](ACTIVE-WORK.md#peak-memory-levers-still-open-after-the-2026-11-20-fixes)
+
+**Via** `supported_by` → `@exprim.memory.peak-after-20261120/1` (stale: `watches "src/render_cpu/mask.rs"` was matched by `92f9303a`, which touched `src/render_cpu/mask.rs`.)
+
+### The scheduler bounds the reorder backlog in bytes by gating when out-of-order pages start
+
+`proposed` · `@exprim.memory.reorder-backlog-bytes/1` · decision · **depth 1** · [The scheduler bounds the reorder backlog in bytes by gating when out-of-order pages start](DECISION-HISTORY.md#revision-1--the-scheduler-bounds-the-reorder-backlog-in-bytes-by-gating-when-out-of-order-pages-start)
+
+**Via** `supported_by` → `@exprim.memory.peak-audit-20261120/1` (stale: `watches "src/render_cpu/exec.rs"` was matched by `92f9303a`, which touched `src/render_cpu/exec.rs`.)
+
+### Session memory is bounded per document by explicit options; RGB can be packed in place on request
+
+`proposed` · `@exprim.memory.session-bounds/1` · decision · **depth 1** · [Session memory is bounded per document by explicit options; RGB can be packed in place on request](DECISION-HISTORY.md#revision-1--session-memory-is-bounded-per-document-by-explicit-options-rgb-can-be-packed-in-place-on-request)
+
+**Via** `supported_by` → `@exprim.memory.peak-after-20261120/1` (stale: `watches "src/render_cpu/mask.rs"` was matched by `92f9303a`, which touched `src/render_cpu/mask.rs`.)
+
+### Reusable buffers and worker contexts belong to the backend and the session, not to threads
+
+`proposed` · `@exprim.memory.session-owned-idle-memory/1` · decision · **depth 1** · [Reusable buffers and worker contexts belong to the backend and the session, not to threads](DECISION-HISTORY.md#revision-1--reusable-buffers-and-worker-contexts-belong-to-the-backend-and-the-session-not-to-threads)
+
+**Via** `supported_by` → `@exprim.memory.peak-audit-20261120/1` (stale: `watches "src/render_cpu/exec.rs"` was matched by `92f9303a`, which touched `src/render_cpu/exec.rs`.)
+
+### Filter-decoded image samples decode once per overlapping compile, into one exactly-sized buffer
+
+`proposed` · `@exprim.memory.shared-image-samples/1` · decision · **depth 1** · [Filter-decoded image samples decode once per overlapping compile, into one exactly-sized buffer](DECISION-HISTORY.md#revision-1--filter-decoded-image-samples-decode-once-per-overlapping-compile-into-one-exactly-sized-buffer)
+
+**Via** `supported_by` → `@exprim.memory.peak-audit-20261120/1` (stale: `watches "src/render_cpu/exec.rs"` was matched by `92f9303a`, which touched `src/render_cpu/exec.rs`.)
+
+### Large pages are rendered in strips: Gray8 and RGB always, RGBA when offscreens are large
+
+`proposed` · `@exprim.memory.strip-output/1` · decision · **depth 1** · [Large pages are rendered in strips: Gray8 and RGB always, RGBA when offscreens are large](DECISION-HISTORY.md#revision-1--large-pages-are-rendered-in-strips-gray8-and-rgb-always-rgba-when-offscreens-are-large)
+
+**Via** `supported_by` → `@exprim.memory.peak-after-20261120/1` (stale: `watches "src/render_cpu/mask.rs"` was matched by `92f9303a`, which touched `src/render_cpu/mask.rs`.)
+
+### Strip rendering: bound page, group, soft-mask and tiling surfaces by a row window
+
+`proposed` · `@exprim.memory.strip-rendering/1` · work · **depth 1** · [Strip rendering: bound page, group, soft-mask and tiling surfaces by a row window](ACTIVE-WORK.md#strip-rendering-bound-page-group-soft-mask-and-tiling-surfaces-by-a-row-window)
+
+**Via** `supported_by` → `@exprim.memory.peak-after-20261120/1` (stale: `watches "src/render_cpu/mask.rs"` was matched by `92f9303a`, which touched `src/render_cpu/mask.rs`.)
+
+### An opaque non-isolated wrapper group paints on its parent surface
+
+`proposed` · `@exprim.memory.wrapper-groups-direct/1` · decision · **depth 1** · [An opaque non-isolated wrapper group paints on its parent surface](DECISION-HISTORY.md#revision-1--an-opaque-non-isolated-wrapper-group-paints-on-its-parent-surface)
+
+**Via** `supported_by` → `@exprim.memory.peak-audit-20261120/1` (stale: `watches "src/render_cpu/exec.rs"` was matched by `92f9303a`, which touched `src/render_cpu/exec.rs`.)
+
+### Next renderer levers after G1's exact part
+
+`proposed` · `@exprim.renderer.next-levers/1` · work · **depth 1** · [Next renderer levers after G1's exact part](ACTIVE-WORK.md#next-renderer-levers-after-g1s-exact-part)
+
+**Via** `supported_by` → `@exprim.renderer.attribution-20261110/3` (stale: `watches "src/render_cpu/**"` was matched by `92f9303a`, which touched `src/render_cpu/attribution.rs`.)
+
+### The cross-reference rebuild scan steps over stream bodies whose /Length is verified
+
+`proposed` · `@exprim.structure.rebuild-skips-stream-bodies/1` · decision · **depth 1** · [The cross-reference rebuild scan steps over stream bodies whose /Length is verified](DECISION-HISTORY.md#revision-1--the-cross-reference-rebuild-scan-steps-over-stream-bodies-whose-length-is-verified)
+
+**Via** `supported_by` → `@exprim.memory.real-documents-20261120/1` (stale: `watches "src/structure/loader.rs"` was matched by `92f9303a`, which touched `src/structure/loader.rs`.)

@@ -11,7 +11,7 @@ Live work, grouped by parent in `ROADMAP.md` order. Blocked work names its block
 
 ### Peak-memory levers after the 2026-11-20 audit
 
-`proposed` · `@exprim.memory.next-levers/1`
+`proposed` · `@exprim.memory.next-levers/1` · **at risk**
 
 The engine is described as memory-bounded, but the audit found several places where memory at one instant is many times the output and outside every limit. Candidates ranked by measured or computed size, none started. All are expected to leave page hashes unchanged unless marked.
 1. Clip masks: share one mask between identical clip paths, release a mask after its last consumer, and prebuild within a byte budget rather than all at once (3.6 GB to about 150 MB on the fixture).
@@ -25,9 +25,11 @@ The engine is described as memory-bounded, but the audit found several places wh
 9. Smaller, read only: promoted images held twice in the image cache; Gray8 widened to RGB8 on every draw; progressive JPEG keeping coefficients through assembly; RenderSession opening only from an in-memory Arc; the 256 MiB parse-cache budget being per thread and holding decrypted stream bodies; per-document cache budgets with no process-wide cap; images decoded before the visibility cull.
 10. Design question rather than a patch: banded execution, which would bound group, soft-mask, tiling and clip intermediates to a band and let Gray8 and RGB8 be written directly.
 
+> **At risk** at depth 1 via `supported_by` → `@exprim.memory.peak-audit-20261120/1` (stale: `watches "src/render_cpu/exec.rs"` was matched by `92f9303a`, which touched `src/render_cpu/exec.rs`.). See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#peak-memory-levers-after-the-2026-11-20-audit).
+
 ### Peak-memory levers still open after the 2026-11-20 fixes
 
-`proposed` · `@exprim.memory.remaining-levers/1`
+`proposed` · `@exprim.memory.remaining-levers/1` · **at risk**
 
 What is still open after the passes of 2026-11-20, with the reason each was left, so it is not rediscovered. Done and no longer listed: painting in chunks while lowering; RGB packed in place for consumers that drop the raster; a byte bound on the compiled-page cache; per-session memory options; the rebuild scan and the xref keyword search stepping over verified stream bodies; a clip-mask term in the scheduler estimate. Checked and closed: JPEG 2000 decode memory on a large scan is the decoded image plus a few megabytes (67 MB committed at native resolution for a 35 MB surface), so the codec holds no hidden working set there.
 
@@ -42,15 +44,19 @@ Each remaining item needs a decision or a design, not a patch:
 8. Cache budgets are per session; a cap shared by all open documents needs an owner for the shared caches.
 9. Print renders each placed page raster whole before banding; strip rendering needs a strip-concatenation hash gate.
 
+> **At risk** at depth 1 via `supported_by` → `@exprim.memory.peak-after-20261120/1` (stale: `watches "src/render_cpu/mask.rs"` was matched by `92f9303a`, which touched `src/render_cpu/mask.rs`.). See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#peak-memory-levers-still-open-after-the-2026-11-20-fixes).
+
 ### Strip rendering: bound page, group, soft-mask and tiling surfaces by a row window
 
-`proposed` · `@exprim.memory.strip-rendering/1`
+`proposed` · `@exprim.memory.strip-rendering/1` · **at risk**
 
 Every surface a page still holds without bound is proportional to its pixel count: the RGBA page surface, the Gray8 or RGB8 plane converted beside it, group offscreens, soft-mask rendering and tiling fills (174 MB for a 34 MB Gray8 page at 600 dpi; 241 MB for RGB8; 309 MB for a page with tilings, groups and a soft mask). The proposal renders a page as horizontal strips, each a full lower-and-paint pass in the same absolute device coordinates with painting clamped to a row window, converting each strip into the final output buffer. Chunked lowering runs inside each strip. It must stay byte-identical, which is why a strip is a row window and not a translated region crop. Phase 0 is a harness only: the window threaded through lowering and execution behind a test entry, a strips-versus-one-pass property test, and an environment knob for the page-hash gate. Its result, which of the listed hazards actually fail and what the extra lowering costs, decides whether the output and offscreen phases follow. The design, hazards and open decisions are in docs/plans/strip-rendering-2026-11-20.md.
 
+> **At risk** at depth 1 via `supported_by` → `@exprim.memory.peak-after-20261120/1` (stale: `watches "src/render_cpu/mask.rs"` was matched by `92f9303a`, which touched `src/render_cpu/mask.rs`.). See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#strip-rendering-bound-page-group-soft-mask-and-tiling-surfaces-by-a-row-window).
+
 ### Next renderer levers after G1's exact part
 
-`proposed` · `@exprim.renderer.next-levers/1`
+`proposed` · `@exprim.renderer.next-levers/1` · **at risk**
 
 Candidates ranked by measured share, none started:
 1. Stroke outlines as ribbons with fewer join polygons (changes pixels;
@@ -67,3 +73,5 @@ Candidates ranked by measured share, none started:
 8. Masked draws under a mostly opaque clip mask: needs a row-detail
    profile first.
 Dropped on evidence: exact floor/ceil replacements, a trig table.
+
+> **At risk** at depth 1 via `supported_by` → `@exprim.renderer.attribution-20261110/3` (stale: `watches "src/render_cpu/**"` was matched by `92f9303a`, which touched `src/render_cpu/attribution.rs`.). See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#next-renderer-levers-after-g1s-exact-part).

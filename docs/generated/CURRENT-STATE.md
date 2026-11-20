@@ -112,6 +112,8 @@ The sixty-page figure is still several copies of the image: compiles that do not
 
 **derived_from** `@exprim.memory.peak-audit-20261120/1`
 
+> **Stale** — `watches "src/render_cpu/mask.rs"` was matched by `92f9303a`, which touched `src/render_cpu/mask.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#peak-memory-after-the-2026-11-20-fixes-same-fixtures-and-method-as-the-audit).
+
 ### Where peak memory goes: clip masks, reorder window, compile-time image inflation, session RGB path
 
 `verified` · `@exprim.memory.peak-audit-20261120/1` · scope `path "src/content/**"`, `path "src/print/**"`, `path "src/reader/session.rs"`, `path "src/render_cpu/**"`, `path "src/render_scheduler/**"`, `path "src/structure/decode.rs"`
@@ -132,6 +134,8 @@ Peak working set measured with tools/render-probe (debug-fast build, Windows, 20
 
 Already done, not a finding: the bilevel summed-area table is test-only (replaced by the row-band popcount); the image cache is single-flight with one global bound; baseline JPEG streams by MCU row.
 
+> **Stale** — `watches "src/render_cpu/exec.rs"` was matched by `92f9303a`, which touched `src/render_cpu/exec.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#where-peak-memory-goes-clip-masks-reorder-window-compile-time-image-inflation-session-rgb-path).
+
 ### On large real scans the whole file is read at open; render-side changes are hash-identical there
 
 `verified` · `@exprim.memory.real-documents-20261120/1` · scope `path "src/render_cpu/**"`, `path "src/source/**"`, `path "src/structure/loader.rs"`
@@ -147,6 +151,8 @@ What dominates on the large scans is not rendering. After open, before any page 
 An intermediate build regressed the mixed-raster-content book from 302 to 391 MB over eight pages. Two causes, both fixed: the buffer pool kept one buffer per distinct page size (the pages all differ), and chunked rendering allocated the page surface before lowering, so it sat beside each image decode.
 
 **derived_from** `@exprim.memory.peak-after-20261120/1`
+
+> **Stale** — `watches "src/structure/loader.rs"` was matched by `92f9303a`, which touched `src/structure/loader.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#on-large-real-scans-the-whole-file-is-read-at-open-render-side-changes-are-hash-identical-there).
 
 ### Where CPU render time goes on dense vectors, tables and text (G0)
 
@@ -177,6 +183,8 @@ Absolute times drifted with machine load during the session; shares and
 paired ratios are the reliable figures.
 
 **supersedes** `@exprim.renderer.attribution-20261110/2`
+
+> **Stale** — `watches "src/render_cpu/**"` was matched by `92f9303a`, which touched `src/render_cpu/attribution.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#where-cpu-render-time-goes-on-dense-vectors-tables-and-text-g0).
 
 ## Evidence
 
