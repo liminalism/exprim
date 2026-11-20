@@ -5,7 +5,7 @@ exprim was developed inside the Lege repository as the renderer workspace
 `lege-pdf-print` and `lege-pdf-agent` crates over it. Versions below 0.4.0
 were internal and never published.
 
-## 0.4.0 — 2026-11-10
+## 0.4.1 — 2026-11-20
 
 ### Gray8 output, 2026-11-20
 
@@ -153,6 +153,8 @@ images, a mixed-raster-content book, vector and text documents).
   decode to the same pixels but are no longer byte-identical (the image data
   is split into 1 MiB chunks). A print job keeps one compiled page instead of
   eight.
+
+## 0.4.0 — 2026-11-10
 
 ### Dependencies, 2026-11-10
 
