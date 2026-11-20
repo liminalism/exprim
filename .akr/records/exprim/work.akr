@@ -1,6 +1,261 @@
 akr 0.1
 project exprim
 
+record exprim.memory.next-levers/1 : work {
+    title "Peak-memory levers after the 2026-11-20 audit"
+    state proposed
+    scope [
+        path "src/content/**",
+        path "src/document/**",
+        path "src/print/**",
+        path "src/reader/**",
+        path "src/render_cpu/**",
+        path "src/render_scheduler/**",
+        path "src/structure/decode.rs"
+    ]
+    intent """
+        The engine is described as memory-bounded, but the audit found several places where memory at one instant is many times the output and outside every limit. Candidates ranked by measured or computed size, none started. All are expected to leave page hashes unchanged unless marked.
+        1. Clip masks: share one mask between identical clip paths, release a mask after its last consumer, and prebuild within a byte budget rather than all at once (3.6 GB to about 150 MB on the fixture).
+        2. Scheduler: bound the reorder backlog in bytes, or keep the permit until the page is emitted, or let a worker-side finish step shrink the product before it waits (2.6 GB to about 0.5 GB at 300 dpi).
+        3. Non-codec images: first a size hint and SharedBytes for samples (removes the 2x transient); then keep the stream reference in the IR and inflate at lowering through SharedImageCache, so shared images decode once and queued or cached pages hold no samples.
+        4. Session output: a session-owned, byte-capped surface pool released with the session in place of the two thread-locals; RGB written without a second full plane (overlaps item 6 of exprim.renderer.next-levers).
+        5. Scheduler estimate: charge the RGBA surface for Gray8, scale the group term by the transform, count clip masks and all decoded images; charge compiled pages while they wait.
+        6. Opaque non-isolated wrapper groups painted directly on the parent (needs the hash gate to confirm).
+        7. Lowered arena: lower and execute in chunks at scope depth 0 with the draw arena reset between chunks; u32 subpath ranges.
+        8. Print: deliver bands to the spoolers instead of accumulating the sheet and copying it to BGR (about 340 MB to about 110 MB for a 600 dpi colour sheet, by accounting).
+        9. Smaller, read only: promoted images held twice in the image cache; Gray8 widened to RGB8 on every draw; progressive JPEG keeping coefficients through assembly; RenderSession opening only from an in-memory Arc; the 256 MiB parse-cache budget being per thread and holding decrypted stream bodies; per-document cache budgets with no process-wide cap; images decoded before the visibility cull.
+        10. Design question rather than a patch: banded execution, which would bound group, soft-mask, tiling and clip intermediates to a band and let Gray8 and RGB8 be written directly.
+        """
+    note """
+        Items 6 to 10 rest on reading and byte accounting, not measurement; measure before starting any of them.
+        """
+    trace [
+        "User asked for all fixes, with up to two Opus subagents and reasoning in the ledger; work split by file ownership so no two writers share a file.",
+        "Subagents work in git worktrees cut from HEAD: one crate means a half-edited file in a shared checkout would break the other writers' builds.",
+        "Rasterizer and session changes stay with the main session: they carry the pixel-identity risk and overlap the user's uncommitted formatting edits in render_cpu.",
+        "Pixel identity is checked by rendering public and synthetic fixtures with a probe built before the changes and one built after, comparing page hashes.",
+        "Clip masks: residency moved into one store because four draw paths each built and cached masks on their own, with no place to count or release them.",
+        "Masks release after their last consumer: ops run in increasing index order, each once, so one scan of the op stream gives an exact last-use table.",
+        "Release alone leaves deep nesting unbounded, so the store also evicts least-recently-used masks under a budget; a mask is a pure function and rebuilds identically.",
+        "Budget is eight page-sized planes, at least 64 MiB: wide enough that clip-dense maps still build dozens of masks per parallel batch.",
+        "The parallel build became budget-sized batches in first-use order; building everything up front was the 3.5 GB peak.",
+        "Identical clips share at lowering, not execution: the later copy of the geometry is the arena tail there and can be dropped too.",
+        "Sharing compares points bit for bit after a hash match and keys on the mask above, since a mask is the product of its whole path-clip chain.",
+        "The cancellation probe before mask building stays unconditional: an existing test counts probe calls to cancel inside one fill.",
+        "Opaque non-isolated wrapper groups paint on the parent: the seeded offscreen starts as the parent's pixels and is copied back whole, so the bytes are the same.",
+        "Each new path is compared in unit tests with the one it replaces through test-only switches, following the existing tile-culling test.",
+        "Hash gate after masks and wrapper groups: 24 documents, 576 configurations, 0 differ, and again 0 with the mask budget forced to zero.",
+        "Image placement is now settled before decode: bounds depend on the CTM and clip only, so an off-window draw no longer decodes or caches its image.",
+        "That cull drops the degraded-draw note of an undecodable image nobody can see; the code already treats invisible placements as geometry no-ops, not content loss.",
+        "Parked page buffers moved from worker contexts and a thread-local into one pool per backend, so they die with the session and obey one byte cap.",
+        "Pool cap is 256 MiB: under it any thread can reuse any free buffer, which is at least the hit rate of per-thread slots.",
+        "The one-shot render path the scheduler uses stays out of the pool: it parked nothing durable before, and pooling there would add idle memory.",
+        "Session worker contexts became a session-owned checkout list: thread-locals kept each thread's parse cache and scratch alive after the document closed.",
+        "A context whose job unwinds is dropped, not returned, so interrupted scratch is never reused.",
+        "RGB output still allocates its own plane beside the RGBA surface: removing that needs RGB-native or banded rendering, left to the design question.",
+        "RenderSession gained open_path over the existing memory map; in-memory open kept, since callers hold bytes they did not read from a file.",
+        "Second hash gate after the image cull, surface pool and session contexts: 576 configurations, 0 differ.",
+        "Measured after: the 200-clip fixture peaks at 44 MB at 300 dpi and 158 MB at 600 dpi (was 911 MB and 3.62 GB).",
+        "Measured after: a page-sized opaque wrapper group at 600 dpi peaks at 140 MB (was 260 MB); warm render cycles drop about 20 percent.",
+        "Shared masks also cut render cycles 90 to 95 percent on the 200-clip fixture; other fixtures moved within the 5 percent noise of a busy machine.",
+        "Not done, promoted images held twice: the image cache is bounded at 96 MiB either way, so this wastes cache room but does not raise the peak.",
+        "Fixing that double retention needs the promotion keyed before decoding, which changes how eligibility is decided; left for a change with an image corpus to gate it.",
+        "Not done, Gray8 widened to RGB8 per draw: the fix threads a bytes-per-texel parameter through the hot image kernels, and no public fixture exercises them.",
+        "Not done, u32 subpath ranges: six of 84 MB on the worst fixture for a type change across every raster call site.",
+        "Not done, chunked lowering: lowering is one 700-line loop shared with tiling cells, attribution and the GPU seam; it needs its own design.",
+        "Not done, cache budgets per session or process-wide: that is an API shape for the owner to choose, not a patch.",
+        "Scheduler: the byte bound sits between compile and render, because the feeder admits pages before they are compiled and cannot know their size.",
+        "Holding the permit until emission was rejected: the measured 2.6 GB backlog plus 0.4 GB in use fits the 4 GiB budget, so it would not have bound.",
+        "The compiled-page channel became an ordered ready set: a FIFO worker blocked on bytes still holds a page, and the head could sit behind every such worker.",
+        "A render worker waits only while holding nothing, and the head page is always accepted and always takeable; that is the no-deadlock argument.",
+        "Pages still rendering are not counted in the backlog: they hold permits already, and counting them would cap parallelism on large pages that are in order.",
+        "Backlog default is 256 MiB: 32 Letter surfaces at 2x, the window the 22-page throughput measurement settled on, so small pages never wait on it.",
+        "Found on the way: a panic in the caller's emit hung render_range, the feeder waiting on credits forever; the collector now owns the credit sender.",
+        "Estimate: group term is now the peak of nested live groups, scaled by the transform area and capped at two surfaces per group against oversized form boxes.",
+        "Estimate is clamped to the whole budget, so a pessimistic figure makes a page run alone instead of failing a page that renders today.",
+        "Estimate still ignores decode-time reduction (placement unknown at compile time), soft-mask offscreens (no bounds in the IR) and the clip-mask budget.",
+        "Print: the Windows spooler composes bands straight into the DIB; the GDI call, its count and geometry are untouched because no printer could verify a change.",
+        "Print file and CUPS spoolers stream bands into the PNG writer: decoded pixels are identical, file bytes are not (IDAT chunking differs).",
+        "Print opens its session with a one-page compiled cache: imposition visits each page once, and a distant repeat only recompiles.",
+        "Measured after the scheduler change: slow-first-page document peaks at 688 MiB at 300 dpi (was 2,616) and 393 MiB at 2x (was 637), same wall time.",
+        "Image samples: the size hint only commits when the stream ends cleanly at exactly the hinted length; any other outcome reruns the old path unchanged.",
+        "The old inflate growth schedule was kept for the fallback: with zlib-rs, what a corrupt stream salvages depends on the output space each call had.",
+        "PNG predictor now unfilters in place in the ordinary path too, removing the second full-size buffer for every predicted stream, xref streams included.",
+        "Sharing decoded samples uses strong references pruned by count, not Weak: an Arc slice stores its bytes inline, so a Weak pins the whole allocation.",
+        "A shared hit must match a fingerprint of the body and resolved filter parameters, because resolving the same object id can differ by worker in edge cases.",
+        "A hit charges the decode budget what the publishing decode charged, and decodes alone if the budget cannot cover it, so limits never depend on compile order.",
+        "Sample entries exist only while a page compile is running and empty when the last one ends, so an idle document retains nothing on the cache's account.",
+        "Multi-scan JPEG frees each component's coefficients once its plane is built; the limit checks still count all three and were left, to keep what decodes unchanged.",
+        "Decrypted bodies over 64 KiB leave the parse cache at the next job, not immediately: a page drawing one encrypted image many times resolves it per draw.",
+        "Left: the Vec-to-Arc copy and the second AES buffer on the decrypt path need a slice-based decrypt in the security module, outside this change.",
+        "Left: the 256 MiB parse-cache default; lowering it wants measured cached_bytes on large real documents first.",
+        "Final state: all three patch sets merged in one working tree, uncommitted; 78 test binaries, 1,285 tests pass; final hash gate 576 configurations, 0 differ.",
+        "Hash gate has no codec images: the public fixtures hold none, so DCT, JPX, JBIG2 and CCITT pages rest on the unit and fixture tests alone.",
+        "Measured after image sharing: sixty pages on one large Flate image peak at 327 MiB (was 725); still several copies, since non-overlapping compiles do not share.",
+        "What was left, and why, is listed in exprim.memory.remaining-levers so it is not rediscovered."
+    ]
+    supported_by [ @exprim.memory.peak-audit-20261120 ]
+    author "dk"
+}
+
+record exprim.memory.remaining-levers/1 : work {
+    title "Peak-memory levers still open after the 2026-11-20 fixes"
+    state proposed
+    scope [
+        path "src/content/**",
+        path "src/document/**",
+        path "src/reader/**",
+        path "src/render_cpu/**",
+        path "src/render_scheduler/**",
+        path "src/security/**"
+    ]
+    intent """
+        What is still open after the passes of 2026-11-20, with the reason each was left, so it is not rediscovered. Done and no longer listed: painting in chunks while lowering; RGB packed in place for consumers that drop the raster; a byte bound on the compiled-page cache; per-session memory options; the rebuild scan and the xref keyword search stepping over verified stream bodies; a clip-mask term in the scheduler estimate. Checked and closed: JPEG 2000 decode memory on a large scan is the decoded image plus a few megabytes (67 MB committed at native resolution for a 35 MB surface), so the codec holds no hidden working set there.
+
+        Each remaining item needs a decision or a design, not a patch:
+        1. Banded execution: group, soft-mask and tiling offscreens are still sized by their bounds, and Gray8 output still holds the RGBA surface plus the gray plane. Row-windowed fills are already exact; the design question is how groups and masks split across bands.
+        2. Gray8 images are widened to RGB8 for each draw (three bytes per source pixel for the draw's duration, one image at a time). Removing it means a bytes-per-texel parameter through every opaque image kernel: nearest with its vector widen, bilinear, the area filter and the masked path. Each has a scalar reference test; none was touched.
+        3. The image cache holds a promoted image twice (the decode and its RGB8 form). It is bounded at 96 MiB either way, so this costs cache room, not peak. The fix keys the promotion before decoding, which moves where eligibility is decided.
+        4. The default RenderSession::render still packs RGB into a second plane (7 bytes per pixel at that instant). Making in-place the default changes the length of the returned buffer, which callers and tests rely on: an API decision.
+        5. Compiled pages carry full-resolution filter-decoded samples through the scheduler queue, and text extraction decodes images it never uses. Text and raster share one compiled page by design; splitting them, or moving the decode behind the image cache, changes the IR contract.
+        6. Scheduler estimate still ignores soft-mask offscreens (no bounds in the IR) and decode-time reduction (placement unknown at compile time).
+        7. Decrypt path: a second AES buffer and a Vec-to-Arc copy per stream need a slice-based decrypt in the security module. The 256 MiB per-worker parse cache default wants measured cached_bytes on large documents before it is lowered; non-stream objects are charged a flat 64 bytes.
+        8. Cache budgets are per session; a cap shared by all open documents needs an owner for the shared caches.
+        9. Print renders each placed page raster whole before banding; strip rendering needs a strip-concatenation hash gate.
+        """
+    note """
+        Items are ordered by expected size, largest first. None is started.
+        """
+    trace [
+        "User asked to continue the not-done list and to test on the largest local PDFs, which include an MRC document and a full JPEG 2000 one.",
+        "Subagents were not used this round: worktrees are cut from HEAD and the work builds on uncommitted changes.",
+        "Chunked lowering is a sink callback inside the existing loop, not a resumable lowerer: lowering stays one loop and execution interleaves at top-level op boundaries.",
+        "A flush waits until no group or soft-mask scope is open, because their bounds and extents are patched into ops already emitted.",
+        "After a flush only clip geometry is kept, compacted with clip ranges rewritten: later ops draw under those clips and identical clips compare against them.",
+        "Pending bytes count decoded image samples as well as geometry, so an image-heavy page paints and drops each large image instead of holding all of them.",
+        "The chunk size is 16 MiB so an ordinary page still lowers in one piece and clip-dense pages keep wide parallel mask batches.",
+        "Across chunks a mask stays resident while its clip is still on the clip stack; otherwise one page-wide clip would rebuild its mask every chunk.",
+        "RGB without a second plane is a new opt-in call, not the default: existing callers and tests assume the pixel buffer is exactly stride times height.",
+        "Packing in place keeps the surface's length, so a caller retaining many pages holds a third more; export and print, which drop the raster, use it.",
+        "Local corpus gate, pre-change build against chunked build: 19 documents, 228 configurations, 0 differ, default chunk size and a flush after every op.",
+        "One local file would not open by path in either build (non-ASCII name mangled by the shell listing); it was copied to an ASCII path and gated separately.",
+        "Compiled-page cache now also bounded by bytes: eight pages of full-resolution image samples sat behind a count that looked small.",
+        "Page weight counts image samples, encoded payloads and op tables, not font programs, which every page of a document shares.",
+        "Per-document budgets became SessionOptions rather than a process-wide cap: sharing one budget across sessions needs an owner for the shared caches, a larger design.",
+        "Still open: Gray8 widened to RGB8 per draw and promoted images cached twice; with chunking only one image's promotion is alive at a time.",
+        "Still open: banded execution; group, soft-mask and tiling offscreens are still sized by their bounds, and Gray8 output still holds RGBA plus the gray plane.",
+        "Final verification of the second pass: 78 test binaries, 1,291 tests pass; every hash gate (public, local corpus, mixed-raster book) 0 differ on the last build.",
+        "An intermediate build regressed the mixed-raster book by 89 MB; cause one was a pool holding one buffer per distinct page size.",
+        "Cause two: chunked rendering made the surface exist before lowering, beside each image decode; it is now allocated at the first painted chunk.",
+        "Decoded images got their own flush threshold, the image cache's size: below it the cache holds them anyway and a flush frees nothing.",
+        "New finding from the real scans: open reads the whole file when startxref is wrong, 1.9 s and the full mapping resident; recorded as the first open lever.",
+        "Open fix: the scan was the rebuild, not the keyword search; the table sits within 15 KB of the end and is found at once, but its offsets are stale.",
+        "The four large scans have a startxref a few kilobytes short of the table; the loader rebuilds, as PDFium does, and that rule was kept.",
+        "Skipping uses the object parser's own test for trusting a length, so skipped bytes are exactly what later reads of the object treat as opaque.",
+        "A stream whose length is missing, indirect or wrong is still scanned byte by byte, so nothing after a bad length is lost; a test covers four such cases.",
+        "After the fix: 78 test binaries, 1,293 tests pass; local corpus gate 228 configurations, 0 differ against the build from before all changes.",
+        "Keyword search: the last megabyte is still searched backwards, so a classic table near the end is found exactly as before.",
+        "Beyond that megabyte the search runs forwards over object headers so it can step over verified stream bodies; a backward scan cannot know it is inside one.",
+        "JPEG 2000 profiled on the largest scan: committed peak is surface plus decoded image plus a few megabytes at every resolution tried, so nothing to fix in the codec.",
+        "Estimate counts clips that are not user-space rectangles: the IR cannot know device alignment, and over-counting is the safe direction for a budget.",
+        "The mask term is capped at the backend's mask budget, since the store never keeps more resident than that.",
+        "Stopped here: every remaining item changes an API contract, the IR contract or the hot image kernels, and each is written up with what the change would touch.",
+        "Item 2 partly closed: the Gray8 expansion now covers only the source rows a draw reads. One pass still expands the whole image; removing that needs the kernel work.",
+        "Closed by strip output: Gray8 holding RGBA plus gray, and the default render's second RGB plane. Still open: RGBA pages with large offscreens, the scheduler estimate for Gray8, CMYK-to-RGB8 per draw.",
+        "Closed: the scheduler estimate for Gray8 pages in strips. Still open in the estimate: soft-mask rendering and tiling fills are not charged at all.",
+        "Closed: RGBA pages with large group or soft-mask offscreens, soft masks and tilings in the estimate, CMYK conversion per draw. Open: tiling fills and clip masks are not strip-bounded.",
+        "Seen while measuring, not acted on: converting a 600 dpi page to Gray8 takes about 60 ms on one thread, several times a text page's render.",
+        "Closed: clip masks in strips. Open in strips: tiling fills keep full bounds; the mask budget and the estimate's clip and tiling charges are still sized by the page."
+    ]
+    after [ @exprim.memory.next-levers ]
+    supported_by [ @exprim.memory.peak-after-20261120 ]
+}
+
+record exprim.memory.strip-rendering/1 : work {
+    title "Strip rendering: bound page, group, soft-mask and tiling surfaces by a row window"
+    state proposed
+    scope [
+        path "docs/plans/strip-rendering-2026-11-20.md",
+        path "src/reader/session.rs",
+        path "src/render_cpu/**"
+    ]
+    intent """
+        Every surface a page still holds without bound is proportional to its pixel count: the RGBA page surface, the Gray8 or RGB8 plane converted beside it, group offscreens, soft-mask rendering and tiling fills (174 MB for a 34 MB Gray8 page at 600 dpi; 241 MB for RGB8; 309 MB for a page with tilings, groups and a soft mask). The proposal renders a page as horizontal strips, each a full lower-and-paint pass in the same absolute device coordinates with painting clamped to a row window, converting each strip into the final output buffer. Chunked lowering runs inside each strip. It must stay byte-identical, which is why a strip is a row window and not a translated region crop. Phase 0 is a harness only: the window threaded through lowering and execution behind a test entry, a strips-versus-one-pass property test, and an environment knob for the page-hash gate. Its result, which of the listed hazards actually fail and what the extra lowering costs, decides whether the output and offscreen phases follow. The design, hazards and open decisions are in docs/plans/strip-rendering-2026-11-20.md.
+        """
+    note """
+        Proposed design, nothing implemented. Expected peaks in the plan are computed, not measured.
+        """
+    trace [
+        "User chose the banded-execution design over the Gray8 kernel work as the next step.",
+        "Strips are outermost because ops streamed in painter order need the whole page as their accumulation target; chunking nests inside a strip, not the reverse.",
+        "Region crops per strip were rejected: a crop translates the transform, and f32 rounding is not translation-invariant, so coverage would differ in the last bit.",
+        "A row window reuses what exists: surfaces already carry an absolute origin for group offscreens, and row-windowed fills are already tested byte-identical.",
+        "Tiling is the known hazard: cells are lowered relative to the fill's bounds origin, so the window must restrict rows without moving that origin.",
+        "Strip height comes from a byte target so a page is a handful of strips; re-lowering cost is then bounded for page-spanning ops and nil for small ones.",
+        "Writing converted strips into an exact-length buffer would remove the second RGB plane from the default render without changing the buffer length.",
+        "Phase 0 built as a harness: a row window on the prepared page and a strip loop behind an environment knob; unset, nothing changes.",
+        "Bounds are clamped where fills and images compute them, so geometry outside the strip is dropped and off-strip images are not decoded.",
+        "Glyph runs and shading fills are clamped after emission instead: their bounds are computed in several places and one late clamp covers them all.",
+        "Tiling fills keep full bounds in phase 0: their cells are lowered relative to the bounds origin, so only the final composite is limited to strip rows.",
+        "Clip bounds are left unclamped in phase 0, since every op's bounds derive from them; clamping them would have moved tiling origins.",
+        "Identity: property test over clip, group and soft-mask pages at four strip heights; gates with strips forced, 576 public and 228 local configurations, 0 differ.",
+        "Cost at four strips without pre-culling: +265 percent on text, +198 on a 7,500-op page, +47 to +111 on other vectors, about +50 on JPEG 2000 scans.",
+        "Conclusion: identity is not the obstacle; culling ops by a y-range before lowering them is a precondition for shipping any phase.",
+        "Scans pay per strip for work proportional to the image, the Gray8 widening above all; that must become row-proportional before strips help scans.",
+        "Asked to add the cull phase 0 named as a precondition: every op was lowered once per strip, so four strips cost text and many-op pages up to four lowerings.",
+        "Chose a recorded row range over a per-kind estimate: the first strip lowers everything anyway and notes each op's emitted rows before the strip clamp, so nothing needs proving about stroke reach.",
+        "Only painting ops are skipped (fill, stroke, glyph run, image, shading). State, clip, group and soft-mask ops always run, since their effect outlives their own rows.",
+        "A lowering stopped by cancellation or a refused flush leaves the record incomplete; marking it complete there would let later strips skip ops that were never measured.",
+        "Group and soft-mask bounds now narrow in x when children are skipped. Phase 0 already did this for fills dropped at the clamp; gates confirm the rest.",
+        "Text stayed near +330% after the cull. Cause was the harness: a fresh strip surface per strip, a painted page surface, then a copy. Reused the strip buffer, left the page unpainted.",
+        "Measured four strips against one pass, least of three medians: form page +208% to +55%, clip tiles +128% to +37%, small curves +46% to +7%, text +333% to +112%.",
+        "Remaining cost by cause: text is the strip-to-page copy; forms and clip tiles are boundary straddlers plus unclamped clip masks; round contours re-flatten page-spanning paths; scans re-widen Gray8.",
+        "Single timing runs on this machine swung by 40%, which first made the form page look like +7%. Timing now takes the least of three medians per configuration.",
+        "Correction: the two scans in the strip cost tables are colour JPEG, not JPEG 2000 gray. They are never widened; earlier entries blaming Gray8 widening for them are wrong.",
+        "Asked to fix the Gray8 widening. Found paint_image expands the whole gray image to RGB8 on every draw, so four strips expanded it four times.",
+        "Expanded only the source rows a draw's device rows can read, in a full-length buffer. A band-sized buffer would need a row offset in every reader of samples.",
+        "Rows outside the band stay untouched zero pages, so working set follows the band. Commit does not: the allocation is still full length.",
+        "The band comes from mapping the two end rows, plus half the footprint and two rows of slack. A noise-image window test fails when it is three rows narrower.",
+        "On a real gray page scan, four strips at 1:1 went from +136% to +31% single-thread cycles; peak working set 158 MB to 139 MB.",
+        "Wall time on image pages still rises 50% to 80%: one pass paints in parallel bands, the harness fills and copies strips serially. Inferred from colour scans showing the same; copy not timed alone.",
+        "Process-wide cycle counts include idle worker spin and swung 40% between runs. Image-page timings now use per-page least time, single-thread cycles and wall separately.",
+        "Asked to build phase 1. Strips now convert straight into an exact-length Gray8 or RGB buffer; decision recorded as exprim.memory.strip-output.",
+        "Engage at twice the 32 MiB target, not at it: a 300 dpi Letter surface is 32.1 MiB and would split in two on the commonest page size.",
+        "First measurement showed no saving at the default size. Cause: the shorter last strip needed its own buffer, and one was parked in the pool per render.",
+        "Fixed by painting every strip on a surface of one height, the last using its top rows. Bounds are clamped to the page, so the spare rows are never painted.",
+        "The image cache refuses entries over its budget and can evict, so a scan would decode once per strip. The render holds a decode until the strips pass its last row.",
+        "Moved the RGB conversion from the session into the backend so render and render_in_place share the strip path; the session's own RGBA-to-RGB copy is gone.",
+        "Left the scheduler estimate alone: it has no view of a backend's strip size, and overcharging Gray8 is safe. Recorded as not done.",
+        "The four-strip cost measured at 300 dpi did not carry over to 600 dpi with 32 MiB strips: wall time is within -17% and +10% on the fixtures.",
+        "Asked to update the scheduler estimate. It charged a Gray8 page 169 MB at 600 dpi while the strip render holds about 61 MB, so a tight budget ran one page at a time.",
+        "The estimate is a free function with no view of the backend, so the backend now reports the plane it paints on through a trait method defaulting to the whole surface.",
+        "Render and estimate read the strip choice from one function. Two copies of the rule would drift, and a drift under-charges jobs silently.",
+        "Group term capped by the strip too, since group bounds are clamped to it. Clip masks and tiling fills are not, and stay charged as before.",
+        "Process peak rose 25 to 65 MiB at a 256 MiB budget: four real jobs now fill what one filled on paper. Reported as the budget being used, not as a regression.",
+        "One document looked slower at a loose budget. It is bimodal run to run in both modes, unlimited budget included; best-of-four hid that at first.",
+        "Asked to continue the open list: CMYK conversion per draw, soft masks and tilings missing from the estimate, RGBA pages with large offscreens.",
+        "CMYK: same row band as Gray8, same function for the rows. No CMYK scan in the local corpus, so it is tested for identity but not timed.",
+        "Soft-mask bounds were already computed during content lowering and discarded inside a mask; kept them per mask instead of adding bounds to the IR op.",
+        "Mask live bytes follow the backend's mask stack: four per unit while rendered, one while in force, released at the save scope or group end.",
+        "Phase 2 could not use the old group figure: it counted wrapper groups painted directly on the parent, so most large RGBA pages would have gone to strips for nothing.",
+        "RGBA strips engage only when offscreens at page size exceed twice the target: below that the strip buffer and copy cost more than they save.",
+        "Tiling fills left out of the RGBA rule and capped by the page in the estimate: a fill keeps its whole bounds in a strip.",
+        "RGBA at 600 dpi: transparency fixture 309 to 202 MB at +4% wall; pages without offscreens unchanged, as intended.",
+        "Asked to speed up Gray8 output: at 600 dpi the conversion took about 45 ms of a 54 ms text page, on one thread, in floating point.",
+        "Integer luma equals the float form except on exact halves, where float rounding error decides; a block containing one is redone in float. Proven on all 16.7 million inputs.",
+        "Tried replacing the division with a multiply and shift for wider vectors: no measurable change, so the plain division stayed.",
+        "The integer kernel alone halved the page time; the rest came from splitting large conversions across the pool, only when no other page is rendering.",
+        "Conversion runs between page executions, outside the in-flight count, so its fan-out test is zero pages in flight, not one as inside a draw.",
+        "Asked to clamp clip masks to the strip. Mask building already rasterized only the rows it keeps, in absolute coordinates, so only the kept extent had to change.",
+        "Did not clamp the clip envelope itself: draw bounds pass through it before the row cull records them, and a clamped envelope would poison the recorded extents.",
+        "Added a separate mask extent per clip, equal to the envelope outside strips, so one-pass rendering is untouched by construction.",
+        "500 clipped forms at 600 dpi as Gray8: 122 to 81 MB and 11 percent faster. Left the mask budget and the estimate's clip charge at page size."
+    ]
+    after [ @exprim.memory.next-levers ]
+    supported_by [ @exprim.memory.peak-after-20261120 ]
+    author "dk"
+}
+
 record exprim.renderer.g1-exact-speedups/1 : work {
     title "G1 exact part: tile culling, row-window fills, compact sweep gaps"
     state completed

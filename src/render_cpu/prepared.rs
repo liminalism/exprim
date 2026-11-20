@@ -280,6 +280,16 @@ impl SharedFontProgramCache {
         }
     }
 
+    /// Drop every retained program.
+    pub(crate) fn clear(&self) {
+        for shard in self.shards.iter() {
+            let mut shard = lock_unpoisoned(shard);
+            shard.map.clear();
+            shard.lru.clear();
+            shard.bytes = 0;
+        }
+    }
+
     /// Test-only view of the total retained entry count across shards.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -512,6 +522,17 @@ impl SharedGlyphCache {
             if let Some(removed) = shard.map.remove(&victim) {
                 shard.bytes = shard.bytes.saturating_sub(removed.charge);
             }
+        }
+    }
+
+    /// Drop every retained bitmap. Pages being rendered keep the ones they
+    /// hold.
+    pub(crate) fn clear(&self) {
+        for shard in self.shards.iter() {
+            let mut shard = lock_unpoisoned(shard);
+            shard.map.clear();
+            shard.lru.clear();
+            shard.bytes = 0;
         }
     }
 
@@ -996,6 +1017,19 @@ impl SharedImageCache {
         }
     }
 
+    /// Drop every retained decode. Decodes in flight finish and are
+    /// inserted as usual; pages being rendered keep the samples they hold.
+    pub(crate) fn clear(&self) {
+        // Same lock order as `insert`: the byte total, then each shard.
+        let mut total_bytes = lock_unpoisoned(&self.total_bytes);
+        for shard in self.shards.iter() {
+            let mut shard = lock_unpoisoned(shard);
+            shard.map.clear();
+            shard.lru.clear();
+        }
+        *total_bytes = 0;
+    }
+
     /// Test-only retained entry count across shards.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -1005,8 +1039,7 @@ impl SharedImageCache {
             .sum()
     }
 
-    /// Test-only retained byte total across shards.
-    #[cfg(test)]
+    /// Retained byte total across shards.
     pub(crate) fn retained_bytes(&self) -> usize {
         *lock_unpoisoned(&self.total_bytes)
     }
@@ -1170,6 +1203,14 @@ pub struct PreparedClip {
     /// Intersection of this clip and all rectangular ancestors, culled to the
     /// output — the rectangular envelope of the whole chain.
     pub bounds: DeviceRect,
+    /// The part of `bounds` a mask for this clip covers: `bounds` cut to the
+    /// rows being painted ([`CpuPreparedPage::rows`]), which is all of it
+    /// unless the page is rendered in strips. A strip then builds and holds
+    /// each mask over its own rows only. `bounds` itself stays whole: draw
+    /// bounds are cut by it before the strip's rows are, and the row extents
+    /// recorded for the other strips ([`OpExtents`]) must not depend on the
+    /// strip that recorded them.
+    pub mask_bounds: DeviceRect,
     pub kind: ClipKind,
     /// True if this clip or any ancestor is a path clip (needs a mask).
     pub has_mask: bool,
@@ -1359,6 +1400,18 @@ pub struct CpuPreparedPage {
     /// output) keeps the page's own scale, so page-spanning paths far from
     /// the window's origin are not mistaken for corrupt geometry (B11).
     pub(crate) sanity_extent: f32,
+    /// Device rows `[first, end)` this lowering paints: every op's bounds are
+    /// clamped to them, in the same absolute device coordinates as a whole
+    /// page (nothing is translated, so the rows that are painted come out
+    /// byte-identical to a one-pass render). `(0, u32::MAX)` is the whole
+    /// page. See `docs/plans/strip-rendering-2026-11-20.md`.
+    pub(crate) rows: (u32, u32),
+    /// Device rows `[first, end)` the IR op being lowered would paint with
+    /// no row window: the union of its ops' bounds before they are clamped
+    /// to [`Self::rows`]. Reset per IR op; see [`OpExtents`].
+    pub(crate) op_extent: Option<(i32, i32)>,
+    /// Decodes kept for the later strips of this render: see [`StripDecodes`].
+    pub(crate) strip_decodes: Option<Arc<StripDecodes>>,
     /// Fine-grained timing and codec counters. Interior mutability is used
     /// because image decode helpers deliberately receive `&CpuPreparedPage`.
     #[cfg(feature = "profiling")]
@@ -1582,7 +1635,8 @@ impl LowerProf {
                 let ratio = TOLERANCE_PX / hw.max(1e-9);
                 let spread_ok = (1.0 - q) * (1.0 - q) <= ratio * ratio * q;
                 let min_len = la.min(lb);
-                let radius_ok = c > -1.0 && hw * hw * (1.0 - c) / (1.0 + c) <= 0.25 * min_len * min_len;
+                let radius_ok =
+                    c > -1.0 && hw * hw * (1.0 - c) / (1.0 + c) <= 0.25 * min_len * min_len;
                 if spread_ok && radius_ok {
                     self.stroke_vertices_smooth += 1;
                 }
@@ -1736,6 +1790,7 @@ pub fn lower(
         None,
         None,
         false,
+        None,
         #[cfg(feature = "profiling")]
         None,
         #[cfg(feature = "profiling")]
@@ -1774,6 +1829,7 @@ pub(crate) fn lower_cell(
         outer.image_cache.as_ref(),
         outer.decode_floor,
         false,
+        None,
         #[cfg(feature = "profiling")]
         outer.decode_cache.clone(),
         #[cfg(feature = "profiling")]
@@ -1798,6 +1854,7 @@ pub(crate) fn lower_with_font_cache(
     shared_glyphs: Option<&SharedGlyphCache>,
     shared_images: Option<&Arc<SharedImageCache>>,
     decode_floor: Option<Matrix>,
+    sink: Option<&mut LowerSink<'_>>,
 ) -> CpuPreparedPage {
     lower_impl(
         page,
@@ -1813,6 +1870,7 @@ pub(crate) fn lower_with_font_cache(
         shared_images,
         decode_floor,
         false,
+        sink,
         #[cfg(feature = "profiling")]
         None,
         #[cfg(feature = "profiling")]
@@ -1853,6 +1911,7 @@ pub(crate) fn lower_for_external_raster(
         shared_images,
         None,
         true,
+        None,
         #[cfg(feature = "profiling")]
         None,
         #[cfg(feature = "profiling")]
@@ -1885,6 +1944,7 @@ pub fn lower_with_decode_cache(
         None,
         None,
         false,
+        None,
         Some(decode_cache),
         #[cfg(feature = "profiling")]
         true,
@@ -1918,6 +1978,9 @@ pub fn decode_page(
         image_cache: None,
         decode_floor: None,
         sanity_extent: 1.0,
+        rows: (0, u32::MAX),
+        op_extent: None,
+        strip_decodes: None,
         profile: std::cell::RefCell::new(crate::profiling::ProfileReport::new()),
         decode_cache: None,
         lower_prof: Default::default(),
@@ -2023,6 +2086,204 @@ fn decode_unique_payload(
     }
 }
 
+/// Where lowering hands finished ops when it runs in chunks.
+///
+/// Lowering used to flatten the whole page — every stroke outline, every
+/// decoded image — before a pixel was painted, so a page's peak held all of
+/// it beside the surface (84 MB of points for a stroke-dense map at 600 dpi;
+/// every image of an image-heavy page at once). With a sink, whenever the
+/// pending draw geometry and decoded image bytes pass `chunk_bytes` and no
+/// group or soft-mask scope is open, the ops lowered so far are handed to
+/// `flush`, painted, and dropped; only clip geometry is kept, because later
+/// ops can still draw under those clips or share their masks. The ops, their
+/// order and their geometry are exactly those of one-pass lowering, so the
+/// pixels are too.
+pub(crate) struct LowerSink<'a> {
+    /// Pending draw-geometry bytes beyond which the ops lowered so far are
+    /// flushed. 0 flushes after every top-level op.
+    pub chunk_bytes: usize,
+    /// Pending decoded-image bytes beyond which they are flushed. Larger than
+    /// `chunk_bytes` on purpose: decoded images also sit in the image cache,
+    /// so dropping a few from the pending ops frees nothing, while flushing
+    /// brings the page surface into existence beside the next image's decode
+    /// (a scan page measured 21 MB higher that way). Past the cache's size
+    /// the pending images cannot all be cached, and flushing frees them.
+    pub image_chunk_bytes: usize,
+    /// Device rows to paint (see [`CpuPreparedPage::rows`]); `(0, u32::MAX)`
+    /// for the whole page.
+    pub rows: (u32, u32),
+    /// Row extents of the page's painting ops, when it is rendered in strips:
+    /// recorded by the first strip's lowering, used by the others to skip ops
+    /// that cannot touch their rows. `None` lowers every op.
+    pub extents: Option<&'a mut OpExtents>,
+    /// Decoded images kept from one strip to the next: see [`StripDecodes`].
+    pub decodes: Option<Arc<StripDecodes>>,
+    /// Paint `page.ops` (they are dropped afterwards). The slice is the clip
+    /// stack in force after them: clips later ops may still draw under.
+    /// Returns `false` when the request was cancelled; lowering then stops.
+    pub flush: &'a mut dyn FnMut(&CpuPreparedPage, &[u32]) -> bool,
+}
+
+/// Pending bytes after which a page's lowered ops are painted and dropped
+/// (see [`LowerSink`]): 16 MiB, so an ordinary page still lowers in one piece
+/// and a heavy one holds a bounded backlog. `PDF_RENDERER_LOWER_CHUNK_MB`
+/// overrides it (0 = after every top-level op), for paired A/B isolation on
+/// one binary. Read once.
+pub(crate) fn lower_chunk_bytes() -> usize {
+    lower_chunk_override().unwrap_or(16 << 20)
+}
+
+/// Pending decoded-image bytes after which they are painted and dropped: the
+/// image cache's size (see [`LowerSink::image_chunk_bytes`]), or the
+/// `PDF_RENDERER_LOWER_CHUNK_MB` override.
+pub(crate) fn lower_image_chunk_bytes() -> usize {
+    lower_chunk_override().unwrap_or(SharedImageCache::DEFAULT_TOTAL_BYTES)
+}
+
+fn lower_chunk_override() -> Option<usize> {
+    use std::sync::OnceLock;
+    static BYTES: OnceLock<Option<usize>> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("PDF_RENDERER_LOWER_CHUNK_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|mb| mb.saturating_mul(1 << 20))
+    })
+}
+
+/// The device rows each IR op of a page paints, indexed like
+/// `CompiledPage::operations`.
+///
+/// A page rendered in strips is lowered once per strip, and without this every
+/// op was lowered for every strip: four strips cost a text page 3.6 times its
+/// render time. The first strip's lowering records, for each painting op, the
+/// rows of everything it emitted *before* the clamp to the strip (so the range
+/// does not depend on which strip recorded it). A later strip skips an op
+/// whose range misses its rows. That is exact by construction: the range is
+/// what lowering really produces, and an op it excludes would have had its
+/// bounds clamped to nothing and painted nothing.
+#[derive(Debug, Default)]
+pub(crate) struct OpExtents {
+    /// Set once a whole lowering has recorded every op.
+    complete: bool,
+    /// `[first, end)` device rows; `(0, 0)` for an op that emits nothing.
+    rows: Vec<(i32, i32)>,
+}
+
+/// Decoded images, and images resolved to RGB8, that a later strip of the
+/// same render will draw again.
+///
+/// A page rendered in strips lowers an image once per strip it crosses. The
+/// shared image cache normally answers the second time, but not always: it
+/// refuses an entry larger than its whole budget (a 600 dpi colour page scan
+/// decodes to about 100 MB against 96 MiB), other pages rendering at the same
+/// time can evict it, and it can be switched off. A codec decode repeated per
+/// strip would cost several times the render, so the render itself keeps what
+/// it will need again. An entry is held only when its draw reaches below the
+/// strip being lowered, and released once the strips have passed its last
+/// row, so an image that fits one strip is never held.
+#[derive(Debug, Default)]
+pub(crate) struct StripDecodes {
+    /// The decode and the device row its draw ends at.
+    held: std::sync::Mutex<HashMap<ImageCacheKey, (CodecSamples, i32)>>,
+}
+
+impl StripDecodes {
+    fn get(&self, key: &ImageCacheKey) -> Option<CodecSamples> {
+        lock_unpoisoned(&self.held)
+            .get(key)
+            .map(|(decoded, _)| decoded.clone())
+    }
+
+    fn hold(&self, key: ImageCacheKey, decoded: &CodecSamples, until_row: i32) {
+        let mut held = lock_unpoisoned(&self.held);
+        let entry = held
+            .entry(key)
+            .or_insert_with(|| (decoded.clone(), until_row));
+        entry.1 = entry.1.max(until_row);
+    }
+
+    /// Drop what no strip after device row `end_row` draws.
+    pub(crate) fn release_through(&self, end_row: u32) {
+        lock_unpoisoned(&self.held).retain(|_, (_, until)| i64::from(*until) > i64::from(end_row));
+    }
+
+    /// Entries currently held.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        lock_unpoisoned(&self.held).len()
+    }
+}
+
+/// Keep `decoded` for the strips still to come, when the IR op being lowered
+/// paints below the current strip.
+fn hold_for_later_strips(out: &CpuPreparedPage, key: ImageCacheKey, decoded: &CodecSamples) {
+    if let (Some(held), Some((_, end))) = (&out.strip_decodes, out.op_extent)
+        && out.rows.1 != u32::MAX
+        && i64::from(end) > i64::from(out.rows.1)
+    {
+        held.hold(key, decoded, end);
+    }
+}
+
+/// Fold `bounds` into the row extent of the IR op being lowered.
+fn note_extent(out: &mut CpuPreparedPage, bounds: DeviceRect) {
+    if bounds.width == 0 || bounds.height == 0 {
+        return;
+    }
+    let (first, end) = (bounds.y, bounds.y.saturating_add(bounds.height as i32));
+    out.op_extent = Some(match out.op_extent {
+        Some((lo, hi)) => (lo.min(first), hi.max(end)),
+        None => (first, end),
+    });
+}
+
+/// The device rectangle a lowering paints: the output, cut to its row window.
+fn row_window(out: &CpuPreparedPage) -> DeviceRect {
+    let first = out.rows.0.min(out.size.height);
+    let end = out.rows.1.min(out.size.height).max(first);
+    DeviceRect {
+        x: 0,
+        y: first as i32,
+        width: out.size.width,
+        height: end - first,
+    }
+}
+
+/// Bytes of the geometry arenas in use.
+fn arena_len_bytes(out: &CpuPreparedPage) -> usize {
+    out.points.len() * std::mem::size_of::<[f32; 2]>()
+        + out.subpaths.len() * std::mem::size_of::<(usize, usize)>()
+}
+
+/// Drop every draw's geometry from the arenas and keep the path clips', which
+/// later ops still use: to build the mask they draw under, and to recognise an
+/// identical clip. Clip ranges are rewritten to the compacted arenas; clips
+/// that shared one range still do.
+fn retain_clip_geometry(out: &mut CpuPreparedPage) {
+    let mut points: Vec<[f32; 2]> = Vec::new();
+    let mut subpaths: Vec<(usize, usize)> = Vec::new();
+    let mut moved: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
+    for clip in &mut out.clips {
+        let ClipKind::Path { subpath_range, .. } = &mut clip.kind else {
+            continue;
+        };
+        let old = *subpath_range;
+        let new = *moved.entry(old).or_insert_with(|| {
+            let start = subpaths.len() as u32;
+            for &(first, last) in &out.subpaths[old.0 as usize..old.1 as usize] {
+                let base = points.len();
+                points.extend_from_slice(&out.points[first..last]);
+                subpaths.push((base, base + (last - first)));
+            }
+            (start, subpaths.len() as u32)
+        });
+        *subpath_range = new;
+    }
+    out.points = points;
+    out.subpaths = subpaths;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_impl(
     page: &CompiledPage,
@@ -2038,6 +2299,7 @@ fn lower_impl(
     shared_images: Option<&Arc<SharedImageCache>>,
     decode_floor: Option<Matrix>,
     split_glyph_draws: bool,
+    mut sink: Option<&mut LowerSink<'_>>,
     #[cfg(feature = "profiling")] decode_cache: Option<DecodedImageCache>,
     #[cfg(feature = "profiling")] prof_enabled: bool,
 ) -> CpuPreparedPage {
@@ -2055,8 +2317,11 @@ fn lower_impl(
         color_policy,
         diagnostics: RenderDiagnostics::default(),
         image_cache: shared_images.cloned(),
+        strip_decodes: sink.as_deref().and_then(|sink| sink.decodes.clone()),
         decode_floor,
         sanity_extent: sanity_extent(page.bounds.crop, base, size),
+        rows: (0, u32::MAX),
+        op_extent: None,
         #[cfg(feature = "profiling")]
         profile: std::cell::RefCell::new(crate::profiling::ProfileReport::new()),
         #[cfg(feature = "profiling")]
@@ -2067,6 +2332,9 @@ fn lower_impl(
             ..LowerProf::default()
         },
     };
+    if let Some(sink) = sink.as_deref() {
+        out.rows = sink.rows;
+    }
     #[cfg(feature = "profiling")]
     let mut prof_bucket = LowerBucket::State;
     #[cfg(feature = "profiling")]
@@ -2077,6 +2345,8 @@ fn lower_impl(
     // while `PushClip`/`PopClip` move the clip stack (they are emitted
     // balanced by IR lowering).
     let mut clip_stack: Vec<u32> = Vec::new();
+    // Path clips lowered so far, by content, so identical ones share a mask.
+    let mut clip_share = ClipShare::default();
     // Open groups / soft-mask-content scopes, accumulating device bounds.
     let mut scope_stack: Vec<ScopeBuilder> = Vec::new();
     // Active soft masks, and the count captured at each Save so `Restore` can
@@ -2123,13 +2393,73 @@ fn lower_impl(
     // less invasive than threading a parameter through every `lower_*`.
     let mut origin_stack: Vec<crate::page_ir::PaintOrigin> = Vec::new();
 
-    for op in page.operations.iter() {
+    // Chunked lowering (see [`LowerSink`]): arena bytes that survive a flush
+    // (clip geometry), decoded image bytes among the pending ops, and what
+    // earlier chunks held, for the profile.
+    let mut retained_arena = 0usize;
+    let mut pending_image_bytes = 0usize;
+    #[cfg(feature = "profiling")]
+    let (mut flushed_ops, mut flushed_points, mut flushed_subpaths, mut peak_arena) =
+        (0u64, 0u64, 0u64, 0u64);
+
+    // Set when the loop below stops before the last op (cancellation).
+    let mut stopped_early = false;
+    for (op_index, op) in page.operations.iter().enumerate() {
         // Lowering may include a long codec decode. Once its cooperative probe
         // fires, do not continue lowering the rest of a large display list;
         // the caller's post-lowering token check converts this to Cancelled.
         if out.decode_limits.is_cancelled() {
+            stopped_early = true;
             break;
         }
+        // Between top-level ops, with no group or soft-mask scope open (their
+        // bounds and extents are patched into ops already emitted), a backlog
+        // past the chunk size is painted and dropped.
+        if let Some(sink) = sink.as_deref_mut()
+            && scope_stack.is_empty()
+            && !out.ops.is_empty()
+            && (arena_len_bytes(&out).saturating_sub(retained_arena) > sink.chunk_bytes
+                || pending_image_bytes > sink.image_chunk_bytes)
+        {
+            #[cfg(feature = "profiling")]
+            {
+                flushed_ops += out.ops.len() as u64;
+                flushed_points += out.points.len() as u64;
+                flushed_subpaths += out.subpaths.len() as u64;
+                peak_arena = peak_arena.max(
+                    (out.points.capacity() * std::mem::size_of::<[f32; 2]>()
+                        + out.subpaths.capacity() * std::mem::size_of::<(usize, usize)>())
+                        as u64,
+                );
+            }
+            if !(sink.flush)(&out, &clip_stack) {
+                stopped_early = true;
+                break;
+            }
+            out.ops.clear();
+            retain_clip_geometry(&mut out);
+            retained_arena = arena_len_bytes(&out);
+            pending_image_bytes = 0;
+        }
+        // A painting op whose recorded rows miss this strip is not lowered
+        // at all (see [`OpExtents`]). State ops always run.
+        if matches!(
+            op,
+            DisplayOp::FillPath { .. }
+                | DisplayOp::StrokePath { .. }
+                | DisplayOp::DrawGlyphRun { .. }
+                | DisplayOp::DrawImage { .. }
+                | DisplayOp::DrawShading { .. }
+        ) && let Some(extents) = sink.as_deref().and_then(|sink| sink.extents.as_deref())
+            && extents.complete
+            && let Some(&(first, end)) = extents.rows.get(op_index)
+        {
+            let window = row_window(&out);
+            if end <= window.y || first >= window.y.saturating_add(window.height as i32) {
+                continue;
+            }
+        }
+        out.op_extent = None;
         #[cfg(feature = "profiling")]
         {
             // Close the previous operation's bucket, then open this one's.
@@ -2169,6 +2499,7 @@ fn lower_impl(
                 push_clip(
                     &mut out,
                     &mut clip_stack,
+                    &mut clip_share,
                     &page.paths[path.index()],
                     ctm,
                     *rule,
@@ -2178,6 +2509,7 @@ fn lower_impl(
                 push_text_clip(
                     &mut out,
                     &mut clip_stack,
+                    &mut clip_share,
                     runs,
                     page,
                     ctm,
@@ -2561,12 +2893,15 @@ fn lower_impl(
                     }
                     let end_index = out.ops.len() as u32;
                     out.ops.push(PreparedOp::EndGroup);
-                    let bounds = gb.bounds.unwrap_or(DeviceRect {
-                        x: 0,
-                        y: 0,
-                        width: 0,
-                        height: 0,
-                    });
+                    let bounds = intersect(
+                        gb.bounds.unwrap_or(DeviceRect {
+                            x: 0,
+                            y: 0,
+                            width: 0,
+                            height: 0,
+                        }),
+                        row_window(&out),
+                    );
                     if let PreparedOp::BeginGroup { group, end } = &mut out.ops[gb.begin_index] {
                         group.bounds = bounds;
                         *end = end_index;
@@ -2598,12 +2933,15 @@ fn lower_impl(
                 soft_mask_content_depth = soft_mask_content_depth.saturating_sub(1);
                 if let Some(sb) = scope_stack.pop() {
                     let content_end = out.ops.len() as u32;
-                    let bounds = sb.bounds.unwrap_or(DeviceRect {
-                        x: 0,
-                        y: 0,
-                        width: 0,
-                        height: 0,
-                    });
+                    let bounds = intersect(
+                        sb.bounds.unwrap_or(DeviceRect {
+                            x: 0,
+                            y: 0,
+                            width: 0,
+                            height: 0,
+                        }),
+                        row_window(&out),
+                    );
                     if let PreparedOp::PushSoftMask {
                         content_end: ce,
                         bounds: b,
@@ -2732,6 +3070,53 @@ fn lower_impl(
             // The deprecated ApplySoftMask op is superseded by BeginSoftMask.
             DisplayOp::ApplySoftMask { .. } => {}
         }
+        if let Some(extents) = sink
+            .as_deref_mut()
+            .and_then(|sink| sink.extents.as_deref_mut())
+            && !extents.complete
+        {
+            // Ops whose bounds are clamped below, not where they were
+            // computed, still carry their full bounds here.
+            for index in ops_before.min(out.ops.len())..out.ops.len() {
+                let bounds = match &out.ops[index] {
+                    PreparedOp::Draw(cmd) => Some(cmd.bounds),
+                    PreparedOp::GlyphRun(gr) => Some(gr.bounds),
+                    PreparedOp::Image(img) => Some(img.bounds),
+                    PreparedOp::TiledFill(t) => Some(t.bounds),
+                    _ => None,
+                };
+                if let Some(bounds) = bounds {
+                    note_extent(&mut out, bounds);
+                }
+            }
+            if extents.rows.len() <= op_index {
+                extents.rows.resize(op_index + 1, (i32::MIN, i32::MAX));
+            }
+            extents.rows[op_index] = out.op_extent.unwrap_or((0, 0));
+        }
+        if out.rows != (0, u32::MAX) && out.ops.len() > ops_before {
+            // Ops whose bounds were not clamped where they were computed
+            // (glyph runs, shading fills). A tiling fill keeps its bounds:
+            // its cells are lowered relative to their origin.
+            let window = row_window(&out);
+            for prepared in &mut out.ops[ops_before..] {
+                match prepared {
+                    PreparedOp::Draw(cmd) => cmd.bounds = intersect(cmd.bounds, window),
+                    PreparedOp::GlyphRun(gr) => gr.bounds = intersect(gr.bounds, window),
+                    PreparedOp::Image(img) => img.bounds = intersect(img.bounds, window),
+                    _ => {}
+                }
+            }
+        }
+        if sink.is_some() {
+            for prepared in &out.ops[ops_before.min(out.ops.len())..] {
+                if let PreparedOp::Image(img) = prepared {
+                    pending_image_bytes = pending_image_bytes
+                        .saturating_add(img.samples.len())
+                        .saturating_add(img.smask.as_ref().map_or(0, |m| m.samples.len()));
+                }
+            }
+        }
         if let Some(&origin) = origin_stack.last()
             && out.ops.len() > ops_before
         {
@@ -2754,14 +3139,37 @@ fn lower_impl(
         glyph_raster.prof.drain_into(&mut profile);
         profile.add_duration("render.lower.total", lower_start.elapsed());
         profile.increment("render.lower.operations", page.operations.len() as u64);
-        profile.increment("render.lower.prepared_ops", out.ops.len() as u64);
-        profile.increment("render.lower.points", out.points.len() as u64);
-        profile.increment("render.lower.subpaths", out.subpaths.len() as u64);
+        // Totals over every chunk; the arena figure is the largest held.
+        profile.increment(
+            "render.lower.prepared_ops",
+            flushed_ops + out.ops.len() as u64,
+        );
+        profile.increment(
+            "render.lower.points",
+            flushed_points + out.points.len() as u64,
+        );
+        profile.increment(
+            "render.lower.subpaths",
+            flushed_subpaths + out.subpaths.len() as u64,
+        );
         profile.increment(
             "render.lower.arena_bytes",
-            (out.points.capacity() * std::mem::size_of::<[f32; 2]>()
-                + out.subpaths.capacity() * std::mem::size_of::<(usize, usize)>()) as u64,
+            peak_arena.max(
+                (out.points.capacity() * std::mem::size_of::<[f32; 2]>()
+                    + out.subpaths.capacity() * std::mem::size_of::<(usize, usize)>())
+                    as u64,
+            ),
         );
+    }
+    // A lowering that ran to the end has recorded every op. One that stopped
+    // early (cancellation) has not, and must not let later strips skip ops.
+    if !stopped_early
+        && !out.decode_limits.is_cancelled()
+        && let Some(extents) = sink.and_then(|sink| sink.extents.as_deref_mut())
+        && !extents.complete
+    {
+        extents.rows.resize(page.operations.len(), (0, 0));
+        extents.complete = true;
     }
     if let Some(cache) = font_cache {
         cache.store_for_page(page, font_programs);
@@ -2826,6 +3234,52 @@ fn lower_image(
     // raster. Computed once and shared by the base image, its soft mask, and
     // any stencil mask (they share the placement).
     let target_size = decode_target_size(ctm, out.decode_floor);
+
+    // Sampling needs a *trustworthy* inverse, not merely a defined one: an
+    // ill-conditioned CTM inverts to noise and would smear garbage texels.
+    // A degenerate placement collapses the image to no visible area (PDFium
+    // likewise paints nothing), so this is a geometry no-op, not a
+    // content-losing drop — intentionally not counted as degraded.
+    if !ctm.is_stably_invertible() {
+        return None;
+    }
+    let inv = ctm.invert()?;
+
+    // Device bounds of the unit square.
+    let corners = [
+        ctm.apply(Point { x: 0.0, y: 0.0 }),
+        ctm.apply(Point { x: 1.0, y: 0.0 }),
+        ctm.apply(Point { x: 1.0, y: 1.0 }),
+        ctm.apply(Point { x: 0.0, y: 1.0 }),
+    ];
+    let pts: Vec<[f32; 2]> = corners.iter().map(|p| [p.x as f32, p.y as f32]).collect();
+    let (bx0, by0, bx1, by1) = device_bounds(&pts, out.size);
+    let mut bounds = DeviceRect {
+        x: bx0,
+        y: by0,
+        width: (bx1 - bx0).max(0) as u32,
+        height: (by1 - by0).max(0) as u32,
+    };
+    let clip_has_mask = if let Some(cid) = clip {
+        let c = &out.clips[cid as usize];
+        bounds = intersect(bounds, c.bounds);
+        c.has_mask
+    } else {
+        false
+    };
+    note_extent(out, bounds);
+    bounds = intersect(bounds, row_window(out));
+    // The image maps to a sub-pixel or off-surface rectangle: nothing visible
+    // to paint (PDFium likewise), so this is a geometry no-op, not a
+    // content-losing drop — intentionally not counted as degraded.
+    //
+    // The placement is settled before the image is decoded: it depends on the
+    // CTM and the clip alone, and a draw outside a region render's window (a
+    // zoomed viewer tile, a cropped print placement) used to decode its whole
+    // image — and insert it in the image cache — to paint nothing.
+    if bounds.width == 0 || bounds.height == 0 {
+        return None;
+    }
 
     // Direct samples, or a codec decode through the injected registry (no
     // resource cache yet — decoded per draw op, see DEFERRED.md). A
@@ -2980,45 +3434,6 @@ fn lower_image(
     if img_w == 0 || img_h == 0 {
         return None;
     }
-    // Sampling needs a *trustworthy* inverse, not merely a defined one: an
-    // ill-conditioned CTM inverts to noise and would smear garbage texels.
-    // A degenerate placement collapses the image to no visible area (PDFium
-    // likewise paints nothing), so this is a geometry no-op, not a
-    // content-losing drop — intentionally not counted as degraded.
-    if !ctm.is_stably_invertible() {
-        return None;
-    }
-    let inv = ctm.invert()?;
-
-    // Device bounds of the unit square.
-    let corners = [
-        ctm.apply(Point { x: 0.0, y: 0.0 }),
-        ctm.apply(Point { x: 1.0, y: 0.0 }),
-        ctm.apply(Point { x: 1.0, y: 1.0 }),
-        ctm.apply(Point { x: 0.0, y: 1.0 }),
-    ];
-    let pts: Vec<[f32; 2]> = corners.iter().map(|p| [p.x as f32, p.y as f32]).collect();
-    let (bx0, by0, bx1, by1) = device_bounds(&pts, out.size);
-    let mut bounds = DeviceRect {
-        x: bx0,
-        y: by0,
-        width: (bx1 - bx0).max(0) as u32,
-        height: (by1 - by0).max(0) as u32,
-    };
-    let clip_has_mask = if let Some(cid) = clip {
-        let c = &out.clips[cid as usize];
-        bounds = intersect(bounds, c.bounds);
-        c.has_mask
-    } else {
-        false
-    };
-    // The image maps to a sub-pixel or off-surface rectangle: nothing visible
-    // to paint (PDFium likewise), so this is a geometry no-op, not a
-    // content-losing drop — intentionally not counted as degraded.
-    if bounds.width == 0 || bounds.height == 0 {
-        return None;
-    }
-
     let sample_lut = crate::render_cpu::image::build_sample_lut(
         bpc,
         &color_space,
@@ -3115,15 +3530,21 @@ fn promote_through_cache(
     if prepared.is_sixteen_bit_device_family() && unmasked_opaque && !ring_ok {
         return prepared;
     }
-    let cache = out
-        .image_cache
-        .as_ref()
-        .map(|cache| (cache, promotion_cache_key(&prepared)));
+    let key = (out.image_cache.is_some() || out.strip_decodes.is_some())
+        .then(|| promotion_cache_key(&prepared));
+    let cache = out.image_cache.as_ref().zip(key);
     let expected = prepared.width as usize * prepared.height as usize * 3;
+    if let (Some(held), Some(key)) = (&out.strip_decodes, &key)
+        && let Some(hit) = held.get(key)
+        && hit.samples.len() == expected
+    {
+        return Box::new(prepared.with_rgb8_samples(hit.samples));
+    }
     if let Some((cache, key)) = &cache
         && let Some(hit) = cache.get(key)
         && hit.samples.len() == expected
     {
+        hold_for_later_strips(out, *key, &hit);
         return Box::new(prepared.with_rgb8_samples(hit.samples));
     }
     let samples = if indexed {
@@ -3134,19 +3555,20 @@ fn promote_through_cache(
     let Some(samples) = samples else {
         return prepared;
     };
-    if let Some((cache, key)) = cache {
-        cache.insert(
-            key,
-            CodecSamples {
-                samples: samples.clone(),
-                width: prepared.width,
-                height: prepared.height,
-                bpc: 8,
-                color_space: crate::page_ir::ImageColorSpace::Rgb,
-                format: crate::image::DecodedFormat::Rgb8,
-                alpha: None,
-            },
-        );
+    if let Some(key) = key {
+        let resolved = CodecSamples {
+            samples: samples.clone(),
+            width: prepared.width,
+            height: prepared.height,
+            bpc: 8,
+            color_space: crate::page_ir::ImageColorSpace::Rgb,
+            format: crate::image::DecodedFormat::Rgb8,
+            alpha: None,
+        };
+        hold_for_later_strips(out, key, &resolved);
+        if let Some((cache, key)) = cache {
+            cache.insert(key, resolved);
+        }
     }
     Box::new(prepared.with_rgb8_samples(samples))
 }
@@ -3547,12 +3969,12 @@ fn decode_codec_samples(
     // The codec names the resolution it will decode this draw at, from the
     // same descriptor and parameters the decode below receives, so a reduced
     // decode is only ever served to draws the codec would reduce the same way.
-    let image_cache_key = out.image_cache.as_ref().map(|cache| {
+    let image_key = (out.image_cache.is_some() || out.strip_decodes.is_some()).then(|| {
         let scale = match codec.reduction_level(data, &descriptor, &params, &out.decode_limits) {
             Some(level) => DecodeScaleKey::Level(level),
             None => DecodeScaleKey::Target(target_size),
         };
-        let key = ImageCacheKey::new(
+        ImageCacheKey::new(
             kind,
             data,
             width,
@@ -3562,12 +3984,20 @@ fn decode_codec_samples(
             descriptor.color_space.as_ref(),
             parms.as_ref(),
             scale,
-        );
-        (cache, key)
+        )
     });
-    let image_decode_flight = match image_cache_key {
+    // An earlier strip of this render decoded it and kept it for this one.
+    if let (Some(held), Some(key)) = (&out.strip_decodes, &image_key)
+        && let Some(decoded) = held.get(key)
+    {
+        return Some(decoded);
+    }
+    let image_decode_flight = match out.image_cache.as_ref().zip(image_key) {
         Some((cache, key)) => match cache.probe(key) {
-            ImageCacheProbe::Hit(cached) => return Some(cached),
+            ImageCacheProbe::Hit(cached) => {
+                hold_for_later_strips(out, key, &cached);
+                return Some(cached);
+            }
             ImageCacheProbe::Leader(flight) => Some(flight),
         },
         None => None,
@@ -3745,6 +4175,9 @@ fn decode_codec_samples(
     if let Some(flight) = image_decode_flight {
         flight.complete(&decoded);
     }
+    if let Some(key) = image_key {
+        hold_for_later_strips(out, key, &decoded);
+    }
     #[cfg(feature = "profiling")]
     if let Some(cache) = &out.decode_cache {
         lock_unpoisoned(&cache.entries).insert(cache_key, decoded.clone());
@@ -3804,6 +4237,7 @@ fn union(a: DeviceRect, b: DeviceRect) -> DeviceRect {
 fn push_clip(
     out: &mut CpuPreparedPage,
     clip_stack: &mut Vec<u32>,
+    share: &mut ClipShare,
     path: &PathData,
     ctm: Matrix,
     rule: crate::page_ir::FillRule,
@@ -3870,20 +4304,164 @@ fn push_clip(
             .map(|p| out.clips[p as usize].has_mask)
             .unwrap_or(false);
 
+    let (kind, mask_source) = share.resolve(out, kind, bounds, parent);
     let cid = out.clips.len() as u32;
-    let mask_source = if matches!(kind, ClipKind::Path { .. }) {
-        Some(cid)
-    } else {
-        parent.and_then(|p| out.clips[p as usize].mask_source)
-    };
     out.clips.push(PreparedClip {
         parent,
         bounds,
+        mask_bounds: intersect(bounds, row_window(out)),
         kind,
         has_mask,
         mask_source,
     });
     clip_stack.push(cid);
+}
+
+/// Whether identical path clips share one mask. On by default;
+/// `PDF_RENDERER_CLIPSHARE=off` (or `0`) disables it, for paired A/B isolation
+/// on one binary. Read once.
+fn clip_share_enabled() -> bool {
+    #[cfg(test)]
+    if CLIP_SHARE_OFF_FOR_TEST.with(std::cell::Cell::get) {
+        return false;
+    }
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("PDF_RENDERER_CLIPSHARE") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v != "off" && v != "0" && v != "false"
+        }
+        Err(_) => true,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lets a test lower the same page with and without clip sharing.
+    pub(crate) static CLIP_SHARE_OFF_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What makes two path clips the same mask: the same flattened geometry
+/// (hashed here, compared bit for bit on a match), fill rule and envelope,
+/// under the same mask above them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ClipShareKey {
+    geometry: u64,
+    even_odd: bool,
+    bounds: (i32, i32, u32, u32),
+    /// The (already shared) mask source of the parent chain.
+    above: Option<u32>,
+}
+
+/// Path clips lowered so far, by content.
+///
+/// Producers re-establish one clip path around every element (`q <path> W n
+/// ... Q`, repeated), and each `W` used to become a clip with a mask of its
+/// own over the whole envelope: 200 repeats of a page-sized clip built and
+/// held 200 identical masks. A clip's mask is the product of the coverage of
+/// its path and of every path clip above it, over its envelope, so two clips
+/// with bit-identical device geometry, the same rule and envelope, and the
+/// same mask above them have byte-identical masks. The later clip is pointed
+/// at the mask and geometry of the first, and its copy of the points is
+/// dropped.
+#[derive(Debug, Default)]
+struct ClipShare {
+    by_key: HashMap<ClipShareKey, Vec<u32>>,
+}
+
+impl ClipShare {
+    /// Clips kept per key. The hash is not collision-resistant and its input
+    /// comes from the document, so a crafted page could pile distinct clips
+    /// onto one key; beyond this many they simply stop being shared.
+    const MAX_PER_KEY: usize = 4;
+
+    /// Decide the kind and mask source of the clip about to be pushed. For a
+    /// path clip whose geometry sits at the tail of the arenas, an identical
+    /// earlier clip takes over both (and the tail is reclaimed).
+    fn resolve(
+        &mut self,
+        out: &mut CpuPreparedPage,
+        kind: ClipKind,
+        bounds: DeviceRect,
+        parent: Option<u32>,
+    ) -> (ClipKind, Option<u32>) {
+        let above = parent.and_then(|p| out.clips[p as usize].mask_source);
+        let ClipKind::Path {
+            subpath_range,
+            rule,
+        } = kind
+        else {
+            return (kind, above);
+        };
+        let cid = out.clips.len() as u32;
+        if bounds.width == 0 || bounds.height == 0 || !clip_share_enabled() {
+            return (kind, Some(cid));
+        }
+        let (first, last) = (subpath_range.0 as usize, subpath_range.1 as usize);
+        let mut geometry: u64 = 0x9E37_79B9_7F4A_7C15 ^ (last - first) as u64;
+        let mut mix = |word: u64| {
+            geometry = (geometry ^ word)
+                .wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+                .rotate_left(31);
+        };
+        for &(start, end) in &out.subpaths[first..last] {
+            mix((end - start) as u64);
+            for p in &out.points[start..end] {
+                mix((u64::from(p[0].to_bits()) << 32) | u64::from(p[1].to_bits()));
+            }
+        }
+        let key = ClipShareKey {
+            geometry,
+            even_odd: matches!(rule, FillRule::EvenOdd),
+            bounds: (bounds.x, bounds.y, bounds.width, bounds.height),
+            above,
+        };
+        let known = self.by_key.entry(key).or_default();
+        for &candidate in known.iter() {
+            let ClipKind::Path {
+                subpath_range: shared,
+                ..
+            } = out.clips[candidate as usize].kind
+            else {
+                continue;
+            };
+            if same_clip_geometry(out, subpath_range, shared) {
+                // The new copy is the arena tail and nothing refers to it yet.
+                if let Some(&(tail, _)) = out.subpaths.get(first) {
+                    out.points.truncate(tail);
+                }
+                out.subpaths.truncate(first);
+                return (
+                    ClipKind::Path {
+                        subpath_range: shared,
+                        rule,
+                    },
+                    Some(candidate),
+                );
+            }
+        }
+        if known.len() < Self::MAX_PER_KEY {
+            known.push(cid);
+        }
+        (kind, Some(cid))
+    }
+}
+
+/// Whether two subpath ranges hold bit-identical polylines.
+fn same_clip_geometry(out: &CpuPreparedPage, a: (u32, u32), b: (u32, u32)) -> bool {
+    let (sa, sb) = (
+        &out.subpaths[a.0 as usize..a.1 as usize],
+        &out.subpaths[b.0 as usize..b.1 as usize],
+    );
+    sa.len() == sb.len()
+        && sa.iter().zip(sb).all(|(&(s0, e0), &(s1, e1))| {
+            let (pa, pb) = (&out.points[s0..e0], &out.points[s1..e1]);
+            pa.len() == pb.len()
+                && pa.iter().zip(pb).all(|(p, q)| {
+                    p[0].to_bits() == q[0].to_bits() && p[1].to_bits() == q[1].to_bits()
+                })
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4658,9 +5236,11 @@ fn append_glyph_run_clip(
 /// `CFX_Path` of the glyph outlines with `SetClip_PathFill`. An empty run set
 /// (no glyph placed an outline) yields an empty clip — nothing passes — the
 /// spec's empty-clip-path rule and PDFium's `AppendRect(-1,-1,0,0)` fallback.
+#[allow(clippy::too_many_arguments)]
 fn push_text_clip(
     out: &mut CpuPreparedPage,
     clip_stack: &mut Vec<u32>,
+    share: &mut ClipShare,
     runs: &[crate::page_ir::GlyphRunId],
     page: &CompiledPage,
     ctm: Matrix,
@@ -4715,15 +5295,12 @@ fn push_text_clip(
             .map(|p| out.clips[p as usize].has_mask)
             .unwrap_or(false);
 
+    let (kind, mask_source) = share.resolve(out, kind, bounds, parent);
     let cid = out.clips.len() as u32;
-    let mask_source = if matches!(kind, ClipKind::Path { .. }) {
-        Some(cid)
-    } else {
-        parent.and_then(|p| out.clips[p as usize].mask_source)
-    };
     out.clips.push(PreparedClip {
         parent,
         bounds,
+        mask_bounds: intersect(bounds, row_window(out)),
         kind,
         has_mask,
         mask_source,
@@ -5853,6 +6430,8 @@ fn finish_glyph_fill(
     } else {
         false
     };
+    note_extent(out, bounds);
+    bounds = intersect(bounds, row_window(out));
     if bounds.width == 0 || bounds.height == 0 {
         out.points.truncate(pt_start);
         out.subpaths.truncate(range_start as usize);
@@ -7279,6 +7858,9 @@ mod glyph_cache_tests {
             image_cache: None,
             decode_floor: None,
             sanity_extent: w.max(h) as f32,
+            rows: (0, u32::MAX),
+            op_extent: None,
+            strip_decodes: None,
             #[cfg(feature = "profiling")]
             profile: std::cell::RefCell::new(crate::profiling::ProfileReport::new()),
             #[cfg(feature = "profiling")]
@@ -7631,6 +8213,7 @@ mod image_cache_tests {
             cache,
             reference.and_then(|r| decode_floor_map(base, Matrix::scale(r, r))),
             false,
+            None,
             #[cfg(feature = "profiling")]
             None,
             #[cfg(feature = "profiling")]
@@ -7803,6 +8386,85 @@ mod image_cache_tests {
             stride: width as usize,
             data: Arc::from(vec![128u8; width as usize * height as usize]),
         })
+    }
+
+    /// A page rendered in strips lowers an image once per strip it crosses.
+    /// With nothing to remember the decode (no image cache, or one that
+    /// refuses the entry) the codec would run once per strip; the render's
+    /// own holder makes it once per render, and lets go of the decode as
+    /// soon as the strips have passed the draw's last row.
+    #[test]
+    fn a_draw_crossing_strips_is_decoded_once_and_released_after_its_last_row() {
+        let page = dct_page_sized(jpeg_payload_sized(64, 3), 64);
+        for hold in [true, false] {
+            let codec = Arc::new(FixedScaleCodec::default());
+            let codecs = crate::image::CodecRegistry::new([
+                Arc::clone(&codec) as Arc<dyn crate::image::ImageCodec>
+            ]);
+            let decodes = Arc::new(StripDecodes::default());
+            let mut extents = OpExtents::default();
+            // The image covers rows 0..64 of a taller page: three strips
+            // cross it, the fourth is below it.
+            for (first, end) in [(0u32, 24u32), (24, 48), (48, 72), (72, 96)] {
+                let mut flush = |_: &CpuPreparedPage, _: &[u32]| true;
+                let mut sink = LowerSink {
+                    chunk_bytes: usize::MAX,
+                    image_chunk_bytes: usize::MAX,
+                    rows: (first, end),
+                    extents: Some(&mut extents),
+                    decodes: hold.then(|| Arc::clone(&decodes)),
+                    flush: &mut flush,
+                };
+                let prepared = lower_impl(
+                    &page,
+                    // The page's top edge at device row 0, one pixel a unit.
+                    Matrix {
+                        a: 1.0,
+                        b: 0.0,
+                        c: 0.0,
+                        d: 1.0,
+                        e: 0.0,
+                        f: 0.0,
+                    },
+                    DeviceSize {
+                        width: 64,
+                        height: 96,
+                    },
+                    &codecs,
+                    &crate::image::DecodeLimits::default(),
+                    crate::font::HintingPolicy::None,
+                    crate::render_api::RenderColorPolicy::Original,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    Some(&mut sink),
+                    #[cfg(feature = "profiling")]
+                    None,
+                    #[cfg(feature = "profiling")]
+                    true,
+                );
+                let drawn = prepared
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, PreparedOp::Image(_)));
+                assert_eq!(drawn, first < 64, "strip {first}..{end}");
+                decodes.release_through(end);
+                // Held while a later strip still draws it, then dropped.
+                assert_eq!(
+                    decodes.len(),
+                    usize::from(hold && end < 64),
+                    "strip {first}..{end}"
+                );
+            }
+            assert_eq!(
+                codec.decodes.load(Ordering::Relaxed),
+                if hold { 1 } else { 3 },
+                "hold={hold}"
+            );
+        }
     }
 
     /// An injected DCT codec that, like JBIG2 and CCITT, never scales and says

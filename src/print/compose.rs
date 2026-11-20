@@ -661,7 +661,8 @@ fn render_placement(
         });
     }
 
-    let plane = session.render(&page, &product)?;
+    // Copied into bands and dropped: no second plane for the RGB packing.
+    let plane = session.render_in_place(&page, &product)?;
     let (width, height, stride, channels, pixels) = match plane {
         RasterPlane::Rgb8(surface) => (
             surface.width,

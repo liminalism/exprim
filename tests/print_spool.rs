@@ -351,6 +351,162 @@ fn file_names(paths: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
+/// A two-page document with distinct, asymmetric colour content.
+fn colour_session() -> exprim::RenderSession {
+    use exprim::test_support::builder::PdfBuilder;
+    let mut b = PdfBuilder::new();
+    b.add_object(1, "<</Type/Catalog/Pages 2 0 R>>");
+    b.add_object(
+        2,
+        "<</Type/Pages/Kids[3 0 R 5 0 R]/Count 2/MediaBox[0 0 200 200]>>",
+    );
+    b.add_object(
+        3,
+        "<</Type/Page/Parent 2 0 R/Contents 4 0 R/Resources<<>>>>",
+    );
+    b.add_stream(
+        4,
+        "",
+        b"1 0 0 rg 0 100 100 100 re f 0 0 1 rg 100 0 50 50 re f",
+    );
+    b.add_object(
+        5,
+        "<</Type/Page/Parent 2 0 R/Contents 6 0 R/Resources<<>>>>",
+    );
+    b.add_stream(6, "", b"0.2 0.8 0.3 rg 20 20 60 130 re f");
+    b.finish_classic_xref("/Root 1 0 R");
+    let bytes: std::sync::Arc<[u8]> = b.into_bytes().into();
+    exprim::RenderSession::open(bytes, None).expect("fixture opens")
+}
+
+fn sheet_of(pages: &[u32]) -> exprim::print::Sheet {
+    use exprim::print::{Matrix, Placement, Rect, Sheet, Side};
+    let bounds = Rect::new(0.0, 0.0, 401.0, 210.0);
+    Sheet {
+        index: 0,
+        bounds,
+        imageable: bounds,
+        side: Side::Front,
+        placements: pages
+            .iter()
+            .enumerate()
+            .map(|(cell, &page)| Placement {
+                source_page: page,
+                transform: Matrix::translate(200.0 * cell as f64, 5.0),
+                clip: Rect::new(200.0 * cell as f64, 0.0, 200.0 * (cell + 1) as f64, 210.0),
+            })
+            .collect(),
+    }
+}
+
+/// The file backend streams composed bands into its PNG encoder instead of
+/// composing whole sheets first. The pixels it writes must be exactly the
+/// composed sheet's, for colour and gray, across bands and sheets.
+#[test]
+fn composed_sheets_are_streamed_to_png_with_the_composed_pixels() {
+    let session = colour_session();
+    let sheets = vec![sheet_of(&[0, 1]), sheet_of(&[1]), sheet_of(&[0])];
+    for grayscale in [false, true] {
+        let compose = ComposeOptions {
+            dpi: 72.0,
+            grayscale,
+            // Several bands per sheet, the last one partial (210 = 4*50 + 10).
+            band_rows: 50,
+            ..ComposeOptions::default()
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let spooler = FileSpooler::new(dir.path());
+        let options = PrintOptions::default();
+        spooler
+            .submit(SpoolJob {
+                printer: PrinterId::new("file"),
+                title: "Composed".to_string(),
+                options: &options,
+                payload: SpoolPayload::Sheets {
+                    session: &session,
+                    sheets: &sheets,
+                    compose,
+                },
+            })
+            .expect("submit");
+        let job = spooler.last_job().expect("job recorded");
+        assert_eq!(
+            file_names(&job.files),
+            ["sheet-0001.png", "sheet-0002.png", "sheet-0003.png"]
+        );
+        assert_eq!(job.compose, Some(compose));
+
+        // The same sheets composed whole and written through the raster
+        // seam, which is what `submit` did before.
+        let reference_dir = tempfile::tempdir().expect("temp dir");
+        let reference = FileSpooler::new(reference_dir.path());
+        let rasters = sheets
+            .iter()
+            .map(|sheet| exprim::print::compose::compose_sheet(&session, sheet, &compose));
+        reference
+            .submit_raster_stream(
+                &PrinterId::new("file"),
+                "Composed",
+                &options,
+                compose,
+                rasters,
+            )
+            .expect("reference submit");
+        let reference_job = reference.last_job().expect("reference job");
+
+        for ((streamed, whole), sheet) in job.files.iter().zip(&reference_job.files).zip(&sheets) {
+            let raster =
+                exprim::print::compose::compose_sheet(&session, sheet, &compose).expect("compose");
+            let (info, pixels) = decode_png(streamed);
+            assert_eq!((info.width, info.height), (raster.width, raster.height));
+            assert_eq!(
+                info.color_type,
+                if grayscale {
+                    png::ColorType::Grayscale
+                } else {
+                    png::ColorType::Rgb
+                }
+            );
+            assert!(pixels == raster.pixels, "streamed pixels differ");
+            assert!(pixels == decode_png(whole).1, "differs from the old path");
+            assert!(pixels.iter().any(|&v| v < 0xF0), "the sheet has content");
+        }
+    }
+}
+
+/// A sheet that fails while it is being streamed leaves no partial file and
+/// no record, like a sheet that failed to compose before.
+#[test]
+fn a_composed_sheet_that_fails_mid_job_leaves_no_files() {
+    let session = colour_session();
+    // Page 7 does not exist: composition of the second sheet fails after its
+    // file was created.
+    let sheets = vec![sheet_of(&[0]), sheet_of(&[1, 7])];
+    let dir = tempfile::tempdir().expect("temp dir");
+    let spooler = FileSpooler::new(dir.path());
+    let options = PrintOptions::default();
+    let result = spooler.submit(SpoolJob {
+        printer: PrinterId::new("file"),
+        title: "Broken".to_string(),
+        options: &options,
+        payload: SpoolPayload::Sheets {
+            session: &session,
+            sheets: &sheets,
+            compose: ComposeOptions {
+                dpi: 72.0,
+                ..ComposeOptions::default()
+            },
+        },
+    });
+    assert!(result.is_err());
+    assert!(spooler.recorded().is_empty());
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("dir").count(),
+        0,
+        "no sheet file is left behind"
+    );
+}
+
 fn decode_png(path: &std::path::Path) -> (png::OutputInfo, Vec<u8>) {
     let file = std::fs::File::open(path).expect("open png");
     let decoder = png::Decoder::new(std::io::BufReader::new(file));

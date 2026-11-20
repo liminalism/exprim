@@ -34,7 +34,7 @@ fn choose_blend(mode: crate::page_ir::BlendMode) -> BlendChoice {
     }
 }
 use crate::page_ir::DeviceRect;
-use crate::render_cpu::mask::{ClipGeom, ClipMask, build_clip_mask_cancellable};
+use crate::render_cpu::mask::{ClipMask, ClipMasks};
 
 use crate::render_cpu::prepared::{
     CpuPreparedPage, DrawClass, PreparedCommand, PreparedGlyphRun, PreparedOp,
@@ -52,13 +52,6 @@ pub struct CpuWorkerContext {
     raster: RasterKernel,
     kernels: KernelSet,
     pub(crate) fonts: crate::render_cpu::prepared::FontProgramCache,
-    /// The previous render's page buffer, kept so the next render of the same
-    /// geometry repaints resident memory instead of faulting in a fresh
-    /// mapping. At most one buffer, always the most recent page's size, and
-    /// only ever handed back out when its consumer has dropped it — so this
-    /// retains no more than the one page surface the worker was already sized
-    /// for, and nothing at all until a page has been rendered.
-    pub(crate) surface_buffer: Option<std::sync::Arc<[u8]>>,
 }
 
 impl Default for CpuWorkerContext {
@@ -67,7 +60,6 @@ impl Default for CpuWorkerContext {
             raster: RasterKernel::default(),
             kernels: KernelSet::select(),
             fonts: crate::render_cpu::prepared::FontProgramCache::default(),
-            surface_buffer: None,
         }
     }
 }
@@ -75,6 +67,18 @@ impl Default for CpuWorkerContext {
 impl CpuWorkerContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The font residency lowering uses and the scratch execution uses, as
+    /// separate borrows, so a page can be painted while it is being lowered.
+    pub(crate) fn parts(
+        &mut self,
+    ) -> (
+        &mut crate::render_cpu::prepared::FontProgramCache,
+        &mut RasterKernel,
+        &KernelSet,
+    ) {
+        (&mut self.fonts, &mut self.raster, &self.kernels)
     }
 
     /// Choose how much timing profiled renders on this worker collect (see
@@ -87,23 +91,95 @@ impl CpuWorkerContext {
     }
 }
 
-/// Execute a page into `surface`, rendering transparency groups into bounded
-/// offscreen surfaces that composite back (advice §9).
+/// Execute a whole prepared page into `surface`, rendering transparency
+/// groups into bounded offscreen surfaces that composite back (advice §9).
+/// Production renders paint in chunks instead ([`execute_chunk`]); this is the
+/// one-pass form the prepared-page profiling entry and the tests use.
+#[cfg(any(test, feature = "profiling"))]
 pub fn execute(
     page: &CpuPreparedPage,
     surface: &mut Surface,
     ctx: &mut CpuWorkerContext,
     stats: &mut RenderStats,
 ) {
-    #[cfg(feature = "profiling")]
-    let start = Instant::now();
-    let _in_flight = PageInFlight::enter();
+    // Region-local clip masks, indexed by dense ClipId (advice §8 — no hash
+    // map in the draw loop), each resident from its first consumer to its
+    // last and all of them under a byte budget (see [`ClipMasks`]).
+    execute_with(page, surface, ctx, stats, ClipMasks::for_page(page));
+}
+
+/// [`execute`] with a caller-chosen clip-mask store.
+#[cfg(any(test, feature = "profiling"))]
+fn execute_with(
+    page: &CpuPreparedPage,
+    surface: &mut Surface,
+    ctx: &mut CpuWorkerContext,
+    stats: &mut RenderStats,
+    mut masks: ClipMasks,
+) {
     let CpuWorkerContext {
         raster, kernels, ..
     } = ctx;
-    // Region-local clip masks, built once per page and indexed by dense
-    // ClipId (advice §8 — no hash map in the draw loop).
-    let mut masks: Vec<Option<ClipMask>> = (0..page.clips.len()).map(|_| None).collect();
+    // Active soft masks (top = current); `None` entry = /SMask /None.
+    let mut soft: Vec<Option<ClipMask>> = Vec::new();
+    run_planned(page, surface, raster, kernels, &mut masks, &mut soft, stats);
+}
+
+/// What a page execution carries from one chunk of ops to the next when the
+/// page is lowered and painted in pieces (see
+/// [`LowerSink`](crate::render_cpu::prepared::LowerSink)): the clip masks
+/// still resident and the soft-mask stack in force.
+#[derive(Debug)]
+pub(crate) struct ExecState {
+    masks: ClipMasks,
+    soft: Vec<Option<ClipMask>>,
+}
+
+impl ExecState {
+    pub(crate) fn new() -> Self {
+        Self {
+            masks: ClipMasks::unmanaged(0),
+            soft: Vec::new(),
+        }
+    }
+}
+
+/// Paint one chunk of a page: `page.ops` are the chunk's ops and `live_clips`
+/// the clip stack in force after them (empty for the last chunk).
+pub(crate) fn execute_chunk(
+    page: &CpuPreparedPage,
+    live_clips: &[u32],
+    state: &mut ExecState,
+    surface: &mut Surface,
+    raster: &mut RasterKernel,
+    kernels: &KernelSet,
+    stats: &mut RenderStats,
+) {
+    state.masks.begin_chunk(page, live_clips);
+    run_planned(
+        page,
+        surface,
+        raster,
+        kernels,
+        &mut state.masks,
+        &mut state.soft,
+        stats,
+    );
+}
+
+/// Run `page.ops` against a planned mask store and the soft-mask stack.
+fn run_planned(
+    page: &CpuPreparedPage,
+    surface: &mut Surface,
+    raster: &mut RasterKernel,
+    kernels: &KernelSet,
+    masks: &mut ClipMasks,
+    soft: &mut Vec<Option<ClipMask>>,
+    stats: &mut RenderStats,
+) {
+    #[cfg(feature = "profiling")]
+    let start = Instant::now();
+    let _in_flight = PageInFlight::enter();
     #[cfg(feature = "profiling")]
     let mut lap = crate::profiling::Lap::start();
     #[cfg(feature = "profiling")]
@@ -113,39 +189,32 @@ pub fn execute(
     // Clip-dense pages (basin maps, music notation) spend nearly all their time
     // rasterizing hundreds of large independent path-clip masks. Each mask is a
     // pure function of the page and is byte-identical regardless of build order,
-    // so pre-build every consumed mask across the rayon pool before the serial
-    // draw loop. The draw loop then finds them cached. Peak memory is unchanged
-    // (every consumed mask is cached by page end anyway); this only front-loads
-    // and parallelizes the build.
-    prebuild_masks(
-        page,
-        &mut masks,
-        #[cfg(feature = "profiling")]
-        &mut raster.prof,
-    );
+    // so the first budget's worth is built across the rayon pool before the
+    // serial draw loop, and each later batch when the loop reaches a mask that
+    // is not resident yet.
+    if !masks.prebuild(page, raster) {
+        stats.cancelled = true;
+    }
     #[cfg(feature = "profiling")]
     {
         stats.hot.ns_prebuild_masks += lap.lap_ns();
-        stats.hot.n_clip_mask_prebuilt += masks.iter().flatten().count() as u64;
-        stats.hot.clip_mask_bytes += masks
-            .iter()
-            .flatten()
-            .map(|mask| mask.data.len() as u64)
-            .sum::<u64>();
     }
-    // Active soft masks (top = current); `None` entry = /SMask /None.
-    let mut soft: Vec<Option<ClipMask>> = Vec::new();
-    run_ops(
-        page,
-        0,
-        page.ops.len(),
-        surface,
-        raster,
-        kernels,
-        &mut masks,
-        &mut soft,
-        stats,
-    );
+    // A request cancelled while the first batch was building draws nothing.
+    if !stats.cancelled {
+        run_ops(
+            page,
+            0,
+            page.ops.len(),
+            surface,
+            raster,
+            kernels,
+            masks,
+            soft,
+            stats,
+        );
+    }
+    flush_mask_counters(masks, stats);
+    stats.clip_mask_peak_bytes = stats.clip_mask_peak_bytes.max(masks.peak_bytes() as u64);
     #[cfg(feature = "profiling")]
     {
         stats.hot.ns_run_ops += lap.lap_ns();
@@ -170,7 +239,9 @@ pub(crate) fn prepare_soft_masks(page: &CpuPreparedPage) -> Option<Vec<Option<Cl
         .collect();
     let mut raster = RasterKernel::default();
     let kernels = KernelSet::select();
-    let mut masks: Vec<Option<ClipMask>> = (0..page.clips.len()).map(|_| None).collect();
+    // Only soft-mask content runs here, so the op stream is not walked in
+    // full: keep every mask (as before) rather than plan releases.
+    let mut masks = ClipMasks::unmanaged(page.clips.len());
     let mut stats = RenderStats::default();
     let mut i = 0;
 
@@ -230,7 +301,7 @@ pub(crate) fn prepare_patterned_stencil(
     let mut surface = Surface::offscreen(normalized.bounds);
     let mut raster = RasterKernel::default();
     let kernels = KernelSet::select();
-    let mut masks: Vec<Option<ClipMask>> = (0..page.clips.len()).map(|_| None).collect();
+    let mut masks = ClipMasks::unmanaged(page.clips.len());
     let mut stats = RenderStats::default();
     render_tiling(
         page,
@@ -270,82 +341,37 @@ pub(crate) fn prepare_patterned_stencil(
     })
 }
 
-/// Pre-build every clip mask the ops will consume, across the rayon pool, so the
-/// serial draw loop finds them cached. Each mask is a pure function of `page`
-/// and byte-identical regardless of build order, so this is safe to parallelize
-/// and never changes output. Engaged only past a threshold where the fan-out
-/// pays for itself; below it the draw loop builds the few masks lazily.
-fn prebuild_masks(
-    page: &CpuPreparedPage,
-    masks: &mut [Option<ClipMask>],
-    #[cfg(feature = "profiling")] prof: &mut crate::render_cpu::raster::RasterProf,
-) {
-    // Cooperative cancellation: skip the (bounded) pre-pass if already cancelled.
-    if let Some(cancel) = &page.decode_limits.should_cancel
-        && cancel()
-    {
-        return;
-    }
-    // The distinct mask-source clips actually drawn under (a mask pushed but
-    // never consumed is never built — matching the lazy loop's behavior).
-    let mut wanted = vec![false; page.clips.len()];
-    for op in &page.ops {
-        let clip = match op {
-            PreparedOp::Draw(c) if c.clip_has_mask => c.clip,
-            PreparedOp::GlyphRun(g) if g.clip_has_mask => g.clip,
-            PreparedOp::Image(i) if i.clip_has_mask => i.clip,
-            PreparedOp::TiledFill(t) if t.clip_has_mask => t.clip,
-            _ => None,
-        };
-        if let Some(cid) = clip
-            && let Some(src) = page.clips[cid as usize].mask_source
-        {
-            wanted[src as usize] = true;
-        }
-    }
-    let ids: Vec<u32> = (0..page.clips.len() as u32)
-        .filter(|&i| wanted[i as usize])
-        .collect();
-    // Below this count, rayon fan-out costs more than it saves.
-    const PARALLEL_MASK_THRESHOLD: usize = 16;
-    if ids.len() < PARALLEL_MASK_THRESHOLD {
-        return;
-    }
-    // One reused scratch kernel per worker thread (grows on first fill).
-    let geom = ClipGeom::of(page);
-    let should_cancel = page.decode_limits.should_cancel.as_deref();
+/// Fold a mask store's build counters into the page statistics.
+fn flush_mask_counters(masks: &mut ClipMasks, stats: &mut RenderStats) {
+    let (serial, parallel, bytes) = masks.take_counters();
     #[cfg(feature = "profiling")]
     {
-        // Each rayon worker's kernel carries its own attribution; hand it back
-        // with the mask and merge serially (summed CPU time, not wall time).
-        let built: Vec<(u32, Option<ClipMask>, crate::render_cpu::raster::RasterProf)> = ids
-            .par_iter()
-            .map_init(RasterKernel::default, |rk, &cid| {
-                rk.prof.class = crate::render_cpu::raster::RasterClass::Clip;
-                let mask = build_clip_mask_cancellable(rk, geom, cid, should_cancel);
-                (cid, mask, std::mem::take(&mut rk.prof))
-            })
-            .collect();
-        for (cid, mask, worker_prof) in built {
-            prof.merge(&worker_prof);
-            if let Some(mask) = mask {
-                masks[cid as usize] = Some(mask);
-            }
-        }
+        stats.hot.n_clip_mask_lazy += serial;
+        stats.hot.n_clip_mask_prebuilt += parallel;
+        stats.hot.clip_mask_bytes += bytes;
     }
     #[cfg(not(feature = "profiling"))]
-    {
-        let built: Vec<(u32, ClipMask)> = ids
-            .par_iter()
-            .map_init(RasterKernel::default, |rk, &cid| {
-                build_clip_mask_cancellable(rk, geom, cid, should_cancel).map(|mask| (cid, mask))
-            })
-            .filter_map(|built| built)
-            .collect();
-        for (cid, m) in built {
-            masks[cid as usize] = Some(m);
-        }
+    let _ = (serial, parallel, bytes, stats);
+}
+
+/// Make the mask a draw under `clip` uses resident and return its source
+/// index: the nearest path-clip ancestor's, shared across rect descendants
+/// (a rect clip contributes only its bounds, which every draw's bounds are
+/// already intersected with). `None` means the request was cancelled while
+/// the mask was being built; `stats.cancelled` is set and the draw is skipped.
+fn resident_mask(
+    page: &CpuPreparedPage,
+    raster: &mut RasterKernel,
+    masks: &mut ClipMasks,
+    clip: u32,
+    stats: &mut RenderStats,
+) -> Option<usize> {
+    let source = page.clips[clip as usize].mask_source.unwrap_or(clip) as usize;
+    if !masks.ensure(page, raster, source) {
+        stats.cancelled = true;
+        return None;
     }
+    Some(source)
 }
 
 /// Execute ops `[start, end)` into `surface`. `BeginGroup` recurses into a
@@ -359,7 +385,7 @@ fn run_ops(
     surface: &mut Surface,
     raster: &mut RasterKernel,
     kernels: &KernelSet,
-    masks: &mut Vec<Option<ClipMask>>,
+    masks: &mut ClipMasks,
     soft: &mut Vec<Option<ClipMask>>,
     stats: &mut RenderStats,
 ) {
@@ -375,6 +401,7 @@ fn run_ops(
             stats.cancelled = true;
             return;
         }
+        let at = i;
         match &page.ops[i] {
             PreparedOp::Draw(cmd) => {
                 let active_soft = soft.last().and_then(Option::as_ref);
@@ -456,6 +483,56 @@ fn run_ops(
                 // the `run_ops` mutable borrow.
                 let soft_slot = soft.len().checked_sub(1);
                 let seed = !group.isolated && matches!(blend, BlendChoice::Normal);
+                // The common wrapper group: non-isolated, Normal, fully
+                // opaque, no soft mask in force. Its seeded offscreen would
+                // start as a copy of the parent's pixels, take the content,
+                // and be copied back whole (`composite_group_seeded` at
+                // opacity 255 without a mask is a row copy). Painting the
+                // content on the parent writes the same bytes to the same
+                // pixels — every op is confined to its own bounds, which lie
+                // inside the group's — without a group-sized buffer (page
+                // sized for a page-level wrapper) and its two full copies.
+                let soft_in_force = soft_slot
+                    .and_then(|ix| soft.get(ix))
+                    .is_some_and(Option::is_some);
+                let parent_rect = DeviceRect {
+                    x: surface.origin_x as i32,
+                    y: surface.origin_y as i32,
+                    width: surface.width as u32,
+                    height: surface.height as u32,
+                };
+                #[cfg(test)]
+                let direct_allowed = !GROUPS_ALWAYS_OFFSCREEN.with(std::cell::Cell::get);
+                #[cfg(not(test))]
+                let direct_allowed = true;
+                if direct_allowed
+                    && seed
+                    && !group.knockout
+                    && group.opacity == 255
+                    && !soft_in_force
+                    && rect_contains(parent_rect, group.bounds)
+                {
+                    #[cfg(test)]
+                    DIRECT_GROUPS.with(|count| count.set(count.get() + 1));
+                    run_ops(
+                        page,
+                        i + 1,
+                        ge,
+                        surface,
+                        raster,
+                        kernels,
+                        masks,
+                        soft,
+                        stats,
+                    );
+                    stats.transparency_groups += 1;
+                    i = ge + 1;
+                    if stats.cancelled {
+                        return;
+                    }
+                    masks.op_done(at);
+                    continue;
+                }
                 let mut off = if seed {
                     Surface::offscreen_seeded(surface, group.bounds)
                 } else {
@@ -535,7 +612,20 @@ fn run_ops(
         if stats.cancelled {
             return;
         }
+        // Ops run in increasing index order, each once: a mask whose last
+        // consumer was this op (or one nested in it) is no longer needed.
+        masks.op_done(at);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only reference switch: give every group its offscreen, as before
+    /// opaque wrapper groups painted on their parent, so the tests can compare
+    /// bytes.
+    static GROUPS_ALWAYS_OFFSCREEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only count of groups painted directly on their parent.
+    static DIRECT_GROUPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -548,7 +638,7 @@ fn render_soft_mask(
     bounds: DeviceRect,
     raster: &mut RasterKernel,
     kernels: &KernelSet,
-    masks: &mut Vec<Option<ClipMask>>,
+    masks: &mut ClipMasks,
     stats: &mut RenderStats,
 ) -> ClipMask {
     if bounds.width == 0 || bounds.height == 0 {
@@ -594,31 +684,6 @@ fn render_soft_mask(
     derive_soft_mask(&off, kind, transfer)
 }
 
-fn build_render_clip_mask(
-    page: &CpuPreparedPage,
-    raster: &mut RasterKernel,
-    cid: u32,
-    stats: &mut RenderStats,
-) -> Option<ClipMask> {
-    #[cfg(feature = "profiling")]
-    let caller_class =
-        std::mem::replace(&mut raster.prof.class, crate::render_cpu::raster::RasterClass::Clip);
-    let mask = build_clip_mask_cancellable(
-        raster,
-        ClipGeom::of(page),
-        cid,
-        page.decode_limits.should_cancel.as_deref(),
-    );
-    #[cfg(feature = "profiling")]
-    {
-        raster.prof.class = caller_class;
-    }
-    if mask.is_none() {
-        stats.cancelled = true;
-    }
-    mask
-}
-
 /// Execute a *knockout* group's ops `[start, end)` into `off` (ISO 32000-1
 /// §11.6.6): every painting element composites against the group's **initial**
 /// backdrop rather than the accumulated result, later elements replacing
@@ -640,7 +705,7 @@ fn run_knockout_group(
     off: &mut Surface,
     raster: &mut RasterKernel,
     kernels: &KernelSet,
-    masks: &mut Vec<Option<ClipMask>>,
+    masks: &mut ClipMasks,
     soft: &mut Vec<Option<ClipMask>>,
     stats: &mut RenderStats,
 ) {
@@ -708,7 +773,7 @@ fn paint_image(
     img: &crate::render_cpu::image::PreparedImage,
     surface: &mut Surface,
     raster: &mut RasterKernel,
-    masks: &mut [Option<ClipMask>],
+    masks: &mut ClipMasks,
     soft: Option<&ClipMask>,
     stats: &mut RenderStats,
 ) {
@@ -733,19 +798,14 @@ fn paint_image(
                 .note_degraded("image draw skipped: masked clip without a clip id".into());
             return;
         };
-        // Share the nearest path-clip ancestor's mask across rect descendants.
-        let cid = page.clips[cid as usize].mask_source.unwrap_or(cid);
-        if masks[cid as usize].is_none() {
-            let Some(mask) = build_render_clip_mask(page, raster, cid, stats) else {
-                return;
-            };
-            masks[cid as usize] = Some(mask);
-        }
-        Some(cid as usize)
+        let Some(source) = resident_mask(page, raster, masks, cid, stats) else {
+            return;
+        };
+        Some(source)
     } else {
         None
     };
-    let raw_cmask = cmask_cid.and_then(|cid| masks[cid].as_ref());
+    let raw_cmask = cmask_cid.and_then(|cid| masks.get(cid));
     // Path clips that rasterize to full coverage over their envelope are
     // semantically rectangular for this draw. Avoid a mask lookup and
     // multiply for every destination pixel once that is proven.
@@ -788,7 +848,9 @@ fn paint_image(
             || img.footprint[1] > 1.0
             || (img.smask.is_none() && img.mask.is_none()))
     {
-        match img.gray8_promoted_to_rgb8() {
+        // Only the source rows this draw's rows read: a strip of a page scan
+        // expands its own share of the image, not all of it.
+        match img.gray8_promoted_to_rgb8(img.source_rows_for(y0, y1)) {
             Some(rgb) => {
                 promoted_gray = rgb;
                 &promoted_gray
@@ -2940,7 +3002,9 @@ fn paint_axis_aligned_cmyk_area_min_opaque(
     x1: usize,
     y1: usize,
 ) -> Option<(u64, u64)> {
-    let rgb = img.cmyk_source_as_rgb8()?;
+    // Only the source rows these device rows read: a strip of a CMYK scan
+    // converts its own share of the image.
+    let rgb = img.cmyk_source_as_rgb8(img.source_rows_for(y0, y1))?;
     Some(area_min_box_average_opaque(
         img, surface, &rgb, x0, y0, x1, y1,
     ))
@@ -4254,6 +4318,18 @@ fn image_row_parallel_enabled() -> bool {
     }
 }
 
+/// Whether converting a finished page (or strip) to its output format should
+/// fan out over the rayon pool. The conversion runs between page executions,
+/// so this render is not counted in [`PAGES_IN_FLIGHT`]: any page in flight
+/// is another render, with the cores already busy.
+pub(crate) fn output_fan_out() -> bool {
+    match row_par_policy() {
+        RowParPolicy::Never => false,
+        RowParPolicy::Always => true,
+        RowParPolicy::Auto => PAGES_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed) == 0,
+    }
+}
+
 /// Render a tiling-pattern fill: replicate the compiled cell across the
 /// lattice into a fill-sized offscreen, then composite it onto `surface`
 /// masked by the fill shape (advice §9-style bounded offscreen).
@@ -4264,7 +4340,7 @@ fn render_tiling(
     surface: &mut Surface,
     raster: &mut RasterKernel,
     kernels: &KernelSet,
-    masks: &mut [Option<ClipMask>],
+    masks: &mut ClipMasks,
     stats: &mut RenderStats,
 ) {
     #[cfg(test)]
@@ -4373,7 +4449,8 @@ fn cell_paint_extent(cell: &crate::page_ir::CompiledPage) -> Option<CellPaintExt
                 let style = cell.stroke_styles.get(style.index())?;
                 let factor = style.miter_limit.max(std::f64::consts::SQRT_2);
                 // The Frobenius norm bounds the largest stretch of the CTM.
-                let stretch = (ctm.a * ctm.a + ctm.b * ctm.b + ctm.c * ctm.c + ctm.d * ctm.d).sqrt();
+                let stretch =
+                    (ctm.a * ctm.a + ctm.b * ctm.b + ctm.c * ctm.c + ctm.d * ctm.d).sqrt();
                 let reach = 0.5 * style.width.abs() * stretch * factor;
                 if !(reach.is_finite() && factor.is_finite()) {
                     return None;
@@ -4410,10 +4487,22 @@ fn tile_reaches_mask(
     };
     let pad = stroke_pad + 2.0;
     let corners = [
-        m.apply(Point { x: extent.x0, y: extent.y0 }),
-        m.apply(Point { x: extent.x1, y: extent.y0 }),
-        m.apply(Point { x: extent.x1, y: extent.y1 }),
-        m.apply(Point { x: extent.x0, y: extent.y1 }),
+        m.apply(Point {
+            x: extent.x0,
+            y: extent.y0,
+        }),
+        m.apply(Point {
+            x: extent.x1,
+            y: extent.y0,
+        }),
+        m.apply(Point {
+            x: extent.x1,
+            y: extent.y1,
+        }),
+        m.apply(Point {
+            x: extent.x0,
+            y: extent.y1,
+        }),
     ];
     let (mut min_x, mut min_y, mut max_x, mut max_y) = (
         f64::INFINITY,
@@ -4451,7 +4540,7 @@ fn render_tiling_impl(
     surface: &mut Surface,
     raster: &mut RasterKernel,
     kernels: &KernelSet,
-    masks: &mut [Option<ClipMask>],
+    masks: &mut ClipMasks,
     stats: &mut RenderStats,
     cull_tiles: bool,
 ) {
@@ -4520,15 +4609,11 @@ fn render_tiling_impl(
         // its bounds, which the tile bounds are already intersected with, so
         // inside them the ancestor's mask is this clip's mask, and it is
         // rasterized once instead of once per descendant.
-        let cid = page.clips[cid as usize].mask_source.unwrap_or(cid);
-        if masks[cid as usize].is_none() {
-            let Some(mask) = build_render_clip_mask(page, raster, cid, stats) else {
-                return;
-            };
-            masks[cid as usize] = Some(mask);
-        }
-        let Some(cm) = masks[cid as usize].as_ref() else {
-            return; // unreachable: just built above
+        let Some(cid) = resident_mask(page, raster, masks, cid, stats) else {
+            return;
+        };
+        let Some(cm) = masks.get(cid) else {
+            return; // unreachable: just made resident above
         };
         let mw = cm.stride();
         for ly in 0..h {
@@ -4638,8 +4723,8 @@ fn render_tiling_impl(
             t.color_policy,
             &mut cell_fonts,
         );
-        let mut cmasks: Vec<Option<ClipMask>> =
-            (0..cell_prepared.clips.len()).map(|_| None).collect();
+        // A cell's masks live for one tile instance; nothing to plan.
+        let mut cmasks = ClipMasks::unmanaged(cell_prepared.clips.len());
         let mut csoft: Vec<Option<ClipMask>> = Vec::new();
         #[cfg(feature = "profiling")]
         {
@@ -4666,6 +4751,7 @@ fn render_tiling_impl(
             stats.hot.ns_tiling_cells += lap.lap_ns();
             stats.hot.clock_reads += 2;
         }
+        flush_mask_counters(&mut cmasks, stats);
         // A codec image dropped while lowering this tile cell counts too.
         stats.absorb_diagnostics(&cell_prepared.diagnostics);
     }
@@ -4685,6 +4771,11 @@ fn render_tiling_impl(
     let blend_is_normal = matches!(blend, BlendChoice::Normal);
     for ly in 0..h {
         let dy = by + ly;
+        // A strip surface holds only its row window (the fill keeps its full
+        // bounds so its cells are lowered where they always were).
+        if dy < surface.origin_y || dy >= surface.origin_y + surface.height {
+            continue;
+        }
         // `pat` is this function's own offscreen (built above), distinct from
         // `surface`, so the row can be borrowed rather than copied.
         let prow = pat.local_row(ly);
@@ -4994,7 +5085,7 @@ fn paint_glyph_run(
     surface: &mut Surface,
     raster: &mut RasterKernel,
     kernels: &KernelSet,
-    masks: &mut [Option<ClipMask>],
+    masks: &mut ClipMasks,
     soft: Option<&ClipMask>,
     stats: &mut RenderStats,
 ) {
@@ -5012,18 +5103,14 @@ fn paint_glyph_run(
         };
         // Use the nearest path-clip ancestor's mask (rect children only narrow
         // bounds, applied per draw): one build shared across all descendants.
-        let cid = page.clips[cid as usize].mask_source.unwrap_or(cid) as usize;
-        if masks[cid].is_none() {
-            let Some(mask) = build_render_clip_mask(page, raster, cid as u32, stats) else {
-                return;
-            };
-            masks[cid] = Some(mask);
-        }
-        Some(cid)
+        let Some(source) = resident_mask(page, raster, masks, cid, stats) else {
+            return;
+        };
+        Some(source)
     } else {
         None
     };
-    let raw_mask = mask_cid.and_then(|cid| masks[cid].as_ref());
+    let raw_mask = mask_cid.and_then(|cid| masks.get(cid));
     // A path clip that rasterized to full coverage over its envelope is
     // rectangular for this draw (already reflected in `bounds`): drop the mask.
     let opaque_clip_elided = raw_mask.is_some_and(|cm| cm.all_opaque);
@@ -5173,15 +5260,14 @@ fn paint_command(
     surface: &mut Surface,
     raster: &mut RasterKernel,
     kernels: &KernelSet,
-    masks: &mut [Option<ClipMask>],
+    masks: &mut ClipMasks,
     soft: Option<&ClipMask>,
     stats: &mut RenderStats,
 ) {
     // Page-level commands are always timed; commands nested in tiling cells
     // (often tens of thousands of tiny fills) only at `ProfileDetail::Fill`.
     #[cfg(feature = "profiling")]
-    let command_start =
-        (stats.hot.time_nested || stats.hot.tiling_depth == 0).then(Instant::now);
+    let command_start = (stats.hot.time_nested || stats.hot.tiling_depth == 0).then(Instant::now);
     stats.commands += 1;
     // 0 = opaque rect, 1 = direct runs, 2 = clip-masked, 3 = otherwise modulated.
     #[cfg(feature = "profiling")]
@@ -5197,27 +5283,20 @@ fn paint_command(
             return;
         };
         // Share the nearest path-clip ancestor's mask across rect descendants.
-        let cid = page.clips[cid as usize].mask_source.unwrap_or(cid) as usize;
-        if masks[cid].is_none() {
-            #[cfg(feature = "profiling")]
-            let mask_start = Instant::now();
-            #[cfg(feature = "profiling")]
-            {
-                raster.prof.class = crate::render_cpu::raster::RasterClass::Clip;
-            }
-            let Some(mask) = build_render_clip_mask(page, raster, cid as u32, stats) else {
-                return;
-            };
-            #[cfg(feature = "profiling")]
-            {
-                stats.hot.ns_clip_mask_lazy += mask_start.elapsed().as_nanos() as u64;
-                stats.hot.n_clip_mask_lazy += 1;
-                stats.hot.clip_mask_bytes += mask.data.len() as u64;
-                stats.hot.clock_reads += 2;
-            }
-            masks[cid] = Some(mask);
+        #[cfg(feature = "profiling")]
+        let mask_start = {
+            let source = page.clips[cid as usize].mask_source.unwrap_or(cid) as usize;
+            (!masks.is_resident(source)).then(Instant::now)
+        };
+        let Some(source) = resident_mask(page, raster, masks, cid, stats) else {
+            return;
+        };
+        #[cfg(feature = "profiling")]
+        if let Some(mask_start) = mask_start {
+            stats.hot.ns_clip_mask_lazy += mask_start.elapsed().as_nanos() as u64;
+            stats.hot.clock_reads += 2;
         }
-        Some(cid)
+        Some(source)
     } else {
         None
     };
@@ -5252,7 +5331,7 @@ fn paint_command(
             // multiply already skips 255, and the fill lies inside the mask
             // (checked, since pixels outside it would read `outside`).
             let mask = mask_cid
-                .and_then(|cid| masks[cid].as_ref())
+                .and_then(|cid| masks.get(cid))
                 .filter(|m| !(m.all_opaque && rect_contains(m.bounds, b)));
             let (rgb, alpha, opaque, premul) = (cmd.rgb, cmd.alpha, cmd.opaque, cmd.premul);
             let blend = choose_blend(cmd.blend);
@@ -7658,6 +7737,9 @@ mod rgb8_area_min_tests {
             image_cache: None,
             decode_floor: None,
             sanity_extent: 64.0,
+            rows: (0, u32::MAX),
+            op_extent: None,
+            strip_decodes: None,
             #[cfg(feature = "profiling")]
             profile: Default::default(),
             #[cfg(feature = "profiling")]
@@ -7670,6 +7752,113 @@ mod rgb8_area_min_tests {
         let mut stats = RenderStats::default();
         execute(&page, &mut surface, &mut ctx, &mut stats);
         surface
+    }
+
+    /// A Gray8 image is expanded to RGB8 only over the source rows its draw
+    /// can read (`PreparedImage::source_rows_for`); the rest of the expanded
+    /// buffer is zeros. Painting any window of device rows must therefore
+    /// give exactly the rows the whole draw gives: a window that read a
+    /// source row outside its expanded band would show up as a wrong pixel,
+    /// the sources being noise. Covers each path a promoted image can take
+    /// (nearest, bilinear, box average, the masked box average and its
+    /// generic border), minified and magnified, upright and flipped. An
+    /// unmasked minified CMYK image is converted the same way and is covered
+    /// too.
+    #[test]
+    fn gray_expansion_over_a_row_window_matches_the_whole_draw() {
+        let mut rng = Rng(0x6ea7_0b0e_5712_0001);
+        // (source w, h, device x, y, w, h)
+        let placements: [(u32, u32, f64, f64, f64, f64); 6] = [
+            (37, 230, 1.3, 2.6, 9.4, 46.2),
+            (16, 16, 0.25, 0.75, 15.5, 15.5),
+            (64, 480, 2.5, 1.125, 20.3, 33.7),
+            (5, 7, 0.6, 1.4, 17.8, 41.3),
+            (9, 33, 3.7, 0.2, 4.6, 31.9),
+            (48, 48, 2.0, 3.0, 48.0, 48.0),
+        ];
+        let mut narrowed = 0;
+        for &(sw, sh, ox, oy, w, h) in &placements {
+            let side = (ox + w).max(oy + h).ceil() as u32 + 2;
+            for mask_kind in ["none", "stencil", "smask1", "smask8"] {
+                for interpolation in [InterpolationMode::Nearest, InterpolationMode::Bilinear] {
+                    for (flipped, cmyk) in
+                        [(false, false), (true, false), (false, true), (true, true)]
+                    {
+                        let (space, comps) = if cmyk {
+                            (ImageColorSpace::Cmyk, 4)
+                        } else {
+                            (ImageColorSpace::Gray, 1)
+                        };
+                        let samples: Vec<u8> = (0..sw as usize * sh as usize * comps)
+                            .map(|_| rng.byte())
+                            .collect();
+                        let mut img =
+                            place(make_image_cs(sw, sh, 1, 1, space, samples), ox, oy, w, h);
+                        if flipped {
+                            // v runs the other way down the same rectangle.
+                            img.inv.d = -img.inv.d;
+                            img.inv.f = 1.0 - img.inv.f;
+                        }
+                        img.interpolation = interpolation;
+                        let (mw, mh) = (sw.div_ceil(2) + 1, sh + 3);
+                        match mask_kind {
+                            "stencil" => {
+                                img.mask = Some(crate::page_ir::ImageMask::Stencil(bilevel(
+                                    mw, mh, &mut rng,
+                                )));
+                            }
+                            "smask1" => img.smask = Some(bilevel(mw, mh, &mut rng)),
+                            "smask8" => {
+                                let mask: Vec<u8> = (0..mw * mh)
+                                    .map(|_| if rng.byte() < 60 { rng.byte() } else { 255 })
+                                    .collect();
+                                img.smask = Some(Arc::new(crate::page_ir::ImageSMask {
+                                    width: mw,
+                                    height: mh,
+                                    bits_per_component: 8,
+                                    decode: None,
+                                    samples: Arc::from(mask),
+                                    codec: None,
+                                    codec_data: None,
+                                    codec_parms: None,
+                                }));
+                            }
+                            _ => {}
+                        }
+                        let mut whole = dispatched(&img, side);
+                        let (top, bottom) =
+                            (img.bounds.y as u32, img.bounds.y as u32 + img.bounds.height);
+                        let mut windows: Vec<(u32, u32)> =
+                            (top..bottom).map(|y| (y, y + 1)).collect();
+                        for _ in 0..6 {
+                            let a = top + rng.next() as u32 % (bottom - top);
+                            let b = a + 1 + rng.next() as u32 % (bottom - a);
+                            windows.push((a, b));
+                        }
+                        for (a, b) in windows {
+                            let mut part = img.clone();
+                            part.bounds.y = a as i32;
+                            part.bounds.height = b - a;
+                            let band = part.source_rows_for(a as usize, b as usize);
+                            if band.len() < sh as usize {
+                                narrowed += 1;
+                            }
+                            let mut got = dispatched(&part, side);
+                            for y in a as usize..b as usize {
+                                assert_eq!(
+                                    got.row_mut(y).to_vec(),
+                                    whole.row_mut(y).to_vec(),
+                                    "{mask_kind} {interpolation:?} flipped={flipped} cmyk={cmyk}                                      src {sw}x{sh} \
+                                     at ({ox}, {oy}) size {w}x{h}: rows {a}..{b}, row {y}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The windows did narrow the expansion, or this tested nothing.
+        assert!(narrowed > 1000, "only {narrowed} windows narrowed the band");
     }
 
     /// Every image fast path must equal the full generic body — interior
@@ -8132,6 +8321,9 @@ mod cancel_tests {
             image_cache: None,
             decode_floor: None,
             sanity_extent: 64.0,
+            rows: (0, u32::MAX),
+            op_extent: None,
+            strip_decodes: None,
             #[cfg(feature = "profiling")]
             profile: Default::default(),
             #[cfg(feature = "profiling")]
@@ -8295,7 +8487,7 @@ mod tiling_cull_tests {
     };
     use crate::render_cpu::CpuBackend;
 
-    struct Rng(u64);
+    pub(super) struct Rng(pub(super) u64);
 
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -8304,18 +8496,18 @@ mod tiling_cull_tests {
             self.0 ^= self.0 << 17;
             self.0
         }
-        fn unit(&mut self) -> f64 {
+        pub(super) fn unit(&mut self) -> f64 {
             (self.next() >> 11) as f64 / (1u64 << 53) as f64
         }
-        fn range(&mut self, lo: f64, hi: f64) -> f64 {
+        pub(super) fn range(&mut self, lo: f64, hi: f64) -> f64 {
             lo + (hi - lo) * self.unit()
         }
-        fn pick(&mut self, n: u64) -> u64 {
+        pub(super) fn pick(&mut self, n: u64) -> u64 {
             self.next() % n
         }
     }
 
-    fn polyline(points: &[(f64, f64)], close: bool) -> PathData {
+    pub(super) fn polyline(points: &[(f64, f64)], close: bool) -> PathData {
         let mut verbs = vec![PathVerb::MoveTo];
         verbs.extend(std::iter::repeat_n(PathVerb::LineTo, points.len() - 1));
         if close {
@@ -8334,7 +8526,7 @@ mod tiling_cull_tests {
         }
     }
 
-    fn page(
+    pub(super) fn page(
         size: f64,
         operations: Vec<DisplayOp>,
         paths: Vec<PathData>,
@@ -8398,7 +8590,12 @@ mod tiling_cull_tests {
             paints.push(Paint::Solid(color));
             let paint = PaintId(paints.len() as u32 - 1);
             let alpha = if rng.pick(2) == 0 { 1.0 } else { 0.6 };
-            let p = |rng: &mut Rng| (rng.range(-0.4 * cell, 1.4 * cell), rng.range(-0.4 * cell, 1.4 * cell));
+            let p = |rng: &mut Rng| {
+                (
+                    rng.range(-0.4 * cell, 1.4 * cell),
+                    rng.range(-0.4 * cell, 1.4 * cell),
+                )
+            };
             let path = match rng.pick(3) {
                 0 => polyline(&[p(rng), p(rng), p(rng)], true),
                 1 => polyline(&[p(rng), p(rng), p(rng), p(rng)], false),
@@ -8410,7 +8607,11 @@ mod tiling_cull_tests {
                 operations.push(DisplayOp::FillPath {
                     path,
                     paint,
-                    rule: if rng.pick(2) == 0 { FillRule::NonZero } else { FillRule::EvenOdd },
+                    rule: if rng.pick(2) == 0 {
+                        FillRule::NonZero
+                    } else {
+                        FillRule::EvenOdd
+                    },
                     alpha,
                     blend: BlendMode::Normal,
                 });
@@ -8538,7 +8739,10 @@ mod tiling_cull_tests {
                         alpha: 0.8,
                         blend: BlendMode::Multiply,
                     }],
-                    vec![polyline(&[p(&mut rng), p(&mut rng), p(&mut rng), p(&mut rng)], true)],
+                    vec![polyline(
+                        &[p(&mut rng), p(&mut rng), p(&mut rng), p(&mut rng)],
+                        true,
+                    )],
                     Vec::new(),
                 ),
                 2 => (
@@ -8549,7 +8753,10 @@ mod tiling_cull_tests {
                         alpha: 1.0,
                         blend: BlendMode::Normal,
                     }],
-                    vec![polyline(&[(0.0, 0.0), (size, 0.0), (size, size), (0.0, size)], true)],
+                    vec![polyline(
+                        &[(0.0, 0.0), (size, 0.0), (size, size), (0.0, size)],
+                        true,
+                    )],
                     Vec::new(),
                 ),
                 _ => (
@@ -8587,7 +8794,10 @@ mod tiling_cull_tests {
         }
         // The comparison is vacuous unless tiles are really skipped and the
         // pattern really paints.
-        assert!(culled_cases >= 40, "only {culled_cases} cases culled a tile");
+        assert!(
+            culled_cases >= 40,
+            "only {culled_cases} cases culled a tile"
+        );
         assert!(painted_cases >= 100, "only {painted_cases} cases painted");
     }
 
@@ -8603,7 +8813,10 @@ mod tiling_cull_tests {
                 alpha: 1.0,
                 blend: BlendMode::Normal,
             }],
-            vec![polyline(&[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)], true)],
+            vec![polyline(
+                &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+                true,
+            )],
             vec![Paint::Pattern {
                 tiling: TilingId(0),
                 matrix: Matrix::IDENTITY,
@@ -8613,7 +8826,761 @@ mod tiling_cull_tests {
         );
         assert!(super::cell_paint_extent(&inner).is_none());
 
-        let empty = page(4.0, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let empty = page(
+            4.0,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         assert!(super::cell_paint_extent(&empty).is_none());
+    }
+}
+
+#[cfg(test)]
+mod residency_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    //! Where a mask or a group surface lives must not change a byte: sharing
+    //! one mask between identical clips, dropping masks after their last
+    //! consumer, evicting under a budget, and painting an opaque wrapper group
+    //! on its parent are each compared with the path they replace.
+
+    use std::sync::Arc;
+
+    use super::tiling_cull_tests::{Rng, page, polyline};
+    use super::{
+        ClipMasks, CpuWorkerContext, DIRECT_GROUPS, GROUPS_ALWAYS_OFFSCREEN, execute_with,
+    };
+    use crate::page_ir::{
+        BlendMode, Color, CompiledPage, DeviceSize, DisplayOp, FillRule, Matrix, Paint, PaintId,
+        PathData, PathId, Rect, TransparencyGroup, TransparencyGroupId,
+    };
+    use crate::render_api::Background;
+    use crate::render_cpu::prepared::{ClipKind, CpuPreparedPage};
+    use crate::render_cpu::stats::RenderStats;
+    use crate::render_cpu::surface::Surface;
+
+    const SIZE: f64 = 96.0;
+
+    fn blob(rng: &mut Rng, cx: f64, cy: f64, r: f64) -> PathData {
+        let n = 5 + rng.pick(4) as usize;
+        let points: Vec<(f64, f64)> = (0..n)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / n as f64;
+                let rr = r * rng.range(0.55, 1.0);
+                (cx + rr * a.cos(), cy + rr * a.sin())
+            })
+            .collect();
+        polyline(&points, true)
+    }
+
+    fn lower(page: &CompiledPage, scale: f64) -> CpuPreparedPage {
+        let dim = (SIZE * scale).ceil() as u32;
+        crate::render_cpu::prepared::lower(
+            page,
+            Matrix {
+                a: scale,
+                b: 0.0,
+                c: 0.0,
+                d: scale,
+                e: 0.0,
+                f: 0.0,
+            },
+            DeviceSize {
+                width: dim,
+                height: dim,
+            },
+            &crate::image::CodecRegistry::default(),
+            &crate::image::DecodeLimits::default(),
+            crate::font::HintingPolicy::None,
+        )
+    }
+
+    fn paint(prepared: &CpuPreparedPage, masks: ClipMasks) -> (Arc<[u8]>, RenderStats) {
+        let mut surface = Surface::new(
+            prepared.size.width as usize,
+            prepared.size.height as usize,
+            Background::White,
+        );
+        let mut ctx = CpuWorkerContext::default();
+        let mut stats = RenderStats::default();
+        execute_with(prepared, &mut surface, &mut ctx, &mut stats, masks);
+        assert!(!stats.cancelled);
+        let (_, pixels) =
+            surface.into_output(crate::render_api::OutputFormat::Rgba8PremultipliedSrgb);
+        (pixels, stats)
+    }
+
+    /// A page of path clips: a small pool of shapes re-established many times
+    /// (under either rule, nested in each other, with rect clips between),
+    /// each with fills under it, and some clips used again after a nested
+    /// scope ends.
+    fn clip_page(rng: &mut Rng, scopes: usize) -> CompiledPage {
+        let mut paths: Vec<PathData> = (0..5)
+            .map(|_| {
+                let (cx, cy) = (rng.range(30.0, 66.0), rng.range(30.0, 66.0));
+                let r = rng.range(18.0, 44.0);
+                blob(rng, cx, cy, r)
+            })
+            .collect();
+        let shapes = paths.len() as u64;
+        paths.push(polyline(
+            &[(10.5, 12.25), (80.5, 12.25), (80.5, 70.75), (10.5, 70.75)],
+            true,
+        ));
+        let rect = PathId(paths.len() as u32 - 1);
+        paths.push(polyline(
+            &[(-4.0, -4.0), (100.0, -4.0), (100.0, 100.0), (-4.0, 100.0)],
+            true,
+        ));
+        let full = PathId(paths.len() as u32 - 1);
+        let mut paints = Vec::new();
+        let mut ops = Vec::new();
+        let mut fill = |ops: &mut Vec<DisplayOp>, rng: &mut Rng, path: PathId| {
+            paints.push(Paint::Solid(Color {
+                r: rng.unit() as f32,
+                g: rng.unit() as f32,
+                b: rng.unit() as f32,
+                a: 1.0,
+            }));
+            ops.push(DisplayOp::FillPath {
+                path,
+                paint: PaintId(paints.len() as u32 - 1),
+                rule: FillRule::NonZero,
+                alpha: if rng.pick(3) == 0 { 0.5 } else { 1.0 },
+                blend: BlendMode::Normal,
+            });
+        };
+        let rule = |rng: &mut Rng| {
+            if rng.pick(3) == 0 {
+                FillRule::EvenOdd
+            } else {
+                FillRule::NonZero
+            }
+        };
+        for _ in 0..scopes {
+            let outer = PathId(rng.pick(shapes) as u32);
+            ops.push(DisplayOp::Save);
+            ops.push(DisplayOp::PushClip {
+                path: outer,
+                rule: rule(rng),
+            });
+            fill(&mut ops, rng, full);
+            match rng.pick(4) {
+                0 => {
+                    // A nested path clip, then the outer clip again.
+                    ops.push(DisplayOp::Save);
+                    ops.push(DisplayOp::PushClip {
+                        path: PathId(rng.pick(shapes) as u32),
+                        rule: rule(rng),
+                    });
+                    fill(&mut ops, rng, full);
+                    ops.push(DisplayOp::PopClip);
+                    ops.push(DisplayOp::Restore);
+                    let again = PathId(rng.pick(shapes) as u32);
+                    fill(&mut ops, rng, again);
+                }
+                1 => {
+                    // A rect clip under the path clip shares its mask.
+                    ops.push(DisplayOp::Save);
+                    ops.push(DisplayOp::PushClip {
+                        path: rect,
+                        rule: FillRule::NonZero,
+                    });
+                    fill(&mut ops, rng, full);
+                    ops.push(DisplayOp::PopClip);
+                    ops.push(DisplayOp::Restore);
+                }
+                _ => {}
+            }
+            ops.push(DisplayOp::PopClip);
+            ops.push(DisplayOp::Restore);
+        }
+        page(SIZE, ops, paths, paints, Vec::new(), Vec::new())
+    }
+
+    #[test]
+    fn sharing_and_budgeting_masks_never_change_pixels() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut shared_cases = 0;
+        let mut evicting_cases = 0;
+        for case in 0..60 {
+            // Past sixteen masks the store builds in parallel batches.
+            let scopes = if case % 2 == 0 { 6 } else { 40 };
+            let compiled = clip_page(&mut rng, scopes);
+            let scale = [1.0, 0.61, 2.3][case % 3];
+
+            crate::render_cpu::prepared::CLIP_SHARE_OFF_FOR_TEST.with(|off| off.set(true));
+            let unshared = lower(&compiled, scale);
+            crate::render_cpu::prepared::CLIP_SHARE_OFF_FOR_TEST.with(|off| off.set(false));
+            let shared = lower(&compiled, scale);
+
+            let path_clips = |p: &CpuPreparedPage| {
+                p.clips
+                    .iter()
+                    .filter(|c| matches!(c.kind, ClipKind::Path { .. }))
+                    .count()
+            };
+            let sources = |p: &CpuPreparedPage| {
+                let mut ids: Vec<u32> = p.clips.iter().filter_map(|c| c.mask_source).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                ids.len()
+            };
+            assert_eq!(path_clips(&shared), path_clips(&unshared));
+            assert_eq!(sources(&unshared), path_clips(&unshared), "case {case}");
+            if sources(&shared) < sources(&unshared) {
+                shared_cases += 1;
+            }
+            assert!(shared.points.len() <= unshared.points.len());
+
+            // The reference: no sharing, every mask kept for the whole page.
+            let (reference, _) = paint(&unshared, ClipMasks::unmanaged(unshared.clips.len()));
+            let (planned, planned_stats) = paint(&shared, ClipMasks::for_page(&shared));
+            // A zero budget holds one mask at a time: every other mask is
+            // evicted and rebuilt on its next use.
+            let (tight, tight_stats) = paint(&shared, ClipMasks::for_page_with_budget(&shared, 0));
+            let (tight_unshared, _) =
+                paint(&unshared, ClipMasks::for_page_with_budget(&unshared, 0));
+            assert!(reference == planned, "case {case}: planned store differs");
+            assert!(reference == tight, "case {case}: evicting store differs");
+            assert!(
+                reference == tight_unshared,
+                "case {case}: unshared evicting differs"
+            );
+
+            let largest = shared
+                .clips
+                .iter()
+                .map(|c| c.bounds.width as u64 * c.bounds.height as u64)
+                .max()
+                .unwrap_or(0);
+            assert!(
+                tight_stats.clip_mask_peak_bytes <= largest,
+                "case {case}: a zero budget held {} bytes, largest mask {largest}",
+                tight_stats.clip_mask_peak_bytes
+            );
+            if tight_stats.clip_mask_peak_bytes < planned_stats.clip_mask_peak_bytes {
+                evicting_cases += 1;
+            }
+        }
+        // Vacuous unless clips really are shared and the budget really bites.
+        assert!(
+            shared_cases >= 40,
+            "only {shared_cases} cases shared a mask"
+        );
+        assert!(evicting_cases >= 20, "only {evicting_cases} cases evicted");
+    }
+
+    /// Render `compiled` the way the backend does: painted in chunks while
+    /// it is lowered, flushing once `chunk_bytes` are pending.
+    fn paint_chunked(compiled: &CompiledPage, scale: f64, chunk_bytes: usize) -> (Arc<[u8]>, u32) {
+        let dim = (SIZE * scale).ceil() as u32;
+        let size = DeviceSize {
+            width: dim,
+            height: dim,
+        };
+        let mut surface = Surface::new(dim as usize, dim as usize, Background::White);
+        let mut ctx = CpuWorkerContext::default();
+        let mut stats = RenderStats::default();
+        let mut state = super::ExecState::new();
+        let mut chunks = 0u32;
+        let (fonts, raster, kernels) = ctx.parts();
+        let rest = {
+            let mut flush = |chunk: &CpuPreparedPage, live: &[u32]| {
+                chunks += 1;
+                super::execute_chunk(
+                    chunk,
+                    live,
+                    &mut state,
+                    &mut surface,
+                    raster,
+                    kernels,
+                    &mut stats,
+                );
+                !stats.cancelled
+            };
+            let mut sink = crate::render_cpu::prepared::LowerSink {
+                chunk_bytes,
+                image_chunk_bytes: chunk_bytes,
+                rows: (0, u32::MAX),
+                extents: None,
+                decodes: None,
+                flush: &mut flush,
+            };
+            crate::render_cpu::prepared::lower_with_font_cache(
+                compiled,
+                Matrix {
+                    a: scale,
+                    b: 0.0,
+                    c: 0.0,
+                    d: scale,
+                    e: 0.0,
+                    f: 0.0,
+                },
+                size,
+                &crate::image::CodecRegistry::default(),
+                &crate::image::DecodeLimits::default(),
+                crate::font::HintingPolicy::None,
+                crate::render_api::RenderColorPolicy::Original,
+                fonts,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut sink),
+            )
+        };
+        super::execute_chunk(
+            &rest,
+            &[],
+            &mut state,
+            &mut surface,
+            raster,
+            kernels,
+            &mut stats,
+        );
+        assert!(!stats.cancelled);
+        let (_, pixels) =
+            surface.into_output(crate::render_api::OutputFormat::Rgba8PremultipliedSrgb);
+        (pixels, chunks)
+    }
+
+    #[test]
+    fn painting_in_chunks_matches_one_pass() {
+        let mut rng = Rng(0x0dd0_5eed_cafe_f00d);
+        let mut chunked_cases = 0;
+        for case in 0..80 {
+            // Clip pages keep masks alive across chunk boundaries; group pages
+            // hold chunks back while a scope is open.
+            let compiled = if case % 2 == 0 {
+                clip_page(&mut rng, if case % 4 == 0 { 8 } else { 36 })
+            } else {
+                group_page(&mut rng, case)
+            };
+            let scale = [1.0, 0.61, 2.3][case % 3];
+            let (reference, _) = {
+                let prepared = lower(&compiled, scale);
+                paint(&prepared, ClipMasks::for_page(&prepared))
+            };
+            // Flush after every top-level op, after a few, and never.
+            let (every, flushes) = paint_chunked(&compiled, scale, 0);
+            let (some, _) = paint_chunked(&compiled, scale, 600);
+            let (never, none) = paint_chunked(&compiled, scale, usize::MAX);
+            assert!(reference == every, "case {case}: flushing every op differs");
+            assert!(reference == some, "case {case}: flushing in chunks differs");
+            assert!(reference == never, "case {case}: one chunk differs");
+            assert_eq!(none, 0);
+            if flushes > 3 {
+                chunked_cases += 1;
+            }
+        }
+        assert!(
+            chunked_cases >= 70,
+            "only {chunked_cases} cases really chunked"
+        );
+    }
+
+    /// Render `compiled` strip by strip: one lowering per strip, in the page's
+    /// own device coordinates, painting only that strip's rows.
+    fn paint_strips(compiled: &CompiledPage, scale: f64, strip_rows: u32, cull: bool) -> Arc<[u8]> {
+        paint_strips_measured(compiled, scale, strip_rows, cull).0
+    }
+
+    /// [`paint_strips`], also returning the most clip-mask bytes any one
+    /// strip held at once.
+    fn paint_strips_measured(
+        compiled: &CompiledPage,
+        scale: f64,
+        strip_rows: u32,
+        cull: bool,
+    ) -> (Arc<[u8]>, u64) {
+        let mut mask_peak = 0u64;
+        // With `cull`, the first strip records each op's rows and the others
+        // skip ops that miss theirs, as the backend does.
+        let mut extents = crate::render_cpu::prepared::OpExtents::default();
+        let dim = (SIZE * scale).ceil() as u32;
+        let size = DeviceSize {
+            width: dim,
+            height: dim,
+        };
+        let mut page = Surface::new(dim as usize, dim as usize, Background::White);
+        let mut ctx = CpuWorkerContext::default();
+        let (fonts, raster, kernels) = ctx.parts();
+        let mut first = 0u32;
+        while first < dim {
+            let end = first.saturating_add(strip_rows).min(dim);
+            let mut strip = Surface::new(dim as usize, (end - first) as usize, Background::White);
+            strip.origin_y = first as usize;
+            let mut stats = RenderStats::default();
+            let mut state = super::ExecState::new();
+            let rest = {
+                let mut flush = |chunk: &CpuPreparedPage, live: &[u32]| {
+                    super::execute_chunk(
+                        chunk, live, &mut state, &mut strip, raster, kernels, &mut stats,
+                    );
+                    !stats.cancelled
+                };
+                let mut sink = crate::render_cpu::prepared::LowerSink {
+                    chunk_bytes: 900,
+                    image_chunk_bytes: 900,
+                    rows: (first, end),
+                    extents: cull.then_some(&mut extents),
+                    decodes: None,
+                    flush: &mut flush,
+                };
+                crate::render_cpu::prepared::lower_with_font_cache(
+                    compiled,
+                    Matrix {
+                        a: scale,
+                        b: 0.0,
+                        c: 0.0,
+                        d: scale,
+                        e: 0.0,
+                        f: 0.0,
+                    },
+                    size,
+                    &crate::image::CodecRegistry::default(),
+                    &crate::image::DecodeLimits::default(),
+                    crate::font::HintingPolicy::None,
+                    crate::render_api::RenderColorPolicy::Original,
+                    fonts,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&mut sink),
+                )
+            };
+            super::execute_chunk(
+                &rest,
+                &[],
+                &mut state,
+                &mut strip,
+                raster,
+                kernels,
+                &mut stats,
+            );
+            assert!(!stats.cancelled);
+            mask_peak = mask_peak.max(stats.clip_mask_peak_bytes);
+            for local in 0..strip.height {
+                page.row_mut(first as usize + local)
+                    .copy_from_slice(strip.local_row(local));
+            }
+            first = end;
+        }
+        let (_, pixels) = page.into_output(crate::render_api::OutputFormat::Rgba8PremultipliedSrgb);
+        (pixels, mask_peak)
+    }
+
+    /// Shapes under a luminosity or alpha soft mask, some of them in a group.
+    fn mask_page(rng: &mut Rng, case: usize) -> CompiledPage {
+        let mut paths = Vec::new();
+        let mut paints = Vec::new();
+        let mut ops = Vec::new();
+        let mut shape = |ops: &mut Vec<DisplayOp>, rng: &mut Rng, gray: bool| {
+            let (cx, cy) = (rng.range(10.0, 86.0), rng.range(10.0, 86.0));
+            let r = rng.range(10.0, 45.0);
+            paths.push(blob(rng, cx, cy, r));
+            let v = rng.unit() as f32;
+            paints.push(Paint::Solid(if gray {
+                Color {
+                    r: v,
+                    g: v,
+                    b: v,
+                    a: 1.0,
+                }
+            } else {
+                Color {
+                    r: v,
+                    g: rng.unit() as f32,
+                    b: rng.unit() as f32,
+                    a: 1.0,
+                }
+            }));
+            ops.push(DisplayOp::FillPath {
+                path: PathId(paths.len() as u32 - 1),
+                paint: PaintId(paints.len() as u32 - 1),
+                rule: FillRule::NonZero,
+                alpha: [1.0, 0.6][rng.pick(2) as usize],
+                blend: BlendMode::Normal,
+            });
+        };
+        for _ in 0..3 {
+            shape(&mut ops, rng, false);
+        }
+        ops.push(DisplayOp::Save);
+        ops.push(DisplayOp::BeginSoftMask {
+            kind: match case % 3 {
+                0 => crate::page_ir::MaskKind::Luminosity,
+                1 => crate::page_ir::MaskKind::Alpha,
+                _ => crate::page_ir::MaskKind::LuminosityBc {
+                    backdrop: [90, 90, 90],
+                },
+            },
+            transfer: None,
+        });
+        for _ in 0..=rng.pick(3) {
+            shape(&mut ops, rng, true);
+        }
+        ops.push(DisplayOp::EndSoftMask);
+        let grouped = case % 2 == 0;
+        if grouped {
+            ops.push(DisplayOp::BeginTransparencyGroup {
+                group: TransparencyGroupId(0),
+            });
+        }
+        for _ in 0..=rng.pick(4) {
+            shape(&mut ops, rng, false);
+        }
+        if grouped {
+            ops.push(DisplayOp::EndTransparencyGroup);
+        }
+        ops.push(DisplayOp::Restore);
+        shape(&mut ops, rng, false);
+        let mut compiled = page(SIZE, ops, paths, paints, Vec::new(), Vec::new());
+        compiled.groups = Arc::from(vec![TransparencyGroup {
+            isolated: case % 4 == 0,
+            knockout: false,
+            bounds: Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: SIZE,
+                y1: SIZE,
+            },
+            opacity: 0.7,
+            blend: BlendMode::Normal,
+        }]);
+        compiled
+    }
+
+    #[test]
+    fn painting_in_strips_matches_one_pass() {
+        let mut rng = Rng(0x5712_1b5e_ed00_0001);
+        for case in 0..90 {
+            let compiled = match case % 3 {
+                0 => clip_page(&mut rng, if case % 2 == 0 { 8 } else { 30 }),
+                1 => group_page(&mut rng, case),
+                _ => mask_page(&mut rng, case),
+            };
+            let scale = [1.0, 0.61, 2.3][case % 3];
+            let dim = (SIZE * scale).ceil() as u32;
+            let (reference, _) = {
+                let prepared = lower(&compiled, scale);
+                paint(&prepared, ClipMasks::for_page(&prepared))
+            };
+            // One row at a time, an odd handful, and a strip taller than the page.
+            for strip_rows in [1, 7, 1 + rng.pick(u64::from(dim)) as u32, dim + 5] {
+                for cull in [false, true] {
+                    let strips = paint_strips(&compiled, scale, strip_rows, cull);
+                    assert!(
+                        reference == strips,
+                        "case {case}: strips of {strip_rows} rows (cull {cull}) differ"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A strip builds and holds each clip mask over its own rows, not over
+    /// the clip's whole envelope: the masks of a one-row strip are one row
+    /// tall. The pixels are those of one pass
+    /// (`painting_in_strips_matches_one_pass`).
+    #[test]
+    fn a_strip_holds_clip_masks_over_its_own_rows_only() {
+        let mut rng = Rng(0xc11b_5712_0000_0003);
+        for case in 0..6 {
+            let compiled = clip_page(&mut rng, if case % 2 == 0 { 8 } else { 30 });
+            let scale = 2.3;
+            let prepared = lower(&compiled, scale);
+            let (reference, whole) = paint(&prepared, ClipMasks::for_page(&prepared));
+            assert!(
+                whole.clip_mask_peak_bytes > 0,
+                "case {case}: the page has masks"
+            );
+            for strip_rows in [1u32, 16] {
+                let (strips, peak) = paint_strips_measured(&compiled, scale, strip_rows, true);
+                assert!(
+                    reference == strips,
+                    "case {case}: strips of {strip_rows} rows"
+                );
+                assert!(
+                    peak > 0,
+                    "case {case}: strips of {strip_rows} rows hold masks"
+                );
+                assert!(
+                    peak * 2 <= whole.clip_mask_peak_bytes,
+                    "case {case}: strips of {strip_rows} rows held {peak} mask bytes, one pass {}",
+                    whole.clip_mask_peak_bytes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn masks_are_dropped_after_their_last_consumer() {
+        // Twenty disjoint scopes, each a different clip used by one fill: at
+        // most one mask (plus the batch built ahead) is ever needed, and with
+        // a budget of one mask exactly one is resident at a time.
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut paths = Vec::new();
+        let mut ops = Vec::new();
+        for i in 0..20 {
+            paths.push(blob(&mut rng, 48.0, 48.0, 20.0 + i as f64));
+            ops.push(DisplayOp::Save);
+            ops.push(DisplayOp::PushClip {
+                path: PathId(i),
+                rule: FillRule::NonZero,
+            });
+            ops.push(DisplayOp::FillPath {
+                path: PathId(i),
+                paint: PaintId(0),
+                rule: FillRule::NonZero,
+                alpha: 1.0,
+                blend: BlendMode::Normal,
+            });
+            ops.push(DisplayOp::PopClip);
+            ops.push(DisplayOp::Restore);
+        }
+        let paints = vec![Paint::Solid(Color::from_rgb(0.1, 0.4, 0.8))];
+        let compiled = page(SIZE, ops, paths, paints, Vec::new(), Vec::new());
+        let prepared = lower(&compiled, 2.0);
+        let total: u64 = prepared
+            .clips
+            .iter()
+            .map(|c| c.bounds.width as u64 * c.bounds.height as u64)
+            .sum();
+        let largest = prepared
+            .clips
+            .iter()
+            .map(|c| c.bounds.width as u64 * c.bounds.height as u64)
+            .max()
+            .unwrap();
+        let (kept, kept_stats) = paint(&prepared, ClipMasks::unmanaged(prepared.clips.len()));
+        let (one, one_stats) = paint(
+            &prepared,
+            ClipMasks::for_page_with_budget(&prepared, largest as usize),
+        );
+        assert!(kept == one);
+        assert_eq!(kept_stats.clip_mask_peak_bytes, total);
+        assert!(one_stats.clip_mask_peak_bytes <= largest);
+    }
+
+    /// Groups of every flavour over a busy backdrop; `wrapper` picks the
+    /// flavour the direct path takes.
+    fn group_page(rng: &mut Rng, case: usize) -> CompiledPage {
+        let mut paths = Vec::new();
+        let mut paints = Vec::new();
+        let mut ops = Vec::new();
+        let mut groups = Vec::new();
+        let mut shape = |ops: &mut Vec<DisplayOp>, rng: &mut Rng, blend: BlendMode| {
+            let (cx, cy) = (rng.range(10.0, 86.0), rng.range(10.0, 86.0));
+            let r = rng.range(8.0, 40.0);
+            paths.push(blob(rng, cx, cy, r));
+            paints.push(Paint::Solid(Color {
+                r: rng.unit() as f32,
+                g: rng.unit() as f32,
+                b: rng.unit() as f32,
+                a: 1.0,
+            }));
+            ops.push(DisplayOp::FillPath {
+                path: PathId(paths.len() as u32 - 1),
+                paint: PaintId(paints.len() as u32 - 1),
+                rule: FillRule::NonZero,
+                alpha: [1.0, 0.5, 0.25][rng.pick(3) as usize],
+                blend,
+            });
+        };
+        let blends = [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen];
+        for _ in 0..4 {
+            shape(&mut ops, rng, BlendMode::Normal);
+        }
+        let mut begin = |ops: &mut Vec<DisplayOp>, rng: &mut Rng, wrapper: bool| {
+            groups.push(TransparencyGroup {
+                isolated: !wrapper && rng.pick(2) == 0,
+                knockout: !wrapper && rng.pick(4) == 0,
+                bounds: Rect {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: SIZE,
+                    y1: SIZE,
+                },
+                opacity: if wrapper || rng.pick(2) == 0 {
+                    1.0
+                } else {
+                    0.6
+                },
+                blend: if wrapper {
+                    BlendMode::Normal
+                } else {
+                    blends[rng.pick(3) as usize]
+                },
+            });
+            ops.push(DisplayOp::BeginTransparencyGroup {
+                group: TransparencyGroupId(groups.len() as u32 - 1),
+            });
+        };
+        for g in 0..3 {
+            // Most groups are wrappers; the rest keep every other path alive.
+            let wrapper = (case + g) % 4 != 3;
+            begin(&mut ops, rng, wrapper);
+            for _ in 0..=rng.pick(4) {
+                let blend = blends[rng.pick(3) as usize];
+                shape(&mut ops, rng, blend);
+            }
+            if rng.pick(2) == 0 {
+                // A wrapper nested in the group.
+                begin(&mut ops, rng, true);
+                for _ in 0..=rng.pick(3) {
+                    let blend = blends[rng.pick(3) as usize];
+                    shape(&mut ops, rng, blend);
+                }
+                ops.push(DisplayOp::EndTransparencyGroup);
+            }
+            shape(&mut ops, rng, BlendMode::Normal);
+            ops.push(DisplayOp::EndTransparencyGroup);
+            let blend = blends[rng.pick(3) as usize];
+            shape(&mut ops, rng, blend);
+        }
+        let mut compiled = page(SIZE, ops, paths, paints, Vec::new(), Vec::new());
+        compiled.groups = Arc::from(groups);
+        compiled.features |= crate::page_ir::PageFeatures::TRANSPARENCY;
+        compiled
+    }
+
+    #[test]
+    fn opaque_wrapper_groups_painted_directly_match_their_offscreen() {
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        let mut differing_work = 0;
+        DIRECT_GROUPS.with(|count| count.set(0));
+        for case in 0..120 {
+            let compiled = group_page(&mut rng, case);
+            let scale = [1.0, 0.7, 1.9][case % 3];
+            let prepared = lower(&compiled, scale);
+
+            GROUPS_ALWAYS_OFFSCREEN.with(|flag| flag.set(true));
+            let (offscreen, off_stats) = paint(&prepared, ClipMasks::for_page(&prepared));
+            GROUPS_ALWAYS_OFFSCREEN.with(|flag| flag.set(false));
+            let (direct, direct_stats) = paint(&prepared, ClipMasks::for_page(&prepared));
+
+            assert!(offscreen == direct, "case {case}: direct group differs");
+            assert_eq!(
+                off_stats.transparency_groups,
+                direct_stats.transparency_groups
+            );
+            assert_eq!(off_stats.commands, direct_stats.commands);
+            if direct_stats.transparency_groups > 0 {
+                differing_work += 1;
+            }
+        }
+        assert!(
+            differing_work >= 100,
+            "only {differing_work} cases had groups"
+        );
+        // Vacuous unless wrapper groups really took the direct path.
+        let direct = DIRECT_GROUPS.with(std::cell::Cell::get);
+        assert!(direct >= 150, "only {direct} groups were painted directly");
     }
 }

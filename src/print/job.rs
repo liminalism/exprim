@@ -215,9 +215,18 @@ pub fn print_document_with(
             })
         }
         RouteKind::Composed => {
-            let session = crate::reader::RenderSession::open(
+            // Retain one compiled page, not the default eight. Composition
+            // compiles a page when the first band it touches is drawn and
+            // drops it after rendering, and imposition places each selected
+            // page once, so the cache only ever served a page that is placed
+            // twice in a row (a repeated range such as "1-3,3"); a repeat
+            // further apart recompiles, at CPU cost and with identical output.
+            // Eight retained compilations kept up to eight pages' IR, with
+            // their filter-decoded image samples, alive for nothing.
+            let session = crate::reader::RenderSession::open_with_cache_capacity(
                 Arc::clone(&request.pdf_bytes),
                 request.password,
+                1,
             )?;
             let job = PrintJob::from_session(&session, request.options.clone())?;
             let sheets = spooler.plan_sheets(request.printer, &job, &capabilities)?;

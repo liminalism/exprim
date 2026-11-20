@@ -102,6 +102,14 @@ pub(crate) struct Lowerer<'a> {
     /// does not itself put marks on the page.
     content_bounds: Option<Rect>,
     soft_mask_depth: u32,
+    /// Page-space bounds of the content of each soft mask being lowered,
+    /// innermost last, with its index into `soft_mask_units`.
+    mask_bounds: Vec<(usize, Option<Rect>)>,
+    /// Square user units each soft mask's content covers, in the order of
+    /// the `BeginSoftMask` ops.
+    soft_mask_units: Vec<u64>,
+    /// The most square user units one tiling-pattern fill covers.
+    tiling_fill_units: u64,
 }
 
 impl<'a> Lowerer<'a> {
@@ -126,6 +134,9 @@ impl<'a> Lowerer<'a> {
             clip_scope: Vec::new(),
             content_bounds: None,
             soft_mask_depth: 0,
+            mask_bounds: Vec::new(),
+            soft_mask_units: Vec::new(),
+            tiling_fill_units: 0,
         }
     }
 
@@ -207,6 +218,7 @@ impl<'a> Lowerer<'a> {
             SemanticOp::SetBlendMode(m) => self.gs.blend = *m,
 
             SemanticOp::Fill { path, rule } => {
+                self.note_tiling_path(path.index(), 0.0, true, false);
                 self.include_path(path.index(), 0.0);
                 let path = self.intern_path(path.index());
                 let paint = self.intern_paint(&self.gs.fill_color.clone());
@@ -219,6 +231,7 @@ impl<'a> Lowerer<'a> {
                 });
             }
             SemanticOp::Stroke { path } => {
+                self.note_tiling_path(path.index(), self.gs.line_width * 0.5, false, true);
                 self.include_path(path.index(), self.gs.line_width * 0.5);
                 let path = self.intern_path(path.index());
                 let paint = self.intern_paint(&self.gs.stroke_color.clone());
@@ -232,6 +245,7 @@ impl<'a> Lowerer<'a> {
                 });
             }
             SemanticOp::FillStroke { path, rule } => {
+                self.note_tiling_path(path.index(), self.gs.line_width * 0.5, true, true);
                 self.include_path(path.index(), self.gs.line_width * 0.5);
                 let path = self.intern_path(path.index());
                 let fill_paint = self.intern_paint(&self.gs.fill_color.clone());
@@ -280,6 +294,12 @@ impl<'a> Lowerer<'a> {
                 }
                 let mode = semantic_run.render_mode;
                 let run_id = self.intern_glyph_run(run.index());
+                if matches!(self.gs.fill_color, SemColor::TilingPattern { .. })
+                    || matches!(self.gs.stroke_color, SemColor::TilingPattern { .. })
+                {
+                    let rect = self.glyph_run_rect(run_id);
+                    self.note_tiling_rect(rect);
+                }
                 self.include_glyph_run(run_id);
                 let paint = self.intern_paint(&self.gs.fill_color.clone());
                 // Stroking render modes (Tr 1/2/5/6) also stroke the glyph
@@ -355,6 +375,8 @@ impl<'a> Lowerer<'a> {
             SemanticOp::EndPaintOrigin => self.ops.push(DisplayOp::EndPaintOrigin),
             SemanticOp::BeginSoftMask { kind, transfer } => {
                 self.soft_mask_depth += 1;
+                self.mask_bounds.push((self.soft_mask_units.len(), None));
+                self.soft_mask_units.push(0);
                 self.ops.push(DisplayOp::BeginSoftMask {
                     kind: *kind,
                     transfer: transfer.clone(),
@@ -363,6 +385,12 @@ impl<'a> Lowerer<'a> {
             SemanticOp::EndSoftMask => {
                 self.ops.push(DisplayOp::EndSoftMask);
                 self.soft_mask_depth = self.soft_mask_depth.saturating_sub(1);
+                if let Some((index, bounds)) = self.mask_bounds.pop() {
+                    let units = self.page_units(bounds);
+                    if let Some(slot) = self.soft_mask_units.get_mut(index) {
+                        *slot = units;
+                    }
+                }
             }
             SemanticOp::ClearSoftMask => self.ops.push(DisplayOp::ClearSoftMask),
             SemanticOp::PaintShading(id) => {
@@ -382,9 +410,6 @@ impl<'a> Lowerer<'a> {
     }
 
     fn include_rect(&mut self, rect: Rect) {
-        if self.soft_mask_depth != 0 {
-            return;
-        }
         let rect = rect.normalized();
         if ![rect.x0, rect.y0, rect.x1, rect.y1]
             .iter()
@@ -392,6 +417,19 @@ impl<'a> Lowerer<'a> {
             || rect.width() <= 0.0
             || rect.height() <= 0.0
         {
+            return;
+        }
+        // Soft-mask content marks the mask, not the page: its bounds size
+        // the mask's planes for the memory estimate and stay out of the
+        // page's content bounds.
+        if let Some((_, bounds)) = self.mask_bounds.last_mut() {
+            *bounds = Some(match *bounds {
+                Some(seen) => seen.union(rect),
+                None => rect,
+            });
+            return;
+        }
+        if self.soft_mask_depth != 0 {
             return;
         }
         self.content_bounds = Some(match self.content_bounds {
@@ -405,12 +443,17 @@ impl<'a> Lowerer<'a> {
     }
 
     fn include_path(&mut self, semantic_index: usize, stroke_half_width: f64) {
-        if self.soft_mask_depth != 0 {
-            return;
+        if let Some(rect) = self.path_rect(semantic_index, stroke_half_width) {
+            self.include_rect(rect);
         }
+    }
+
+    /// Page-space bounding box of a path's control points under the current
+    /// transform, padded by `stroke_half_width` in user units.
+    fn path_rect(&self, semantic_index: usize, stroke_half_width: f64) -> Option<Rect> {
         let path = &self.page.paths[semantic_index];
         if path.points.is_empty() {
-            return;
+            return None;
         }
         let points: Vec<Point> = path
             .points
@@ -424,12 +467,59 @@ impl<'a> Lowerer<'a> {
             .hypot(self.gs.ctm.b)
             .max(self.gs.ctm.c.hypot(self.gs.ctm.d));
         let pad = stroke_half_width.abs() * scale;
-        self.include_rect(Rect {
+        Some(Rect {
             x0: points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min) - pad,
             y0: points.iter().map(|p| p.y).fold(f64::INFINITY, f64::min) - pad,
             x1: points.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max) + pad,
             y1: points.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max) + pad,
-        });
+        })
+    }
+
+    /// Square user units of `rect` that lie on the page; 0 for none.
+    fn page_units(&self, rect: Option<Rect>) -> u64 {
+        let Some(rect) = rect else { return 0 };
+        let (rect, page) = (rect.normalized(), self.page.bounds.crop.normalized());
+        let width = rect.x1.min(page.x1) - rect.x0.max(page.x0);
+        let height = rect.y1.min(page.y1) - rect.y0.max(page.y0);
+        if !(width.is_finite() && height.is_finite()) || width <= 0.0 || height <= 0.0 {
+            return 0;
+        }
+        (width.ceil() as u64).saturating_mul(height.ceil() as u64)
+    }
+
+    /// A shape painted with a tiling pattern holds planes over its whole
+    /// bounds while it is filled; remember the largest.
+    fn note_tiling_rect(&mut self, rect: Option<Rect>) {
+        self.tiling_fill_units = self.tiling_fill_units.max(self.page_units(rect));
+    }
+
+    fn note_tiling_path(&mut self, path: usize, stroke_half_width: f64, fill: bool, stroke: bool) {
+        if (fill && matches!(self.gs.fill_color, SemColor::TilingPattern { .. }))
+            || (stroke && matches!(self.gs.stroke_color, SemColor::TilingPattern { .. }))
+        {
+            let rect = self.path_rect(path, stroke_half_width);
+            self.note_tiling_rect(rect);
+        }
+    }
+
+    /// Page-space union of a glyph run's (generous) glyph boxes.
+    fn glyph_run_rect(&self, run_id: crate::page_ir::GlyphRunId) -> Option<Rect> {
+        let run = &self.glyph_runs[run_id.index()];
+        let transform = run.transform.then(self.gs.ctm);
+        let size = run.font_size.abs().max(0.01);
+        run.glyphs
+            .iter()
+            .map(|glyph| {
+                transform
+                    .transform_rect(Rect {
+                        x0: glyph.x,
+                        y0: glyph.y - size * 0.25,
+                        x1: glyph.x + size,
+                        y1: glyph.y + size,
+                    })
+                    .normalized()
+            })
+            .reduce(|a, b| a.union(b))
     }
 
     fn include_unit_square(&mut self) {
@@ -445,9 +535,6 @@ impl<'a> Lowerer<'a> {
     }
 
     fn include_glyph_run(&mut self, run_id: crate::page_ir::GlyphRunId) {
-        if self.soft_mask_depth != 0 {
-            return;
-        }
         let run = &self.glyph_runs[run_id.index()];
         let transform = run.transform.then(self.gs.ctm);
         let size = run.font_size.abs().max(0.01);
@@ -705,29 +792,108 @@ impl<'a> Lowerer<'a> {
             .iter()
             .map(|i| u64::from(i.width).saturating_mul(u64::from(i.height)))
             .fold(0u64, u64::saturating_add);
-        // Rendering prepares images one at a time. Budget the largest cold
-        // working set, not the sum of every image on the page: a four-byte
-        // converted raster remains live while codec-backed inputs may hold one
-        // four-byte coefficient plane per source component. An attached mask
-        // can be decoded while its base image remains live, so it is nested in
-        // that image's estimate.
-        let estimated_image_decode_peak_bytes = self
+        // The CPU backend decodes every image of the page while it prepares
+        // the page, and each prepared draw keeps its decoded samples until the
+        // page finishes, so what an image *retains* adds up across the page.
+        // Only a codec's working planes are freed when its decode returns,
+        // and decodes run one at a time, so that part is the largest one.
+        let (retained, working) = self
             .images
             .iter()
-            .map(estimate_cold_image_decode_bytes)
-            .max()
-            .unwrap_or(0);
-        // Transparency surface requirement: each group needs an offscreen
-        // buffer sized to its bounds (4 bytes/pixel at 1× scale).
-        let estimated_peak_bytes = self
-            .groups
-            .iter()
-            .map(|g| {
-                let w = (g.bounds.x1 - g.bounds.x0).abs().ceil().max(0.0) as u64;
-                let h = (g.bounds.y1 - g.bounds.y0).abs().ceil().max(0.0) as u64;
-                w.saturating_mul(h).saturating_mul(4)
-            })
-            .fold(0u64, u64::saturating_add);
+            .map(estimate_cold_image_bytes)
+            .fold((0u64, 0u64), |(retained, working), image| {
+                (retained.saturating_add(image.0), working.max(image.1))
+            });
+        let estimated_image_decode_peak_bytes = retained.saturating_add(working);
+        // Transparency groups: each renders into its own offscreen surface,
+        // live from its begin to its end op. Nested groups are live together
+        // and sequential ones are not, so walk the op stream and keep the
+        // peak of the live sum. User-space units at 1x (4 bytes per square
+        // unit); the scheduler scales this by the request transform and caps
+        // it by the device surface.
+        let mut live: Vec<u64> = Vec::new();
+        let mut live_bytes = 0u64;
+        let mut estimated_peak_bytes = 0u64;
+        // Soft masks, the same way. While a mask's content is rendered it
+        // holds an RGBA plane over its bounds (four bytes per square unit);
+        // afterwards its coverage plane (one byte per unit) stays on the mask
+        // stack until the enclosing save scope or group ends. `masks` mirrors
+        // that stack: a mask's coverage units, or 0 for the "no mask" entry a
+        // group or a cleared mask pushes.
+        let mut masks: Vec<u64> = Vec::new();
+        let mut mask_marks: Vec<usize> = Vec::new();
+        let mut group_marks: Vec<usize> = Vec::new();
+        let mut rendering: Vec<u64> = Vec::new();
+        let mut next_mask = 0usize;
+        let mut mask_bytes = 0u64;
+        let mut estimated_soft_mask_peak_bytes = 0u64;
+        let unwind = |masks: &mut Vec<u64>, mask_bytes: &mut u64, to: usize| {
+            while masks.len() > to {
+                if let Some(units) = masks.pop() {
+                    *mask_bytes = mask_bytes.saturating_sub(units);
+                }
+            }
+        };
+        for op in &self.ops {
+            match op {
+                DisplayOp::BeginTransparencyGroup { group } => {
+                    // A wrapper group is painted straight onto its parent
+                    // (`render_cpu::exec`), with no surface of its own.
+                    let direct = self.groups.get(group.index()).is_some_and(|g| {
+                        !g.isolated
+                            && !g.knockout
+                            && g.blend == BlendMode::Normal
+                            && g.opacity >= 1.0
+                            && masks.last().is_none_or(|&units| units == 0)
+                    });
+                    let bytes = if direct {
+                        0
+                    } else {
+                        self.groups
+                            .get(group.index())
+                            .map_or(0, estimate_group_surface_bytes)
+                    };
+                    live.push(bytes);
+                    live_bytes = live_bytes.saturating_add(bytes);
+                    estimated_peak_bytes = estimated_peak_bytes.max(live_bytes);
+                    group_marks.push(masks.len());
+                    masks.push(0);
+                }
+                DisplayOp::EndTransparencyGroup => {
+                    if let Some(bytes) = live.pop() {
+                        live_bytes = live_bytes.saturating_sub(bytes);
+                    }
+                    if let Some(mark) = group_marks.pop() {
+                        unwind(&mut masks, &mut mask_bytes, mark);
+                    }
+                }
+                DisplayOp::Save => mask_marks.push(masks.len()),
+                DisplayOp::Restore => {
+                    if let Some(mark) = mask_marks.pop() {
+                        unwind(&mut masks, &mut mask_bytes, mark);
+                    }
+                }
+                DisplayOp::BeginSoftMask { .. } => {
+                    let units = self.soft_mask_units.get(next_mask).copied().unwrap_or(0);
+                    next_mask += 1;
+                    rendering.push(units);
+                    mask_bytes = mask_bytes.saturating_add(units.saturating_mul(4));
+                    estimated_soft_mask_peak_bytes = estimated_soft_mask_peak_bytes.max(mask_bytes);
+                }
+                DisplayOp::EndSoftMask => {
+                    if let Some(units) = rendering.pop() {
+                        mask_bytes = mask_bytes
+                            .saturating_sub(units.saturating_mul(4))
+                            .saturating_add(units);
+                        masks.push(units);
+                        estimated_soft_mask_peak_bytes =
+                            estimated_soft_mask_peak_bytes.max(mask_bytes);
+                    }
+                }
+                DisplayOp::ClearSoftMask => masks.push(0),
+                _ => {}
+            }
+        }
         PageComplexity {
             operation_count: self.ops.len() as u32,
             path_segment_count,
@@ -735,41 +901,155 @@ impl<'a> Lowerer<'a> {
             image_pixels,
             transparency_group_count: self.groups.len() as u32,
             estimated_peak_bytes,
+            soft_mask_count: self.soft_mask_units.len() as u32,
+            estimated_soft_mask_peak_bytes,
+            estimated_tiling_peak_bytes: self.tiling_fill_units.saturating_mul(5),
             estimated_image_decode_peak_bytes,
+            path_clip_count: self
+                .ops
+                .iter()
+                .filter(|op| match op {
+                    DisplayOp::PushClip { path, .. } => self
+                        .paths
+                        .get(path.index())
+                        .is_none_or(|path| !is_user_space_rect(path)),
+                    DisplayOp::PushClipText { .. } => true,
+                    _ => false,
+                })
+                .count()
+                .min(u32::MAX as usize) as u32,
         }
     }
 }
 
-fn estimate_cold_image_decode_bytes(image: &ImageIr) -> u64 {
-    let pixels = u64::from(image.width).saturating_mul(u64::from(image.height));
-    let converted = pixels.saturating_mul(4);
-    let codec_planes = if image.codec.is_some() {
-        let source_components = (image.color_space.components() as u64)
-            .saturating_add(u64::from(image.smask_in_data != 0));
-        pixels.saturating_mul(source_components).saturating_mul(4)
-    } else {
-        0
+/// Offscreen bytes of one transparency group at 1x: four bytes per square
+/// unit of its user-space bounds, twice for a knockout group, which keeps a
+/// same-sized scratch copy for the whole group.
+/// Whether `path` is one closed axis-aligned rectangle in user space: the
+/// clips that need no coverage mask (at any page rotation that is a multiple
+/// of a quarter turn). Anything else is counted as a path clip, which is the
+/// safe direction for a memory estimate.
+fn is_user_space_rect(path: &crate::page_ir::PathData) -> bool {
+    use crate::page_ir::PathVerb::{Close, LineTo, MoveTo};
+    let points = &path.points[..];
+    let corners = match &*path.verbs {
+        [MoveTo, LineTo, LineTo, LineTo] | [MoveTo, LineTo, LineTo, LineTo, Close] => points,
+        [MoveTo, LineTo, LineTo, LineTo, LineTo]
+        | [MoveTo, LineTo, LineTo, LineTo, LineTo, Close]
+            if points.len() == 5 && points[0] == points[4] =>
+        {
+            &points[..4]
+        }
+        _ => return false,
     };
-    let soft_mask = image
-        .smask
-        .as_deref()
-        .map(estimate_cold_mask_decode_bytes)
-        .unwrap_or(0);
-    let hard_mask = match image.mask.as_ref() {
-        Some(crate::page_ir::ImageMask::Stencil(mask)) => estimate_cold_mask_decode_bytes(mask),
-        _ => 0,
+    let [a, b, c, d] = corners else {
+        return false;
     };
-    converted
-        .saturating_add(codec_planes)
-        .saturating_add(soft_mask)
-        .saturating_add(hard_mask)
+    (a.x == b.x && b.y == c.y && c.x == d.x && d.y == a.y)
+        || (a.y == b.y && b.x == c.x && c.y == d.y && d.x == a.x)
 }
 
-fn estimate_cold_mask_decode_bytes(mask: &crate::page_ir::ImageSMask) -> u64 {
-    let pixels = u64::from(mask.width).saturating_mul(u64::from(mask.height));
-    // One retained byte of coverage plus a four-byte coefficient/sample plane
-    // for codec-backed masks.
-    pixels.saturating_mul(if mask.codec.is_some() { 5 } else { 1 })
+fn estimate_group_surface_bytes(group: &crate::page_ir::TransparencyGroup) -> u64 {
+    let w = (group.bounds.x1 - group.bounds.x0).abs().ceil().max(0.0) as u64;
+    let h = (group.bounds.y1 - group.bounds.y0).abs().ceil().max(0.0) as u64;
+    let surfaces = if group.knockout { 2 } else { 1 };
+    w.saturating_mul(h)
+        .saturating_mul(4)
+        .saturating_mul(surfaces)
+}
+
+/// `(retained, working)` bytes of one image at source resolution, the most
+/// a render can allocate for it.
+///
+/// *Retained*, kept until the page finishes: the codec's decoded raster
+/// (filter-decoded samples are already owned by the IR and are shared, not
+/// copied), any decoded codec mask, and the RGB8 copy the backend resolves
+/// palette, ICC, Lab, tint, CMYK, gray and 16-bit images to (charged to every
+/// image that is not a stencil, one-bit, bilevel-codec or DeviceRGB of at
+/// most eight bits, which the backend samples in place).
+///
+/// *Working*, freed when the decode returns: four bytes per source component
+/// per pixel for DCT and JPX (coefficient and sample planes), and two packed
+/// one-bit planes for JBIG2 and CCITT.
+///
+/// Decode-time reduction (DCT and JPX decode a minified draw at a fraction of
+/// full size) is not modelled: the placement is not known here, so this stays
+/// the full-resolution upper bound.
+fn estimate_cold_image_bytes(image: &ImageIr) -> (u64, u64) {
+    let pixels = u64::from(image.width).saturating_mul(u64::from(image.height));
+    let bpc = image.bits_per_component;
+    let (decoded, working) = match image.codec {
+        None => (0, 0),
+        Some(codec) => {
+            // A JPX `/SMaskInData` opacity channel is one more component than
+            // the declared colour space has.
+            let components = (image.color_space.components() as u64)
+                .saturating_add(u64::from(image.smask_in_data != 0));
+            estimate_codec_bytes(codec, image.width, image.height, components, bpc)
+        }
+    };
+    let bilevel_codec = matches!(
+        image.codec,
+        Some(crate::page_ir::ImageCodecKind::Jbig2 | crate::page_ir::ImageCodecKind::CcittFax)
+    );
+    let sampled_in_place = image.is_stencil
+        || bpc <= 1
+        || bilevel_codec
+        || (bpc <= 8 && image.color_space == crate::page_ir::ImageColorSpace::Rgb);
+    let promoted = if sampled_in_place {
+        0
+    } else {
+        pixels.saturating_mul(3)
+    };
+    let mut retained = decoded.saturating_add(promoted);
+    let mut working = working;
+    let masks = [
+        image.smask.as_deref(),
+        match image.mask.as_ref() {
+            Some(crate::page_ir::ImageMask::Stencil(mask)) => Some(mask.as_ref()),
+            _ => None,
+        },
+    ];
+    for mask in masks.into_iter().flatten() {
+        if let Some(codec) = mask.codec {
+            let (decoded, mask_working) =
+                estimate_codec_bytes(codec, mask.width, mask.height, 1, mask.bits_per_component);
+            retained = retained.saturating_add(decoded);
+            working = working.max(mask_working);
+        }
+    }
+    (retained, working)
+}
+
+/// `(decoded, working)` bytes of one codec decode of a `width` x `height`
+/// raster with `components` components.
+fn estimate_codec_bytes(
+    codec: crate::page_ir::ImageCodecKind,
+    width: u32,
+    height: u32,
+    components: u64,
+    bits_per_component: u8,
+) -> (u64, u64) {
+    use crate::page_ir::ImageCodecKind;
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    match codec {
+        // Packed one-bit rows out; the decoder's own bitmap is one bit per
+        // pixel as well (in 32-bit words), plus margin for a region bitmap.
+        ImageCodecKind::Jbig2 | ImageCodecKind::CcittFax => {
+            let packed = u64::from(width)
+                .div_ceil(8)
+                .saturating_mul(u64::from(height));
+            (packed, packed.saturating_mul(2))
+        }
+        ImageCodecKind::Dct | ImageCodecKind::Jpx => {
+            let bytes_per_sample = if bits_per_component > 8 { 2 } else { 1 };
+            let samples = pixels.saturating_mul(components);
+            (
+                samples.saturating_mul(bytes_per_sample),
+                samples.saturating_mul(4),
+            )
+        }
+    }
 }
 
 /// Set the transparency and non-separable-blend flags from one op's alpha and

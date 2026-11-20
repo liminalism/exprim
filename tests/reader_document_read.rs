@@ -50,6 +50,210 @@ fn text_and_raster_share_one_retained_page_in_either_order() {
     }
 }
 
+fn plane_pixels(plane: RasterPlane) -> Arc<[u8]> {
+    match plane {
+        RasterPlane::Rgb8(surface) => surface.pixels,
+        RasterPlane::Gray8(surface) => surface.pixels,
+    }
+}
+
+#[test]
+fn a_session_opened_from_a_path_reads_the_same_document() {
+    let bytes = builder::multipage_classic(2);
+    let dir = std::env::temp_dir().join(format!("exprim-open-path-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("document.pdf");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let from_memory = RenderSession::open(shared(bytes), None).unwrap();
+    {
+        let from_path = RenderSession::open_path(&path, None).unwrap();
+        assert_eq!(from_path.page_count(), from_memory.page_count());
+        for page in 0..from_memory.page_count() {
+            let product = RasterProduct::rgb8(153, 198);
+            let a = from_memory.compile(page).unwrap();
+            let b = from_path.compile(page).unwrap();
+            assert_eq!(
+                plane_pixels(from_memory.render(&a, &product).unwrap()),
+                plane_pixels(from_path.render(&b, &product).unwrap()),
+                "page {page}"
+            );
+            assert_eq!(
+                page_text(&from_memory, page).unwrap(),
+                page_text(&from_path, page).unwrap()
+            );
+        }
+        // The mapping is released with the session, before the file goes.
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(matches!(
+        RenderSession::open_path(dir.join("missing.pdf"), None),
+        Err(ReadError::Open(_))
+    ));
+}
+
+#[test]
+fn idle_memory_belongs_to_the_session_and_releasing_it_never_changes_output() {
+    let session = RenderSession::open(shared(builder::multipage_classic(1)), None).unwrap();
+    let page = session.compile(0).unwrap();
+    assert_eq!(session.idle_surface_bytes(), 0);
+
+    // RGB output is packed into its own buffer, so the RGBA surface it came
+    // from is idle afterwards: kept by the session for the next render.
+    let rgb = RasterProduct::rgb8(153, 198);
+    let first = plane_pixels(session.render(&page, &rgb).unwrap());
+    assert_eq!(session.idle_surface_bytes(), 153 * 198 * 4);
+    let again = plane_pixels(session.render(&page, &rgb).unwrap());
+    assert_eq!(first, again);
+    assert_eq!(
+        session.idle_surface_bytes(),
+        153 * 198 * 4,
+        "reused, not grown"
+    );
+
+    // Rendering on other threads leaves nothing behind on them: every
+    // buffer is the session's, whichever thread used it.
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                let pixels = plane_pixels(session.render(&page, &rgb).unwrap());
+                assert_eq!(pixels, first);
+            });
+        }
+    });
+    assert!(session.idle_surface_bytes() <= 4 * 153 * 198 * 4);
+
+    session.release_idle_memory();
+    assert_eq!(session.idle_surface_bytes(), 0);
+    let after = plane_pixels(session.render(&page, &rgb).unwrap());
+    assert_eq!(first, after);
+    let gray = plane_pixels(
+        session
+            .render(&page, &RasterProduct::gray8(153, 198))
+            .unwrap(),
+    );
+    assert_eq!(gray.len(), 153 * 198);
+}
+
+#[test]
+fn rendering_in_place_gives_the_same_pixels_in_one_buffer() {
+    let session = RenderSession::open(shared(builder::multipage_classic(1)), None).unwrap();
+    let page = session.compile(0).unwrap();
+    let (w, h) = (153usize, 198usize);
+    let product = RasterProduct::rgb8(w as u32, h as u32);
+
+    let RasterPlane::Rgb8(copied) = session.render(&page, &product).unwrap() else {
+        panic!("rgb product");
+    };
+    assert_eq!(copied.pixels.len(), w * h * 3);
+    assert_eq!(copied.as_bytes(), &copied.pixels[..]);
+    session.release_idle_memory();
+
+    let RasterPlane::Rgb8(packed) = session.render_in_place(&page, &product).unwrap() else {
+        panic!("rgb product");
+    };
+    // The same pixels, in the surface they were rendered on.
+    assert_eq!(packed.stride, w * 3);
+    assert_eq!(packed.as_bytes(), copied.as_bytes());
+    assert_eq!(packed.pixels.len(), w * h * 4);
+    // Nothing else was allocated for the page: while the caller holds it the
+    // session keeps no idle buffer, and afterwards exactly that one.
+    assert_eq!(session.idle_surface_bytes(), 0);
+    drop(packed);
+    assert_eq!(session.idle_surface_bytes(), w * h * 4);
+
+    // Gray products are unaffected.
+    let gray = RasterProduct::gray8(w as u32, h as u32);
+    assert_eq!(
+        plane_pixels(session.render(&page, &gray).unwrap()),
+        plane_pixels(session.render_in_place(&page, &gray).unwrap())
+    );
+}
+
+#[test]
+fn large_gray_and_rgb_pages_render_in_strips_to_the_same_pixels() {
+    // A page is rendered in strips once its working surface is more than
+    // twice the strip size, and no strip is shorter than 256 rows: five
+    // strips for this size.
+    let (w, h) = (300u32, 1100u32);
+    let strip = w as usize * 4 * 256;
+    let surface = w as usize * h as usize * 4;
+    for (name, bytes) in [
+        ("text", builder::multipage_classic(1)),
+        ("gray scan", jpeg_scan()),
+        ("annotations", annotation_fixture()),
+    ] {
+        let bytes = shared(bytes);
+        let open = |strip_bytes: usize, image_cache_bytes: usize| {
+            let mut options = exprim::SessionOptions::default();
+            options.strip_bytes = strip_bytes;
+            options.image_cache_bytes = image_cache_bytes;
+            let source: Arc<dyn exprim::source::PdfSource> =
+                Arc::new(exprim::source::OwnedBytesSource::new(Arc::clone(&bytes)));
+            RenderSession::open_source_with_options(source, None, &options).unwrap()
+        };
+        let whole = open(0, 96 << 20);
+        let whole_page = whole.compile(0).unwrap();
+        // With no image cache the strips have only the render's own holder to
+        // keep a scan decoded from one strip to the next.
+        for image_cache_bytes in [96 << 20, 0] {
+            let striped = open(strip, image_cache_bytes);
+            let page = striped.compile(0).unwrap();
+            for product in [RasterProduct::rgb8(w, h), RasterProduct::gray8(w, h)] {
+                let what = format!("{name}, {:?}, cache {image_cache_bytes}", product.format);
+                let expected = plane_pixels(whole.render(&whole_page, &product).unwrap());
+                let got = plane_pixels(striped.render(&page, &product).unwrap());
+                assert_eq!(expected.len(), got.len(), "{what}");
+                assert!(expected == got, "{what}: strips differ from one pass");
+                // Rendered in place it is the same strips, so the buffer is
+                // the exact length here too.
+                let in_place = plane_pixels(striped.render_in_place(&page, &product).unwrap());
+                assert!(expected == in_place, "{what}: in place differs");
+            }
+            // What the session is left holding is strips, not a page surface.
+            let idle = striped.idle_surface_bytes();
+            assert!(idle > 0 && idle <= 2 * strip, "{name}: {idle} idle bytes");
+        }
+        whole
+            .render(&whole_page, &RasterProduct::rgb8(w, h))
+            .unwrap();
+        assert_eq!(whole.idle_surface_bytes(), surface, "{name}");
+    }
+}
+
+#[test]
+fn tight_session_bounds_and_cleared_caches_never_change_output() {
+    let bytes = shared(builder::multipage_classic(3));
+    let roomy = RenderSession::open(Arc::clone(&bytes), None).unwrap();
+    let mut options = exprim::SessionOptions::default();
+    options.cached_pages = 8;
+    options.cached_page_bytes = 1;
+    options.image_cache_bytes = 0;
+    options.font_cache_bytes = 0;
+    options.glyph_cache_bytes = 0;
+    options.surface_pool_bytes = 0;
+    let source: Arc<dyn exprim::source::PdfSource> =
+        Arc::new(exprim::source::OwnedBytesSource::new(bytes));
+    let tight = RenderSession::open_source_with_options(source, None, &options).unwrap();
+
+    let product = RasterProduct::rgb8(153, 198);
+    for page in 0..3 {
+        let a = roomy.compile(page).unwrap();
+        let b = tight.compile(page).unwrap();
+        let expected = plane_pixels(roomy.render(&a, &product).unwrap());
+        assert_eq!(expected, plane_pixels(tight.render(&b, &product).unwrap()));
+        // One byte of budget keeps only the most recent page.
+        assert_eq!(Arc::strong_count(&b), 2, "page {page} is retained");
+        assert_eq!(tight.idle_surface_bytes(), 0, "nothing is pooled");
+        roomy.clear_resource_caches();
+        assert_eq!(expected, plane_pixels(roomy.render(&a, &product).unwrap()));
+    }
+    assert!(roomy.cached_page_bytes() > tight.cached_page_bytes());
+    assert!(tight.cached_page_bytes() > 0);
+    let first = tight.compile(0).unwrap();
+    assert_eq!(Arc::strong_count(&first), 2);
+}
+
 #[test]
 fn concurrent_session_requests_share_the_same_page_handle() {
     fn assert_send_sync<T: Send + Sync>() {}

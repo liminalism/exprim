@@ -1042,6 +1042,41 @@ fn clamp_output_to_budget(
     )
 }
 
+/// A page rendered by [`CpuBackend::render_rgb_with_options`] or
+/// [`CpuBackend::render_packed_rgb_with_options`]: 8-bit RGB, three bytes per
+/// pixel, rows top to bottom.
+#[derive(Debug, Clone)]
+pub struct PackedRgbPage {
+    pub width: u32,
+    pub height: u32,
+    /// Bytes from one row to the next: `width * 3`.
+    pub stride: usize,
+    /// The pixels are the first `stride * height` bytes. From
+    /// `render_rgb_with_options` that is the whole buffer. From
+    /// `render_packed_rgb_with_options` the buffer may be the surface the
+    /// page was rendered on, which is a third longer; the rest is
+    /// unspecified.
+    pub pixels: std::sync::Arc<[u8]>,
+}
+
+/// What a render hands back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputTarget {
+    /// The request's own format: the RGBA surface itself, or Gray8.
+    Request,
+    /// RGB packed inside the RGBA surface it was rendered on.
+    PackedRgb,
+    /// RGB in a buffer of exactly `width * height * 3` bytes.
+    ExactRgb,
+}
+
+/// The strip size a backend aims for by default: see
+/// [`CpuBackend::with_strip_target_bytes`].
+const STRIP_TARGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// No strip is shorter than this many rows, however wide the page.
+const MIN_STRIP_ROWS: u64 = 256;
+
 /// Per-request CPU rendering policy beyond the backend-neutral
 /// [`RenderRequest`]; see [`CpuBackend::render_with_options`]. The default is
 /// what [`CpuBackend::render_with`] does.
@@ -1142,6 +1177,12 @@ pub struct CpuBackend {
     /// outline lowering, stable path/clip Arcs let the WGPU upload caches reuse
     /// immutable device buffers on page revisits.
     shared_prepared_gpu_pages: Arc<SharedPreparedGpuPageCache>,
+    /// Page buffers of finished renders through a caller-owned worker context
+    /// ([`Self::render_with`]), kept for the next render of the same size and
+    /// released with the backend. See [`surface::SurfacePool`].
+    surfaces: surface::SurfacePool,
+    /// RGBA bytes per strip for pages rendered in strips; 0 never strips.
+    strip_target_bytes: usize,
 }
 
 impl CpuBackend {
@@ -1159,7 +1200,128 @@ impl CpuBackend {
                 SharedPreparedPatternedStencilCache::default(),
             ),
             shared_prepared_gpu_pages: Arc::new(SharedPreparedGpuPageCache::default()),
+            surfaces: surface::SurfacePool::new(surface::SURFACE_POOL_BYTES),
+            strip_target_bytes: default_strip_target_bytes(),
         }
+    }
+
+    /// Set the size of the strips large pages are rendered in (32 MiB of
+    /// RGBA by default; 0 renders every page in one pass).
+    ///
+    /// A page whose output is not the RGBA surface itself (Gray8, RGB) needs
+    /// that surface only as a working plane. When the surface would be more
+    /// than twice this size the page is rendered as horizontal strips of at
+    /// most this size, each converted straight into the output buffer, so the
+    /// render holds the output plus one strip instead of the output plus the
+    /// whole surface (five to seven bytes per pixel). Group and soft-mask
+    /// intermediates shrink to the strip with it.
+    ///
+    /// An RGBA page of that size is rendered in strips, each copied into the
+    /// page, only when its group and soft-mask intermediates would themselves
+    /// exceed twice this size: then the render holds the page, one strip and
+    /// strip-sized intermediates instead of the page and page-sized ones.
+    ///
+    /// The pixels are the same either way; strips cost render time, more on
+    /// pages whose shapes cross many strip boundaries.
+    pub fn with_strip_target_bytes(mut self, bytes: usize) -> Self {
+        self.strip_target_bytes = bytes;
+        self
+    }
+
+    /// Rows per strip for this render, or `None` for one pass: what
+    /// [`strip_rows_override`] forces, else [`Self::auto_strip_rows`] when
+    /// strips pay. The one place the choice is made, for the render and for
+    /// the scheduler's estimate of it. `matrix` and the size are the ones the
+    /// render uses, after any clamp to the page budget.
+    ///
+    /// Strips always pay for an output converted from the surface (Gray8,
+    /// RGB): the whole surface is then never needed. An RGBA page is its own
+    /// surface, so strips add a strip buffer and a copy; they pay only when
+    /// they shrink the page's group and soft-mask offscreens by more than
+    /// that, which is taken to be when those would exceed twice the strip
+    /// target at page size. Tiling fills are not counted: a fill keeps its
+    /// whole bounds in a strip.
+    fn strip_rows_for(
+        &self,
+        rgba_out: bool,
+        complexity: &crate::page_ir::PageComplexity,
+        matrix: &Matrix,
+        width: u32,
+        height: u32,
+    ) -> Option<u32> {
+        strip_rows_override()
+            .or_else(|| {
+                let pays = !rgba_out || {
+                    let surface = u64::from(width) * 4 * u64::from(height);
+                    complexity.offscreen_bytes(matrix, surface)
+                        > (self.strip_target_bytes as u64).saturating_mul(2)
+                };
+                pays.then(|| self.auto_strip_rows(width, height)).flatten()
+            })
+            .filter(|&rows| rows < height)
+    }
+
+    /// Rows per strip for a page of this size, or `None` to render it in one
+    /// pass. A function of the size alone, so the choice never depends on
+    /// thread count or cache state.
+    fn auto_strip_rows(&self, width: u32, height: u32) -> Option<u32> {
+        let target = self.strip_target_bytes as u64;
+        if target == 0 {
+            return None;
+        }
+        let surface = u64::from(width) * 4 * u64::from(height);
+        if surface <= target.saturating_mul(2) {
+            return None;
+        }
+        let strips = surface.div_ceil(target);
+        let rows = u64::from(height).div_ceil(strips).max(MIN_STRIP_ROWS);
+        (rows < u64::from(height)).then_some(rows as u32)
+    }
+
+    /// Cap the bytes of finished page buffers this backend keeps for reuse
+    /// (256 MiB by default; 0 keeps none). A render whose buffer does not fit
+    /// allocates and frees its surface, which costs time, never output.
+    pub fn with_surface_pool_bytes(mut self, bytes: usize) -> Self {
+        self.surfaces = surface::SurfacePool::new(bytes);
+        self
+    }
+
+    /// Set the byte budgets of the decoded-image, parsed-font and glyph
+    /// caches (96, 48 and 32 MiB by default). Every backend has its own
+    /// caches, so a host with many documents open divides its allowance among
+    /// them here. A smaller cache costs repeated decoding and rasterizing,
+    /// never output. Call before rendering: the caches start empty.
+    pub fn with_cache_bytes(mut self, images: usize, fonts: usize, glyphs: usize) -> Self {
+        self.shared_images = Arc::new(prepared::SharedImageCache::new(images));
+        self.shared_fonts = Arc::new(prepared::SharedFontProgramCache::new(fonts));
+        self.shared_glyphs = Arc::new(prepared::SharedGlyphCache::new(glyphs));
+        self
+    }
+
+    /// Drop everything the decoded-image, parsed-font and glyph caches hold.
+    /// Renders in progress keep what they are using; later ones decode,
+    /// parse and rasterize again, to the same bytes.
+    pub fn clear_resource_caches(&self) {
+        self.shared_images.clear();
+        self.shared_fonts.clear();
+        self.shared_glyphs.clear();
+    }
+
+    /// Bytes the decoded-image cache currently retains.
+    pub fn image_cache_bytes(&self) -> usize {
+        self.shared_images.retained_bytes()
+    }
+
+    /// Drop the page buffers kept for reuse. They are otherwise held until
+    /// the backend is dropped; a long-lived idle session can call this to
+    /// give the memory back. The next render allocates a fresh surface.
+    pub fn release_idle_memory(&self) {
+        self.surfaces.clear();
+    }
+
+    /// Bytes of page buffers this backend currently keeps alive for reuse.
+    pub fn idle_surface_bytes(&self) -> usize {
+        self.surfaces.idle_bytes()
     }
 
     /// Decode a codec-retained one-bit JBIG2 image `/SMask` without rendering
@@ -1305,8 +1467,17 @@ impl CpuBackend {
         &self,
         request: &RenderRequest,
     ) -> Result<(HostPage, RenderStats), RenderError> {
+        // One-shot: the scheduler's path and the benchmarks'. Nothing is
+        // taken from or parked in the surface pool, as nothing outlived this
+        // call when buffers were parked in the (fresh) worker context.
         let mut ctx = CpuWorkerContext::new();
-        self.render_with(request, &mut ctx)
+        self.render_impl(
+            request,
+            &CpuRenderOptions::default(),
+            &mut ctx,
+            false,
+            OutputTarget::Request,
+        )
     }
 
     /// Lower a request into the exact prepared representation consumed by the
@@ -1361,6 +1532,7 @@ impl CpuBackend {
                 shared_fonts,
                 glyph_cache_enabled().then_some(self.shared_glyphs.as_ref()),
                 shared_images,
+                None,
                 None,
             )
         } else {
@@ -1860,6 +2032,89 @@ impl CpuBackend {
         options: &CpuRenderOptions,
         ctx: &mut CpuWorkerContext,
     ) -> Result<(HostPage, RenderStats), RenderError> {
+        self.render_impl(
+            request,
+            options,
+            ctx,
+            surface_reuse_enabled(),
+            OutputTarget::Request,
+        )
+    }
+
+    /// Render an RGBA request and return it as tightly packed 8-bit RGB in a
+    /// buffer of exactly `width * height * 3` bytes.
+    ///
+    /// A large page is rendered in strips that are converted as they finish
+    /// (see [`Self::with_strip_target_bytes`]), so the render holds the RGB
+    /// page plus one strip. A page small enough for one pass is converted
+    /// from its surface, both planes alive during the copy. The page should
+    /// be composited over an opaque background, since the alpha byte is
+    /// dropped.
+    pub fn render_rgb_with_options(
+        &self,
+        request: &RenderRequest,
+        options: &CpuRenderOptions,
+        ctx: &mut CpuWorkerContext,
+    ) -> Result<(PackedRgbPage, RenderStats), RenderError> {
+        self.render_rgb(request, options, ctx, OutputTarget::ExactRgb)
+    }
+
+    /// Render an RGBA request and return it as tightly packed 8-bit RGB,
+    /// never holding a second full plane.
+    ///
+    /// A page small enough for one pass is packed inside the surface it was
+    /// rendered on: one buffer throughout (four bytes per pixel), which keeps
+    /// the RGBA length, so only the first `stride * height` bytes are pixels
+    /// and a caller that retains many pages retains a third more than it
+    /// needs. A large page is rendered in strips exactly as by
+    /// [`Self::render_rgb_with_options`], which holds less still. The page
+    /// should be composited over an opaque background, since the alpha byte
+    /// is dropped.
+    pub fn render_packed_rgb_with_options(
+        &self,
+        request: &RenderRequest,
+        options: &CpuRenderOptions,
+        ctx: &mut CpuWorkerContext,
+    ) -> Result<(PackedRgbPage, RenderStats), RenderError> {
+        self.render_rgb(request, options, ctx, OutputTarget::PackedRgb)
+    }
+
+    fn render_rgb(
+        &self,
+        request: &RenderRequest,
+        options: &CpuRenderOptions,
+        ctx: &mut CpuWorkerContext,
+        target: OutputTarget,
+    ) -> Result<(PackedRgbPage, RenderStats), RenderError> {
+        if request.output_format != OutputFormat::Rgba8PremultipliedSrgb {
+            return Err(RenderError::Backend(
+                "RGB output needs an RGBA request".into(),
+            ));
+        }
+        let (host, stats) =
+            self.render_impl(request, options, ctx, surface_reuse_enabled(), target)?;
+        Ok((
+            PackedRgbPage {
+                width: host.width,
+                height: host.height,
+                stride: host.stride,
+                pixels: host.pixels,
+            },
+            stats,
+        ))
+    }
+
+    /// For an RGB `target` the `HostPage` carries a three-byte stride under
+    /// the request's RGBA format, so that form never leaves this module
+    /// ([`Self::render_rgb`] rewraps it).
+    fn render_impl(
+        &self,
+        request: &RenderRequest,
+        options: &CpuRenderOptions,
+        ctx: &mut CpuWorkerContext,
+        pool_surface: bool,
+        target: OutputTarget,
+    ) -> Result<(HostPage, RenderStats), RenderError> {
         if let Some(token) = &request.limits.cancellation
             && token.is_cancelled()
         {
@@ -1901,53 +2156,246 @@ impl CpuBackend {
         }
 
         // Request-specific lowering: transform, flatten, cull, classify, once.
-        #[cfg(feature = "profiling")]
-        let lower_start = std::time::Instant::now();
         let decode_limits = image_decode_limits(&request.limits);
         let decode_floor = options
             .image_decode_reference
             .and_then(|reference| prepared::decode_floor_map(transform_matrix, reference.matrix));
-        let prepared = prepared::lower_with_font_cache(
-            &request.page,
-            transform_matrix,
-            output_size,
-            &self.options.codecs,
-            &decode_limits,
-            self.options.hinting,
-            request.color_policy,
-            &mut ctx.fonts,
-            shared_font_cache_enabled().then_some(self.shared_fonts.as_ref()),
-            glyph_cache_enabled().then_some(self.shared_glyphs.as_ref()),
-            image_cache_enabled().then_some(&self.shared_images),
-            decode_floor,
-        );
+        // The page is painted in chunks while it is lowered (see
+        // `prepared::LowerSink`), so neither the whole page's flattened
+        // geometry nor all of its decoded images are ever held at once. The
+        // surface is allocated when the first chunk is painted, not before
+        // lowering starts: a codec's working set while it decodes a scan is
+        // several times the page, and for a page that lowers in one piece
+        // (most pages) the surface must not sit beside it.
         #[cfg(feature = "profiling")]
-        {
-            stats.lower = lower_start.elapsed();
+        let prep_time = std::cell::Cell::new(std::time::Duration::ZERO);
+        let new_surface = || {
+            #[cfg(feature = "profiling")]
+            let prep_start = std::time::Instant::now();
+            let surface = Surface::new_recycled(
+                width as usize,
+                height as usize,
+                request.background,
+                pool_surface
+                    .then(|| self.surfaces.take(width as usize, height as usize))
+                    .flatten(),
+            );
+            #[cfg(feature = "profiling")]
+            prep_time.set(prep_start.elapsed());
+            surface
+        };
+        #[cfg(feature = "profiling")]
+        let lower_start = std::time::Instant::now();
+
+        // One pass over the whole page, or one pass per horizontal strip: the
+        // same lowering in the same device coordinates with painting clamped
+        // to the strip's rows (docs/plans/strip-rendering-2026-11-20.md).
+        //
+        // A page whose output is converted from the surface (Gray8, RGB) and
+        // is large is rendered in strips, each converted straight into the
+        // output buffer, so the full RGBA surface never exists. An RGBA page
+        // is its own surface; it is rendered in strips, each copied into the
+        // page, only when its group and soft-mask offscreens are large enough
+        // for that to hold less (see `strip_rows_for`).
+        let rgba_out = target == OutputTarget::Request
+            && request.output_format == OutputFormat::Rgba8PremultipliedSrgb;
+        let strip_rows = self.strip_rows_for(
+            rgba_out,
+            &request.page.complexity,
+            &transform_matrix,
+            width,
+            height,
+        );
+        let windows: Vec<(u32, u32)> = match strip_rows {
+            Some(rows) => (0..height)
+                .step_by(rows as usize)
+                .map(|first| (first, first.saturating_add(rows).min(height)))
+                .collect(),
+            _ => vec![(0, u32::MAX)],
+        };
+        let striped = windows.len() > 1;
+        // Every strip is painted on a surface of the same height, the last
+        // one using only its top rows: one buffer then serves the whole page
+        // and, parked, the next page of the same size. A shorter last strip
+        // needed a second buffer, and one of those was parked per render.
+        let strip_height = strip_rows.map_or(0, |rows| rows.min(height)) as usize;
+        // Strips written straight into the output, and its bytes per pixel.
+        let direct = striped && !rgba_out;
+        let direct_bpp = match target {
+            OutputTarget::Request => bpp,
+            OutputTarget::PackedRgb | OutputTarget::ExactRgb => 3,
+        };
+        let direct_stride = width as usize * direct_bpp;
+        let mut direct_out: Option<Arc<[u8]>> = None;
+        let mut strip_bytes = 0u64;
+        let (fonts, raster, kernels) = ctx.parts();
+        let mut page_surface: Option<Surface> = None;
+        let mut kept: Option<prepared::CpuPreparedPage> = None;
+        // Recorded by the first strip, read by the rest.
+        let mut extents = prepared::OpExtents::default();
+        // Decodes a later strip draws again, kept by the render itself.
+        let decodes = striped.then(|| Arc::new(prepared::StripDecodes::default()));
+        // The strip buffer between two strips.
+        let strip_buffer: std::cell::Cell<Option<Arc<[u8]>>> = std::cell::Cell::new(None);
+        for &(first_row, end_row) in &windows {
+            let strip_surface = || {
+                if striped {
+                    let mut strip = Surface::new_recycled(
+                        width as usize,
+                        strip_height,
+                        request.background,
+                        strip_buffer.take().or_else(|| {
+                            pool_surface
+                                .then(|| self.surfaces.take(width as usize, strip_height))
+                                .flatten()
+                        }),
+                    );
+                    strip.origin_y = first_row as usize;
+                    strip
+                } else {
+                    new_surface()
+                }
+            };
+            let mut surface: Option<Surface> = None;
+            let mut exec_state = exec::ExecState::new();
+            let prepared = {
+                let mut flush = |chunk: &prepared::CpuPreparedPage, live_clips: &[u32]| {
+                    exec::execute_chunk(
+                        chunk,
+                        live_clips,
+                        &mut exec_state,
+                        surface.get_or_insert_with(&strip_surface),
+                        raster,
+                        kernels,
+                        &mut stats,
+                    );
+                    !stats.cancelled
+                };
+                let mut sink = prepared::LowerSink {
+                    chunk_bytes: prepared::lower_chunk_bytes(),
+                    image_chunk_bytes: prepared::lower_image_chunk_bytes(),
+                    rows: (first_row, end_row),
+                    extents: striped.then_some(&mut extents),
+                    decodes: decodes.clone(),
+                    flush: &mut flush,
+                };
+                prepared::lower_with_font_cache(
+                    &request.page,
+                    transform_matrix,
+                    output_size,
+                    &self.options.codecs,
+                    &decode_limits,
+                    self.options.hinting,
+                    request.color_policy,
+                    fonts,
+                    shared_font_cache_enabled().then_some(self.shared_fonts.as_ref()),
+                    glyph_cache_enabled().then_some(self.shared_glyphs.as_ref()),
+                    image_cache_enabled().then_some(&self.shared_images),
+                    decode_floor,
+                    Some(&mut sink),
+                )
+            };
+            if stats.cancelled {
+                return Err(RenderError::Cancelled);
+            }
+            // What was not flushed along the way: everything, when it is small.
+            let mut strip = surface.unwrap_or_else(&strip_surface);
+            exec::execute_chunk(
+                &prepared,
+                &[],
+                &mut exec_state,
+                &mut strip,
+                raster,
+                kernels,
+                &mut stats,
+            );
+            if stats.cancelled {
+                return Err(RenderError::Cancelled);
+            }
+            if let Some(decodes) = &decodes {
+                decodes.release_through(end_row);
+            }
+            // The rows of this strip that belong to the page.
+            let used_rows = if striped {
+                (end_row - first_row) as usize
+            } else {
+                strip.height
+            };
+            if direct {
+                // Convert this strip's rows into their place in the output.
+                // The buffer is zero pages until written, so it grows with
+                // the strips instead of sitting whole beside the first one.
+                let out = direct_out
+                    .get_or_insert_with(|| surface::zeroed_arc(direct_stride * height as usize));
+                let rows = surface::unique_arc_mut(out)
+                    .get_mut(first_row as usize * direct_stride..)
+                    .and_then(|rest| rest.get_mut(..used_rows * direct_stride))
+                    .ok_or_else(|| RenderError::Backend("strip outside the page".into()))?;
+                let painted = strip
+                    .pixels()
+                    .get(..used_rows * width as usize * 4)
+                    .ok_or_else(|| RenderError::Backend("strip shorter than its rows".into()))?;
+                if direct_bpp == 1 {
+                    surface::rgba_rows_to_gray8(painted, rows, exec::output_fan_out());
+                } else {
+                    surface::rgba_rows_to_rgb8(painted, rows);
+                }
+                strip_bytes = strip_bytes.max(strip.bytes());
+                strip_buffer.set(Some(strip.into_buffer()));
+            } else if striped {
+                // The strips cover every row, so the page needs no background.
+                let page = page_surface.get_or_insert_with(|| {
+                    Surface::new_unpainted(
+                        width as usize,
+                        height as usize,
+                        pool_surface
+                            .then(|| self.surfaces.take(width as usize, height as usize))
+                            .flatten(),
+                    )
+                });
+                for local in 0..used_rows {
+                    page.row_mut(first_row as usize + local)
+                        .copy_from_slice(strip.local_row(local));
+                }
+                strip_buffer.set(Some(strip.into_buffer()));
+            } else {
+                page_surface = Some(strip);
+            }
+            // A dropped draw is noted by every strip it touches; report the
+            // strip that saw the most rather than the sum.
+            if kept.as_ref().is_none_or(|best| {
+                prepared.diagnostics.degraded_draws() > best.diagnostics.degraded_draws()
+            }) {
+                kept = Some(prepared);
+            }
         }
         stats.ops_total = request.page.operations.len() as u32;
-
-        #[cfg(feature = "profiling")]
-        let prep_start = std::time::Instant::now();
-        let mut surface = Surface::new_recycled(
-            width as usize,
-            height as usize,
-            request.background,
-            surface_reuse_enabled()
-                .then(|| {
-                    surface::take_recycled(&mut ctx.surface_buffer, width as usize, height as usize)
-                })
-                .flatten(),
-        );
-        stats.surface_bytes = surface.bytes();
+        let Some(prepared) = kept else {
+            return Err(RenderError::Backend("no strip was rendered".into()));
+        };
+        // The working plane: one strip, or the page surface.
+        let surface = if direct {
+            stats.surface_bytes = strip_bytes;
+            None
+        } else {
+            let surface = page_surface.unwrap_or_else(&new_surface);
+            stats.surface_bytes = surface.bytes();
+            // An RGBA page painted in strips: keep the strip buffer for the
+            // next one.
+            if pool_surface && let Some(buffer) = strip_buffer.take() {
+                self.surfaces.park(buffer);
+            }
+            Some(surface)
+        };
         #[cfg(feature = "profiling")]
         {
-            stats.prep = prep_start.elapsed();
-        }
-
-        exec::execute(&prepared, &mut surface, ctx, &mut stats);
-        if stats.cancelled {
-            return Err(RenderError::Cancelled);
+            // Chunks were painted, and the surface made, inside the lowering
+            // call.
+            stats.prep = prep_time.get();
+            stats.lower = lower_start
+                .elapsed()
+                .saturating_sub(stats.raster)
+                .saturating_sub(stats.prep);
         }
         // Fold in codec draws dropped during top-level lowering (tiling-cell
         // drops are absorbed inside `execute`). A page left blank by an
@@ -1959,13 +2407,27 @@ impl CpuBackend {
 
         #[cfg(feature = "profiling")]
         let output_start = std::time::Instant::now();
-        let mut discard = None;
-        let pool = if surface_reuse_enabled() {
-            &mut ctx.surface_buffer
-        } else {
-            &mut discard
+        let mut parked = None;
+        let (stride, pixels) = match surface {
+            Some(surface) => match target {
+                OutputTarget::PackedRgb => surface.into_packed_rgb(&mut parked),
+                OutputTarget::ExactRgb => surface.into_exact_rgb(&mut parked),
+                OutputTarget::Request => {
+                    surface.into_output_recycling(request.output_format, &mut parked)
+                }
+            },
+            // Already converted, strip by strip; the strip buffer is what
+            // there is to reuse.
+            None => {
+                parked = strip_buffer.take();
+                let pixels = direct_out
+                    .ok_or_else(|| RenderError::Backend("no strip was converted".into()))?;
+                (direct_stride, pixels)
+            }
         };
-        let (stride, pixels) = surface.into_output_recycling(request.output_format, pool);
+        if pool_surface && let Some(buffer) = parked {
+            self.surfaces.park(buffer);
+        }
         stats.output_bytes = pixels.len() as u64;
         #[cfg(feature = "profiling")]
         {
@@ -2116,9 +2578,7 @@ impl CpuBackend {
             height as usize,
             request.background,
             surface_reuse_enabled()
-                .then(|| {
-                    surface::take_recycled(&mut ctx.surface_buffer, width as usize, height as usize)
-                })
+                .then(|| self.surfaces.take(width as usize, height as usize))
                 .flatten(),
         );
         let mut stats = RenderStats {
@@ -2132,13 +2592,13 @@ impl CpuBackend {
         }
         stats.absorb_diagnostics(&prepared.diagnostics);
         let output_start = std::time::Instant::now();
-        let mut discard = None;
-        let pool = if surface_reuse_enabled() {
-            &mut ctx.surface_buffer
-        } else {
-            &mut discard
-        };
-        let (stride, pixels) = surface.into_output_recycling(request.output_format, pool);
+        let mut parked = None;
+        let (stride, pixels) = surface.into_output_recycling(request.output_format, &mut parked);
+        if surface_reuse_enabled()
+            && let Some(buffer) = parked
+        {
+            self.surfaces.park(buffer);
+        }
         stats.output_bytes = pixels.len() as u64;
         stats.output = output_start.elapsed();
         let mut profile = stats.profile.clone();
@@ -2173,7 +2633,36 @@ impl Default for CpuBackend {
     }
 }
 
-/// Whether the per-worker page-surface buffer is reused across renders. On by
+/// The default strip size: `PDF_RENDERER_STRIP_MB` in MiB when set (0 turns
+/// automatic strips off), else [`STRIP_TARGET_BYTES`]. Read once.
+pub(crate) fn default_strip_target_bytes() -> usize {
+    use std::sync::OnceLock;
+    static BYTES: OnceLock<usize> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("PDF_RENDERER_STRIP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(STRIP_TARGET_BYTES, |mb| mb.saturating_mul(1024 * 1024))
+    })
+}
+
+/// Rows per strip when `PDF_RENDERER_STRIP_ROWS` is set (and positive): every
+/// page is then rendered strip by strip, whatever its size and format. It
+/// exists so the page-hash gate can check that strips are byte-identical to
+/// one pass on pages too small to be stripped otherwise, RGBA included (whose
+/// strips are assembled into a full surface and save nothing). Read once.
+fn strip_rows_override() -> Option<u32> {
+    use std::sync::OnceLock;
+    static ROWS: OnceLock<Option<u32>> = OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("PDF_RENDERER_STRIP_ROWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&rows| rows > 0)
+    })
+}
+
+/// Whether finished page buffers are pooled and reused across renders. On by
 /// default; `PDF_RENDERER_SURFACE_REUSE=off` (or `0`) disables it, for paired
 /// A/B isolation on one binary. Read once.
 fn surface_reuse_enabled() -> bool {
@@ -2299,6 +2788,30 @@ impl RenderBackend for CpuBackend {
         }
     }
 
+    /// One strip for a page [`Self::render_to_host`] renders in strips, the
+    /// whole surface otherwise: the same choice, from the same function, on
+    /// the size and transform the render clamps the request to.
+    fn working_surface_bytes(&self, request: &RenderRequest) -> u64 {
+        let (size, matrix, _) = clamp_output_to_budget(
+            request.output_size,
+            request.transform.matrix,
+            request.limits.max_page_bytes,
+        );
+        let rgba_out = request.output_format == OutputFormat::Rgba8PremultipliedSrgb;
+        let rows = self
+            .strip_rows_for(
+                rgba_out,
+                &request.page.complexity,
+                &matrix,
+                size.width,
+                size.height,
+            )
+            .unwrap_or(size.height);
+        u64::from(size.width)
+            .saturating_mul(u64::from(rows))
+            .saturating_mul(4)
+    }
+
     fn submit(&self, request: RenderRequest) -> Result<RenderTicket, SubmitError> {
         let job_id = self.job_counter.fetch_add(1, Ordering::Relaxed);
         let (ticket, tx) = RenderTicket::new(job_id);
@@ -2313,7 +2826,6 @@ impl RenderBackend for CpuBackend {
         Ok(ticket)
     }
 }
-
 
 /// The stage report for one render: the `RenderStats` stage timers and counters
 /// under their `render.*` names, plus everything the lowering and execution

@@ -15,6 +15,7 @@ use crate::page_ir::{
     BlendMode, FillRule, ImageColorSpace, ImageSMask, LineCap, LineJoin, MaskKind, Matrix,
     PageBounds, PaintOrigin, PathData, PathVerb, Point, Rect,
 };
+use crate::structure::decode::SharedDecoded;
 
 use crate::content::marked::MarkedContentSpan;
 use crate::content::semantic::{
@@ -415,6 +416,10 @@ pub(crate) struct Interpreter<'a> {
     /// An ExtGState enabled overprint (`/OP` or `/op` true). Feeds
     /// `PageFeatures::OVERPRINT`; compositing itself is unchanged.
     uses_overprint: bool,
+    /// Keeps the document's image-sample sharing open while this compile
+    /// runs, so concurrent compiles drawing the same image XObject decode it
+    /// once and share one buffer (see `DocumentSnapshot::decode_image_data`).
+    _image_samples: crate::document::ImageSampleSession,
 }
 
 /// The name-keyed resolution caches, parked while a nested content stream runs
@@ -643,6 +648,7 @@ impl<'a> Interpreter<'a> {
             image_xobject_cache: HashMap::new(),
             image_cs_resource_relative: false,
             uses_overprint: false,
+            _image_samples: snapshot.image_sample_session(),
         }
     }
 
@@ -3581,13 +3587,22 @@ impl<'a> Interpreter<'a> {
 
         // Decode through the general filters; a codec filter (DCT/JPX/
         // JBIG2/CCITT) stops decoding and yields the encoded payload for
-        // the backend's codec registry.
-        let (samples, codec, codec_data) =
-            match self.snapshot.decode_stream_data_to_codec(stream, self.ctx) {
-                Ok((bytes, None)) => (Some(Arc::from(bytes)), None, None),
-                Ok((bytes, Some(name))) => (None, codec_kind(name.as_bytes()), Some(bytes.into())),
-                Err(_) => (None, None, None),
-            };
+        // the backend's codec registry. Samples decode straight into their
+        // shared buffer, shared with any concurrent compile of this object.
+        let components = color_space
+            .as_ref()
+            .map_or(1, crate::page_ir::ImageColorSpace::components);
+        let expected = image_sample_len(width, height, components, bpc);
+        let (samples, codec, codec_data) = match self
+            .snapshot
+            .decode_image_data(stream, obj_id, expected, self.ctx)
+        {
+            Ok(SharedDecoded::Bytes(bytes)) => (Some(bytes), None, None),
+            Ok(SharedDecoded::Codec(bytes, name)) => {
+                (None, codec_kind(name.as_bytes()), Some(bytes.into()))
+            }
+            Err(_) => (None, None, None),
+        };
         let smask = self.build_image_smask(dict);
         // `/SMaskInData` (§7.4.7): a JPXDecode image's own opacity channel acts
         // as a soft mask (1) or premultiplied opacity (2). Only honoured when
@@ -4313,7 +4328,9 @@ impl<'a> Interpreter<'a> {
     /// their encoded payload for the backend's registry, exactly like the
     /// base image: the interpreter never decodes codecs.
     fn build_image_smask(&mut self, dict: &Dictionary) -> Option<Arc<ImageSMask>> {
-        let smask = self.resolve_obj(&dict.get(self.intern(b"SMask"))?.clone())?;
+        let entry = dict.get(self.intern(b"SMask"))?.clone();
+        let smask_id = entry.as_reference();
+        let smask = self.resolve_obj(&entry)?;
         let PdfObject::Stream(stream) = &*smask else {
             return None;
         };
@@ -4330,16 +4347,20 @@ impl<'a> Interpreter<'a> {
         let decode = self.read_decode_array(sdict).map(Arc::from);
         let codec_parms = self.read_codec_parms(sdict);
 
-        let (samples, codec, codec_data) =
-            match self.snapshot.decode_stream_data_to_codec(stream, self.ctx) {
-                Ok((bytes, None)) => (Arc::from(bytes), None, None),
-                Ok((bytes, Some(name))) => (
-                    Arc::from(Vec::new()),
-                    codec_kind(name.as_bytes()),
-                    Some(bytes.into()),
-                ),
-                Err(_) => return None,
-            };
+        // A soft mask is one gray component (§11.6.5.2).
+        let expected = image_sample_len(width, height, 1, bpc);
+        let (samples, codec, codec_data) = match self
+            .snapshot
+            .decode_image_data(stream, smask_id, expected, self.ctx)
+        {
+            Ok(SharedDecoded::Bytes(bytes)) => (bytes, None, None),
+            Ok(SharedDecoded::Codec(bytes, name)) => (
+                Arc::from(Vec::new()),
+                codec_kind(name.as_bytes()),
+                Some(bytes.into()),
+            ),
+            Err(_) => return None,
+        };
         Some(Arc::new(ImageSMask {
             width,
             height,
@@ -4369,7 +4390,9 @@ impl<'a> Interpreter<'a> {
         color_space: Option<&ImageColorSpace>,
         bpc: u8,
     ) -> Option<crate::page_ir::ImageMask> {
-        let mask = self.resolve_obj(&dict.get(self.intern(b"Mask"))?.clone())?;
+        let entry = dict.get(self.intern(b"Mask"))?.clone();
+        let mask_id = entry.as_reference();
+        let mask = self.resolve_obj(&entry)?;
         match &*mask {
             // Color-key masking: integer ranges in raw-sample space.
             PdfObject::Array(items) => {
@@ -4414,16 +4437,23 @@ impl<'a> Interpreter<'a> {
                 }
                 let decode = decode.map(Arc::from);
                 let codec_parms = self.read_codec_parms(sdict);
-                let (samples, codec, codec_data) =
-                    match self.snapshot.decode_stream_data_to_codec(stream, self.ctx) {
-                        Ok((bytes, None)) => (Arc::from(bytes), None, None),
-                        Ok((bytes, Some(name))) => (
-                            Arc::from(Vec::new()),
-                            codec_kind(name.as_bytes()),
-                            Some(bytes.into()),
-                        ),
-                        Err(_) => return None,
-                    };
+                // One component; a stencil is 1-bit, a gray image used as a
+                // mask may declare more.
+                let mask_bpc = dict_int(sdict, self.intern(b"BitsPerComponent"))
+                    .map_or(1, |v| v.clamp(0, 255) as u8);
+                let expected = image_sample_len(width, height, 1, mask_bpc);
+                let (samples, codec, codec_data) = match self
+                    .snapshot
+                    .decode_image_data(stream, mask_id, expected, self.ctx)
+                {
+                    Ok(SharedDecoded::Bytes(bytes)) => (bytes, None, None),
+                    Ok(SharedDecoded::Codec(bytes, name)) => (
+                        Arc::from(Vec::new()),
+                        codec_kind(name.as_bytes()),
+                        Some(bytes.into()),
+                    ),
+                    Err(_) => return None,
+                };
                 Some(crate::page_ir::ImageMask::Stencil(Arc::new(ImageSMask {
                     width,
                     height,
@@ -4908,7 +4938,11 @@ impl<'a> Interpreter<'a> {
         } else {
             mask_op.and_then(|op| inline_color_key_mask(&op, color_space.as_ref(), bpc))
         };
-        let (samples, codec, codec_data) = self.decode_inline(&filters, &data);
+        let components = color_space
+            .as_ref()
+            .map_or(1, crate::page_ir::ImageColorSpace::components);
+        let expected = image_sample_len(width, height, components, bpc);
+        let (samples, codec, codec_data) = self.decode_inline(&filters, &data, expected);
         let img = SemImage {
             object: None,
             width,
@@ -5007,6 +5041,7 @@ impl<'a> Interpreter<'a> {
         &mut self,
         filters: &[Vec<u8>],
         data: &[u8],
+        expected: Option<usize>,
     ) -> (
         Option<Arc<[u8]>>,
         Option<crate::page_ir::ImageCodecKind>,
@@ -5030,9 +5065,16 @@ impl<'a> Interpreter<'a> {
             dict,
             data: StreamData::Owned(Arc::from(data)),
         };
-        match self.snapshot.decode_stream_data_to_codec(&stream, self.ctx) {
-            Ok((bytes, None)) => (Some(Arc::from(bytes)), None, None),
-            Ok((bytes, Some(name))) => (None, codec_kind(name.as_bytes()), Some(bytes.into())),
+        // No object identity: decoded for this draw alone, but still
+        // straight into its shared buffer.
+        match self
+            .snapshot
+            .decode_image_data(&stream, None, expected, self.ctx)
+        {
+            Ok(SharedDecoded::Bytes(bytes)) => (Some(bytes), None, None),
+            Ok(SharedDecoded::Codec(bytes, name)) => {
+                (None, codec_kind(name.as_bytes()), Some(bytes.into()))
+            }
             Err(_) => (None, None, None),
         }
     }
@@ -6190,6 +6232,19 @@ impl FontResourceCache {
 }
 
 // --- free helpers ----------------------------------------------------------
+
+/// Decoded byte length of a `width` × `height` image of `components` samples
+/// of `bpc` bits per pixel, each row padded to a whole byte (ISO 32000-1
+/// §8.9.3); `None` when degenerate. Only a size hint for the decoder.
+fn image_sample_len(width: u32, height: u32, components: usize, bpc: u8) -> Option<usize> {
+    if width == 0 || height == 0 || components == 0 || bpc == 0 {
+        return None;
+    }
+    let row_bits = (width as usize)
+        .checked_mul(components)?
+        .checked_mul(usize::from(bpc))?;
+    row_bits.div_ceil(8).checked_mul(height as usize)
+}
 
 /// Resolve a page-level concatenated offset to its source stream object and
 /// stream-relative span. Segments are disjoint and ascending; an offset that

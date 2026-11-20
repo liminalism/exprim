@@ -7,6 +7,153 @@ were internal and never published.
 
 ## 0.4.0 — 2026-11-10
 
+### Gray8 output, 2026-11-20
+
+- The Gray8 output conversion is integer arithmetic instead of
+  floating-point, and a large page is converted across the thread pool when
+  no other page is rendering. Every output byte is the one the floating-point
+  form produced, checked over all 16.7 million colours. A text page at
+  600 dpi renders to Gray8 in 13 ms instead of 54 ms (27 ms when the cores
+  are busy with other pages), at 300 dpi in 3.6 ms instead of 13.5 ms. The
+  600 dpi page takes 9.5 ms as RGBA.
+
+### Peak memory, 2026-11-20
+
+Output is byte-identical throughout: page hashes are unchanged across the
+repository fixtures, a set of synthetic clip, group and image documents, and
+twenty large local documents (scans with JPEG 2000, JPEG, JBIG2 and CCITT
+images, a mixed-raster-content book, vector and text documents).
+
+- Clip masks no longer accumulate for the whole page. Identical clip paths
+  share one mask, a mask is dropped after the last draw that uses it, and the
+  rest stay under a budget of eight page-sized planes (at least 64 MiB),
+  rebuilt on demand beyond it. A page that re-established one page-sized clip
+  200 times peaked at 3.6 GB at 600 dpi and now peaks at 158 MB; it also
+  renders about ten times faster. `RenderStats::clip_mask_peak_bytes` reports
+  the most mask bytes held at once.
+- A non-isolated, fully opaque, Normal-blend transparency group with no soft
+  mask in force (the wrapper most producers put around a page or a form)
+  paints directly on its parent instead of a group-sized offscreen. A page
+  with one page-sized wrapper at 600 dpi drops from 260 MB to 140 MB.
+- An image whose placement lies outside the rendered window is no longer
+  decoded. A degraded-draw note is therefore no longer recorded for an
+  undecodable image that could not have been seen.
+- Finished page buffers kept for reuse now belong to the `CpuBackend` (the
+  three most recent sizes, at most 256 MiB,
+  `CpuBackend::with_surface_pool_bytes`) instead of to each thread, and `RenderSession` owns its worker contexts instead of keeping
+  them in thread-locals: both are released with the session, or earlier with
+  `RenderSession::release_idle_memory`.
+- `RenderSession::open_path` memory-maps the file instead of holding it on
+  the heap; `RenderSession::open_source` takes any `PdfSource`.
+- Opening a document whose cross-reference table has to be rebuilt no longer
+  reads the whole file. The rebuild scan steps over a stream body when the
+  stream's `/Length` is a direct number that lands on `endstream` (the
+  condition under which the object parser trusts it); other streams are
+  scanned as before. A 781 MB scanned book whose `startxref` was off by 13 KB
+  opened in 3.3 s with all 781 MB resident; it now opens in 15 ms with 14 MB.
+  Bytes inside such a stream that look like an object header or a trailer
+  (an embedded PDF stored uncompressed, say) are no longer indexed as objects
+  of the document.
+- When `startxref` is missing or wrong, the search for the last `xref`
+  keyword covers the last megabyte backwards and only then the rest of the
+  file, forwards, stepping over verified stream bodies; it used to read every
+  byte backwards, which for a file with cross-reference streams only read the
+  whole file to find nothing.
+- The scheduler's job estimate charges clip masks: one output-sized plane per
+  non-rectangular clip (`PageComplexity::path_clip_count`), up to the
+  backend's mask budget.
+- A page is painted in chunks while it is lowered: once 16 MiB of flattened
+  draw geometry and decoded image samples are pending and no group or
+  soft-mask scope is open, the ops lowered so far are painted and dropped.
+  The whole page's stroke outlines and every one of its decoded images are
+  no longer held at once before the first pixel is painted.
+- `RenderSession::render_in_place` packs an RGB raster inside the surface it
+  was rendered on (four bytes per pixel at the peak instead of seven); export
+  and print use it. Its `RgbSurface::pixels` may be longer than
+  `stride * height`; `RgbSurface::as_bytes` gives exactly the pixels.
+- Large Gray8 and RGB pages are rendered in horizontal strips, each converted
+  straight into the output buffer, so the RGBA working surface of the whole
+  page never exists. A page is rendered that way when that surface would
+  exceed 64 MiB, in strips of at most 32 MiB
+  (`SessionOptions::strip_bytes`, `CpuBackend::with_strip_target_bytes`,
+  `PDF_RENDERER_STRIP_MB`; 0 turns it off). Group, soft-mask and tiling
+  intermediates shrink to the strip with it. At 600 dpi, US Letter: a text
+  page as Gray8 peaks at 67 MB instead of 175 MB and as RGB through
+  `RenderSession::render` at 134 MB instead of 242 MB; a page with tiling
+  fills, groups and a soft mask at 94 MB instead of 309 MB. Wall time on the
+  pages measured is within -37% and +10% of one pass. The pixels are
+  identical. For such a page `RenderStats::surface_bytes` is the strip and
+  the per-draw counters count each strip's work.
+- A page rendered in strips builds and holds each clip mask over the
+  strip's rows only, not over the clip's whole extent once per strip. At
+  600 dpi as Gray8 a page of 500 rotated clipped forms peaks at 81 MB
+  instead of 122 MB and renders 11% faster; a page that re-establishes one
+  large clip 200 times at 67 MB instead of 78 MB.
+- `RenderSession::render` no longer converts an RGB page from a finished
+  RGBA one in the session: the backend produces the exact-length RGB buffer
+  (`CpuBackend::render_rgb_with_options`), in strips for a large page. A
+  large page rendered with `render_in_place` now comes back in a buffer of
+  the exact length as well.
+- An 8-bit gray image is expanded to RGB8 (which the fast image paths read)
+  only over the source rows a draw paints, not over the whole image on every
+  draw. The CMYK-to-RGB8 conversion of a minified CMYK image likewise.
+- A large RGBA page is rendered in strips too, each copied into the page,
+  when its transparency-group and soft-mask intermediates would exceed
+  64 MiB at page size: it then holds the page, one strip and strip-sized
+  intermediates. At 600 dpi a page with tiling fills, groups and a soft mask
+  peaks at 202 MB instead of 309 MB (+4% wall), a page of groups at 206 MB
+  instead of 258 MB (-6%). An RGBA page without such intermediates renders
+  in one pass as before.
+- `SessionOptions` (with `RenderSession::open_source_with_options`) sets the
+  per-document bounds: compiled pages by count and now also by bytes
+  (256 MiB), the image, font and glyph caches, and the buffer pool.
+  `RenderSession::clear_resource_caches` empties the three caches.
+- `RenderScheduler` bounds finished pages waiting for in-order emission in
+  bytes as well as in pages (`SchedulerOptions::reorder_backlog_bytes`,
+  256 MiB by default): a page that would finish out of order is not started
+  while the backlog is over the limit; the page needed next always is. A
+  200-page document with a slow first page held 2.6 GB of finished surfaces
+  at 300 dpi and now peaks at 688 MiB, in the same wall time. A panic in the
+  `emit` callback now propagates instead of hanging `render_range`.
+- The scheduler's per-job estimate charges the RGBA surface for every output
+  format, the peak of nested transparency groups scaled to the render
+  resolution, and every decoded image at its true depth. It is clamped to the
+  whole budget, so an oversized page runs alone instead of failing.
+  `PageComplexity::estimated_peak_bytes` and
+  `estimated_image_decode_peak_bytes` change meaning accordingly.
+- The scheduler budgets a job for the plane its backend paints on
+  (`RenderBackend::working_surface_bytes`, the whole RGBA surface by
+  default; `estimate_job_bytes_on`). The CPU backend reports one strip for a
+  Gray8 page it renders in strips, so such a page is charged its output plus
+  a strip instead of five bytes per pixel, and its group estimate is capped
+  by the strip. More large Gray8 pages run at once under the same
+  `memory_limit_bytes`: 32 pages at 600 dpi under a 256 MiB budget took 2.8 s
+  and now take 1.2 s on one document, 7.6 s and 6.8 s on another. The budget
+  is then actually used, so the process holds more at that setting than it
+  did when one job filled it on paper.
+- The job estimate charges soft masks and tiling fills, which it did not
+  count at all: `PageComplexity::estimated_soft_mask_peak_bytes` (four bytes
+  per square unit of a mask's content while it is rendered, one while it
+  stays in force, the peak of what is live together) and
+  `estimated_tiling_peak_bytes` (five per square unit of the largest tiling
+  fill). It no longer charges a transparency group that is painted straight
+  onto its parent. `PageComplexity::offscreen_bytes` and `tiling_bytes` give
+  the device figures; `estimated_peak_bytes` changes meaning accordingly.
+- Filter-decoded (Flate, LZW, RunLength, raw) image samples decode into one
+  exactly-sized buffer instead of a doubling one that was then copied, PNG
+  predictors are undone in place, and pages compiled at the same time share
+  one decoded copy of an image XObject.
+- Multi-scan (progressive) JPEG frees each component's coefficients as soon
+  as its plane is built.
+- A worker's parse cache no longer keeps decrypted stream bodies over 64 KiB
+  past the page job that read them.
+- Print: the Windows spooler composes bands straight into the device bitmap
+  and the file and CUPS spoolers stream bands into the PNG encoder, so no
+  second full-sheet copy exists. PNG files written by those two spoolers
+  decode to the same pixels but are no longer byte-identical (the image data
+  is split into 1 MiB chunks). A print job keeps one compiled page instead of
+  eight.
+
 ### Dependencies, 2026-11-10
 
 - `jbig2enc-rust` 0.6.1 (the faster generic-region decoder) and `skrifa`

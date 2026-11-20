@@ -568,6 +568,94 @@ fn rebuild_last_object_occurrence_wins() {
 }
 
 #[test]
+fn rebuild_steps_over_verified_stream_bodies() {
+    // A stream whose /Length lands on `endstream` holds bytes shaped like
+    // object headers and a trailer (an embedded PDF stored uncompressed looks
+    // like this). They are stream data, not objects of this document: the
+    // scan must not index them, and need not read them.
+    let mut pdf = MiniPdf::new();
+    let catalog = pdf.add_object(1, "<</Type/Catalog/Pages 2 0 R>>");
+    let pages = pdf.add_object(2, "<</Type/Pages/Kids[]/Count 0>>");
+    let payload: &[u8] = b"1 0 obj
+<</Type/Catalog/Pages 9 0 R>>
+endobj
+        2 0 obj
+<</Fake 1>>
+endobj
+6 0 obj
+<</Hidden 1>>
+endobj
+        trailer
+<</Root 6 0 R>>
+";
+    let stream = pdf.add_stream_object(3, &format!("<</Length {}>>", payload.len()), payload);
+    let after = pdf.add_object(4, "<</After 1>>");
+
+    let structure = load(pdf.buf); // no xref at all: a full rebuild
+    assert!(
+        structure
+            .recovery
+            .iter()
+            .any(|e| matches!(e, RecoveryEvent::XrefRebuilt))
+    );
+    assert_eq!(structure.trailer.root, ObjectId::new(1, 0));
+    for (number, offset) in [(1, catalog), (2, pages), (3, stream), (4, after)] {
+        assert_eq!(
+            structure.xref.locate(ObjectId::new(number, 0)),
+            ObjectLocation::Offset(offset),
+            "object {number}"
+        );
+    }
+    assert!(
+        !matches!(
+            structure.xref.locate(ObjectId::new(6, 0)),
+            ObjectLocation::Offset(_)
+        ),
+        "an object header inside stream data is not an object"
+    );
+}
+
+#[test]
+fn rebuild_scans_through_a_stream_whose_length_cannot_be_trusted() {
+    // Too short, past the end of the file, missing, or indirect (nothing to
+    // resolve it with during a rebuild): the body is scanned byte by byte as
+    // before, so nothing after it is lost.
+    for dict in [
+        "<</Length 5>>",
+        "<</Length 99999>>",
+        "<<>>",
+        "<</Length 8 0 R>>",
+    ] {
+        let mut pdf = MiniPdf::new();
+        pdf.add_object(1, "<</Type/Catalog/Pages 2 0 R>>");
+        pdf.add_object(2, "<</Type/Pages/Kids[]/Count 0>>");
+        pdf.add_stream_object(
+            3,
+            dict,
+            b"data 5 0 obj
+<</Inside 1>>
+endobj
+ more",
+        );
+        let after = pdf.add_object(4, "<</After 1>>");
+
+        let structure = load(pdf.buf);
+        assert_eq!(
+            structure.xref.locate(ObjectId::new(4, 0)),
+            ObjectLocation::Offset(after),
+            "{dict}"
+        );
+        assert!(
+            matches!(
+                structure.xref.locate(ObjectId::new(5, 0)),
+                ObjectLocation::Offset(_)
+            ),
+            "{dict}: an untrusted body is still scanned"
+        );
+    }
+}
+
+#[test]
 fn bogus_startxref_offset_recovers() {
     let mut pdf = MiniPdf::new();
     pdf.add_object(1, "<</Type/Catalog/Pages 2 0 R>>");
@@ -586,6 +674,64 @@ fn bogus_startxref_offset_recovers() {
     assert_eq!(structure.trailer.root, ObjectId::new(1, 0));
     assert!(matches!(
         structure.xref.locate(ObjectId::new(1, 0)),
+        ObjectLocation::Offset(_)
+    ));
+}
+
+#[test]
+fn a_table_far_from_the_end_is_still_found_past_stream_data() {
+    // The table is followed by more than the megabyte the backward search
+    // covers, so it is found by the forward scan, which steps over a stream
+    // whose body holds a decoy `xref` keyword and a decoy object.
+    let mut pdf = MiniPdf::new();
+    let catalog = pdf.add_object(1, "<</Type/Catalog/Pages 2 0 R>>");
+    pdf.add_object(2, "<</Type/Pages/Kids[]/Count 0>>");
+    let decoy: &[u8] = b"junk
+xref
+0 1
+0000000000 65535 f
+9 0 obj
+<</Decoy 1>>
+endobj
+";
+    pdf.add_stream_object(3, &format!("<</Length {}>>", decoy.len()), decoy);
+    let mut buf = pdf.finish_classic("/Root 1 0 R");
+    let table = buf
+        .windows(5)
+        .rposition(|w| {
+            w == b"
+xref"
+        })
+        .unwrap()
+        + 1;
+    // Wrong startxref, then a long run of padding after the end-of-file mark.
+    let pos = buf.windows(9).rposition(|w| w == b"startxref").unwrap();
+    let end = buf[pos..].iter().position(|&b| b == b'%').unwrap() + pos;
+    buf.splice(
+        pos..end,
+        b"startxref
+99999999
+"
+        .to_vec(),
+    );
+    buf.extend(std::iter::repeat_n(b' ', (1 << 20) + 4096));
+
+    let structure = load(buf);
+    assert!(
+        structure.recovery.iter().any(|e| matches!(
+            e,
+            RecoveryEvent::StartXrefRecovered { used, .. } if *used == table as u64
+        )),
+        "the real table is used, not the decoy: {:?}",
+        structure.recovery
+    );
+    assert_eq!(structure.trailer.root, ObjectId::new(1, 0));
+    assert_eq!(
+        structure.xref.locate(ObjectId::new(1, 0)),
+        ObjectLocation::Offset(catalog)
+    );
+    assert!(!matches!(
+        structure.xref.locate(ObjectId::new(9, 0)),
         ObjectLocation::Offset(_)
     ));
 }

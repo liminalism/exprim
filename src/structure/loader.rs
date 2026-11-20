@@ -109,7 +109,7 @@ pub fn load_structure(
         // The reported chain was missing or unusable: scan for the last
         // classic `xref` keyword before giving up (partial recovery that
         // preserves incremental-update semantics when only startxref lied).
-        if let Some(found) = find_last_keyword(file, b"xref")
+        if let Some(found) = find_last_xref_keyword(file, &loader.limits.syntax, loader.names)
             && Some(found as u64) != reported
         {
             loader.reset_merge_state();
@@ -304,20 +304,69 @@ fn find_last_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
-/// Last *whole-word* occurrence of keyword `kw` (not embedded in a longer
-/// regular-character run — `xref` inside `startxref` must not match).
-fn find_last_keyword(haystack: &[u8], kw: &[u8]) -> Option<usize> {
-    let mut end = haystack.len();
-    while let Some(i) = find_last_subslice(&haystack[..end], kw) {
-        let left_ok = i == 0 || !crate::syntax::classify::is_regular(haystack[i - 1]);
-        let right_ok = i + kw.len() >= haystack.len()
-            || !crate::syntax::classify::is_regular(haystack[i + kw.len()]);
-        if left_ok && right_ok {
-            return Some(i);
-        }
-        end = i;
+/// How much of the end of the file is searched backwards for the `xref`
+/// keyword before the rest is scanned forwards (see
+/// [`find_last_xref_keyword`]). A classic table sits just before its trailer,
+/// so the last megabyte finds it unless a megabyte of something else follows.
+const XREF_KEYWORD_TAIL_SCAN: usize = 1 << 20;
+
+/// Whether `file[i..]` starts with keyword `kw` as a whole word (not embedded
+/// in a longer regular-character run — `xref` inside `startxref` must not
+/// match).
+fn keyword_at(file: &[u8], i: usize, kw: &[u8]) -> bool {
+    file.get(i..i + kw.len()) == Some(kw)
+        && (i == 0 || !crate::syntax::classify::is_regular(file[i - 1]))
+        && file
+            .get(i + kw.len())
+            .is_none_or(|&b| !crate::syntax::classify::is_regular(b))
+}
+
+/// Last whole-word `xref` keyword in the file: the fallback for a `startxref`
+/// that is missing or wrong.
+///
+/// The end of the file is searched backwards, which finds a classic table at
+/// once. Only when it holds none is the rest searched, forwards, stepping over
+/// stream bodies whose `/Length` is verified ([`verified_stream_body`]). The
+/// search used to run backwards over every byte: for a file with no classic
+/// table at all (cross-reference streams only) that read the whole file, image
+/// data included, to find nothing, before the rebuild read it again. A
+/// keyword-shaped run inside verified stream data is no longer a candidate; it
+/// could only ever have named a table that is not one.
+fn find_last_xref_keyword(file: &[u8], syntax: &SyntaxLimits, names: &NameTable) -> Option<usize> {
+    const KW: &[u8] = b"xref";
+    let tail_start = file.len().saturating_sub(XREF_KEYWORD_TAIL_SCAN);
+    if let Some(found) = (tail_start..file.len().saturating_sub(KW.len() - 1))
+        .rev()
+        .find(|&i| keyword_at(file, i, KW))
+    {
+        return Some(found);
     }
-    None
+    let mut last = None;
+    let mut body: Option<(usize, usize)> = None;
+    let mut i = 0usize;
+    while i < tail_start {
+        if let Some((from, to)) = body
+            && i >= from
+        {
+            body = None;
+            if to > i {
+                i = to;
+                continue;
+            }
+        }
+        if keyword_at(file, i, b"obj") && backtrack_obj_header(file, i).is_some() {
+            body = verified_stream_body(file, i + 3, syntax, names);
+            i += 3;
+            continue;
+        }
+        if keyword_at(file, i, KW) {
+            last = Some(i);
+            i += KW.len();
+            continue;
+        }
+        i += 1;
+    }
+    last
 }
 
 /// Working state for one load.
@@ -855,9 +904,21 @@ impl<'a> Loader<'a> {
         // has no `trailer` keyword, so its /Root lives only here.
         let mut xref_streams: Vec<(u32, u64)> = Vec::new();
         let mut current: Option<(u32, u64)> = None;
+        // The body of the stream object being scanned, when its `/Length` is
+        // verified: the scan steps over it instead of reading it.
+        let mut body: Option<(usize, usize)> = None;
 
         let mut i = 0usize;
         while i + 3 <= file.len() {
+            if let Some((from, to)) = body
+                && i >= from
+            {
+                body = None;
+                if to > i {
+                    i = to;
+                    continue;
+                }
+            }
             if &file[i..i + 3] == b"obj"
                 && (i + 3 == file.len() || !crate::syntax::classify::is_regular(file[i + 3]))
                 && let Some((start, number, generation)) = backtrack_obj_header(file, i)
@@ -866,6 +927,7 @@ impl<'a> Loader<'a> {
                 // Last occurrence wins (headers are scanned in offset order).
                 best.insert(number, (start, generation, ObjectLocation::Offset(start)));
                 current = Some((number, start));
+                body = verified_stream_body(file, i + 3, &self.limits.syntax, self.names);
                 i += 3;
                 continue;
             }
@@ -1257,6 +1319,77 @@ pub fn scan_for_object_header(window: &[u8], number: u32) -> Option<(usize, u16)
 
 /// From an `obj` keyword at `kw_pos`, backtrack over `<num> <gen>` and
 /// return (header start, number, generation).
+/// The body of the stream object whose `obj` keyword ends at `after_obj`, as
+/// `(first byte, one past the last)`, when it can be trusted: the object is a
+/// dictionary followed by `stream`, its `/Length` is a direct number, and
+/// `endstream` is the next token after that many bytes. These are the object
+/// parser's own conditions for taking `/Length` at its word
+/// (`ObjectParser::read_stream_body`), so the range is exactly what every
+/// later read of the object treats as opaque stream data.
+///
+/// The rebuild scan steps over such a body. Reading it found nothing that
+/// belongs to the document — bytes inside a stream are not objects, and a
+/// header-shaped run in compressed data (or the objects of an embedded PDF
+/// stored uncompressed) could only displace a real object — and it read the
+/// whole file: a 781 MB scanned book whose `startxref` was 13 KB off took
+/// 1.9 s to open and had every page of its mapping resident before the first
+/// page was rendered, though its dictionaries are a few megabytes. PDFium's
+/// rebuild reads stream bodies by `/Length` the same way. A stream whose
+/// `/Length` is missing, indirect or wrong is scanned through as before.
+fn verified_stream_body(
+    file: &[u8],
+    after_obj: usize,
+    syntax: &SyntaxLimits,
+    names: &NameTable,
+) -> Option<(usize, usize)> {
+    // Only a dictionary can head a stream; do not parse anything else.
+    let mut at = after_obj;
+    while file
+        .get(at)
+        .is_some_and(|&b| crate::syntax::classify::is_whitespace(b))
+    {
+        at += 1;
+    }
+    if file.get(at..at + 2) != Some(b"<<".as_slice()) {
+        return None;
+    }
+    let mut parser = ObjectParser::new(file.get(after_obj..)?, after_obj as u64, syntax, names);
+    let PdfObject::Dictionary(dict) = parser.parse_object().ok()? else {
+        return None;
+    };
+    let lexer = parser.lexer_mut();
+    let keyword = lexer.next_token().ok()?;
+    if !matches!(&keyword.value, Token::Keyword(kw) if kw == b"stream") {
+        return None;
+    }
+    // The same end-of-line rule as the object parser: optional blanks, then
+    // CRLF, LF or a lone CR.
+    let mut pos = after_obj + lexer.pos();
+    while matches!(file.get(pos), Some(b' ') | Some(b'\t')) {
+        pos += 1;
+    }
+    if file.get(pos) == Some(&b'\r') {
+        pos += 1;
+        if file.get(pos) == Some(&b'\n') {
+            pos += 1;
+        }
+    } else if file.get(pos) == Some(&b'\n') {
+        pos += 1;
+    }
+    let declared = match dict.get(names.known.length) {
+        Some(PdfObject::Integer(n)) => *n,
+        Some(PdfObject::Real(r)) => *r as i64,
+        _ => return None,
+    };
+    let len = usize::try_from(declared).ok()?;
+    let end = pos.checked_add(len).filter(|&end| end <= file.len())?;
+    let mut check = Lexer::new(file, 0, syntax);
+    check.set_pos(end);
+    matches!(check.next_token(),
+        Ok(t) if matches!(&t.value, Token::Keyword(kw) if kw == b"endstream"))
+    .then_some((pos, end))
+}
+
 fn backtrack_obj_header(file: &[u8], kw_pos: usize) -> Option<(usize, u32, u16)> {
     let mut j = kw_pos;
     // whitespace between gen and `obj` (required)

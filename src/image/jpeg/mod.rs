@@ -1041,7 +1041,11 @@ impl<'a> Decoder<'a> {
         // not the coefficients, which are entropy-coded at full resolution.
         let dct_size = self.pick_dct_size(width, height, ncomp, coeff_bytes);
 
-        // Coefficients + sample planes + output, all bounded up front.
+        // Coefficients + sample planes + output, all bounded up front. An
+        // upper bound: the multi-scan path releases each component's
+        // coefficients once its plane is built (see `finish`), and the
+        // streaming baseline path never holds coefficients at all. Relaxing
+        // it would change which images decode, so it stays as it is.
         let plane_bytes: u64 = comps
             .iter()
             .map(|c| (c.bw as u64 * dct_size as u64) * (c.bh as u64 * dct_size as u64))
@@ -1699,13 +1703,20 @@ impl<'a> Decoder<'a> {
         if let Some(img) = self.streamed.take() {
             return Ok(img);
         }
-        let frame = self.frame.take().ok_or_else(|| err("no frame"))?;
+        let mut frame = self.frame.take().ok_or_else(|| err("no frame"))?;
         let ncomp = frame.comps.len();
         // Per-component dequantization tables in natural order, with the AAN
         // scale factors and the 1/8 descale folded in (the exact reciprocal
         // of the encoder's forward scale).
         let mut planes: Vec<Vec<u8>> = Vec::with_capacity(ncomp);
-        for c in &frame.comps {
+        for c in &mut frame.comps {
+            // Each component's coefficients are released as soon as its
+            // plane is built, so the peak is the larger of "coefficients
+            // still to transform + planes built so far" and "planes +
+            // output" (`assemble` reads only frame geometry), rather than
+            // coefficients + planes + output at once: 4.5·W·H bytes instead
+            // of 7.5 for a 4:2:0 RGB image, 7 instead of 12 for 4:4:4.
+            let coeffs = std::mem::take(&mut c.coeffs);
             let raw = self.quant[c.tq].ok_or_else(|| err("missing quantization table"))?;
             let mut dq = [0f32; 64];
             for zig in 0..64 {
@@ -1727,8 +1738,7 @@ impl<'a> Decoder<'a> {
                     // `coeffs` is allocated as `bw * bh * 64`, so the block is
                     // always present; take it as a fixed-size reference so the
                     // AVX2 kernel's 64-element read is guaranteed by the type.
-                    let Some(coeff_block) = c.coeffs.get(off..).and_then(<[i16]>::first_chunk)
-                    else {
+                    let Some(coeff_block) = coeffs.get(off..).and_then(<[i16]>::first_chunk) else {
                         continue;
                     };
                     idct_block(coeff_block, &dq, &mut block);

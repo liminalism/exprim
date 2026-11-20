@@ -50,7 +50,7 @@ pub fn apply_predictor(data: Vec<u8>, parms: &PredictorParms) -> Result<Vec<u8>,
 }
 
 /// Bytes per complete pixel (rounded up to at least 1) and per row.
-fn geometry(parms: &PredictorParms) -> Result<(usize, usize), PredictorError> {
+pub(crate) fn geometry(parms: &PredictorParms) -> Result<(usize, usize), PredictorError> {
     let colors = usize::try_from(parms.colors).map_err(|_| PredictorError::InvalidParameters)?;
     let bpc =
         usize::try_from(parms.bits_per_component).map_err(|_| PredictorError::InvalidParameters)?;
@@ -81,6 +81,13 @@ fn geometry(parms: &PredictorParms) -> Result<(usize, usize), PredictorError> {
 /// fell back to identity for `bpc != 8`, leaving the deltas un-summed: a
 /// bilevel page came out near-solid ink (issue6071/flate_predictor_bpc_1).
 fn apply_tiff(mut data: Vec<u8>, parms: &PredictorParms) -> Result<Vec<u8>, PredictorError> {
+    tiff_in_place(&mut data, parms)?;
+    Ok(data)
+}
+
+/// [`apply_tiff`] over a caller-owned buffer: complete rows are un-predicted
+/// in place, a partial trailing row is left as it is.
+pub(crate) fn tiff_in_place(data: &mut [u8], parms: &PredictorParms) -> Result<(), PredictorError> {
     let (bpp, row_len) = geometry(parms)?;
     if parms.bits_per_component == 8 {
         for row in data.chunks_exact_mut(row_len) {
@@ -88,7 +95,7 @@ fn apply_tiff(mut data: Vec<u8>, parms: &PredictorParms) -> Result<Vec<u8>, Pred
                 row[i] = row[i].wrapping_add(row[i - bpp]);
             }
         }
-        return Ok(data);
+        return Ok(());
     }
     let bpc = parms.bits_per_component as usize;
     let colors = parms.colors as usize;
@@ -128,11 +135,18 @@ fn apply_tiff(mut data: Vec<u8>, parms: &PredictorParms) -> Result<Vec<u8>, Pred
             }
         }
     }
-    Ok(data)
+    Ok(())
 }
 
 /// PNG filter family: each row is `filter_byte || filtered_bytes`.
-fn apply_png(data: Vec<u8>, parms: &PredictorParms) -> Result<Vec<u8>, PredictorError> {
+///
+/// Un-predicted in place: row `r` is moved down to `r * row_len` (forward
+/// compaction — each row loses its tag byte, so the write position never
+/// passes the read position and no unread byte is overwritten) and then
+/// un-filtered there against the already-decoded row above it. One buffer for
+/// the whole stream, where a separate output buffer would double the peak for
+/// the length of the decode.
+fn apply_png(mut data: Vec<u8>, parms: &PredictorParms) -> Result<Vec<u8>, PredictorError> {
     let (bpp, row_len) = geometry(parms)?;
     let stride = row_len + 1; // +1 for the per-row filter byte
     if !data.len().is_multiple_of(stride) {
@@ -144,71 +158,75 @@ fn apply_png(data: Vec<u8>, parms: &PredictorParms) -> Result<Vec<u8>, Predictor
         }
     }
     let rows = data.len() / stride;
-    // Decode straight into the output. Every filter branch writes all
-    // `row_len` bytes of its row, so `out` needs no clearing between rows,
-    // and splitting it gives the previous row as a borrow — no per-row
-    // scratch allocation and no per-row copy into the output.
-    let mut out: Vec<u8> = vec![0u8; rows * row_len];
     // The imaginary row above row 0 is all zero (RFC 2083 §6.3). One
     // allocation for the whole image rather than one per row.
     let zero_row = vec![0u8; row_len];
 
     for r in 0..rows {
-        let row = &data[r * stride..(r + 1) * stride];
-        let filter = row[0];
-        let src = &row[1..];
+        let filter = data[r * stride];
+        // Row `r`'s filtered bytes start at `r * stride + 1`, its output at
+        // `r * row_len` — `r + 1` bytes earlier — so this overlapping move
+        // only touches bytes already consumed.
+        data.copy_within(r * stride + 1..(r + 1) * stride, r * row_len);
         // `done` holds every row already decoded, `cur` the row being
         // decoded — disjoint borrows into the same buffer.
-        let (done, rest) = out.split_at_mut(r * row_len);
-        let cur = &mut rest[..row_len];
+        let (done, rest) = data.split_at_mut(r * row_len);
         let prev: &[u8] = if r == 0 {
             &zero_row
         } else {
-            &done[(r - 1) * row_len..r * row_len]
+            &done[(r - 1) * row_len..]
         };
-        match filter {
-            0 => cur.copy_from_slice(src),
-            1 => {
-                // Sub: left neighbour.
-                for i in 0..row_len {
-                    let left = if i >= bpp { cur[i - bpp] } else { 0 };
-                    cur[i] = src[i].wrapping_add(left);
-                }
-            }
-            2 => {
-                // Up: previous row.
-                for i in 0..row_len {
-                    cur[i] = src[i].wrapping_add(prev[i]);
-                }
-            }
-            3 => {
-                // Average of left and up.
-                for i in 0..row_len {
-                    let left = if i >= bpp { cur[i - bpp] } else { 0 };
-                    let up = prev[i];
-                    let avg = ((u16::from(left) + u16::from(up)) / 2) as u8;
-                    cur[i] = src[i].wrapping_add(avg);
-                }
-            }
-            4 => {
-                // Paeth.
-                for i in 0..row_len {
-                    let left = if i >= bpp { cur[i - bpp] } else { 0 };
-                    let up = prev[i];
-                    let up_left = if i >= bpp { prev[i - bpp] } else { 0 };
-                    cur[i] = src[i].wrapping_add(paeth(left, up, up_left));
-                }
-            }
-            // Unknown filter byte: treat the row as unfiltered rather than
-            // failing the whole stream (tolerated deviation).
-            _ => cur.copy_from_slice(src),
-        }
+        unfilter_png_row(filter, &mut rest[..row_len], prev, bpp);
     }
-    Ok(out)
+    data.truncate(rows * row_len);
+    Ok(data)
+}
+
+/// Undo one PNG row filter in place: `cur` holds the row's filtered bytes on
+/// entry and its samples on return; `prev` is the decoded row above (all
+/// zero for the first row) and `bpp` the bytes per complete pixel.
+pub(crate) fn unfilter_png_row(filter: u8, cur: &mut [u8], prev: &[u8], bpp: usize) {
+    let row_len = cur.len();
+    match filter {
+        1 => {
+            // Sub: left neighbour (already decoded).
+            for i in bpp..row_len {
+                cur[i] = cur[i].wrapping_add(cur[i - bpp]);
+            }
+        }
+        2 => {
+            // Up: previous row.
+            for (c, &up) in cur.iter_mut().zip(prev) {
+                *c = c.wrapping_add(up);
+            }
+        }
+        3 => {
+            // Average of left and up.
+            for i in 0..row_len {
+                let left = if i >= bpp { cur[i - bpp] } else { 0 };
+                let up = prev[i];
+                let avg = ((u16::from(left) + u16::from(up)) / 2) as u8;
+                cur[i] = cur[i].wrapping_add(avg);
+            }
+        }
+        4 => {
+            // Paeth.
+            for i in 0..row_len {
+                let left = if i >= bpp { cur[i - bpp] } else { 0 };
+                let up = prev[i];
+                let up_left = if i >= bpp { prev[i - bpp] } else { 0 };
+                cur[i] = cur[i].wrapping_add(paeth(left, up, up_left));
+            }
+        }
+        // 0 (None), and an unknown filter byte: the row is taken as
+        // unfiltered rather than failing the whole stream (tolerated
+        // deviation).
+        _ => {}
+    }
 }
 
 /// PNG Paeth prediction function (RFC 2083 §6.6).
-fn paeth(a: u8, b: u8, c: u8) -> u8 {
+pub(crate) fn paeth(a: u8, b: u8, c: u8) -> u8 {
     let p = i32::from(a) + i32::from(b) - i32::from(c);
     let pa = (p - i32::from(a)).abs();
     let pb = (p - i32::from(b)).abs();
@@ -406,6 +424,85 @@ mod tests {
             apply_predictor(vec![0; 4], &parms),
             Err(PredictorError::UnsupportedPredictor(7))
         ));
+    }
+
+    /// The out-of-place decoder `apply_png` used before it worked in place,
+    /// kept as the reference the in-place one must match byte for byte.
+    fn reference_png(data: &[u8], parms: &PredictorParms) -> Result<Vec<u8>, PredictorError> {
+        let (bpp, row_len) = geometry(parms)?;
+        let stride = row_len + 1;
+        if !data.len().is_multiple_of(stride) && data.len() < stride {
+            return Err(PredictorError::TruncatedRows);
+        }
+        let rows = data.len() / stride;
+        let mut out = vec![0u8; rows * row_len];
+        let zero_row = vec![0u8; row_len];
+        for r in 0..rows {
+            let row = &data[r * stride..(r + 1) * stride];
+            let (filter, src) = (row[0], &row[1..]);
+            let (done, rest) = out.split_at_mut(r * row_len);
+            let cur = &mut rest[..row_len];
+            let prev: &[u8] = if r == 0 {
+                &zero_row
+            } else {
+                &done[(r - 1) * row_len..r * row_len]
+            };
+            for i in 0..row_len {
+                let left = if i >= bpp { cur[i - bpp] } else { 0 };
+                let up = prev[i];
+                let up_left = if i >= bpp { prev[i - bpp] } else { 0 };
+                let pred = match filter {
+                    1 => left,
+                    2 => up,
+                    3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
+                    4 => paeth(left, up, up_left),
+                    _ => 0,
+                };
+                cur[i] = src[i].wrapping_add(pred);
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn in_place_png_matches_the_out_of_place_reference() {
+        let mut x: u32 = 0x9e37_79b9;
+        let mut next = || {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 24) as u8
+        };
+        for (colors, bpc, columns) in [(1, 8, 1), (3, 8, 17), (4, 8, 5), (1, 1, 13), (2, 16, 3)] {
+            let parms = PredictorParms {
+                predictor: 15,
+                colors,
+                bits_per_component: bpc,
+                columns,
+            };
+            let (_, row_len) = geometry(&parms).unwrap();
+            for len in [
+                0,
+                1,
+                row_len,
+                row_len + 1,
+                5 * (row_len + 1),
+                5 * (row_len + 1) + 3,
+            ] {
+                let data: Vec<u8> = (0..len)
+                    .enumerate()
+                    .map(|(i, _)| {
+                        let b = next();
+                        // Tag bytes: mostly the five filters, some unknown.
+                        if i % (row_len + 1) == 0 { b % 7 } else { b }
+                    })
+                    .collect();
+                let expected = reference_png(&data, &parms).map_err(|e| format!("{e:?}"));
+                let got = apply_png(data, &parms).map_err(|e| format!("{e:?}"));
+                assert_eq!(
+                    got, expected,
+                    "colors {colors} bpc {bpc} columns {columns} len {len}"
+                );
+            }
+        }
     }
 
     #[test]

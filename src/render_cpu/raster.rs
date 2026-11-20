@@ -2509,7 +2509,10 @@ mod row_window_tests {
         let mut bytes = vec![0u8; last - first + 1];
         for run in runs {
             // A cell run may extend past the covered span (trailing zeros).
-            let (x0, x1) = ((run.x0 as usize).max(first), (run.x1 as usize).min(last + 1));
+            let (x0, x1) = (
+                (run.x0 as usize).max(first),
+                (run.x1 as usize).min(last + 1),
+            );
             if x0 >= x1 {
                 continue;
             }
@@ -2616,15 +2619,23 @@ mod row_window_tests {
                     let (x0, y0) = (rng.range(-5.0, w - rw), rng.range(-5.0, h - rh));
                     let snap = |v: f32, on: bool| if on { v.round() } else { v };
                     let on = rng.pick(3) == 0;
-                    let (x0, y0, x1, y1) =
-                        (snap(x0, on), snap(y0, on), snap(x0 + rw, on), snap(y0 + rh, on));
+                    let (x0, y0, x1, y1) = (
+                        snap(x0, on),
+                        snap(y0, on),
+                        snap(x0 + rw, on),
+                        snap(y0 + rh, on),
+                    );
                     polygon(&mut points, &[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]);
                     if rng.pick(4) == 0 {
                         // A slanted sliver across the rule: partial coverage
                         // inside an otherwise constant row.
                         polygon(
                             &mut points,
-                            &[[x0 + 3.3, y0 - 1.0], [x0 + 9.1, y0 - 1.0], [x0 + 30.7, y1 + 1.0]],
+                            &[
+                                [x0 + 3.3, y0 - 1.0],
+                                [x0 + 9.1, y0 - 1.0],
+                                [x0 + 30.7, y1 + 1.0],
+                            ],
                         );
                     }
                 }
@@ -2681,7 +2692,10 @@ mod row_window_tests {
                 0..usize::MAX,
                 !runs_mode,
             );
-            assert!(full == other_mode, "case {case} kind {kind}: runs and bytes disagree");
+            assert!(
+                full == other_mode,
+                "case {case} kind {kind}: runs and bytes disagree"
+            );
             // Windows inside, straddling, covering and outside the path's rows.
             let a = rng.pick(height as u64 + 40) as usize;
             let b = a + rng.pick(height as u64 / 2 + 2) as usize;
@@ -2712,6 +2726,9 @@ mod row_window_tests {
                 }
             }
         }
-        assert!(nonempty > 400, "only {nonempty} windows actually restricted a fill");
+        assert!(
+            nonempty > 400,
+            "only {nonempty} windows actually restricted a fill"
+        );
     }
 }

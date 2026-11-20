@@ -212,7 +212,32 @@ placement is small; and the scheduler's deterministic reordering, which lets
 slow pages overlap without changing output order. Tuning knobs are
 environment variables prefixed `PDF_RENDERER_` (`IMAGECACHE`, `FONTCACHE`,
 `GLYPHCACHE`, `GLYPH_SUBPIXEL`, `IMAGE_ROW_PAR`, `JPX_CONCURRENCY`,
-`JPX_REDUCE`, `JPX_HEADROOM`, `SURFACE_REUSE`, each with a `_STATS` companion where it caches).
+`JPX_REDUCE`, `JPX_HEADROOM`, `SURFACE_REUSE`, `CLIPSHARE`, `CLIPMASK_MB`,
+`LOWER_CHUNK_MB`, each with a `_STATS` companion where it caches).
+`STRIP_MB` sets the strip size for large pages (32 by default, 0 for
+one pass always). `STRIP_ROWS` forces every page into strips
+of that many rows, RGBA included; it exists so the page-hash gate can check
+strips against one pass on small pages and is not a tuning knob.
+
+What keeps a page's memory near its output: a page is painted in chunks while
+it is lowered, so its flattened geometry and decoded images are held 16 MiB at
+a time rather than all at once; clip masks live in a per-page
+store that shares one mask between identical clip paths, drops each mask after
+its last consumer and holds the rest under a budget of eight page-sized planes
+(at least 64 MiB), building ahead in budget-sized parallel batches; an opaque
+non-isolated wrapper group paints on its parent instead of a group-sized
+offscreen; an image whose placement is outside the render window is never
+decoded; a Gray8 or RGB page whose working surface would exceed 64 MiB is
+rendered in strips of at most 32 MiB, each converted straight into the
+output, so the page holds its output plus one strip (the first strip records
+the rows each op paints and the others skip what misses them; a decoded
+image a later strip draws again is kept by the render until its last row;
+clip masks cover the strip's rows only);
+an RGBA page of that size is rendered in strips copied into the page when
+its group and soft-mask offscreens would exceed 64 MiB, so those are
+strip-sized;
+and finished page buffers kept for reuse belong to the backend (256 MiB at
+most) and are released with it.
 
 The reproducible head-to-head against hayro, pdf-toolkit, PDFium, and MuPDF
 is phase 1 of `CRATES-IO-PLAN.md`; until it has run, no cross-engine ratio

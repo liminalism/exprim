@@ -365,9 +365,11 @@ fn image_lowers_and_sets_feature_flags() {
             .any(|o| matches!(o, DisplayOp::DrawImage { .. }))
     );
     assert_eq!(page.complexity.image_pixels, 4);
-    // RGB codec input: 4 B/pixel retained converted raster + three 4-B
-    // coefficient planes = 16 B/pixel.
-    assert_eq!(page.complexity.estimated_image_decode_peak_bytes, 64);
+    // RGB codec input: the decoded 8-bit RGB raster the prepared draw keeps
+    // (3 B/pixel; 8-bit DeviceRGB is sampled in place, so no RGB8 promotion
+    // copy) + the codec's three 4-B working planes, freed after the decode
+    // (12 B/pixel) = 15 B/pixel.
+    assert_eq!(page.complexity.estimated_image_decode_peak_bytes, 60);
 }
 
 #[test]
@@ -393,8 +395,135 @@ fn cold_jpx_estimate_counts_in_data_alpha_plane() {
     b.finish_classic_xref("/Root 1 0 R");
     let page = compile(&open(b.into_bytes()));
 
-    // 4 B/pixel converted + four 4-B planes (RGB + alpha) = 20 B/pixel.
+    // Decoded RGB + alpha kept for the draw (4 B/pixel) + four 4-B working
+    // planes (RGB + alpha, 16 B/pixel) = 20 B/pixel.
     assert_eq!(page.complexity.estimated_image_decode_peak_bytes, 80);
+}
+
+/// A one-page document drawing image XObjects `Im0..` (given as dictionary
+/// entries and payloads) with `content`.
+fn page_with_images(content: &[u8], images: &[(&str, &[u8])]) -> CompiledPage {
+    let mut b = PdfBuilder::new();
+    b.add_object(1, "<</Type/Catalog/Pages 2 0 R>>");
+    b.add_object(
+        2,
+        "<</Type/Pages/Kids[3 0 R]/Count 1/MediaBox[0 0 200 200]>>",
+    );
+    let names: String = (0..images.len())
+        .map(|i| format!("/Im{i} {} 0 R", 5 + i))
+        .collect();
+    b.add_object(
+        3,
+        &format!("<</Type/Page/Parent 2 0 R/Contents 4 0 R/Resources<</XObject<<{names}>>>>>>"),
+    );
+    b.add_stream(4, "", content);
+    for (i, (dict, data)) in images.iter().enumerate() {
+        b.add_stream(5 + i as u32, dict, data);
+    }
+    b.finish_classic_xref("/Root 1 0 R");
+    compile(&open(b.into_bytes()))
+}
+
+#[test]
+fn image_estimate_sums_retained_rasters_and_keeps_the_largest_working_set() {
+    // Two DCT RGB images drawn on one page are both decoded while the page is
+    // prepared and both kept until it finishes; their working planes are not
+    // live at the same time.
+    const DCT: &str = "/Type/XObject/Subtype/Image/Width 2/Height 2/BitsPerComponent 8/ColorSpace/DeviceRGB/Filter/DCTDecode";
+    const BIG_DCT: &str = "/Type/XObject/Subtype/Image/Width 4/Height 2/BitsPerComponent 8/ColorSpace/DeviceRGB/Filter/DCTDecode";
+    let page = page_with_images(
+        b"q 10 0 0 10 0 0 cm /Im0 Do Q q 10 0 0 10 20 0 cm /Im1 Do Q",
+        &[(DCT, b"deadbeef"), (BIG_DCT, b"deadbeef")],
+    );
+    assert_eq!(page.images.len(), 2);
+    // Retained 4*3 + 8*3 = 36; largest working set 8 px * 3 planes * 4 B = 96.
+    assert_eq!(page.complexity.estimated_image_decode_peak_bytes, 36 + 96);
+}
+
+#[test]
+fn bilevel_images_are_charged_by_the_bit_not_by_the_rgba_pixel() {
+    // A JBIG2 scan decodes to packed one-bit rows: 16x4 pixels are 8 bytes,
+    // plus two packed planes of decoder working memory. The old estimate
+    // charged 4 + 4 bytes per pixel (512 B) for this image.
+    let page = page_with_images(
+        b"q 10 0 0 10 0 0 cm /Im0 Do Q",
+        &[(
+            "/Type/XObject/Subtype/Image/Width 16/Height 4/BitsPerComponent 1/ColorSpace/DeviceGray/Filter/JBIG2Decode",
+            b"deadbeef",
+        )],
+    );
+    assert_eq!(page.complexity.estimated_image_decode_peak_bytes, 8 + 16);
+
+    // Filter-decoded one-bit samples are already owned by the IR and are
+    // sampled in place: nothing more to allocate.
+    let page = page_with_images(
+        b"q 10 0 0 10 0 0 cm /Im0 Do Q",
+        &[(
+            "/Type/XObject/Subtype/Image/Width 16/Height 4/BitsPerComponent 1/ColorSpace/DeviceGray",
+            &[0x55; 8],
+        )],
+    );
+    assert_eq!(page.images.len(), 1);
+    assert_eq!(page.complexity.estimated_image_decode_peak_bytes, 0);
+
+    // An 8-bit gray image is promoted to an RGB8 copy for the fast paths.
+    let page = page_with_images(
+        b"q 10 0 0 10 0 0 cm /Im0 Do Q",
+        &[(
+            "/Type/XObject/Subtype/Image/Width 4/Height 2/BitsPerComponent 8/ColorSpace/DeviceGray",
+            &[0x80; 8],
+        )],
+    );
+    assert_eq!(page.complexity.estimated_image_decode_peak_bytes, 8 * 3);
+}
+
+/// A page drawing `content` with form XObjects `/Fm` (a 20x20 transparency
+/// group, knockout when asked) and `/Outer` (a 10x10 group that draws `/Fm`).
+fn page_with_groups(content: &[u8], knockout: bool) -> CompiledPage {
+    let mut b = PdfBuilder::new();
+    b.add_object(1, "<</Type/Catalog/Pages 2 0 R>>");
+    b.add_object(
+        2,
+        "<</Type/Pages/Kids[3 0 R]/Count 1/MediaBox[0 0 200 200]>>",
+    );
+    b.add_object(
+        3,
+        "<</Type/Page/Parent 2 0 R/Contents 4 0 R/Resources<</XObject<</Fm 5 0 R/Outer 6 0 R>>>>>>",
+    );
+    b.add_stream(4, "", content);
+    let k = if knockout { "/K true" } else { "" };
+    b.add_stream(
+        5,
+        &format!("/Type/XObject/Subtype/Form/BBox[0 0 20 20]/Group<</S/Transparency/I true{k}>>"),
+        b"0 0 1 rg 0 0 20 20 re f",
+    );
+    b.add_stream(
+        6,
+        "/Type/XObject/Subtype/Form/BBox[0 0 10 10]/Group<</S/Transparency/I true>>/Resources<</XObject<</Fm 5 0 R>>>>",
+        b"/Fm Do",
+    );
+    b.finish_classic_xref("/Root 1 0 R");
+    compile(&open(b.into_bytes()))
+}
+
+#[test]
+fn group_estimate_is_the_peak_of_simultaneously_live_groups() {
+    let fm = 20 * 20 * 4;
+    let outer = 10 * 10 * 4;
+
+    // Sequential groups are never live together: one surface, not two.
+    let page = page_with_groups(b"/Fm Do /Fm Do", false);
+    assert_eq!(page.complexity.transparency_group_count, 2);
+    assert_eq!(page.complexity.estimated_peak_bytes, fm);
+
+    // A nested group is live inside its parent: both surfaces at once.
+    let page = page_with_groups(b"/Fm Do /Outer Do", false);
+    assert_eq!(page.complexity.transparency_group_count, 3);
+    assert_eq!(page.complexity.estimated_peak_bytes, outer + fm);
+
+    // A knockout group keeps a scratch copy of its surface.
+    let page = page_with_groups(b"/Fm Do", true);
+    assert_eq!(page.complexity.estimated_peak_bytes, 2 * fm);
 }
 
 #[test]
@@ -980,4 +1109,184 @@ fn simple_embedded_font_resolves_code_to_gid() {
         page.glyph_runs[0].glyphs[0].glyph, 1,
         "'A' → GID 1 via encoding+cmap"
     );
+}
+
+#[test]
+fn complexity_counts_only_clips_that_need_a_mask() {
+    // Rectangles, however they are written, clip by arithmetic; a triangle
+    // and a curve need a coverage mask.
+    let page = compile(&single_page(
+        b"q 10 20 30 40 re W n 0 0 200 200 re f Q \
+          q 10 10 m 60 10 l 60 50 l 10 50 l h W n 0 0 200 200 re f Q \
+          q 10 10 m 60 10 l 35 80 l h W n 0 0 200 200 re f Q \
+          q 10 10 m 60 10 90 40 60 80 c h W* n 0 0 200 200 re f Q",
+    ));
+    assert_eq!(page.complexity.path_clip_count, 2);
+}
+
+/// A 200x200 page with: `/GS0`, a soft mask whose content fills 40x30;
+/// `/GSa`, half opacity; `/P0`, a tiling pattern; `/Fm`, a 20x20
+/// non-isolated transparency group.
+fn page_with_offscreens(content: &[u8]) -> CompiledPage {
+    let mut b = PdfBuilder::new();
+    b.add_object(1, "<</Type/Catalog/Pages 2 0 R>>");
+    b.add_object(
+        2,
+        "<</Type/Pages/Kids[3 0 R]/Count 1/MediaBox[0 0 200 200]>>",
+    );
+    b.add_object(
+        3,
+        "<</Type/Page/Parent 2 0 R/Contents 4 0 R/Resources<</ExtGState<</GS0 5 0 R/GSa 9 0 R>>\
+         /Pattern<</P0 7 0 R>>/XObject<</Fm 8 0 R>>>>>>",
+    );
+    b.add_stream(4, "", content);
+    b.add_object(5, "<</Type/ExtGState/SMask<</S/Luminosity/G 6 0 R>>>>");
+    b.add_stream(
+        6,
+        "/Type/XObject/Subtype/Form/BBox[0 0 200 200]/Group<</S/Transparency>>",
+        b"1 g 10 10 40 30 re f",
+    );
+    b.add_stream(
+        7,
+        "/Type/Pattern/PatternType 1/PaintType 1/TilingType 1/BBox[0 0 8 8]/XStep 8/YStep 8/Resources<<>>",
+        b"1 0 0 rg 0 0 4 4 re f",
+    );
+    b.add_stream(
+        8,
+        "/Type/XObject/Subtype/Form/BBox[0 0 20 20]/Group<</S/Transparency>>",
+        b"0 0 1 rg 0 0 20 20 re f",
+    );
+    b.add_object(9, "<</Type/ExtGState/ca 0.5>>");
+    b.finish_classic_xref("/Root 1 0 R");
+    compile(&open(b.into_bytes()))
+}
+
+#[test]
+fn complexity_sizes_soft_masks_from_their_content_and_while_they_are_live() {
+    let mask = 40 * 30;
+    // Rendering the mask holds an RGBA plane over its content; afterwards
+    // one coverage plane stays in force.
+    let page = page_with_offscreens(b"q /GS0 gs 0 0 150 150 re f Q");
+    assert_eq!(page.complexity.soft_mask_count, 1);
+    assert_eq!(page.complexity.estimated_soft_mask_peak_bytes, 4 * mask);
+    // The mask's own content is not the page's content.
+    let bounds = page.content_bounds.expect("the masked fill paints");
+    assert_eq!((bounds.x1, bounds.y1), (150.0, 150.0));
+
+    // One after another, each in its own save scope: never live together.
+    let page = page_with_offscreens(b"q /GS0 gs 0 0 150 150 re f Q q /GS0 gs 0 0 150 150 re f Q");
+    assert_eq!(page.complexity.soft_mask_count, 2);
+    assert_eq!(page.complexity.estimated_soft_mask_peak_bytes, 4 * mask);
+
+    // Set twice in one scope: the first mask's coverage plane is still held
+    // while the second is rendered.
+    let page = page_with_offscreens(b"/GS0 gs 0 0 150 150 re f /GS0 gs 0 0 150 150 re f");
+    assert_eq!(page.complexity.soft_mask_count, 2);
+    assert_eq!(
+        page.complexity.estimated_soft_mask_peak_bytes,
+        mask + 4 * mask
+    );
+
+    // No soft mask, no charge.
+    let page = page_with_offscreens(b"0 0 150 150 re f");
+    assert_eq!(page.complexity.soft_mask_count, 0);
+    assert_eq!(page.complexity.estimated_soft_mask_peak_bytes, 0);
+}
+
+#[test]
+fn complexity_charges_the_largest_tiling_fill() {
+    // Five bytes per square unit of the filled shape's bounds, clipped to
+    // the page; fills are painted one at a time, so the largest counts.
+    let page = page_with_offscreens(
+        b"/Pattern cs /P0 scn 10 10 60 50 re f 100 100 20 20 re f 150 150 100 100 re f",
+    );
+    assert_eq!(page.complexity.estimated_tiling_peak_bytes, 5 * 60 * 50);
+    let page = page_with_offscreens(b"1 0 0 rg 10 10 60 50 re f");
+    assert_eq!(page.complexity.estimated_tiling_peak_bytes, 0);
+}
+
+#[test]
+fn complexity_does_not_charge_a_group_painted_on_its_parent() {
+    // A non-isolated, opaque, Normal-blend group with no soft mask in force
+    // is painted straight onto its parent: no surface.
+    let page = page_with_offscreens(b"/Fm Do");
+    assert_eq!(page.complexity.transparency_group_count, 1);
+    assert_eq!(page.complexity.estimated_peak_bytes, 0);
+    // At half opacity it needs its surface...
+    let page = page_with_offscreens(b"/GSa gs /Fm Do");
+    assert_eq!(page.complexity.estimated_peak_bytes, 20 * 20 * 4);
+    // ...and so it does under a soft mask.
+    let page = page_with_offscreens(b"/GS0 gs /Fm Do");
+    assert_eq!(page.complexity.estimated_peak_bytes, 20 * 20 * 4);
+}
+
+/// An RGBA page is its own surface, so strips only pay when its group and
+/// soft-mask offscreens are large: then it is painted strip by strip into the
+/// page, to the same pixels, and the backend says so to the scheduler.
+#[test]
+fn rgba_pages_with_large_offscreens_render_in_strips_to_the_same_pixels() {
+    use exprim::render_api::{
+        AnnotationMode, Background, OutputFormat, OutputResidency, PageTransform, RenderBackend,
+        RenderColorPolicy, RenderLimits, RenderQuality, RenderRequest,
+    };
+    use exprim::render_cpu::CpuBackend;
+
+    // 200x200 units at 5x: a 4 MB surface, four strips of 256 rows against a
+    // 256 KiB strip target.
+    let request = |page: CompiledPage| RenderRequest {
+        page: std::sync::Arc::new(page),
+        transform: PageTransform {
+            matrix: exprim::page_ir::Matrix {
+                a: 5.0,
+                b: 0.0,
+                c: 0.0,
+                d: -5.0,
+                e: 0.0,
+                f: 1000.0,
+            },
+        },
+        crop: None,
+        output_size: exprim::page_ir::DeviceSize {
+            width: 1000,
+            height: 1000,
+        },
+        output_format: OutputFormat::Rgba8PremultipliedSrgb,
+        background: Background::White,
+        annotations: AnnotationMode::None,
+        color_policy: RenderColorPolicy::Original,
+        quality: RenderQuality::Normal,
+        limits: RenderLimits::default(),
+        residency: OutputResidency::HostRequired,
+    };
+    let whole = 1000 * 1000 * 4u64;
+    let striped = CpuBackend::default().with_strip_target_bytes(256 << 10);
+    let one_pass = CpuBackend::default().with_strip_target_bytes(0);
+
+    // A half-opaque 140x140 group and a soft mask over most of the page.
+    let heavy = request(page_with_offscreens(
+        b"0.9 0.8 0.2 rg 0 0 200 200 re f \
+          q 7 0 0 7 10 10 cm /GSa gs /Fm Do Q \
+          q /GS0 gs 0 0 1 rg 20 20 150 150 re f Q \
+          0 0.5 0 rg 60 5 20 190 re f",
+    ));
+    assert_eq!(striped.working_surface_bytes(&heavy), 1000 * 256 * 4);
+    assert_eq!(one_pass.working_surface_bytes(&heavy), whole);
+    let (a, _) = striped.render_to_host(&heavy).unwrap();
+    let (b, _) = one_pass.render_to_host(&heavy).unwrap();
+    assert_eq!(a.pixels.len(), whole as usize);
+    assert!(a.pixels == b.pixels, "strips differ from one pass");
+    assert!(
+        a.pixels
+            .chunks_exact(4)
+            .any(|px| px[..3] != [255, 255, 255]),
+        "the page painted something"
+    );
+
+    // The same size with nothing offscreen: one pass, the surface is the page.
+    let plain = request(page_with_offscreens(
+        b"0.9 0.8 0.2 rg 0 0 200 200 re f /Fm Do",
+    ));
+    assert_eq!(striped.working_surface_bytes(&plain), whole);
+    let (_, stats) = striped.render_to_host(&plain).unwrap();
+    assert_eq!(stats.surface_bytes, whole);
 }

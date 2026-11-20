@@ -13,8 +13,8 @@
 //!
 //! * [`RenderSession::render`] already composites over
 //!   [`Background::White`](crate::render_api::Background::White), so the surface
-//!   that comes back is fully opaque and `rgb_surface_from_rgba` drops the
-//!   alpha byte without any unpremultiply step. There is no alpha to
+//!   that comes back is fully opaque and the renderer drops the alpha byte
+//!   without any unpremultiply step. There is no alpha to
 //!   preserve, and so no straight-vs-premultiplied decision to get wrong.
 //! * `png` and `jpeg-encoder` are already workspace dependencies compiled for
 //!   other members, so this adds no crate to the build graph.
@@ -252,7 +252,8 @@ impl RenderSession {
             crop: None,
             decode_reference: None,
         };
-        let plane = self.render_cancellable(page, &product, cancellation)?;
+        // Encoded and dropped: no second plane for the RGB packing.
+        let plane = self.render_in_place_cancellable(page, &product, cancellation)?;
         encode_plane(&plane, options.format)
     }
 }

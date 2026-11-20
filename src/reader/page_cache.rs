@@ -9,28 +9,57 @@ use crate::reader::{CancellationToken, ReadError};
 #[derive(Debug)]
 pub(crate) struct PageCache<T> {
     capacity: usize,
+    /// Bytes the retained entries may weigh together. The most recent entry
+    /// is kept whatever it weighs, so rendering one heavy page repeatedly
+    /// does not recompile it each time.
+    byte_budget: usize,
+    weigh: fn(&T) -> usize,
     state: Mutex<State<T>>,
     ready: Condvar,
 }
 
 #[derive(Debug)]
 struct State<T> {
-    pages: VecDeque<(u32, Arc<T>)>,
+    /// `(page, value, weight)`, least recently used first.
+    pages: VecDeque<(u32, Arc<T>, usize)>,
+    bytes: usize,
     compiling: HashSet<u32>,
     generation: u64,
 }
 
 impl<T> PageCache<T> {
+    /// A cache bounded by entry count alone.
+    #[cfg(test)]
     pub(crate) fn new(capacity: usize) -> Self {
+        Self::with_byte_budget(capacity, usize::MAX, |_| 0)
+    }
+
+    /// A cache bounded by entry count and by the entries' combined weight. A
+    /// count alone let eight compiled pages of full-resolution image samples
+    /// (26 MB each for 300 dpi colour scans) sit behind a bound that looked
+    /// small.
+    pub(crate) fn with_byte_budget(
+        capacity: usize,
+        byte_budget: usize,
+        weigh: fn(&T) -> usize,
+    ) -> Self {
         Self {
             capacity,
+            byte_budget,
+            weigh,
             state: Mutex::new(State {
                 pages: VecDeque::new(),
+                bytes: 0,
                 compiling: HashSet::new(),
                 generation: 0,
             }),
             ready: Condvar::new(),
         }
+    }
+
+    /// Combined weight of the retained entries.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.lock().bytes
     }
 
     fn lock(&self) -> MutexGuard<'_, State<T>> {
@@ -41,6 +70,7 @@ impl<T> PageCache<T> {
     pub(crate) fn clear(&self) {
         let mut state = self.lock();
         state.pages.clear();
+        state.bytes = 0;
         // A compilation that predates this eviction may finish for its caller,
         // but must not refill a cache just cleared for memory pressure.
         state.generation = state.generation.wrapping_add(1);
@@ -56,7 +86,7 @@ impl<T> PageCache<T> {
             let mut state = self.lock();
             loop {
                 check_cancelled(page, cancellation)?;
-                if let Some(index) = state.pages.iter().position(|(key, _)| *key == page)
+                if let Some(index) = state.pages.iter().position(|(key, _, _)| *key == page)
                     && let Some(entry) = state.pages.remove(index)
                 {
                     let result = Arc::clone(&entry.1);
@@ -81,10 +111,17 @@ impl<T> PageCache<T> {
         let mut state = self.lock();
         check_cancelled(page, cancellation)?;
         if self.capacity > 0 && generation == state.generation {
-            while state.pages.len() >= self.capacity {
-                state.pages.pop_front();
+            let weight = (self.weigh)(&result);
+            while !state.pages.is_empty()
+                && (state.pages.len() >= self.capacity
+                    || state.bytes.saturating_add(weight) > self.byte_budget)
+            {
+                if let Some((_, _, evicted)) = state.pages.pop_front() {
+                    state.bytes = state.bytes.saturating_sub(evicted);
+                }
             }
-            state.pages.push_back((page, Arc::clone(&result)));
+            state.bytes = state.bytes.saturating_add(weight);
+            state.pages.push_back((page, Arc::clone(&result), weight));
         }
         Ok(result)
     }
@@ -123,6 +160,34 @@ mod tests {
         cache
             .get_or_compile(page, None, || Ok(Arc::new(page)))
             .unwrap()
+    }
+
+    #[test]
+    fn the_byte_budget_evicts_before_the_count_does() {
+        // Eight entries allowed, but only 100 bytes; each value weighs itself.
+        let cache: PageCache<u32> = PageCache::with_byte_budget(8, 100, |v| *v as usize);
+        let weigh = |page: u32, weight: u32| {
+            cache
+                .get_or_compile(page, None, || Ok(Arc::new(weight)))
+                .unwrap()
+        };
+        let a = weigh(0, 40);
+        let b = weigh(1, 40);
+        assert_eq!(cache.retained_bytes(), 80);
+        // 40 + 40 + 40 > 100: the least recently used goes.
+        let c = weigh(2, 40);
+        assert_eq!(Arc::strong_count(&a), 1);
+        assert_eq!(Arc::strong_count(&b), 2);
+        assert_eq!(cache.retained_bytes(), 80);
+        // Heavier than the whole budget: kept alone, so it is not recompiled
+        // on every use.
+        let huge = weigh(3, 500);
+        assert_eq!(Arc::strong_count(&b), 1);
+        assert_eq!(Arc::strong_count(&c), 1);
+        assert_eq!(Arc::strong_count(&huge), 2);
+        assert!(Arc::ptr_eq(&huge, &weigh(3, 0)));
+        cache.clear();
+        assert_eq!(cache.retained_bytes(), 0);
     }
 
     #[test]

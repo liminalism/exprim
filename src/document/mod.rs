@@ -29,6 +29,7 @@ mod ocg;
 mod outline;
 mod pages;
 mod resolve;
+mod samples;
 
 pub use links::{DocumentLink, DocumentLinkTarget, DocumentLinks};
 pub use ocg::OcgConfig;
@@ -36,6 +37,7 @@ pub use outline::{
     DestinationFit, DocumentDestination, DocumentOutline, DocumentOutlineItem, OutlineIssue,
 };
 use resolve::Resolver;
+pub(crate) use samples::ImageSampleSession;
 
 /// Open-time limits. Threaded from day one, enforced as parsers land
 /// (blueprint §4.4). All limits are per-document unless stated.
@@ -272,6 +274,10 @@ pub struct ParseContext {
     objstm: HashMap<u32, Arc<ObjStmCached>>,
     /// Bytes accounted to `cache` and `objstm` (see [`Self::cached_bytes`]).
     cache_bytes: usize,
+    /// Entries of `cache` whose decrypted body exceeds
+    /// [`LARGE_OWNED_STREAM_BYTES`]: kept for the job that resolved them,
+    /// dropped at the next [`Self::begin_job`].
+    large_entries: Vec<ObjectId>,
     /// Above this many accounted bytes, the next [`Self::begin_job`] empties
     /// both caches (see [`DEFAULT_PARSE_CACHE_BUDGET`]).
     cache_budget: usize,
@@ -297,10 +303,34 @@ pub struct ParseContext {
 /// re-decrypts, so output cannot change.
 pub const DEFAULT_PARSE_CACHE_BUDGET: usize = 256 << 20;
 
+/// A decrypted (`Owned`) stream body larger than this is cached for the job
+/// that resolved it only, never across jobs.
+///
+/// On an encrypted document every resolved stream carries its decrypted
+/// body, so under the budget alone each persistent worker could keep up to
+/// [`DEFAULT_PARSE_CACHE_BUDGET`] of image, content and embedded-file bodies
+/// alive between jobs — several GiB across a scheduler's workers — although
+/// such bodies are rarely resolved again by a later job of the *same*
+/// worker (decoded image samples are shared at the document level, fonts are
+/// cached resolved). Within a job they stay cached: a page that draws one
+/// image many times resolves its stream once per draw. Re-reading and
+/// re-decrypting a body at this size costs well under a millisecond; the
+/// small bodies that stay — form and pattern streams, functions, ICC
+/// profiles, CMaps — are what successive pages share.
+pub const LARGE_OWNED_STREAM_BYTES: usize = 64 << 10;
+
 /// Fixed per-entry charge for a cached object: map slot, `Arc` header and a
 /// small object's own size. Only a rough floor; stream bodies and object
 /// stream containers are charged their real byte length on top.
 const CACHE_ENTRY_BYTES: usize = 64;
+
+/// Whether `value` is a stream holding a decrypted body over
+/// [`LARGE_OWNED_STREAM_BYTES`].
+fn is_large_owned_stream(value: &PdfObject) -> bool {
+    matches!(value, PdfObject::Stream(stream)
+        if matches!(&stream.data, crate::object::StreamData::Owned(bytes)
+            if bytes.len() > LARGE_OWNED_STREAM_BYTES))
+}
 
 /// Bytes charged for caching `value`.
 fn cached_object_bytes(value: &PdfObject) -> usize {
@@ -342,6 +372,7 @@ impl ParseContext {
             cache: HashMap::new(),
             objstm: HashMap::new(),
             cache_bytes: 0,
+            large_entries: Vec::new(),
             cache_budget: DEFAULT_PARSE_CACHE_BUDGET,
             recovery: Vec::new(),
             cancellation: None,
@@ -390,6 +421,20 @@ impl ParseContext {
             self.cache.clear();
             self.objstm.clear();
             self.cache_bytes = 0;
+            self.large_entries.clear();
+        }
+        // Large decrypted bodies were for the job that just ended (see
+        // `LARGE_OWNED_STREAM_BYTES`); a later job that needs one resolves it
+        // again, reading the same bytes.
+        for id in std::mem::take(&mut self.large_entries) {
+            if self
+                .cache
+                .get(&id)
+                .is_some_and(|v| is_large_owned_stream(v))
+                && let Some(old) = self.cache.remove(&id)
+            {
+                self.cache_bytes = self.cache_bytes.saturating_sub(cached_object_bytes(&old));
+            }
         }
     }
 
@@ -411,6 +456,9 @@ impl ParseContext {
     }
 
     fn cache_put(&mut self, id: ObjectId, value: Arc<PdfObject>) {
+        if is_large_owned_stream(&value) {
+            self.large_entries.push(id);
+        }
         self.cache_bytes = self.cache_bytes.saturating_add(cached_object_bytes(&value));
         if let Some(old) = self.cache.insert(id, value) {
             self.cache_bytes = self.cache_bytes.saturating_sub(cached_object_bytes(&old));
@@ -1210,6 +1258,35 @@ mod tests {
         ctx.begin_job();
         assert_eq!(ctx.cached_bytes(), 0);
         assert!(ctx.cache.is_empty() && ctx.objstm.is_empty());
+    }
+
+    /// Large decrypted bodies serve the job that resolved them and are gone
+    /// after the next job boundary; small ones stay across jobs.
+    #[test]
+    fn large_decrypted_bodies_do_not_outlive_their_job() {
+        let mut ctx = ParseContext::new();
+        let large = ObjectId::new(1, 0);
+        let small = ObjectId::new(2, 0);
+        ctx.cache_put(large, owned_stream(LARGE_OWNED_STREAM_BYTES + 1));
+        ctx.cache_put(small, owned_stream(LARGE_OWNED_STREAM_BYTES));
+        assert!(ctx.cache_get(large).is_some(), "cached within its job");
+        let before = ctx.cached_bytes();
+        ctx.begin_job();
+        assert!(ctx.cache_get(large).is_none());
+        assert!(ctx.cache_get(small).is_some());
+        assert_eq!(
+            ctx.cached_bytes(),
+            before - (CACHE_ENTRY_BYTES + LARGE_OWNED_STREAM_BYTES + 1)
+        );
+        // Replaced by a small value within a job: that one is kept.
+        ctx.cache_put(large, owned_stream(LARGE_OWNED_STREAM_BYTES + 1));
+        ctx.cache_put(large, Arc::new(PdfObject::Null));
+        ctx.begin_job();
+        assert!(ctx.cache_get(large).is_some());
+        assert_eq!(
+            ctx.cached_bytes(),
+            2 * CACHE_ENTRY_BYTES + LARGE_OWNED_STREAM_BYTES
+        );
     }
 
     #[test]

@@ -2,16 +2,20 @@ akr-lock 0.1
 project exprim
 
 build {
-    tool "akr 0.6.5"
+    tool "akr 0.7.0"
     grammar "0.1"
-    vocabulary "0.2"
-    commit git:4e5965df2c156b2b67291bcd654e5743066acb19
-    source_graph "sha256:a8301aaa708525cba90eb061f296003e7b234a208b6db9e7c454160065cc65c4"
+    vocabulary "0.3"
+    source_graph "sha256:b6903e4822c92c1825336bd2dfaa226d8e2edff00d2140ddf6347c592b390f4b"
 }
 
 source ".akr/project.akr" {
     hash "sha256:790ca5b181bdc9fdb56dcac2671aaf997bcdadb065881d3350418fdbee31bfcb"
     records 0
+}
+
+source ".akr/records/exprim/decisions.akr" {
+    hash "sha256:37ef469f2e79fd3484c29d3ff29e5f8799e1804a4ee24709ef052ed5c1ad4ca8"
+    records 9
 }
 
 source ".akr/records/exprim/evidence.akr" {
@@ -20,8 +24,8 @@ source ".akr/records/exprim/evidence.akr" {
 }
 
 source ".akr/records/exprim/observations.akr" {
-    hash "sha256:a83092ce6eb4fa0cf950cae8f3fb89da0ba9538c65c7ce6f20a2183cc38b8561"
-    records 7
+    hash "sha256:3f5ca96e91dada9713ddc7bc0d7e2a29b3f7372c5660e9a5a9d73fddc221c39c"
+    records 10
 }
 
 source ".akr/records/exprim/policies.akr" {
@@ -35,8 +39,104 @@ source ".akr/records/exprim/questions.akr" {
 }
 
 source ".akr/records/exprim/work.akr" {
-    hash "sha256:42cc24572673111112c24b5685d6fd4733b474b3ee6b334f2fc34361408c14d0"
-    records 2
+    hash "sha256:9623791961274ebfa19972bbaf12b5ac4160613ac0c303bf6cb1d90e1ab6fbca"
+    records 5
+}
+
+resolution @exprim.memory.chunked-lowering/1 {
+    slot supported_by
+    to @exprim.memory.peak-after-20261120/1
+    hash "sha256:f10d448241578364f9c3994e247ee18b6c689ba85036bd09781609a29c522f50"
+}
+
+resolution @exprim.memory.clip-mask-store/1 {
+    slot supported_by
+    to @exprim.memory.peak-audit-20261120/1
+    hash "sha256:4c25aabf26fa5536f806c88795f864d9a0d385065ff30fe8c85936eda08d5472"
+}
+
+resolution @exprim.memory.next-levers/1 {
+    slot supported_by
+    to @exprim.memory.peak-audit-20261120/1
+    hash "sha256:4c25aabf26fa5536f806c88795f864d9a0d385065ff30fe8c85936eda08d5472"
+}
+
+resolution @exprim.memory.peak-after-20261120/1 {
+    slot derived_from
+    to @exprim.memory.peak-audit-20261120/1
+    hash "sha256:4c25aabf26fa5536f806c88795f864d9a0d385065ff30fe8c85936eda08d5472"
+}
+
+resolution @exprim.memory.real-documents-20261120/1 {
+    slot derived_from
+    to @exprim.memory.peak-after-20261120/1
+    hash "sha256:f10d448241578364f9c3994e247ee18b6c689ba85036bd09781609a29c522f50"
+}
+
+resolution @exprim.memory.remaining-levers/1 {
+    slot after
+    to @exprim.memory.next-levers/1
+    hash "sha256:e717d48cab708c9927b3b8ef47fd825164c0c83e20d04fe1fcff7dc342d6a817"
+}
+
+resolution @exprim.memory.remaining-levers/1 {
+    slot supported_by
+    to @exprim.memory.peak-after-20261120/1
+    hash "sha256:f10d448241578364f9c3994e247ee18b6c689ba85036bd09781609a29c522f50"
+}
+
+resolution @exprim.memory.reorder-backlog-bytes/1 {
+    slot supported_by
+    to @exprim.memory.peak-audit-20261120/1
+    hash "sha256:4c25aabf26fa5536f806c88795f864d9a0d385065ff30fe8c85936eda08d5472"
+}
+
+resolution @exprim.memory.session-bounds/1 {
+    slot supported_by
+    to @exprim.memory.peak-after-20261120/1
+    hash "sha256:f10d448241578364f9c3994e247ee18b6c689ba85036bd09781609a29c522f50"
+}
+
+resolution @exprim.memory.session-owned-idle-memory/1 {
+    slot supported_by
+    to @exprim.memory.peak-audit-20261120/1
+    hash "sha256:4c25aabf26fa5536f806c88795f864d9a0d385065ff30fe8c85936eda08d5472"
+}
+
+resolution @exprim.memory.shared-image-samples/1 {
+    slot supported_by
+    to @exprim.memory.peak-audit-20261120/1
+    hash "sha256:4c25aabf26fa5536f806c88795f864d9a0d385065ff30fe8c85936eda08d5472"
+}
+
+resolution @exprim.memory.strip-output/1 {
+    slot depends_on
+    to @exprim.memory.chunked-lowering/1
+    hash "sha256:41a847971e0cf0b431841e706cac030846e49500ccf9ec251fd17018c1a77157"
+}
+
+resolution @exprim.memory.strip-output/1 {
+    slot supported_by
+    to @exprim.memory.peak-after-20261120/1
+    hash "sha256:f10d448241578364f9c3994e247ee18b6c689ba85036bd09781609a29c522f50"
+}
+
+resolution @exprim.memory.strip-rendering/1 {
+    slot after
+    to @exprim.memory.next-levers/1
+    hash "sha256:e717d48cab708c9927b3b8ef47fd825164c0c83e20d04fe1fcff7dc342d6a817"
+}
+
+resolution @exprim.memory.strip-rendering/1 {
+    slot supported_by
+    to @exprim.memory.peak-after-20261120/1
+    hash "sha256:f10d448241578364f9c3994e247ee18b6c689ba85036bd09781609a29c522f50"
+}
+
+resolution @exprim.memory.wrapper-groups-direct/1 {
+    slot supported_by
+    to @exprim.memory.peak-audit-20261120/1
+    hash "sha256:4c25aabf26fa5536f806c88795f864d9a0d385065ff30fe8c85936eda08d5472"
 }
 
 resolution @exprim.renderer.g1-exact-speedups/1 {
@@ -63,6 +163,12 @@ resolution @exprim.renderer.next-levers/1 {
     hash "sha256:f24b3966477263b509526b08c6b064ebc0cb7449756f7243c846f9be6db8bacc"
 }
 
+resolution @exprim.structure.rebuild-skips-stream-bodies/1 {
+    slot supported_by
+    to @exprim.memory.real-documents-20261120/1
+    hash "sha256:b4d542de1e00a215f67d053ffcdac369285602aa22790e94e6fc24b0ef612641"
+}
+
 seal @exprim.corpus.attribution-20261110/1 {
     state superseded
     hash "sha256:22e80dcf70b5aac7e42c9c589b4e7e80323bb09ddc5198abf22373d71e4b1203"
@@ -81,6 +187,21 @@ seal @exprim.corpus.benchmark-20261109/1 {
 seal @exprim.corpus.benchmark-20261109/2 {
     state verified
     hash "sha256:c7c569fb1d784ad06e01cef47f9ff6a6264d4ae38632a8b0aef59d1e9f2651da"
+}
+
+seal @exprim.memory.peak-after-20261120/1 {
+    state verified
+    hash "sha256:f10d448241578364f9c3994e247ee18b6c689ba85036bd09781609a29c522f50"
+}
+
+seal @exprim.memory.peak-audit-20261120/1 {
+    state verified
+    hash "sha256:4c25aabf26fa5536f806c88795f864d9a0d385065ff30fe8c85936eda08d5472"
+}
+
+seal @exprim.memory.real-documents-20261120/1 {
+    state verified
+    hash "sha256:b4d542de1e00a215f67d053ffcdac369285602aa22790e94e6fc24b0ef612641"
 }
 
 seal @exprim.privacy.residual-document-mentions/1 {

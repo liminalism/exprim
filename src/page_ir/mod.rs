@@ -360,6 +360,59 @@ pub enum ImageColorSpace {
     },
 }
 
+impl CompiledPage {
+    /// Roughly how many heap bytes this page keeps alive: its op stream, path
+    /// and glyph tables, and above all the image samples and encoded image
+    /// payloads it carries (tiling cells included). Font programs are left
+    /// out: they are shared by every page of the document. An estimate for
+    /// weighing retained pages against a byte budget, not an exact figure.
+    pub fn approx_retained_bytes(&self) -> usize {
+        fn mask_bytes(mask: &ImageSMask) -> usize {
+            mask.samples.len() + mask.codec_data.as_ref().map_or(0, |data| data.len())
+        }
+        let ops = self.operations.len() * std::mem::size_of::<DisplayOp>();
+        let paths: usize = self
+            .paths
+            .iter()
+            .map(|path| {
+                path.points.len() * std::mem::size_of::<Point>()
+                    + path.verbs.len()
+                    + std::mem::size_of::<PathData>()
+            })
+            .sum();
+        let glyphs: usize = self
+            .glyph_runs
+            .iter()
+            .map(|run| {
+                run.glyphs.len() * std::mem::size_of::<PlacedGlyph>()
+                    + std::mem::size_of::<GlyphRun>()
+            })
+            .sum();
+        let images: usize = self
+            .images
+            .iter()
+            .map(|image| {
+                image.samples.as_ref().map_or(0, |samples| samples.len())
+                    + image.codec_data.as_ref().map_or(0, |data| data.len())
+                    + image.smask.as_deref().map_or(0, mask_bytes)
+                    + match &image.mask {
+                        Some(ImageMask::Stencil(mask)) => mask_bytes(mask),
+                        _ => 0,
+                    }
+            })
+            .sum();
+        let tilings: usize = self
+            .tilings
+            .iter()
+            .map(|tiling| tiling.cell.approx_retained_bytes())
+            .sum();
+        ops.saturating_add(paths)
+            .saturating_add(glyphs)
+            .saturating_add(images)
+            .saturating_add(tilings)
+    }
+}
+
 impl ImageColorSpace {
     /// Number of samples per pixel in the *source* data (1 for Indexed/TintLut).
     pub fn components(&self) -> usize {
@@ -754,16 +807,92 @@ pub struct PageComplexity {
     pub glyph_count: u32,
     pub image_pixels: u64,
     pub transparency_group_count: u32,
-    /// Estimated peak intermediate bytes at 1x scale.
-    pub estimated_peak_bytes: u64,
-    /// Largest cold image working set on the page at source resolution.
+    /// Peak bytes of transparency-group offscreen surfaces live at once, in
+    /// user space at 1x (4 bytes per square unit of group bounds; nested
+    /// groups add up, sequential ones do not; a knockout group counts twice).
+    /// A group the CPU backend paints straight onto its parent holds no
+    /// surface and counts nothing: non-isolated, not knockout, Normal blend,
+    /// fully opaque, no soft mask in force.
     ///
-    /// Unrelated images are decoded sequentially by a render job, so this is a
-    /// maximum rather than a page-wide sum. It includes the retained converted
-    /// image and codec coefficient planes, plus an attached mask when present.
+    /// Not device bytes: [`Self::offscreen_bytes`] scales it by the request
+    /// transform's area factor and caps it by the plane painted on.
+    pub estimated_peak_bytes: u64,
+    /// Soft masks (ExtGState `/SMask` groups) on the page.
+    pub soft_mask_count: u32,
+    /// Peak bytes of soft-mask intermediates live at once, in user space at
+    /// 1x: four bytes per square unit of a mask's content bounds while its
+    /// content is rendered, then one per unit for the coverage plane while
+    /// the mask stays in the graphics state. Scaled and capped like
+    /// [`Self::estimated_peak_bytes`], by [`Self::offscreen_bytes`].
+    pub estimated_soft_mask_peak_bytes: u64,
+    /// Bytes one tiling-pattern fill holds, for the largest such fill on the
+    /// page, in user space at 1x: five per square unit of the filled shape's
+    /// bounds (an RGBA plane the cells are painted on and a coverage plane
+    /// for the shape). See [`Self::tiling_bytes`].
+    pub estimated_tiling_peak_bytes: u64,
+    /// Image bytes a render job allocates for this page, at source resolution.
+    ///
+    /// The CPU backend decodes every image while preparing the page and keeps
+    /// the decoded samples until the page finishes, so the retained part
+    /// (decoded codec rasters, decoded codec masks, RGB8 promotion copies) is
+    /// summed over the page; codec working planes are freed after each decode,
+    /// so only the largest is added. Filter-decoded samples are already owned
+    /// by this IR and are not counted again.
     /// The scheduler owns one outer permit covering this estimate; codecs must
     /// not reacquire the same page budget while that permit is held.
     pub estimated_image_decode_peak_bytes: u64,
+    /// Clip operations whose path is not an axis-aligned rectangle in user
+    /// space: each needs a coverage mask of up to one byte per output pixel
+    /// while draws under it run. The CPU backend holds those masks under a
+    /// budget, which is what the scheduler charges
+    /// (`render_scheduler::estimate_job_bytes`).
+    pub path_clip_count: u32,
+}
+
+impl PageComplexity {
+    /// Bytes of group and soft-mask intermediates a render through `matrix`
+    /// holds at its peak, painting on a plane of `plane_bytes` (four bytes
+    /// per pixel: the page surface, or one strip of it). A group's offscreen
+    /// and a mask's planes are sized from device bounds that never exceed the
+    /// plane, so each is capped by it: two planes per group (a knockout group
+    /// keeps a scratch copy), and a plane and a quarter per soft mask.
+    pub fn offscreen_bytes(&self, matrix: &Matrix, plane_bytes: u64) -> u64 {
+        let groups = scale_by_area(self.estimated_peak_bytes, matrix).min(
+            plane_bytes
+                .saturating_mul(2)
+                .saturating_mul(u64::from(self.transparency_group_count)),
+        );
+        let masks = scale_by_area(self.estimated_soft_mask_peak_bytes, matrix).min(
+            (plane_bytes / 4)
+                .saturating_mul(5)
+                .saturating_mul(u64::from(self.soft_mask_count)),
+        );
+        groups.saturating_add(masks)
+    }
+
+    /// Bytes the largest tiling-pattern fill holds in a render through
+    /// `matrix` of a page whose RGBA surface is `page_bytes`. A fill keeps
+    /// its whole bounds however the page is painted, so the cap is the page,
+    /// not a strip of it.
+    pub fn tiling_bytes(&self, matrix: &Matrix, page_bytes: u64) -> u64 {
+        scale_by_area(self.estimated_tiling_peak_bytes, matrix)
+            .min((page_bytes / 4).saturating_mul(5))
+    }
+}
+
+/// `bytes` (an area measure in user space) mapped through `matrix`: times the
+/// absolute determinant, rounded up, saturating. A non-finite determinant
+/// saturates rather than dropping the term.
+fn scale_by_area(bytes: u64, matrix: &Matrix) -> u64 {
+    if bytes == 0 {
+        return 0;
+    }
+    let area = (matrix.a * matrix.d - matrix.b * matrix.c).abs();
+    if !area.is_finite() {
+        return u64::MAX;
+    }
+    // Float-to-integer `as` saturates, so a huge product clamps to u64::MAX.
+    (bytes as f64 * area).ceil() as u64
 }
 
 /// Page geometry needed to map user space to device space.

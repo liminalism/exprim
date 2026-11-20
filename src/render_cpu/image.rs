@@ -720,7 +720,17 @@ impl PreparedImage {
     /// `/Mask`: the key is one `[min, max]` pair tested against the *raw*
     /// gray sample, and after promotion the image has three components, so
     /// `color_key_hit` would read the key as malformed and never hide a texel.
-    pub(crate) fn gray8_promoted_to_rgb8(&self) -> Option<PreparedImage> {
+    ///
+    /// Only the source rows in `rows` are expanded; the rest of the buffer
+    /// stays as allocated, zeroed and (the allocation being fresh zero pages)
+    /// never touched, so the work and the resident memory follow the rows a
+    /// draw reads rather than the image. A page scan drawn in strips expanded
+    /// the whole image once per strip before this. `rows` must cover every
+    /// row the draw can sample: see [`Self::source_rows_for`].
+    pub(crate) fn gray8_promoted_to_rgb8(
+        &self,
+        rows: std::ops::Range<usize>,
+    ) -> Option<PreparedImage> {
         // 64 Mpx -> 192 MiB of RGB8, the same ceiling as the CMYK conversion.
         const MAX_PROMOTE_PIXELS: usize = 64 * 1024 * 1024;
         if self.is_stencil
@@ -740,9 +750,12 @@ impl PreparedImage {
         // converting it with `Arc::from` allocated and copied the 3n bytes
         // twice per draw (two 6.3 MB allocations for a 300-dpi page scan).
         let mut rgb = zeroed_arc(n * 3);
-        for (&g, dst) in self.samples[..n]
+        let width = self.width as usize;
+        let last = rows.end.min(self.height as usize);
+        let first = rows.start.min(last);
+        for (&g, dst) in self.samples[first * width..last * width]
             .iter()
-            .zip(unique_arc_mut(&mut rgb).chunks_exact_mut(3))
+            .zip(unique_arc_mut(&mut rgb)[first * width * 3..last * width * 3].chunks_exact_mut(3))
         {
             dst.copy_from_slice(&[g, g, g]);
         }
@@ -751,6 +764,37 @@ impl PreparedImage {
             samples: rgb,
             ..self.clone()
         })
+    }
+
+    /// The source rows any sampler of this image can read while painting
+    /// device rows `y0..y1`, for an axis-aligned placement (`inv.b` and
+    /// `inv.c` exactly zero); every row otherwise.
+    ///
+    /// A device row centre maps to the source row coordinate
+    /// `fy = (1 - v) * height - 0.5`, linear in `y`, so the two end rows bound
+    /// it. Nearest reads `round(fy)`, bilinear `floor(fy)` and the row after,
+    /// the box filter `fy` plus or minus half the footprint; all clamp to the
+    /// image. Two rows of slack on each side cover every rounding among them.
+    pub(crate) fn source_rows_for(&self, y0: usize, y1: usize) -> std::ops::Range<usize> {
+        let height = self.height as usize;
+        if height == 0 || y1 <= y0 {
+            return 0..0;
+        }
+        if self.inv.b != 0.0 || self.inv.c != 0.0 {
+            return 0..height;
+        }
+        let fy = |y: usize| {
+            let v = self.inv.d * (y as f64 + 0.5) + self.inv.f;
+            (1.0 - v) * self.height as f64 - 0.5
+        };
+        let (a, b) = (fy(y0), fy(y1 - 1));
+        let reach = self.footprint[1].abs().max(1.0) * 0.5 + 2.0;
+        let (lo, hi) = ((a.min(b) - reach).floor(), (a.max(b) + reach).ceil());
+        if !lo.is_finite() || !hi.is_finite() {
+            return 0..height;
+        }
+        let last = (height - 1) as f64;
+        lo.clamp(0.0, last) as usize..hi.clamp(0.0, last) as usize + 1
     }
 
     /// Images whose texels resolve through a per-pixel colour transform — a
@@ -895,7 +939,13 @@ impl PreparedImage {
     ///
     /// `None` if the image is not that shape or exceeds the size cap (then the
     /// generic path runs, unchanged).
-    pub(crate) fn cmyk_source_as_rgb8(&self) -> Option<Vec<u8>> {
+    ///
+    /// Only the source rows in `rows` are converted, as for
+    /// [`Self::gray8_promoted_to_rgb8`]: the rest of the buffer stays zero
+    /// pages that are never touched, so a draw limited to a strip converts
+    /// its share of the image. `rows` must cover every row the draw samples
+    /// ([`Self::source_rows_for`]).
+    pub(crate) fn cmyk_source_as_rgb8(&self, rows: std::ops::Range<usize>) -> Option<Vec<u8>> {
         // 64 Mpx -> 192 MiB of RGB8; above this the generic per-tap path (whose
         // work is bounded by the footprint, not the source area) is preferred.
         const MAX_CONVERT_PIXELS: usize = 64 * 1024 * 1024;
@@ -919,9 +969,12 @@ impl PreparedImage {
             return None;
         }
         let mut out = vec![0u8; n * 3];
-        for (cmyk, rgb) in self.samples[..n * 4]
+        let width = self.width as usize;
+        let last = rows.end.min(self.height as usize);
+        let first = rows.start.min(last);
+        for (cmyk, rgb) in self.samples[first * width * 4..last * width * 4]
             .chunks_exact(4)
-            .zip(out.chunks_exact_mut(3))
+            .zip(out[first * width * 3..last * width * 3].chunks_exact_mut(3))
         {
             let [c, m, y, k] = match &luts {
                 None => [cmyk[0], cmyk[1], cmyk[2], cmyk[3]],
@@ -2506,7 +2559,9 @@ mod tests {
         for decode in decodes {
             let mut image = img(w, h, ImageColorSpace::Cmyk, samples.clone(), None);
             image.decode = decode.map(Arc::from);
-            let rgb = image.cmyk_source_as_rgb8().expect("convertible");
+            let rgb = image
+                .cmyk_source_as_rgb8(0..h as usize)
+                .expect("convertible");
             for row in 0..h {
                 for col in 0..w {
                     let want = image.pixel(col, row).unwrap();

@@ -116,19 +116,57 @@ impl FileSpooler {
         R: std::borrow::Borrow<SheetRaster>,
         I: IntoIterator<Item = Result<R, PrintError>>,
     {
+        self.spool(printer, title, options, compose, rasters, |path, raster| {
+            write_sheet_png(path, raster.borrow())
+        })
+    }
+
+    /// Compose and write `sheets` as [`Spooler::submit`] does: each sheet is
+    /// composed band by band straight into its PNG encoder, so not even one
+    /// whole composed sheet is held (see [`write_composed_sheet_png`]).
+    fn submit_composed(
+        &self,
+        printer: &PrinterId,
+        title: &str,
+        options: &PrintOptions,
+        session: &crate::reader::RenderSession,
+        sheets: &[crate::print::Sheet],
+        compose: ComposeOptions,
+    ) -> Result<JobId, PrintError> {
+        // A sheet that is too large fails before it takes a sheet number or
+        // a file, as it did when the whole sheet was composed first.
+        let items = sheets
+            .iter()
+            .map(|sheet| crate::print::compose::sheet_pixel_size(sheet, &compose).map(|_| sheet));
+        self.spool(printer, title, options, compose, items, |path, sheet| {
+            write_composed_sheet_png(path, session, sheet, &compose)
+        })
+    }
+
+    /// Write one file per item, numbering, recording and cleaning up after a
+    /// failure as [`FileSpooler::submit_raster_stream`] documents.
+    fn spool<S>(
+        &self,
+        printer: &PrinterId,
+        title: &str,
+        options: &PrintOptions,
+        compose: ComposeOptions,
+        items: impl IntoIterator<Item = Result<S, PrintError>>,
+        mut write: impl FnMut(&Path, S) -> Result<(), PrintError>,
+    ) -> Result<JobId, PrintError> {
         std::fs::create_dir_all(&self.dir)?;
         let mut files = Vec::new();
         let mut numbers = Vec::new();
         let write_all = || -> Result<(), PrintError> {
-            for raster in rasters {
-                let raster = raster?;
+            for item in items {
+                let item = item?;
                 let number = self.next_sheet_number();
                 let path = self.dir.join(sheet_name(number));
                 // Recorded before writing, so a partly written file is
                 // removed on failure too.
                 numbers.push(number);
                 files.push(path.clone());
-                write_sheet_png(&path, raster.borrow())?;
+                write(&path, item)?;
             }
             Ok(())
         };
@@ -238,12 +276,16 @@ impl Spooler for FileSpooler {
                 sheets,
                 compose,
             } => {
-                // Composed lazily: each sheet is written and dropped before
-                // the next is composed (B12).
-                let rasters = sheets
-                    .iter()
-                    .map(|sheet| crate::print::compose::compose_sheet(session, sheet, &compose));
-                self.submit_raster_stream(&job.printer, &job.title, job.options, compose, rasters)
+                // Composed lazily, one sheet at a time (B12), and each sheet
+                // streamed band by band into its encoder.
+                self.submit_composed(
+                    &job.printer,
+                    &job.title,
+                    job.options,
+                    session,
+                    sheets,
+                    compose,
+                )
             }
         }
     }
@@ -297,6 +339,51 @@ pub fn write_sheet_png(path: &Path, raster: &SheetRaster) -> Result<(), PrintErr
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().map_err(png_error)?;
     writer.write_image_data(&raster.pixels).map_err(png_error)?;
+    writer.finish().map_err(png_error)?;
+    Ok(())
+}
+
+/// IDAT chunk size when a sheet is streamed into its PNG: the encoder's one
+/// buffer of compressed output.
+const STREAMED_IDAT_BYTES: usize = 1 << 20;
+
+/// Compose `sheet` and encode it as an 8-bit PNG at `path` without ever
+/// holding the composed sheet: each band goes into the encoder as soon as it
+/// is composed. At 600 dpi a Letter colour sheet is 101 MB that
+/// [`write_sheet_png`] needs whole.
+///
+/// The decoded pixels are exactly those of
+/// [`compose_sheet`](crate::print::compose::compose_sheet) written with
+/// [`write_sheet_png`], but the encoded file is not byte-identical to that
+/// one: the stream writer cuts IDAT chunks of [`STREAMED_IDAT_BYTES`] instead
+/// of writing one, and ends the zlib stream after a sync flush. Shared with
+/// the CUPS backend.
+pub(crate) fn write_composed_sheet_png(
+    path: &Path,
+    session: &crate::reader::RenderSession,
+    sheet: &crate::print::Sheet,
+    compose: &ComposeOptions,
+) -> Result<(), PrintError> {
+    use std::io::Write as _;
+
+    let (width, height) = crate::print::compose::sheet_pixel_size(sheet, compose)?;
+    let color = if compose.channels() == 1 {
+        png::ColorType::Grayscale
+    } else {
+        png::ColorType::Rgb
+    };
+    let file = std::fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(color);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(png_error)?;
+    let mut stream = writer
+        .stream_writer_with_size(STREAMED_IDAT_BYTES)
+        .map_err(png_error)?;
+    crate::print::compose::compose_sheet_banded(session, sheet, compose, |band| {
+        stream.write_all(&band.pixels).map_err(PrintError::from)
+    })?;
+    stream.finish().map_err(png_error)?;
     writer.finish().map_err(png_error)?;
     Ok(())
 }

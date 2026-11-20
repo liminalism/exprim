@@ -8,8 +8,10 @@
 //!     the rest through `probe_measured_render` (callgrind --toggle-collect).
 //!
 //! probe doc <pdf> [--scale S] [--compile-workers C] [--render-workers R]
-//!           [--runs N] [--system-fonts]
-//!     Whole document through RenderScheduler::render_range.
+//!           [--runs N] [--system-fonts] [--memory-mb M] [--whole-surface-estimate]
+//!     Whole document through RenderScheduler::render_range. `--memory-mb`
+//!     sets the scheduler's memory budget; `--whole-surface-estimate` budgets
+//!     every job for a whole RGBA surface, as before strips, for comparison.
 //!
 //! probe fontscan
 //!     Cold cost of FolderFontProvider::system() + first lookup.
@@ -496,6 +498,34 @@ fn run(args: &[String]) {
 // doc: whole document through the scheduler
 // ---------------------------------------------------------------------------
 
+/// The CPU backend without its answer to `working_surface_bytes`, so the
+/// scheduler budgets each job for the whole RGBA surface as it did before
+/// pages were rendered in strips (`doc --whole-surface-estimate`).
+#[derive(Debug)]
+struct WholeSurface(CpuBackend);
+
+impl RenderBackend for WholeSurface {
+    fn id(&self) -> exprim::render_api::BackendId {
+        self.0.id()
+    }
+    fn capabilities(&self) -> exprim::render_api::BackendCapabilities {
+        self.0.capabilities()
+    }
+    fn supports(
+        &self,
+        page: &exprim::page_ir::CompiledPage,
+        request: &RenderRequest,
+    ) -> exprim::render_api::SupportLevel {
+        self.0.supports(page, request)
+    }
+    fn submit(
+        &self,
+        request: RenderRequest,
+    ) -> Result<exprim::render_api::RenderTicket, exprim::render_api::SubmitError> {
+        self.0.submit(request)
+    }
+}
+
 fn doc(args: &[String]) {
     let mut a = Args(args.to_vec());
     let scale: f64 = a.value("--scale").map(|v| v.parse().expect("scale")).unwrap_or(1.0);
@@ -513,6 +543,10 @@ fn doc(args: &[String]) {
     let do_hash = a.flag("--hash");
     let ppm_dir = a.value("--ppm");
     let pages_end: Option<u32> = a.value("--pages-end").map(|v| v.parse().expect("pages-end"));
+    // The scheduler's memory budget, and (for A/B) whether to budget every
+    // job for the whole RGBA surface instead of what the backend reports.
+    let memory_mb: Option<u64> = a.value("--memory-mb").map(|v| v.parse().expect("memory-mb"));
+    let whole_surface = a.flag("--whole-surface-estimate");
     let path = a.positional().to_owned();
 
     let (snap, open) = open_snapshot(&path);
@@ -526,10 +560,15 @@ fn doc(args: &[String]) {
         compile_workers: cw,
         render_workers: rw,
         reorder_window_depth: SchedulerOptions::reorder_window_for(cw, rw),
+        memory_limit_bytes: memory_mb.map_or(defaults.memory_limit_bytes, |mb| mb << 20),
         ..defaults
     };
     for run in 0..runs {
-        let backend: Arc<dyn RenderBackend> = Arc::new(CpuBackend::default());
+        let backend: Arc<dyn RenderBackend> = if whole_surface {
+            Arc::new(WholeSurface(CpuBackend::default()))
+        } else {
+            Arc::new(CpuBackend::default())
+        };
         let scheduler = RenderScheduler::new(backend, options.clone());
         let provider = provider.clone();
         let make = move |s: &DocumentSnapshot, page: PageIndex| -> Result<RenderRequest, RenderError> {

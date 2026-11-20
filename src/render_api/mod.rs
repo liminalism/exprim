@@ -462,6 +462,16 @@ pub trait RenderBackend: Send + Sync + std::fmt::Debug {
     fn capabilities(&self) -> BackendCapabilities;
     fn supports(&self, page: &CompiledPage, request: &RenderRequest) -> SupportLevel;
     fn submit(&self, request: RenderRequest) -> Result<RenderTicket, SubmitError>;
+
+    /// Bytes of the premultiplied RGBA plane this backend paints `request`
+    /// on, which the scheduler budgets for beside the output and caps its
+    /// offscreen estimate by. The whole page, four bytes per pixel, unless
+    /// the backend renders the page in pieces.
+    fn working_surface_bytes(&self, request: &RenderRequest) -> u64 {
+        u64::from(request.output_size.width)
+            .saturating_mul(u64::from(request.output_size.height))
+            .saturating_mul(4)
+    }
 }
 
 /// Best-effort extraction of a human-readable message from a panic payload.

@@ -188,8 +188,19 @@ impl Spooler for WindowsSpooler {
                 geometry.validate_paper(job.options.paper, landscape)?;
                 let job_id = dc.start_doc(&job.title)?;
                 for sheet in sheets {
-                    let raster = crate::print::compose::compose_sheet(session, sheet, &compose)?;
-                    dc.print_page(&raster, geometry)?;
+                    // Compose straight into the DIB, band by band: GDI gets
+                    // the same bytes as before without the composed RGB
+                    // sheet existing next to its BGR copy (about 100 MB
+                    // each for a 600 dpi Letter colour sheet).
+                    let (width, height) = crate::print::compose::sheet_pixel_size(sheet, &compose)?;
+                    let mut dib = Dib::blank(width, height)?;
+                    crate::print::compose::compose_sheet_banded(
+                        session,
+                        sheet,
+                        &compose,
+                        |band| dib.write_band(band),
+                    )?;
+                    dc.print_page(&dib, geometry)?;
                 }
                 dc.end_doc()?;
                 Ok(JobId(job_id.to_string()))
@@ -506,12 +517,7 @@ impl PrintDc {
         Ok(job)
     }
 
-    fn print_page(
-        &self,
-        raster: &crate::print::compose::SheetRaster,
-        metrics: DcMetrics,
-    ) -> Result<(), PrintError> {
-        let dib = Dib::from_raster(raster)?;
+    fn print_page(&self, dib: &Dib, metrics: DcMetrics) -> Result<(), PrintError> {
         // SAFETY: `hdc` is a live printer DC with a document open.
         if unsafe { StartPage(self.hdc) } <= 0 {
             return Err(PrintError::Spool("StartPage failed".to_string()));
@@ -866,52 +872,42 @@ fn job_status_from_bits(bits: u32) -> JobStatus {
 // ---------------------------------------------------------------------------
 
 /// A top-down 24-bit BGR DIB, ready for `StretchDIBits`.
+///
+/// Built empty at the sheet's size and filled band by band as composition
+/// hands bands over, so the composed sheet never exists a second time in its
+/// own RGB (or gray) layout. Gray sheets are still expanded to 24-bit, and
+/// the DWORD row padding stays zero, exactly as when the DIB was copied from
+/// a whole composed raster.
 struct Dib {
     info: BITMAPINFO,
     bits: Vec<u8>,
     width: i32,
     height: i32,
+    /// Bytes per DIB row, DWORD-aligned.
+    stride: usize,
 }
 
 impl Dib {
-    fn from_raster(raster: &crate::print::compose::SheetRaster) -> Result<Self, PrintError> {
-        let width = i32::try_from(raster.width)
+    /// An all-zero DIB for a `width` x `height` sheet.
+    fn blank(sheet_width: u32, sheet_height: u32) -> Result<Self, PrintError> {
+        let width = i32::try_from(sheet_width)
             .map_err(|_| PrintError::Spool("sheet is wider than a DIB allows".to_string()))?;
-        let height = i32::try_from(raster.height)
+        let height = i32::try_from(sheet_height)
             .map_err(|_| PrintError::Spool("sheet is taller than a DIB allows".to_string()))?;
         if width == 0 || height == 0 {
             return Err(PrintError::Spool("sheet raster is empty".to_string()));
         }
 
         // DIB rows are DWORD-aligned, and GDI wants BGR rather than RGB.
-        let stride = (raster.width as usize * 3).div_ceil(4) * 4;
-        let mut bits = vec![0u8; stride * raster.height as usize];
-        let channels = raster.channels as usize;
-        for y in 0..raster.height as usize {
-            let src = &raster.pixels[y * raster.width as usize * channels..];
-            let dst = &mut bits[y * stride..];
-            for x in 0..raster.width as usize {
-                let (r, g, b) = match channels {
-                    1 => {
-                        let v = src[x];
-                        (v, v, v)
-                    }
-                    3 | 4 => (
-                        src[x * channels],
-                        src[x * channels + 1],
-                        src[x * channels + 2],
-                    ),
-                    other => {
-                        return Err(PrintError::Spool(format!(
-                            "cannot blit a {other}-channel sheet raster"
-                        )));
-                    }
-                };
-                dst[x * 3] = b;
-                dst[x * 3 + 1] = g;
-                dst[x * 3 + 2] = r;
-            }
-        }
+        let too_large = || PrintError::Spool("sheet is too large for a DIB".to_string());
+        let stride = (sheet_width as usize)
+            .checked_mul(3)
+            .map(|row| row.div_ceil(4) * 4)
+            .ok_or_else(too_large)?;
+        let len = stride
+            .checked_mul(sheet_height as usize)
+            .ok_or_else(too_large)?;
+        let bits = vec![0u8; len];
 
         let mut info = BITMAPINFO::default();
         info.bmiHeader = BITMAPINFOHEADER {
@@ -935,7 +931,61 @@ impl Dib {
             bits,
             width,
             height,
+            stride,
         })
+    }
+
+    /// Convert one composed band into its rows of the DIB.
+    fn write_band(&mut self, band: &crate::print::compose::Band) -> Result<(), PrintError> {
+        if i64::from(band.width) != i64::from(self.width) {
+            return Err(PrintError::Spool(format!(
+                "band is {} pixels wide, the sheet {}",
+                band.width, self.width
+            )));
+        }
+        self.write_rows(band.y, band.height, band.channels, &band.pixels)
+    }
+
+    /// Convert `rows` tightly packed rows of `channels`-channel pixels, the
+    /// first of which is sheet row `y`, to BGR.
+    fn write_rows(
+        &mut self,
+        y: u32,
+        rows: u32,
+        channels: u8,
+        pixels: &[u8],
+    ) -> Result<(), PrintError> {
+        let channels = usize::from(channels);
+        if !matches!(channels, 1 | 3 | 4) {
+            return Err(PrintError::Spool(format!(
+                "cannot blit a {channels}-channel sheet raster"
+            )));
+        }
+        let width = usize::try_from(self.width).unwrap_or(0);
+        let src_stride = width * channels;
+        let short = || PrintError::Spool("sheet band does not fit the DIB".to_string());
+        for row in 0..rows as usize {
+            let src_start = row * src_stride;
+            let src = pixels
+                .get(src_start..src_start + src_stride)
+                .ok_or_else(short)?;
+            let dst_start = (y as usize + row) * self.stride;
+            let dst = self
+                .bits
+                .get_mut(dst_start..dst_start + width * 3)
+                .ok_or_else(short)?;
+            let (dst, _) = dst.as_chunks_mut::<3>();
+            if channels == 1 {
+                for (out, &v) in dst.iter_mut().zip(src) {
+                    *out = [v, v, v];
+                }
+            } else {
+                for (out, px) in dst.iter_mut().zip(src.chunks_exact(channels)) {
+                    *out = [px[2], px[1], px[0]];
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -995,7 +1045,7 @@ unsafe fn pwstr_to_string(ptr: PWSTR) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1090,6 +1140,144 @@ mod tests {
         assert_eq!((fields.dmPaperWidth, fields.dmPaperLength), (1270, 2540));
         apply_options(&mut devmode, &PrintOptions::default(), false);
         assert_eq!(devmode.dmFields.0 & (DM_PAPERWIDTH | DM_PAPERLENGTH).0, 0);
+    }
+
+    /// The DIB conversion as it was before composition streamed into the DIB:
+    /// a whole composed raster copied into DWORD-aligned BGR rows. Kept
+    /// verbatim as the reference the banded path must match byte for byte.
+    fn reference_dib_bits(raster: &crate::print::compose::SheetRaster) -> Vec<u8> {
+        let stride = (raster.width as usize * 3).div_ceil(4) * 4;
+        let mut bits = vec![0u8; stride * raster.height as usize];
+        let channels = raster.channels as usize;
+        for y in 0..raster.height as usize {
+            let src = &raster.pixels[y * raster.width as usize * channels..];
+            let dst = &mut bits[y * stride..];
+            for x in 0..raster.width as usize {
+                let (r, g, b) = match channels {
+                    1 => {
+                        let v = src[x];
+                        (v, v, v)
+                    }
+                    3 | 4 => (
+                        src[x * channels],
+                        src[x * channels + 1],
+                        src[x * channels + 2],
+                    ),
+                    other => panic!("{other}-channel raster"),
+                };
+                dst[x * 3] = b;
+                dst[x * 3 + 1] = g;
+                dst[x * 3 + 2] = r;
+            }
+        }
+        bits
+    }
+
+    fn colour_session() -> crate::reader::RenderSession {
+        use crate::test_support::builder::PdfBuilder;
+        let mut b = PdfBuilder::new();
+        b.add_object(1, "<</Type/Catalog/Pages 2 0 R>>");
+        b.add_object(
+            2,
+            "<</Type/Pages/Kids[3 0 R]/Count 1/MediaBox[0 0 200 200]>>",
+        );
+        b.add_object(
+            3,
+            "<</Type/Page/Parent 2 0 R/Contents 4 0 R/Resources<<>>>>",
+        );
+        b.add_stream(
+            4,
+            "",
+            b"1 0 0 rg 0 100 100 100 re f 0 0 1 rg 100 0 50 50 re f 0.2 0.8 0.3 rg 20 20 60 30 re f",
+        );
+        b.finish_classic_xref("/Root 1 0 R");
+        let bytes: std::sync::Arc<[u8]> = b.into_bytes().into();
+        crate::reader::RenderSession::open(bytes, None).unwrap()
+    }
+
+    #[test]
+    fn banded_dib_matches_the_whole_raster_copy_byte_for_byte() {
+        use crate::print::compose::{
+            ComposeOptions, compose_sheet, compose_sheet_banded, sheet_pixel_size,
+        };
+        use crate::print::{Matrix, Placement, Rect};
+        let session = colour_session();
+        // 301 pixels wide at 72 dpi: 903 bytes of BGR, one byte of row
+        // padding, which must stay zero.
+        let bounds = Rect::new(0.0, 0.0, 301.0, 250.0);
+        let sheet = Sheet {
+            index: 0,
+            bounds,
+            imageable: bounds,
+            side: crate::print::Side::Front,
+            placements: vec![
+                Placement {
+                    source_page: 0,
+                    transform: Matrix::IDENTITY,
+                    clip: Rect::new(0.0, 0.0, 150.0, 250.0),
+                },
+                Placement {
+                    source_page: 0,
+                    transform: Matrix::rotate_degrees(90).then(Matrix::translate(350.0, 20.0)),
+                    clip: Rect::new(150.0, 0.0, 301.0, 250.0),
+                },
+            ],
+        };
+        for grayscale in [false, true] {
+            let options = ComposeOptions {
+                dpi: 72.0,
+                grayscale,
+                // Short bands, the last one partial: 250 = 35 * 7 + 5.
+                band_rows: 7,
+                ..ComposeOptions::default()
+            };
+            let raster = compose_sheet(&session, &sheet, &options).unwrap();
+            let reference = reference_dib_bits(&raster);
+            assert!(
+                raster.pixels.iter().any(|&v| v < 128),
+                "the sheet has content"
+            );
+
+            let (width, height) = sheet_pixel_size(&sheet, &options).unwrap();
+            let mut dib = Dib::blank(width, height).unwrap();
+            compose_sheet_banded(&session, &sheet, &options, |band| dib.write_band(band)).unwrap();
+            assert_eq!((dib.width, dib.height), (301, 250));
+            assert_eq!(dib.stride, 904);
+            assert!(dib.bits == reference, "grayscale={grayscale}");
+            assert_eq!(dib.info.bmiHeader.biWidth, 301);
+            assert_eq!(dib.info.bmiHeader.biHeight, -250);
+            assert_eq!(dib.info.bmiHeader.biBitCount, 24);
+            assert_eq!(dib.info.bmiHeader.biSizeImage as usize, reference.len());
+        }
+    }
+
+    #[test]
+    fn a_band_that_does_not_fit_the_dib_is_an_error_not_a_panic() {
+        let mut dib = Dib::blank(4, 2).unwrap();
+        let band = crate::print::compose::Band {
+            y: 1,
+            height: 2,
+            width: 4,
+            channels: 3,
+            pixels: vec![0; 4 * 2 * 3],
+        };
+        assert!(dib.write_band(&band).is_err());
+        let narrow = crate::print::compose::Band {
+            y: 0,
+            height: 1,
+            width: 3,
+            channels: 3,
+            pixels: vec![0; 3 * 3],
+        };
+        assert!(dib.write_band(&narrow).is_err());
+        let two_channel = crate::print::compose::Band {
+            y: 0,
+            height: 1,
+            width: 4,
+            channels: 2,
+            pixels: vec![0; 4 * 2],
+        };
+        assert!(dib.write_band(&two_channel).is_err());
     }
 
     #[test]

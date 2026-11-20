@@ -374,6 +374,9 @@ mod tests {
             image_cache: None,
             decode_floor: None,
             sanity_extent: 4.0,
+            rows: (0, u32::MAX),
+            op_extent: None,
+            strip_decodes: None,
         }
     }
 

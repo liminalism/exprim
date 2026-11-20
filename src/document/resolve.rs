@@ -16,7 +16,9 @@ use crate::object::{
 };
 use crate::security::SecurityContext;
 use crate::source::PdfSource;
-use crate::structure::decode::{DecodeBudget, DecodeError, decode_stream};
+use crate::structure::decode::{
+    DecodeBudget, DecodeError, SharedDecoded, decode_stream, decode_stream_to_codec_shared,
+};
 use crate::structure::objstm::parse_object_stream_layout;
 use crate::structure::{DocumentStructure, ObjectLocation, RecoveryEvent, scan_for_object_header};
 use crate::syntax::SyntaxError;
@@ -530,18 +532,27 @@ impl Resolver<'_> {
         }
     }
 
-    pub fn decode_stream_data(
-        &self,
-        stream: &PdfStream,
-        ctx: &mut ParseContext,
-    ) -> Result<Vec<u8>, DocumentError> {
-        let raw: Cow<'_, [u8]> = match &stream.data {
+    /// A stream's raw (still-encoded) body as the decoders read it: borrowed
+    /// from the source where it can be, never copied out of an `Owned` body.
+    pub(crate) fn stream_body<'s>(
+        &'s self,
+        data: &'s StreamData,
+    ) -> Result<Cow<'s, [u8]>, DocumentError> {
+        Ok(match data {
             StreamData::InSource { offset, len } => self
                 .source
                 .read_range(*offset..offset.saturating_add(*len))
                 .map_err(crate::structure::StructureError::from)?,
             StreamData::Owned(bytes) => Cow::Borrowed(bytes),
-        };
+        })
+    }
+
+    pub fn decode_stream_data(
+        &self,
+        stream: &PdfStream,
+        ctx: &mut ParseContext,
+    ) -> Result<Vec<u8>, DocumentError> {
+        let raw = self.stream_body(&stream.data)?;
         let mut budget = DecodeBudget::new(
             self.limits
                 .max_decoded_bytes_per_context
@@ -568,13 +579,7 @@ impl Resolver<'_> {
         stream: &PdfStream,
         ctx: &mut ParseContext,
     ) -> Result<(Vec<u8>, Option<String>), DocumentError> {
-        let raw: Cow<'_, [u8]> = match &stream.data {
-            StreamData::InSource { offset, len } => self
-                .source
-                .read_range(*offset..offset.saturating_add(*len))
-                .map_err(crate::structure::StructureError::from)?,
-            StreamData::Owned(bytes) => Cow::Borrowed(bytes),
-        };
+        let raw = self.stream_body(&stream.data)?;
         let mut budget = DecodeBudget::new(
             self.limits
                 .max_decoded_bytes_per_context
@@ -585,12 +590,64 @@ impl Resolver<'_> {
         let result =
             crate::structure::decode::decode_stream_to_codec(&raw, dict, self.names, &mut budget);
         ctx.decoded_bytes_used += budget.used();
-        result.map_err(|e| match e {
-            DecodeError::BudgetExceeded => {
-                DocumentError::LimitExceeded("max_decoded_bytes_per_context")
-            }
-            other => DocumentError::Structure(other.into()),
-        })
+        result.map_err(map_decode_error)
+    }
+
+    /// The decode half of [`Self::decode_stream_data_to_codec`] for image
+    /// samples: `raw` is the stream's body (from [`Self::stream_body`],
+    /// `raw_shared` the same bytes when the body is `Owned`) and `dict` its
+    /// dictionary with `/Filter` and `/DecodeParms` already resolved (see
+    /// [`Self::effective_filter_dict`]). Same bytes, errors and budget charge
+    /// as that method, returned as shared samples (see
+    /// [`crate::structure::decode::decode_stream_to_codec_shared`]); also
+    /// returns the bytes charged, so a cache can charge a hit the same.
+    pub(crate) fn decode_body_shared(
+        &self,
+        raw: &[u8],
+        raw_shared: Option<&Arc<[u8]>>,
+        dict: &Dictionary,
+        ctx: &mut ParseContext,
+        expected_len: Option<usize>,
+    ) -> Result<(SharedDecoded, usize), DocumentError> {
+        let mut budget = DecodeBudget::new(self.remaining_decode_budget(ctx));
+        let result = decode_stream_to_codec_shared(
+            raw,
+            raw_shared,
+            dict,
+            self.names,
+            &mut budget,
+            expected_len,
+        );
+        ctx.decoded_bytes_used += budget.used();
+        Ok((result.map_err(map_decode_error)?, budget.used()))
+    }
+
+    /// Decompressed bytes `ctx` may still produce under
+    /// `max_decoded_bytes_per_context`.
+    pub(crate) fn remaining_decode_budget(&self, ctx: &ParseContext) -> usize {
+        self.limits
+            .max_decoded_bytes_per_context
+            .saturating_sub(ctx.decoded_bytes_used)
+    }
+
+    /// `dict` with an indirect `/Filter` or `/DecodeParms` resolved through
+    /// `ctx` (`None`: both already direct) — exactly what the decode methods
+    /// read the filter chain from.
+    pub(crate) fn effective_filter_dict(
+        &self,
+        dict: &Dictionary,
+        ctx: &mut ParseContext,
+    ) -> Option<Dictionary> {
+        self.resolve_filter_params(dict, ctx)
+    }
+}
+
+fn map_decode_error(e: DecodeError) -> DocumentError {
+    match e {
+        DecodeError::BudgetExceeded => {
+            DocumentError::LimitExceeded("max_decoded_bytes_per_context")
+        }
+        other => DocumentError::Structure(other.into()),
     }
 }
 

@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,33 +19,58 @@ use crate::render_cpu::{
 use crate::reader::intake::source;
 use crate::reader::page_cache::PageCache;
 
+/// The mutable state one page job works with: parser caches and raster
+/// scratch, kept warm from one job to the next.
+#[derive(Debug)]
 struct WorkerContexts {
-    session_id: Option<u64>,
     parse: ParseContext,
     raster: CpuWorkerContext,
 }
 
-thread_local! {
-    /// Rayon has fixed worker threads, so these contexts retain parser caches
-    /// and raster scratch across page jobs without cross-thread locking.
-    static WORKER_CONTEXTS: RefCell<WorkerContexts> = RefCell::new(WorkerContexts {
-        session_id: None,
-        parse: ParseContext::new(),
-        raster: CpuWorkerContext::new(),
-    });
+/// The idle [`WorkerContexts`] of one session.
+///
+/// A job checks one out, works without any lock held, and puts it back, so
+/// there are as many as the session ever had jobs running at once. They used
+/// to be thread-locals, reset only when the thread next served a different
+/// session: closing a document freed nothing on the pool threads that had
+/// worked on it, and each kept its parse cache (up to 256 MiB) and raster
+/// scratch for as long as the thread lived. Owned here, they are dropped with
+/// the session and can be released early ([`RenderSession::release_idle_memory`]).
+#[derive(Debug, Default)]
+struct WorkerPool {
+    idle: std::sync::Mutex<Vec<WorkerContexts>>,
+}
+
+impl WorkerPool {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<WorkerContexts>> {
+        // Contexts are only ever pushed whole; a poisoned lock still guards a
+        // valid list.
+        self.idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Run `job` with a warm context when one is idle, else a new one. A job
+    /// that unwinds drops its context rather than returning it: scratch a
+    /// panic interrupted is never reused.
+    fn with<R>(&self, job: impl FnOnce(&mut WorkerContexts) -> R) -> R {
+        // Most recently returned first: its caches are the likeliest warm.
+        let recycled = self.lock().pop();
+        let mut worker = recycled.unwrap_or_else(|| WorkerContexts {
+            parse: ParseContext::new(),
+            raster: CpuWorkerContext::new(),
+        });
+        let result = job(&mut worker);
+        self.lock().push(worker);
+        result
+    }
+
+    fn clear(&self) {
+        self.lock().clear();
+    }
 }
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
-
-impl WorkerContexts {
-    fn select_document(&mut self, session_id: u64) {
-        if self.session_id != Some(session_id) {
-            self.session_id = Some(session_id);
-            self.parse = ParseContext::new();
-            self.raster = CpuWorkerContext::new();
-        }
-    }
-}
 
 /// Cooperative cancellation token. The renderer token stays private
 /// to this crate while page jobs can cheaply clone, cancel, and checkpoint it.
@@ -471,8 +495,20 @@ pub struct RgbSurface {
     pub height: u32,
     /// Bytes from the start of one row to the start of the next: `width * 3`.
     pub stride: usize,
-    /// Pixel bytes; row `y` starts at `y * stride`.
+    /// Pixel bytes; row `y` starts at `y * stride`. From
+    /// [`RenderSession::render`] this is exactly `stride * height` bytes;
+    /// from [`RenderSession::render_in_place`] it is longer (see there), so
+    /// read it through [`as_bytes`](Self::as_bytes) or row by row.
     pub pixels: Arc<[u8]>,
+}
+
+impl RgbSurface {
+    /// The pixel bytes: exactly `stride * height` of them, whichever render
+    /// call produced the surface.
+    pub fn as_bytes(&self) -> &[u8] {
+        let len = self.stride.saturating_mul(self.height as usize);
+        self.pixels.get(..len).unwrap_or(&self.pixels)
+    }
 }
 
 /// An owned 8-bit grayscale raster: one byte per pixel, rows top to bottom.
@@ -551,6 +587,68 @@ pub struct PreservedJbig2Smask {
     pub working_coverage: GraySurface,
 }
 
+/// Memory bounds of one [`RenderSession`]. Every open document has its own
+/// caches, so a host that keeps many documents open divides its allowance
+/// among them here; the defaults suit one document at a time. A smaller bound
+/// costs recompiling, decoding or rasterizing again, never different output.
+///
+/// ```
+/// let mut options = exprim::SessionOptions::default();
+/// options.image_cache_bytes = 16 << 20;
+/// options.cached_pages = 2;
+/// ```
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct SessionOptions {
+    /// Compiled pages retained (8). Zero disables retention.
+    pub cached_pages: usize,
+    /// Bytes the retained compiled pages may hold together (256 MiB): mostly
+    /// their image samples and encoded image payloads. The most recent page
+    /// is kept whatever its size.
+    pub cached_page_bytes: usize,
+    /// Decoded-image cache (96 MiB).
+    pub image_cache_bytes: usize,
+    /// Parsed-font cache (48 MiB).
+    pub font_cache_bytes: usize,
+    /// Rendered-glyph cache (32 MiB).
+    pub glyph_cache_bytes: usize,
+    /// Finished page buffers kept for reuse (256 MiB).
+    pub surface_pool_bytes: usize,
+    /// Size of the strips a large page is rendered in (32 MiB of working
+    /// surface; 0 renders every page in one pass). A page whose working
+    /// surface would be more than twice this is rendered strip by strip into
+    /// its output buffer, so the render holds the output plus one strip
+    /// instead of the output plus the whole surface. Smaller strips hold
+    /// less and take longer.
+    pub strip_bytes: usize,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            cached_pages: 8,
+            cached_page_bytes: 256 << 20,
+            image_cache_bytes: 96 << 20,
+            font_cache_bytes: 48 << 20,
+            glyph_cache_bytes: 32 << 20,
+            surface_pool_bytes: 256 << 20,
+            strip_bytes: crate::render_cpu::default_strip_target_bytes(),
+        }
+    }
+}
+
+/// What a retained compiled page weighs against
+/// [`SessionOptions::cached_page_bytes`]: the raster IR (image samples and
+/// payloads above all) plus the semantic page's own op and text tables. The
+/// two share paths, image data and font programs, which are counted once.
+fn retained_page_bytes(page: &CompiledDocumentPage) -> usize {
+    let semantic = &page.semantic;
+    page.raster
+        .approx_retained_bytes()
+        .saturating_add(semantic.ops.len() * std::mem::size_of::<crate::content::SemanticOp>())
+        .saturating_add(semantic.text_runs.len() * std::mem::size_of::<crate::content::TextRun>())
+}
+
 /// Per-document immutable renderer state.
 #[derive(Debug)]
 pub struct RenderSession {
@@ -561,6 +659,10 @@ pub struct RenderSession {
     // create page-local font, glyph, and decoded-image caches.
     backend: Arc<CpuBackend>,
     pages: PageCache<CompiledDocumentPage>,
+    workers: WorkerPool,
+    /// Timing detail applied to every worker a profiled render checks out.
+    #[cfg(feature = "profiling")]
+    profile_detail: std::sync::Mutex<crate::profiling::ProfileDetail>,
 }
 
 impl RenderSession {
@@ -596,27 +698,137 @@ impl RenderSession {
 
     /// Open with a bound on retained page compilations (eight by default).
     /// Each entry owns semantic and raster IR together. Zero disables retention;
-    /// caller-held page handles remain valid after eviction. This is a page-count
-    /// bound, not a byte budget for individual pages or the renderer's caches.
+    /// caller-held page handles remain valid after eviction. The retained
+    /// pages are also bounded in bytes (see [`SessionOptions`]).
     pub fn open_with_cache_capacity(
         bytes: Arc<[u8]>,
         password: Option<&str>,
         cached_pages: usize,
     ) -> Result<Self, ReadError> {
-        let snapshot = DocumentSnapshot::open_with_password(
-            source(bytes),
-            DocumentLimits::default(),
-            password,
-        )
-        .map_err(|error| ReadError::Open(error.to_string()))?;
+        Self::open_source_with_cache_capacity(source(bytes), password, cached_pages)
+    }
+
+    /// Open a PDF file by memory-mapping it, so the document's bytes are paged
+    /// in on demand and can be dropped by the operating system under pressure
+    /// instead of sitting on the heap for the life of the session
+    /// ([`open`](Self::open) keeps the whole file in memory, and reading it
+    /// into an `Arc<[u8]>` first copies it once more).
+    ///
+    /// The file must not be truncated or rewritten in place while the session
+    /// is open. Replace it by renaming a new file over it instead.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::Open`] when the file cannot be mapped or is not a PDF this
+    /// crate can open.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// let session = exprim::RenderSession::open_path("document.pdf", None)?;
+    /// println!("{} pages", session.page_count());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn open_path(
+        path: impl AsRef<std::path::Path>,
+        password: Option<&str>,
+    ) -> Result<Self, ReadError> {
+        let mapped = crate::source::MmapSource::open(path)
+            .map_err(|error| ReadError::Open(error.to_string()))?;
+        Self::open_source(Arc::new(mapped), password)
+    }
+
+    /// Open a PDF from any byte source: a memory map, positional file reads,
+    /// or bytes the caller already holds.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::Open`] as for [`open`](Self::open).
+    pub fn open_source(
+        source: Arc<dyn crate::source::PdfSource>,
+        password: Option<&str>,
+    ) -> Result<Self, ReadError> {
+        Self::open_source_with_options(source, password, &SessionOptions::default())
+    }
+
+    /// [`open_source`](Self::open_source) with explicit memory bounds.
+    pub fn open_source_with_options(
+        source: Arc<dyn crate::source::PdfSource>,
+        password: Option<&str>,
+        options: &SessionOptions,
+    ) -> Result<Self, ReadError> {
+        let snapshot =
+            DocumentSnapshot::open_with_password(source, DocumentLimits::default(), password)
+                .map_err(|error| ReadError::Open(error.to_string()))?;
+        let backend = CpuBackend::new(CpuBackendOptions::default())
+            .with_cache_bytes(
+                options.image_cache_bytes,
+                options.font_cache_bytes,
+                options.glyph_cache_bytes,
+            )
+            .with_surface_pool_bytes(options.surface_pool_bytes)
+            .with_strip_target_bytes(options.strip_bytes);
 
         Ok(Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             snapshot: Arc::new(snapshot),
             compiler: Arc::new(PageCompiler::new().with_annotations(true)),
-            backend: Arc::new(CpuBackend::new(CpuBackendOptions::default())),
-            pages: PageCache::new(cached_pages),
+            backend: Arc::new(backend),
+            pages: PageCache::with_byte_budget(
+                options.cached_pages,
+                options.cached_page_bytes,
+                retained_page_bytes,
+            ),
+            workers: WorkerPool::default(),
+            #[cfg(feature = "profiling")]
+            profile_detail: std::sync::Mutex::new(crate::profiling::ProfileDetail::default()),
         })
+    }
+
+    /// [`open_source`](Self::open_source) with a bound on retained page
+    /// compilations (see [`open_with_cache_capacity`](Self::open_with_cache_capacity)).
+    pub fn open_source_with_cache_capacity(
+        source: Arc<dyn crate::source::PdfSource>,
+        password: Option<&str>,
+        cached_pages: usize,
+    ) -> Result<Self, ReadError> {
+        let options = SessionOptions {
+            cached_pages,
+            ..SessionOptions::default()
+        };
+        Self::open_source_with_options(source, password, &options)
+    }
+
+    /// Drop everything the decoded-image, parsed-font and glyph caches hold.
+    /// With [`clear_page_cache`](Self::clear_page_cache) and
+    /// [`release_idle_memory`](Self::release_idle_memory) this returns an
+    /// open but idle document to little more than its parsed structure.
+    /// Later renders decode, parse and rasterize again, to the same bytes.
+    pub fn clear_resource_caches(&self) {
+        self.backend.clear_resource_caches();
+    }
+
+    /// Bytes the retained compiled pages weigh against
+    /// [`SessionOptions::cached_page_bytes`].
+    pub fn cached_page_bytes(&self) -> usize {
+        self.pages.retained_bytes()
+    }
+
+    /// Give back memory the session keeps only to make the next job faster:
+    /// the parser caches and raster scratch of idle workers, and page buffers
+    /// held for reuse. Compiled pages and the font, glyph and image caches
+    /// stay (see [`clear_page_cache`](Self::clear_page_cache) for the former);
+    /// work in flight is unaffected. Output never depends on this.
+    pub fn release_idle_memory(&self) {
+        self.workers.clear();
+        self.backend.release_idle_memory();
+    }
+
+    /// Bytes of finished page buffers the session currently keeps for reuse
+    /// (at most 256 MiB; [`release_idle_memory`](Self::release_idle_memory)
+    /// drops them).
+    pub fn idle_surface_bytes(&self) -> usize {
+        self.backend.idle_surface_bytes()
     }
 
     /// Distinguishes this session from every other one in the process.
@@ -679,10 +891,9 @@ impl RenderSession {
             return Err(self.page_out_of_range(page));
         }
         self.pages.get_or_compile(page, cancellation, || {
-            let artifacts = WORKER_CONTEXTS
+            let artifacts = self
+                .workers
                 .with(|worker| {
-                    let mut worker = worker.borrow_mut();
-                    worker.select_document(self.id);
                     worker.parse.begin_job();
                     worker
                         .parse
@@ -758,7 +969,44 @@ impl RenderSession {
         product: &RasterProduct,
         cancellation: Option<&CancellationToken>,
     ) -> Result<RasterPlane, ReadError> {
-        self.render_inner(page, product, cancellation)
+        self.render_inner(page, product, cancellation, false)
+            .map(|(plane, _stats)| plane)
+    }
+
+    /// [`render`](Self::render) for a raster that is consumed and dropped
+    /// (encoded, printed, analysed), not kept.
+    ///
+    /// An RGB product is packed inside the surface it was rendered on instead
+    /// of into a second buffer, so the render never holds more than four
+    /// bytes per pixel, where [`render`](Self::render) holds seven at the
+    /// instant it packs (the RGBA surface and the RGB copy) and then keeps the
+    /// RGBA surface for reuse. In exchange the returned
+    /// [`RgbSurface::pixels`] keeps the surface's length, a third more than
+    /// `stride * height`: read it through [`RgbSurface::as_bytes`], and
+    /// prefer [`render`](Self::render) for rasters that are retained in
+    /// number. The pixels themselves are identical. Gray products are
+    /// rendered exactly as by [`render`](Self::render).
+    ///
+    /// # Errors
+    ///
+    /// As [`render`](Self::render).
+    pub fn render_in_place(
+        &self,
+        page: &Arc<CompiledDocumentPage>,
+        product: &RasterProduct,
+    ) -> Result<RasterPlane, ReadError> {
+        self.render_in_place_cancellable(page, product, None)
+    }
+
+    /// [`render_in_place`](Self::render_in_place) with cooperative
+    /// cancellation.
+    pub fn render_in_place_cancellable(
+        &self,
+        page: &Arc<CompiledDocumentPage>,
+        product: &RasterProduct,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<RasterPlane, ReadError> {
+        self.render_inner(page, product, cancellation, true)
             .map(|(plane, _stats)| plane)
     }
 
@@ -773,20 +1021,19 @@ impl RenderSession {
         product: &RasterProduct,
     ) -> Result<(RasterPlane, crate::profiling::ProfileReport), ReadError> {
         let start = std::time::Instant::now();
-        let (plane, stats) = self.render_inner(page, product, None)?;
+        let (plane, stats) = self.render_inner(page, product, None, false)?;
         let profile = crate::render_cpu::profile_from_stats(&stats, start.elapsed());
         Ok((plane, profile))
     }
 
-    /// Choose the timing detail of profiled renders on this thread's worker
-    /// (see `CpuWorkerContext::set_profile_detail`).
+    /// Choose the timing detail of this session's profiled renders (see
+    /// `CpuWorkerContext::set_profile_detail`).
     #[cfg(feature = "profiling")]
     pub fn set_profile_detail(&self, detail: crate::profiling::ProfileDetail) {
-        WORKER_CONTEXTS.with(|worker| {
-            let mut worker = worker.borrow_mut();
-            worker.select_document(self.id);
-            worker.raster.set_profile_detail(detail);
-        });
+        *self
+            .profile_detail
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = detail;
     }
 
     fn render_inner(
@@ -794,6 +1041,7 @@ impl RenderSession {
         page: &Arc<CompiledDocumentPage>,
         product: &RasterProduct,
         cancellation: Option<&CancellationToken>,
+        in_place: bool,
     ) -> Result<(RasterPlane, crate::render_cpu::RenderStats), ReadError> {
         if product.width == 0 || product.height == 0 {
             return Err(ReadError::InvalidRasterProduct(
@@ -829,13 +1077,50 @@ impl RenderSession {
             residency: OutputResidency::HostRequired,
         };
         let options = render_options(&page.raster, product);
+        let rgb = product.format == RasterFormat::Rgb8;
 
         let rendered = catch_unwind(AssertUnwindSafe(|| {
-            WORKER_CONTEXTS.with(|worker| {
-                let mut worker = worker.borrow_mut();
-                worker.select_document(self.id);
-                self.backend
-                    .render_with_options(&request, &options, &mut worker.raster)
+            self.workers.with(|worker| {
+                #[cfg(feature = "profiling")]
+                worker.raster.set_profile_detail(
+                    *self
+                        .profile_detail
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+                if rgb {
+                    // The backend drops the alpha byte itself: inside the
+                    // surface for an in-place render, into a buffer of the
+                    // exact length otherwise, and strip by strip for a large
+                    // page either way. Rewrapped as a host page for the
+                    // shared checks below; its stride says three bytes per
+                    // pixel.
+                    let rendered = if in_place {
+                        self.backend.render_packed_rgb_with_options(
+                            &request,
+                            &options,
+                            &mut worker.raster,
+                        )
+                    } else {
+                        self.backend
+                            .render_rgb_with_options(&request, &options, &mut worker.raster)
+                    };
+                    rendered.map(|(packed, stats)| {
+                        (
+                            HostPage {
+                                width: packed.width,
+                                height: packed.height,
+                                stride: packed.stride,
+                                format: output_format,
+                                pixels: packed.pixels,
+                            },
+                            stats,
+                        )
+                    })
+                } else {
+                    self.backend
+                        .render_with_options(&request, &options, &mut worker.raster)
+                }
             })
         }))
         .map_err(|payload| ReadError::Render {
@@ -849,8 +1134,7 @@ impl RenderSession {
             page: page.page_index,
             message: error.to_string(),
         })?;
-        #[cfg_attr(not(feature = "profiling"), allow(unused_mut))]
-        let (rendered, mut stats) = rendered;
+        let (rendered, stats) = rendered;
         if rendered.format != output_format {
             return Err(ReadError::Render {
                 page: page.page_index,
@@ -871,16 +1155,15 @@ impl RenderSession {
                 }),
                 stats,
             )),
-            RasterFormat::Rgb8 => {
-                #[cfg(feature = "profiling")]
-                let pack_start = std::time::Instant::now();
-                let surface = rgb_surface_from_rgba(&rendered, page.page_index)?;
-                #[cfg(feature = "profiling")]
-                stats
-                    .profile
-                    .add_duration("session.rgb_pack", pack_start.elapsed());
-                Ok((RasterPlane::Rgb8(surface), stats))
-            }
+            RasterFormat::Rgb8 => Ok((
+                RasterPlane::Rgb8(RgbSurface {
+                    width: rendered.width,
+                    height: rendered.height,
+                    stride: rendered.stride,
+                    pixels: rendered.pixels,
+                }),
+                stats,
+            )),
         }
     }
 
@@ -974,59 +1257,6 @@ fn render_limits(cancellation: Option<&CancellationToken>) -> RenderLimits {
         cancellation: cancellation.map(|token| token.0.clone()),
         ..RenderLimits::default()
     }
-}
-
-/// Drop the alpha channel from a premultiplied-sRGB RGBA surface into a tightly
-/// packed RGB one. The renderer's stride may exceed `width * 4`, so rows are
-/// copied individually rather than the buffer being reinterpreted wholesale.
-fn rgb_surface_from_rgba(rendered: &HostPage, page_index: u32) -> Result<RgbSurface, ReadError> {
-    let row_bytes = usize::try_from(rendered.width)
-        .ok()
-        .and_then(|width| width.checked_mul(4))
-        .ok_or(ReadError::InvalidRasterProduct("RGBA row size overflow"))?;
-    let rgb_stride = usize::try_from(rendered.width)
-        .ok()
-        .and_then(|width| width.checked_mul(3))
-        .ok_or(ReadError::InvalidRasterProduct("RGB row size overflow"))?;
-    let capacity = rgb_stride
-        .checked_mul(rendered.height as usize)
-        .ok_or(ReadError::InvalidRasterProduct("RGB surface size overflow"))?;
-
-    let malformed = |message: &str| ReadError::Render {
-        page: page_index,
-        message: message.to_string(),
-    };
-    // Built in its final shared allocation (`repeat_n` is exact-size, so the
-    // `Arc` is allocated once) and filled three bytes per pixel. Extending a
-    // `Vec` through `flat_map` pushed byte by byte with a capacity check each,
-    // and `Arc::from` then copied the whole plane again: together about as
-    // long as rendering the page.
-    let mut pixels: Arc<[u8]> = std::iter::repeat_n(0u8, capacity).collect();
-    let Some(out) = Arc::get_mut(&mut pixels) else {
-        return Err(malformed("RGB surface is shared before it is filled"));
-    };
-    for (row, out_row) in (0..rendered.height as usize).zip(out.chunks_exact_mut(rgb_stride.max(1)))
-    {
-        let start = row
-            .checked_mul(rendered.stride)
-            .ok_or_else(|| malformed("renderer row offset overflow"))?;
-        let end = start
-            .checked_add(row_bytes)
-            .ok_or_else(|| malformed("renderer row end overflow"))?;
-        let row = rendered
-            .pixels
-            .get(start..end)
-            .ok_or_else(|| malformed("renderer returned a truncated RGBA surface"))?;
-        for (rgb, rgba) in out_row.chunks_exact_mut(3).zip(row.chunks_exact(4)) {
-            rgb.copy_from_slice(&rgba[..3]);
-        }
-    }
-    Ok(RgbSurface {
-        width: rendered.width,
-        height: rendered.height,
-        stride: rgb_stride,
-        pixels,
-    })
 }
 
 /// Resample a 0/255 opacity plane onto the target grid by exact area
@@ -1424,30 +1654,6 @@ mod tests {
         CodecParms, ImageColorSpace, ImageId, ImageIr, InterpolationMode, PageBounds, PaintId,
         Rect, ResourceKey,
     };
-
-    /// RGB8 output drops alpha from each pixel and skips any row padding the
-    /// renderer's stride carries; a truncated surface is an error, not a panic.
-    #[test]
-    fn rgb_surface_drops_alpha_and_row_padding() {
-        // 2x2 RGBA, stride 12 (one pixel of padding per row).
-        let pixels: Vec<u8> = (0u8..24).collect();
-        let host = HostPage {
-            width: 2,
-            height: 2,
-            stride: 12,
-            format: OutputFormat::Rgba8PremultipliedSrgb,
-            pixels: Arc::from(pixels),
-        };
-        let rgb = rgb_surface_from_rgba(&host, 0).unwrap();
-        assert_eq!(rgb.stride, 6);
-        assert_eq!(&*rgb.pixels, &[0, 1, 2, 4, 5, 6, 12, 13, 14, 16, 17, 18]);
-
-        let truncated = HostPage {
-            pixels: Arc::from(vec![0u8; 15]),
-            ..host
-        };
-        assert!(rgb_surface_from_rgba(&truncated, 0).is_err());
-    }
 
     fn eligible_page() -> CompiledPage {
         let smask = Arc::new(ImageSMask {

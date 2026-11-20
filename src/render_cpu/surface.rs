@@ -106,6 +106,47 @@ impl Surface {
         }
     }
 
+    /// A page surface whose every row the caller is about to overwrite (strips
+    /// copied in): `recycled` is reused as it is, without the pass over the
+    /// whole buffer that painting a background costs.
+    pub(crate) fn new_unpainted(width: usize, height: usize, recycled: Option<Arc<[u8]>>) -> Self {
+        let Some(pixels) = Self::checked_pixels(width, height) else {
+            return Self::empty();
+        };
+        let len = pixels * 4;
+        Self {
+            width,
+            height,
+            origin_x: 0,
+            origin_y: 0,
+            data: reuse(recycled, len).unwrap_or_else(|| zeroed_arc(len)),
+        }
+    }
+
+    /// The premultiplied RGBA bytes, row-major, `width * 4` per row.
+    pub(crate) fn pixels(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Consume the surface into tightly packed 8-bit RGB of exactly
+    /// `width * height * 3` bytes, in a buffer of its own. Both planes exist
+    /// while the copy runs (seven bytes per pixel); a page too large for
+    /// that is rendered in strips instead, each converted with
+    /// [`rgba_rows_to_rgb8`]. The surface's buffer comes back through
+    /// `parked` for reuse.
+    pub(crate) fn into_exact_rgb(self, parked: &mut Option<Arc<[u8]>>) -> (usize, Arc<[u8]>) {
+        let mut rgb = zeroed_arc(self.width * self.height * 3);
+        rgba_rows_to_rgb8(&self.data, unique_arc_mut(&mut rgb));
+        let stride = self.width * 3;
+        *parked = Some(self.data);
+        (stride, rgb)
+    }
+
+    /// Give up the pixel buffer, to hand back through [`Self::new_recycled`].
+    pub(crate) fn into_buffer(self) -> Arc<[u8]> {
+        self.data
+    }
+
     /// Allocate a transparent offscreen surface covering `bounds` (device
     /// space) — for an isolated transparency group.
     pub fn offscreen(bounds: DeviceRect) -> Self {
@@ -233,12 +274,32 @@ impl Surface {
         self.into_output_recycling(format, &mut None)
     }
 
-    /// [`Surface::into_output`], additionally parking this surface's buffer in
-    /// `pool` so the next render of the same geometry can repaint it in place
-    /// instead of faulting in a fresh mapping. For the RGBA format the parked
-    /// handle is a second `Arc` on the *returned* buffer, so the pool never
-    /// keeps a page alive past its consumer: reuse is granted only once that
-    /// consumer has dropped it (see [`reuse`]).
+    /// Consume the surface into tightly packed 8-bit RGB **inside its own
+    /// buffer**: pixel `i` moves from bytes `4i..4i+3` to `3i..3i+3`, front to
+    /// back, so a write never passes an unread pixel. Returns `(stride,
+    /// pixels)` with `stride = width * 3`; the buffer keeps its RGBA length,
+    /// so the last quarter is unspecified. No second plane exists at any
+    /// point, where converting into a fresh RGB buffer holds seven bytes per
+    /// pixel at the instant of the copy. The alpha byte is dropped exactly as
+    /// the copying conversion drops it.
+    pub(crate) fn into_packed_rgb(mut self, parked: &mut Option<Arc<[u8]>>) -> (usize, Arc<[u8]>) {
+        let data = unique_arc_mut(&mut self.data);
+        for pixel in 1..data.len() / 4 {
+            let (src, dst) = (pixel * 4, pixel * 3);
+            data[dst] = data[src];
+            data[dst + 1] = data[src + 1];
+            data[dst + 2] = data[src + 2];
+        }
+        *parked = Some(Arc::clone(&self.data));
+        (self.width * 3, self.data)
+    }
+
+    /// [`Surface::into_output`], additionally handing this surface's buffer
+    /// back through `parked` so the caller can pool it ([`SurfacePool`]) and a
+    /// later render of the same geometry can repaint it in place instead of
+    /// faulting in a fresh mapping. For the RGBA format the handle is a second
+    /// `Arc` on the *returned* buffer: it is reused only once the consumer has
+    /// dropped the page (see [`reuse`]).
     #[allow(
         unsafe_code,
         reason = "Arc::new_uninit_slice hands back MaybeUninit; see SAFETY comment"
@@ -246,45 +307,123 @@ impl Surface {
     pub(crate) fn into_output_recycling(
         self,
         format: OutputFormat,
-        pool: &mut Option<Arc<[u8]>>,
+        parked: &mut Option<Arc<[u8]>>,
     ) -> (usize, Arc<[u8]>) {
         match format {
             OutputFormat::Rgba8PremultipliedSrgb => {
-                park(pool, Arc::clone(&self.data));
+                *parked = Some(Arc::clone(&self.data));
                 (self.width * 4, self.data)
             }
             OutputFormat::Gray8 => {
                 let pixels = self.width * self.height;
-                // `zip` stops at the shorter side. The RGBA buffer is exactly
-                // four bytes per output pixel by construction, so the two
-                // lengths agree — but "the invariant holds" is not something
-                // `assume_init` may be asked to take on trust: a short buffer
-                // would leave a tail of `out` uninitialized and reading it is
-                // UB, not a panic. Count what was written and initialize any
-                // remainder explicitly, so soundness does not depend on the
-                // invariant at all.
                 debug_assert_eq!(self.data.len(), pixels * 4);
-                let mut out = Arc::<[u8]>::new_uninit_slice(pixels);
-                let out_mut = unique_arc_mut(&mut out);
-                let mut written = 0usize;
-                for (dst, px) in out_mut.iter_mut().zip(self.data.chunks_exact(4)) {
-                    dst.write(gray8_luma(px[0], px[1], px[2]));
-                    written += 1;
-                }
-                for dst in &mut out_mut[written..] {
-                    dst.write(0);
-                }
-                // SAFETY: the loop initialized `out[..written]` and the fill
-                // above initialized `out[written..]`, so every element of
-                // `out` is initialized regardless of the source length.
-                let gray = unsafe { out.assume_init() };
+                // Zero pages until written, so nothing is passed over twice
+                // and a short source (which the invariant above rules out)
+                // would leave zeros, never uninitialized bytes.
+                let mut gray = zeroed_arc(pixels);
+                rgba_rows_to_gray8(
+                    &self.data,
+                    unique_arc_mut(&mut gray),
+                    crate::render_cpu::exec::output_fan_out(),
+                );
                 let width = self.width;
                 // The RGBA buffer is not the returned page here, so it can be
                 // parked outright — nothing else holds it.
-                park(pool, self.data);
+                *parked = Some(self.data);
                 (width, gray)
             }
         }
+    }
+}
+
+/// Convert premultiplied RGBA pixels to Gray8, one byte each: the Gray8
+/// output conversion, for a whole surface or for rows painted on a strip and
+/// written straight into the page's gray buffer. Stops at the shorter slice.
+///
+/// Every byte equals [`gray8_luma`] of its pixel
+/// (`gray8_rows_match_the_float_luma_on_every_input`). The float form made
+/// converting a 600 dpi page take several times as long as rendering its
+/// text (about 45 ms of a 54 ms page); the integer form here measured half
+/// the page time on one thread.
+///
+/// With `fan_out` a large conversion is split across the rayon pool; pixels
+/// are independent, so the bytes do not depend on it.
+pub(crate) fn rgba_rows_to_gray8(rgba: &[u8], gray: &mut [u8], fan_out: bool) {
+    /// Pixels per task, and the least that is worth splitting.
+    const TASK: usize = 1 << 16;
+    if fan_out && gray.len() >= 4 * TASK {
+        use rayon::prelude::*;
+        gray.par_chunks_mut(TASK)
+            .zip(rgba.par_chunks(TASK * 4))
+            .for_each(|(gray, rgba)| gray8_rows_best(rgba, gray));
+    } else {
+        gray8_rows_best(rgba, gray);
+    }
+}
+
+/// [`gray8_rows`] in the widest build this CPU runs.
+#[allow(
+    unsafe_code,
+    reason = "dispatches the AVX2 build of the same safe loop behind a runtime probe"
+)]
+fn gray8_rows_best(rgba: &[u8], gray: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 was just detected on this CPU.
+        return unsafe { gray8_rows_avx2(rgba, gray) };
+    }
+    gray8_rows(rgba, gray);
+}
+
+/// [`gray8_rows`] compiled for AVX2. Same code, wider vectors.
+///
+/// # Safety
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+unsafe fn gray8_rows_avx2(rgba: &[u8], gray: &mut [u8]) {
+    gray8_rows(rgba, gray);
+}
+
+/// The Gray8 conversion in integers.
+///
+/// The luma is `(2126 r + 7152 g + 722 b) / 10000` in real numbers, and
+/// [`gray8_luma`] evaluates it in `f32` and rounds half away from zero. The
+/// two agree whenever the real value is not exactly halfway between two
+/// integers: the numerator is even, so its remainder modulo 10000 is at
+/// least 2 away from 5000, 0.0002 in the quotient, while the `f32` evaluation
+/// is off by well under 0.0001. On an exact half the `f32` rounding error
+/// decides which way the float form goes, and no integer rule reproduces
+/// that; such a pixel is rare (one colour in five thousand), so a block that
+/// contains one is redone with the float form. Blocks keep the common case
+/// free of a per-pixel branch.
+#[inline(always)]
+fn gray8_rows(rgba: &[u8], gray: &mut [u8]) {
+    const BLOCK: usize = 64;
+    for (dst, src) in gray.chunks_mut(BLOCK).zip(rgba.chunks(BLOCK * 4)) {
+        let mut halves = 0u32;
+        for (out, px) in dst.iter_mut().zip(src.chunks_exact(4)) {
+            let sum = 2126 * u32::from(px[0]) + 7152 * u32::from(px[1]) + 722 * u32::from(px[2]);
+            let whole = sum / 10_000;
+            let rest = sum - whole * 10_000;
+            halves |= u32::from(rest == 5_000);
+            // At most 255: the three weights add up to 10000.
+            *out = (whole + u32::from(rest > 5_000)) as u8;
+        }
+        if halves != 0 {
+            for (out, px) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                *out = gray8_luma(px[0], px[1], px[2]);
+            }
+        }
+    }
+}
+
+/// Copy premultiplied RGBA pixels to packed RGB, dropping the alpha byte.
+/// Stops at the shorter slice.
+pub(crate) fn rgba_rows_to_rgb8(rgba: &[u8], rgb: &mut [u8]) {
+    for (dst, px) in rgb.chunks_exact_mut(3).zip(rgba.chunks_exact(4)) {
+        dst.copy_from_slice(&px[..3]);
     }
 }
 
@@ -357,72 +496,124 @@ fn paint_background(buf: &mut [u8], background: Background) {
     }
 }
 
-/// Extra parked-surface slots kept per thread beside the worker context's own
-/// slot (so three sizes in all). A document processor renders one page at an analysis
-/// size, the base size and an OCR size on the same thread in turn; a single
-/// slot missed on every alternation. `CpuWorkerContext::surface_buffer` stays
-/// the most-recently-parked slot; displaced buffers of a different size move
-/// here. Parked buffers are repainted in full before use, so which slot
-/// supplies a buffer never changes output bytes.
-const SPARE_SLOTS: usize = 2;
-/// Larger buffers are not retained in the spare slots.
-const SPARE_MAX_BYTES: usize = 128 << 20;
+/// Default byte cap of a backend's [`SurfacePool`].
+pub(crate) const SURFACE_POOL_BYTES: usize = 256 << 20;
 
-thread_local! {
-    static SPARE: std::cell::RefCell<Vec<Arc<[u8]>>> = const { std::cell::RefCell::new(Vec::new()) };
+/// Distinct buffer sizes a [`SurfacePool`] keeps: the three most recently
+/// parked. A document processor renders a page at an analysis size, the base
+/// size and an OCR size in turn, and those must all stay; but the pages of a
+/// scanned book each have their own size, and without this bound the pool
+/// filled to its cap with buffers that were never asked for again (eight
+/// pages of a 300 dpi scan kept 150 MB parked where three slots kept 57 MB).
+const POOL_SIZES: usize = 3;
+
+/// Page buffers of finished renders, kept so the next render of the same
+/// geometry repaints resident memory instead of faulting in a fresh mapping.
+///
+/// One pool per backend, shared by every thread that renders through it, so
+/// the buffers live and die with the backend (one document render session).
+/// They used to be parked per thread — one slot in each worker context plus
+/// two more sizes in a thread-local — which no byte limit covered and which
+/// outlived the session on every pool thread that had served it: twenty
+/// threads at 300 dpi kept 670 MB parked after the last page. Any thread can
+/// take any free buffer here, so the pool gives at least the hits the
+/// per-thread slots did while it is under its cap.
+///
+/// A parked buffer may still be held by the consumer of the page it carried;
+/// it is handed out only once this pool is its sole owner. Parked buffers are
+/// repainted in full before use, so which one a render gets never changes
+/// output bytes.
+#[derive(Debug)]
+pub(crate) struct SurfacePool {
+    cap_bytes: usize,
+    /// Oldest first.
+    parked: std::sync::Mutex<Vec<Arc<[u8]>>>,
 }
 
 static SLOT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SLOT_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Process-wide `(hits, misses)` of parked-surface lookups (a hit found a
-/// parked buffer of the wanted size, in any slot; ownership is checked later).
+/// Process-wide `(hits, misses)` of parked-surface lookups (a hit handed out a
+/// parked buffer of the wanted size).
 pub fn surface_slot_stats() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (SLOT_HITS.load(Relaxed), SLOT_MISSES.load(Relaxed))
 }
 
-/// Park `buf` in `pool` (the most-recent slot), moving a displaced buffer of a
-/// different size into the thread's spare slots.
-pub(crate) fn park(pool: &mut Option<Arc<[u8]>>, buf: Arc<[u8]>) {
-    if let Some(old) = pool.replace(buf) {
-        let new_len = pool.as_ref().map_or(0, |b| b.len());
-        if old.len() != new_len && old.len() <= SPARE_MAX_BYTES {
-            SPARE.with(|s| {
-                let mut s = s.borrow_mut();
-                // A spare of the displaced size is stale: replace it.
-                s.retain(|b| b.len() != old.len());
-                if s.len() >= SPARE_SLOTS {
-                    s.remove(0);
-                }
-                s.push(old);
-            });
+impl SurfacePool {
+    pub(crate) fn new(cap_bytes: usize) -> Self {
+        Self {
+            cap_bytes,
+            parked: std::sync::Mutex::new(Vec::new()),
         }
     }
-}
 
-/// Take a parked buffer for a `width x height` surface from `pool` or the
-/// spare slots, if one of exactly that size is parked.
-pub(crate) fn take_recycled(
-    pool: &mut Option<Arc<[u8]>>,
-    width: usize,
-    height: usize,
-) -> Option<Arc<[u8]>> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let found = match Surface::checked_pixels(width, height).map(|p| p * 4) {
-        None => None,
-        Some(len) if pool.as_ref().is_some_and(|b| b.len() == len) => pool.take(),
-        Some(len) => SPARE.with(|s| {
-            let mut s = s.borrow_mut();
-            let i = s.iter().position(|b| b.len() == len)?;
-            Some(s.remove(i))
-        }),
-    };
-    match found {
-        Some(_) => SLOT_HITS.fetch_add(1, Relaxed),
-        None => SLOT_MISSES.fetch_add(1, Relaxed),
-    };
-    found
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Arc<[u8]>>> {
+        // A poisoned lock only means another render panicked while holding
+        // it; the list of buffers is still a valid list.
+        self.parked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Take a parked buffer for a `width x height` surface, if one of exactly
+    /// that size is parked and no consumer still holds it.
+    pub(crate) fn take(&self, width: usize, height: usize) -> Option<Arc<[u8]>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let found = Surface::checked_pixels(width, height)
+            .map(|pixels| pixels * 4)
+            .and_then(|len| {
+                let mut parked = self.lock();
+                // Most recently parked first: the likeliest to be resident.
+                let index = parked
+                    .iter()
+                    .rposition(|buf| buf.len() == len && Arc::strong_count(buf) == 1)?;
+                Some(parked.remove(index))
+            });
+        match found {
+            Some(_) => SLOT_HITS.fetch_add(1, Relaxed),
+            None => SLOT_MISSES.fetch_add(1, Relaxed),
+        };
+        found
+    }
+
+    /// Park `buf`, dropping the oldest parked buffers beyond the byte cap. A
+    /// buffer larger than the whole cap is not retained.
+    pub(crate) fn park(&self, buf: Arc<[u8]>) {
+        if buf.len() > self.cap_bytes {
+            return;
+        }
+        let mut parked = self.lock();
+        parked.push(buf);
+        let mut sizes = [0usize; POOL_SIZES];
+        let mut kept = 0;
+        for buf in parked.iter().rev() {
+            if kept < POOL_SIZES && !sizes[..kept].contains(&buf.len()) {
+                sizes[kept] = buf.len();
+                kept += 1;
+            }
+        }
+        parked.retain(|buf| sizes[..kept].contains(&buf.len()));
+        let mut total: usize = parked.iter().map(|buf| buf.len()).sum();
+        while total > self.cap_bytes && parked.len() > 1 {
+            total -= parked.remove(0).len();
+        }
+    }
+
+    /// Drop every parked buffer.
+    pub(crate) fn clear(&self) {
+        self.lock().clear();
+    }
+
+    /// Bytes this pool keeps alive on its own account (buffers no consumer
+    /// holds any more).
+    pub(crate) fn idle_bytes(&self) -> usize {
+        self.lock()
+            .iter()
+            .filter(|buf| Arc::strong_count(buf) == 1)
+            .map(|buf| buf.len())
+            .sum()
+    }
 }
 
 /// Accept a recycled buffer only when it is exactly the size wanted and this
@@ -546,6 +737,51 @@ mod tests {
         }
     }
 
+    /// The integer Gray8 kernel must equal the float luma on every (r, g, b),
+    /// in whatever position of a block the pixel falls and whichever build
+    /// of the kernel this CPU selects. Rows of 256 pixels put every blue
+    /// value of one (r, g) through four blocks, the exact halves among them.
+    #[test]
+    fn gray8_rows_match_the_float_luma_on_every_input() {
+        let mut rgba = vec![0u8; 256 * 4];
+        let mut got = vec![0u8; 256];
+        let mut plain = vec![0u8; 256];
+        let mut halves = 0u32;
+        for r in 0..=255u8 {
+            for g in 0..=255u8 {
+                for (b, px) in rgba.chunks_exact_mut(4).enumerate() {
+                    px.copy_from_slice(&[r, g, b as u8, 255]);
+                    let sum = 2126 * u32::from(r) + 7152 * u32::from(g) + 722 * b as u32;
+                    halves += u32::from(sum % 10_000 == 5_000);
+                }
+                rgba_rows_to_gray8(&rgba, &mut got, false);
+                gray8_rows(&rgba, &mut plain);
+                for (b, (&got, &plain)) in got.iter().zip(&plain).enumerate() {
+                    let want = gray8_luma(r, g, b as u8);
+                    assert_eq!(got, want, "rgb ({r}, {g}, {b})");
+                    assert_eq!(plain, want, "rgb ({r}, {g}, {b}), baseline build");
+                }
+            }
+        }
+        // The fallback was exercised: these are the inputs it exists for.
+        assert!(halves > 1_000, "{halves} exact halves");
+        // A ragged tail and a short destination.
+        let rgba: Vec<u8> = (0..4 * 77).map(|i| (i * 37 % 251) as u8).collect();
+        let mut got = vec![7u8; 70];
+        rgba_rows_to_gray8(&rgba, &mut got, false);
+        for (i, &got) in got.iter().enumerate() {
+            let px = &rgba[i * 4..];
+            assert_eq!(got, gray8_luma(px[0], px[1], px[2]), "pixel {i}");
+        }
+        // Split across the pool, with a ragged last task: the same bytes.
+        let pixels = (5 << 16) + 123;
+        let rgba: Vec<u8> = (0..pixels * 4).map(|i| (i * 131 % 253) as u8).collect();
+        let (mut serial, mut split) = (vec![0u8; pixels], vec![0u8; pixels]);
+        rgba_rows_to_gray8(&rgba, &mut serial, false);
+        rgba_rows_to_gray8(&rgba, &mut split, true);
+        assert!(serial == split);
+    }
+
     #[test]
     fn into_output_parks_the_buffer_for_the_next_render() {
         let mut pool = None;
@@ -575,12 +811,12 @@ mod tests {
     fn alternating_sizes_reuse_their_parked_buffers() {
         // Alternate three sizes the way analysis/base/OCR renders do.
         let sizes = [(5usize, 4usize), (9, 7), (3, 2)];
-        let mut pool = None;
+        let pool = SurfacePool::new(SURFACE_POOL_BYTES);
         let mut addrs = [None; 3];
         let (h0, m0) = surface_slot_stats();
         for round in 0..4 {
             for (i, &(w, h)) in sizes.iter().enumerate() {
-                let recycled = take_recycled(&mut pool, w, h);
+                let recycled = pool.take(w, h);
                 if round == 0 {
                     assert!(recycled.is_none());
                 } else {
@@ -590,7 +826,9 @@ mod tests {
                 let surface = Surface::new_recycled(w, h, Background::White, recycled);
                 addrs[i].get_or_insert(Arc::as_ptr(&surface.data));
                 assert_eq!(Arc::as_ptr(&surface.data), addrs[i].unwrap());
-                let (_, out) = surface.into_output_recycling(OutputFormat::Gray8, &mut pool);
+                let mut parked = None;
+                let (_, out) = surface.into_output_recycling(OutputFormat::Gray8, &mut parked);
+                pool.park(parked.unwrap());
                 assert_eq!(out.len(), w * h);
             }
         }
@@ -598,8 +836,81 @@ mod tests {
         assert!(h1 - h0 >= 9 && m1 - m0 >= 3);
         // Recycled output is identical to a fresh surface.
         let fresh = Surface::new(9, 7, Background::White);
-        let again = Surface::new_recycled(9, 7, Background::White, take_recycled(&mut pool, 9, 7));
+        let again = Surface::new_recycled(9, 7, Background::White, pool.take(9, 7));
         assert_eq!(fresh.data, again.data);
+    }
+
+    #[test]
+    fn the_pool_keeps_no_more_than_its_cap_and_never_lends_a_held_buffer() {
+        // Room for two 4x4 RGBA buffers (64 bytes each).
+        let pool = SurfacePool::new(128);
+        let page = |w: usize, h: usize| {
+            let surface = Surface::new(w, h, Background::White);
+            let mut parked = None;
+            let (_, pixels) =
+                surface.into_output_recycling(OutputFormat::Rgba8PremultipliedSrgb, &mut parked);
+            (pixels, parked.unwrap())
+        };
+        // Still held by its consumer: parked, but not lent out and not idle.
+        let (held, handle) = page(4, 4);
+        pool.park(handle);
+        assert!(pool.take(4, 4).is_none());
+        assert_eq!(pool.idle_bytes(), 0);
+        drop(held);
+        assert_eq!(pool.idle_bytes(), 64);
+        // A third buffer pushes the oldest out; the cap holds.
+        for _ in 0..2 {
+            let (pixels, handle) = page(4, 4);
+            drop(pixels);
+            pool.park(handle);
+        }
+        assert_eq!(pool.idle_bytes(), 128);
+        // Larger than the whole cap: not retained at all.
+        let (pixels, handle) = page(8, 8);
+        drop(pixels);
+        pool.park(handle);
+        assert_eq!(pool.idle_bytes(), 128);
+        assert!(pool.take(8, 8).is_none());
+        assert!(pool.take(4, 4).is_some());
+        pool.clear();
+        assert_eq!(pool.idle_bytes(), 0);
+
+        // Only the three most recently parked sizes stay: a run of pages that
+        // each have their own size does not fill the pool.
+        let pool = SurfacePool::new(usize::MAX);
+        for side in 1..=6usize {
+            let (pixels, handle) = page(side, side);
+            drop(pixels);
+            pool.park(handle);
+        }
+        assert_eq!(pool.idle_bytes(), (16 + 25 + 36) * 4);
+        assert!(pool.take(3, 3).is_none());
+        assert!(pool.take(5, 5).is_some());
+    }
+
+    #[test]
+    fn packing_rgb_in_place_matches_dropping_alpha_into_a_copy() {
+        let (w, h) = (7usize, 5usize);
+        let mut surface = Surface::new(w, h, Background::White);
+        for y in 0..h {
+            for (x, px) in surface.row_mut(y).chunks_exact_mut(4).enumerate() {
+                px.copy_from_slice(&[(x * 31 + y) as u8, (y * 17) as u8, (x ^ y) as u8, 255]);
+            }
+        }
+        let expected: Vec<u8> = surface
+            .data
+            .chunks_exact(4)
+            .flat_map(|px| [px[0], px[1], px[2]])
+            .collect();
+        let allocation = Arc::as_ptr(&surface.data);
+        let mut parked = None;
+        let (stride, pixels) = surface.into_packed_rgb(&mut parked);
+        assert_eq!(stride, w * 3);
+        assert_eq!(Arc::as_ptr(&pixels), allocation, "no second buffer");
+        assert_eq!(&pixels[..w * h * 3], &expected[..]);
+        // The parked handle is the same buffer, reusable once the page is dropped.
+        drop(pixels);
+        assert!(reuse(parked, w * h * 4).is_some());
     }
 
     #[test]

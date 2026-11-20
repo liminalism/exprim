@@ -142,6 +142,7 @@ fn slow_first_page_bounds_reorder_admission_without_deadlock() {
             render_workers: 3,
             compiled_queue_depth: 3,
             reorder_window_depth: 3,
+            reorder_backlog_bytes: SchedulerOptions::DEFAULT_REORDER_BACKLOG_BYTES,
             memory_limit_bytes: 1 << 30,
         },
     );
@@ -248,6 +249,7 @@ fn six_pages_compile_and_render_concurrently_in_order() {
         render_workers: 6,
         compiled_queue_depth: 6,
         reorder_window_depth: 6,
+        reorder_backlog_bytes: SchedulerOptions::DEFAULT_REORDER_BACKLOG_BYTES,
         memory_limit_bytes: 1 << 30,
     };
     let scheduler = RenderScheduler::new(backend.clone(), opts);
@@ -290,6 +292,7 @@ fn output_is_deterministic_across_worker_counts() {
             render_workers: rw,
             compiled_queue_depth: 4,
             reorder_window_depth: 4,
+            reorder_backlog_bytes: SchedulerOptions::DEFAULT_REORDER_BACKLOG_BYTES,
             memory_limit_bytes: 1 << 30,
         };
         collect(&RenderScheduler::new(backend, opts), &snap, 8, &make, None)
@@ -318,6 +321,7 @@ fn one_page_failure_does_not_affect_others() {
         render_workers: 4,
         compiled_queue_depth: 4,
         reorder_window_depth: 4,
+        reorder_backlog_bytes: SchedulerOptions::DEFAULT_REORDER_BACKLOG_BYTES,
         memory_limit_bytes: 1 << 30,
     };
     let out = collect(&RenderScheduler::new(backend, opts), &snap, 5, &make, None);
@@ -348,6 +352,7 @@ fn backend_panic_on_one_page_is_isolated() {
         render_workers: 4,
         compiled_queue_depth: 4,
         reorder_window_depth: 4,
+        reorder_backlog_bytes: SchedulerOptions::DEFAULT_REORDER_BACKLOG_BYTES,
         memory_limit_bytes: 1 << 30,
     };
     let out = collect(&RenderScheduler::new(backend, opts), &snap, 4, &make, None);
@@ -388,6 +393,7 @@ fn pipeline_token_is_injected_into_backend_requests() {
         render_workers: 2,
         compiled_queue_depth: 2,
         reorder_window_depth: 2,
+        reorder_backlog_bytes: SchedulerOptions::DEFAULT_REORDER_BACKLOG_BYTES,
         memory_limit_bytes: 1 << 30,
     };
     let token = CancellationToken::new(); // live — never cancelled
@@ -497,6 +503,7 @@ fn cancellation_stops_the_pipeline() {
         render_workers: 2,
         compiled_queue_depth: 2,
         reorder_window_depth: 2,
+        reorder_backlog_bytes: SchedulerOptions::DEFAULT_REORDER_BACKLOG_BYTES,
         memory_limit_bytes: 1 << 30,
     };
     let token = CancellationToken::new();
@@ -521,4 +528,424 @@ fn cancellation_stops_the_pipeline() {
             "cancelled: {r:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reorder backlog bound in bytes
+// ---------------------------------------------------------------------------
+
+/// Finished-but-unemitted surface bytes, as the outside world sees them: the
+/// backend adds a page's bytes the moment it has finished rendering it, and
+/// the caller's `emit` subtracts them once it has consumed the page.
+#[derive(Debug, Default)]
+struct Backlog {
+    bytes: std::sync::atomic::AtomicU64,
+    peak: std::sync::atomic::AtomicU64,
+}
+
+impl Backlog {
+    fn add(&self, n: u64) {
+        let now = self.bytes.fetch_add(n, Ordering::SeqCst) + n;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+    }
+    fn sub(&self, n: u64) {
+        self.bytes.fetch_sub(n, Ordering::SeqCst);
+    }
+    fn peak(&self) -> u64 {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+/// Renders a `width x 1` RGBA surface, holding the page whose width is
+/// `slow_width` for `slow` and every other page for `fast`.
+#[derive(Debug)]
+struct SizedBackend {
+    slow_width: Option<u32>,
+    slow: Duration,
+    fast: Duration,
+    backlog: Arc<Backlog>,
+}
+
+impl RenderBackend for SizedBackend {
+    fn id(&self) -> BackendId {
+        BackendId::Other(3)
+    }
+    fn capabilities(&self) -> BackendCapabilities {
+        MockBackend::default().capabilities()
+    }
+    fn supports(&self, _: &exprim::page_ir::CompiledPage, _: &RenderRequest) -> SupportLevel {
+        SupportLevel::Native
+    }
+    fn submit(&self, request: RenderRequest) -> Result<RenderTicket, SubmitError> {
+        let (ticket, tx) = RenderTicket::new(0);
+        let w = request.output_size.width;
+        std::thread::sleep(if self.slow_width == Some(w) {
+            self.slow
+        } else {
+            self.fast
+        });
+        let pixels: Arc<[u8]> = Arc::from(vec![0u8; w as usize * 4]);
+        self.backlog.add(pixels.len() as u64);
+        let host = HostPage {
+            width: w,
+            height: 1,
+            stride: w as usize * 4,
+            format: OutputFormat::Rgba8PremultipliedSrgb,
+            pixels,
+        };
+        let _ = tx.send(Ok(RenderedPage::Host(host)));
+        Ok(ticket)
+    }
+}
+
+/// Page `n` renders at width `100 + n`: 400 + 4n surface bytes.
+fn sized_requester(
+    snapshot: &DocumentSnapshot,
+    page: PageIndex,
+) -> Result<RenderRequest, RenderError> {
+    let mut ctx = ParseContext::new();
+    let compiled = exprim::content::PageCompiler::new()
+        .compile(snapshot, page, &mut ctx)
+        .map_err(|e| RenderError::Backend(e.to_string()))?;
+    Ok(RenderRequest {
+        page: Arc::new(compiled),
+        transform: PageTransform {
+            matrix: Matrix::IDENTITY,
+        },
+        crop: None,
+        output_size: DeviceSize {
+            width: 100 + page.0,
+            height: 1,
+        },
+        output_format: OutputFormat::Rgba8PremultipliedSrgb,
+        background: Background::White,
+        annotations: AnnotationMode::None,
+        color_policy: exprim::render_api::RenderColorPolicy::Original,
+        quality: RenderQuality::Normal,
+        limits: RenderLimits::default(),
+        residency: OutputResidency::HostRequired,
+    })
+}
+
+/// Run `pages` pages with page 0 held for `slow_first`, returning the
+/// in-order `(page, width)` pairs and the peak backlog. `emit_delay` slows
+/// the caller's consumer down.
+fn run_backlog(
+    pages: u32,
+    render_workers: usize,
+    backlog_limit: u64,
+    slow_first: Duration,
+    emit_delay: Duration,
+) -> (Vec<(u32, u32)>, u64) {
+    let snap = snapshot(pages);
+    let backlog = Arc::new(Backlog::default());
+    let backend = Arc::new(SizedBackend {
+        slow_width: Some(100),
+        slow: slow_first,
+        fast: Duration::from_millis(1),
+        backlog: backlog.clone(),
+    });
+    let scheduler = RenderScheduler::new(
+        backend,
+        SchedulerOptions {
+            compile_workers: 2,
+            render_workers,
+            compiled_queue_depth: 4,
+            // Wide open: the page-count window alone would let every page
+            // finish behind the slow head.
+            reorder_window_depth: 128,
+            reorder_backlog_bytes: backlog_limit,
+            memory_limit_bytes: 1 << 30,
+        },
+    );
+    let mut out = Vec::new();
+    scheduler.render_range(&snap, 0..pages, &sized_requester, None, &mut |o| {
+        let Ok(RenderedPage::Host(host)) = o.result else {
+            panic!("page {} failed: {:?}", o.page.0, o.result.err());
+        };
+        std::thread::sleep(emit_delay);
+        out.push((o.page.0, host.width));
+        backlog.sub(host.pixels.len() as u64);
+    });
+    (out, backlog.peak())
+}
+
+fn assert_all_in_order(out: &[(u32, u32)], pages: u32) {
+    assert_eq!(
+        out.iter().map(|(page, _)| *page).collect::<Vec<_>>(),
+        (0..pages).collect::<Vec<_>>()
+    );
+    for (page, width) in out {
+        assert_eq!(*width, 100 + page, "page {page} carries its own surface");
+    }
+}
+
+#[test]
+fn slow_first_page_backlog_is_bounded_in_bytes() {
+    const PAGES: u32 = 40;
+    const WORKERS: usize = 3;
+    const LIMIT: u64 = 1_000; // about two surfaces
+    let largest = u64::from(100 + PAGES - 1) * 4;
+
+    let (out, peak) = run_backlog(
+        PAGES,
+        WORKERS,
+        LIMIT,
+        Duration::from_millis(300),
+        Duration::ZERO,
+    );
+    assert_all_in_order(&out, PAGES);
+    // Out-of-order pages stop starting once the finished backlog reaches the
+    // limit; pages already rendering at that moment (at most one per worker)
+    // still finish into it.
+    let bound = LIMIT + WORKERS as u64 * largest;
+    assert!(peak <= bound, "backlog peaked at {peak} B, bound {bound} B");
+
+    // The same run with only the page-count window lets (nearly) every page
+    // finish behind the slow head, which is what the byte bound prevents.
+    let (out, unbounded_peak) = run_backlog(
+        PAGES,
+        WORKERS,
+        u64::MAX,
+        Duration::from_millis(300),
+        Duration::ZERO,
+    );
+    assert_all_in_order(&out, PAGES);
+    assert!(
+        unbounded_peak > bound,
+        "the scenario must overflow without the byte bound: {unbounded_peak} B"
+    );
+}
+
+#[test]
+fn a_slow_consumer_is_throttled_by_the_backlog_bound() {
+    const PAGES: u32 = 30;
+    const WORKERS: usize = 3;
+    const LIMIT: u64 = 1_000;
+    let largest = u64::from(100 + PAGES - 1) * 4;
+    // No slow page: here the caller's `emit` is the bottleneck.
+    let (out, peak) = run_backlog(
+        PAGES,
+        WORKERS,
+        LIMIT,
+        Duration::from_millis(1),
+        Duration::from_millis(8),
+    );
+    assert_all_in_order(&out, PAGES);
+    // One more surface than the slow-head case: the page inside `emit` still
+    // counts until `emit` returns.
+    let bound = LIMIT + (WORKERS as u64 + 1) * largest;
+    assert!(peak <= bound, "backlog peaked at {peak} B, bound {bound} B");
+}
+
+#[test]
+fn a_zero_byte_limit_still_drains_every_page_in_order() {
+    // The head-of-line page is always admitted and an empty backlog admits
+    // any page, so even a limit no surface fits makes progress: it degrades
+    // to rendering ahead only while nothing is waiting.
+    for (pages, workers) in [(25, 1), (25, 4), (60, 8)] {
+        let (out, _) = run_backlog(pages, workers, 0, Duration::from_millis(20), Duration::ZERO);
+        assert_all_in_order(&out, pages);
+    }
+}
+
+#[test]
+fn a_tiny_byte_limit_drains_with_cancellation_and_failures() {
+    // Cancelled mid-run with a limit of one byte: every page still produces
+    // exactly one result, in order, and nothing deadlocks.
+    let snap = snapshot(30);
+    let backend = Arc::new(SizedBackend {
+        slow_width: Some(100),
+        slow: Duration::from_millis(50),
+        fast: Duration::from_millis(1),
+        backlog: Arc::new(Backlog::default()),
+    });
+    let scheduler = RenderScheduler::new(
+        backend,
+        SchedulerOptions {
+            compile_workers: 2,
+            render_workers: 4,
+            compiled_queue_depth: 2,
+            reorder_window_depth: 64,
+            reorder_backlog_bytes: 1,
+            memory_limit_bytes: 1 << 30,
+        },
+    );
+    let token = CancellationToken::new();
+    let fail_page = 7;
+    let make = |s: &DocumentSnapshot, page: PageIndex| {
+        if page.0 == fail_page {
+            return Err(RenderError::Backend("intentional compile failure".into()));
+        }
+        sized_requester(s, page)
+    };
+    let mut seen = Vec::new();
+    scheduler.render_range(&snap, 0..30, &make, Some(&token), &mut |o| {
+        if o.page.0 == 10 {
+            token.cancel();
+        }
+        seen.push((o.page.0, o.result.is_ok()));
+    });
+    assert_eq!(
+        seen.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+        (0..30).collect::<Vec<_>>()
+    );
+    assert!(!seen[fail_page as usize].1, "the failed page is an error");
+    assert!(
+        seen[..7].iter().all(|(_, ok)| *ok),
+        "pages before it rendered"
+    );
+    assert_eq!(scheduler.budget().in_use(), 0);
+}
+
+#[test]
+fn a_panicking_consumer_unwinds_out_of_the_pipeline_instead_of_hanging() {
+    // Workers may be parked waiting for backlog room or for emission credits
+    // when the caller's `emit` panics; all of them must be released so the
+    // panic reaches the caller.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let snap = snapshot(30);
+        let backend = Arc::new(SizedBackend {
+            slow_width: Some(100),
+            slow: Duration::from_millis(30),
+            fast: Duration::from_millis(1),
+            backlog: Arc::new(Backlog::default()),
+        });
+        let scheduler = RenderScheduler::new(
+            backend,
+            SchedulerOptions {
+                compile_workers: 2,
+                render_workers: 3,
+                compiled_queue_depth: 2,
+                reorder_window_depth: 8,
+                reorder_backlog_bytes: 1,
+                memory_limit_bytes: 1 << 30,
+            },
+        );
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scheduler.render_range(&snap, 0..30, &sized_requester, None, &mut |o| {
+                if o.page.0 == 3 {
+                    panic!("consumer failed on page 3");
+                }
+            });
+        }));
+        let _ = done_tx.send(outcome.is_err());
+    });
+    let panicked = done_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("render_range returned instead of hanging");
+    assert!(panicked, "the consumer's panic propagates");
+}
+
+/// Holds every job for a moment and records how many it held at once. With
+/// `working` set it reports that many bytes of working surface, as a backend
+/// that paints a page strip by strip does.
+#[derive(Debug)]
+struct StripBackend {
+    working: Option<u64>,
+    live: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl RenderBackend for StripBackend {
+    fn id(&self) -> BackendId {
+        BackendId::Other(4)
+    }
+    fn capabilities(&self) -> BackendCapabilities {
+        MockBackend::default().capabilities()
+    }
+    fn supports(&self, _: &exprim::page_ir::CompiledPage, _: &RenderRequest) -> SupportLevel {
+        SupportLevel::Native
+    }
+    fn submit(&self, request: RenderRequest) -> Result<RenderTicket, SubmitError> {
+        let (ticket, tx) = RenderTicket::new(0);
+        let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(40));
+        self.live.fetch_sub(1, Ordering::SeqCst);
+        let (w, h) = (request.output_size.width, request.output_size.height);
+        let host = HostPage {
+            width: w,
+            height: h,
+            stride: w as usize,
+            format: OutputFormat::Gray8,
+            pixels: Arc::from(vec![0u8; w as usize * h as usize]),
+        };
+        let _ = tx.send(Ok(RenderedPage::Host(host)));
+        Ok(ticket)
+    }
+    fn working_surface_bytes(&self, request: &RenderRequest) -> u64 {
+        self.working.unwrap_or(
+            u64::from(request.output_size.width) * u64::from(request.output_size.height) * 4,
+        )
+    }
+}
+
+/// Every page as a 100 x 100 Gray8 raster: a 40,000-byte RGBA surface for a
+/// 10,000-byte output.
+fn gray_requester(
+    snapshot: &DocumentSnapshot,
+    page: PageIndex,
+) -> Result<RenderRequest, RenderError> {
+    let mut request = sized_requester(snapshot, page)?;
+    request.output_size = DeviceSize {
+        width: 100,
+        height: 100,
+    };
+    request.output_format = OutputFormat::Gray8;
+    Ok(request)
+}
+
+/// The scheduler budgets a job for the plane its backend paints on. A Gray8
+/// page painted whole needs its RGBA surface beside the gray output; painted
+/// strip by strip it needs one strip, so more such pages fit a budget at once.
+#[test]
+fn a_backend_that_paints_in_strips_is_budgeted_for_one_strip() {
+    let snap = snapshot(12);
+    let request = gray_requester(&snap, PageIndex(0)).unwrap();
+    let whole = exprim::render_scheduler::estimate_job_bytes(&request);
+    let strip = 100 * 10 * 4;
+    let striped = exprim::render_scheduler::estimate_job_bytes_on(&request, strip);
+    assert_eq!(
+        whole - striped,
+        40_000 - strip,
+        "only the surface term shrinks"
+    );
+    // A plane larger than the page's surface cannot raise the estimate.
+    assert_eq!(
+        exprim::render_scheduler::estimate_job_bytes_on(&request, u64::MAX),
+        whole
+    );
+    // Room for one page painted whole, and for four painted in strips.
+    let limit = whole + whole / 2;
+    assert!(2 * whole > limit && 4 * striped <= limit);
+
+    let peak_under = |working: Option<u64>| {
+        let backend = Arc::new(StripBackend {
+            working,
+            live: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let scheduler = RenderScheduler::new(
+            backend.clone(),
+            SchedulerOptions {
+                compile_workers: 2,
+                render_workers: 4,
+                compiled_queue_depth: 8,
+                reorder_window_depth: 16,
+                reorder_backlog_bytes: u64::MAX,
+                memory_limit_bytes: limit,
+            },
+        );
+        let mut pages = 0;
+        scheduler.render_range(&snap, 0..12, &gray_requester, None, &mut |o| {
+            assert!(o.result.is_ok(), "page {}: {:?}", o.page.0, o.result.err());
+            pages += 1;
+        });
+        assert_eq!(pages, 12);
+        backend.peak.load(Ordering::SeqCst)
+    };
+    assert_eq!(peak_under(None), 1, "whole surfaces: one page at a time");
+    assert!(peak_under(Some(strip)) >= 2, "strips: pages overlap");
 }

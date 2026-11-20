@@ -10,10 +10,13 @@
 //! — never global.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::object::{Dictionary, NameTable, PdfObject};
 
-use crate::structure::predictor::{PredictorError, PredictorParms, apply_predictor};
+use crate::structure::predictor::{
+    PredictorError, PredictorParms, apply_predictor, geometry, tiff_in_place, unfilter_png_row,
+};
 
 /// Decompressed-byte budget for one decode context. Constructed from the
 /// worker's remaining allowance; the caller settles `used()` back into its
@@ -70,8 +73,8 @@ pub fn decode_stream(
     names: &NameTable,
     budget: &mut DecodeBudget,
 ) -> Result<Vec<u8>, DecodeError> {
-    match decode_stream_inner(raw, dict, names, budget, false)? {
-        (data, None) => Ok(data),
+    match decode_stream_inner(raw, dict, names, budget, false, None)? {
+        (data, None) => Ok(data.into_vec()),
         (_, Some(codec)) => Err(DecodeError::UnsupportedFilter(codec)),
     }
 }
@@ -87,16 +90,83 @@ pub fn decode_stream_to_codec(
     names: &NameTable,
     budget: &mut DecodeBudget,
 ) -> Result<(Vec<u8>, Option<String>), DecodeError> {
-    decode_stream_inner(raw, dict, names, budget, true)
+    let (data, codec) = decode_stream_inner(raw, dict, names, budget, true, None)?;
+    Ok((data.into_vec(), codec))
 }
 
-fn decode_stream_inner(
+/// What [`decode_stream_to_codec_shared`] produced.
+#[derive(Debug)]
+pub enum SharedDecoded {
+    /// The chain held no image codec: the fully decoded bytes.
+    Bytes(Arc<[u8]>),
+    /// The chain stopped at an image codec: the still-encoded bytes and the
+    /// codec filter's canonical name, exactly as [`decode_stream_to_codec`]
+    /// returns them.
+    Codec(Vec<u8>, String),
+}
+
+/// [`decode_stream_to_codec`] for a caller that keeps the result as shared
+/// `Arc<[u8]>` samples (image data), producing the same bytes, errors and
+/// budget charges without the full-buffer copy of `Arc::from(Vec)`.
+///
+/// `expected_len` is the caller's estimate of the fully decoded length (an
+/// image's row bytes × height). When the last filter of the chain is
+/// Flate, LZW or RunLength and its output turns out to be exactly that long —
+/// and, for Flate, the deflate stream ends cleanly there — it is decoded
+/// straight into one exactly-sized shared buffer, with a PNG or TIFF
+/// predictor undone in that buffer row by row. Any other outcome (a shorter,
+/// longer, truncated or corrupt stream, a predictor whose geometry does not
+/// match) discards that attempt, charges nothing for it, and decodes the
+/// ordinary way, so the hint can change only memory use and time, never the
+/// result. `raw_shared`, when given, must hold the same bytes as `raw`: an
+/// unfiltered body is then handed back without copying it.
+pub fn decode_stream_to_codec_shared(
     raw: &[u8],
+    raw_shared: Option<&Arc<[u8]>>,
+    dict: &Dictionary,
+    names: &NameTable,
+    budget: &mut DecodeBudget,
+    expected_len: Option<usize>,
+) -> Result<SharedDecoded, DecodeError> {
+    match decode_stream_inner(raw, dict, names, budget, true, expected_len)? {
+        (Decoded::Shared(bytes), None) => Ok(SharedDecoded::Bytes(bytes)),
+        (Decoded::Cow(Cow::Borrowed(body)), None) => {
+            // Only an unfiltered body comes back borrowed: it *is* `raw`.
+            let shared = raw_shared
+                .filter(|shared| std::ptr::eq(shared.as_ptr(), body.as_ptr()))
+                .filter(|shared| shared.len() == body.len())
+                .map_or_else(|| Arc::from(body), Arc::clone);
+            Ok(SharedDecoded::Bytes(shared))
+        }
+        (Decoded::Cow(Cow::Owned(bytes)), None) => Ok(SharedDecoded::Bytes(Arc::from(bytes))),
+        (data, Some(codec)) => Ok(SharedDecoded::Codec(data.into_vec(), codec)),
+    }
+}
+
+/// The bytes a filter chain produced: still the source body (unfiltered),
+/// an owned intermediate, or an exactly-sized shared buffer.
+enum Decoded<'a> {
+    Cow(Cow<'a, [u8]>),
+    Shared(Arc<[u8]>),
+}
+
+impl Decoded<'_> {
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Decoded::Cow(data) => data.into_owned(),
+            Decoded::Shared(data) => data.to_vec(),
+        }
+    }
+}
+
+fn decode_stream_inner<'a>(
+    raw: &'a [u8],
     dict: &Dictionary,
     names: &NameTable,
     budget: &mut DecodeBudget,
     stop_at_codec: bool,
-) -> Result<(Vec<u8>, Option<String>), DecodeError> {
+    expected_len: Option<usize>,
+) -> Result<(Decoded<'a>, Option<String>), DecodeError> {
     let filter = dict.get(names.known.filter);
     let parms = dict.get(names.known.decode_parms);
 
@@ -137,6 +207,23 @@ fn decode_stream_inner(
         };
         let name = names.resolve(name_id);
         let parms_dict = p.as_ref().and_then(|p| p.as_dict().cloned());
+        // The last filter produces the final bytes: with a length hint, try
+        // decoding it straight into its exactly-sized shared buffer. `None`
+        // has charged nothing, and the ordinary step below runs as if the
+        // attempt never happened.
+        if i + 1 == filters.len()
+            && let Some(expected) = expected_len
+            && let Some(shared) = decode_last_exact(
+                name.as_ref(),
+                &data,
+                parms_dict.as_ref(),
+                names,
+                budget,
+                expected,
+            )
+        {
+            return Ok((Decoded::Shared(shared), None));
+        }
         data = Cow::Owned(match name.as_ref() {
             b"FlateDecode" | b"Fl" => {
                 let inflated = flate_decode(&data, budget)?;
@@ -145,12 +232,7 @@ fn decode_stream_inner(
             b"LZWDecode" | b"LZW" => {
                 // /EarlyChange (default 1) lives in the same /DecodeParms dict
                 // as the predictor keys; read it before applying the predictor.
-                let early_change = parms_dict
-                    .as_ref()
-                    .and_then(|d| names.lookup(b"EarlyChange").and_then(|id| d.get(id)))
-                    .and_then(PdfObject::as_int)
-                    .unwrap_or(1)
-                    != 0;
+                let early_change = lzw_early_change(parms_dict.as_ref(), names);
                 let decoded = lzw_decode(&data, budget, early_change)?;
                 apply_parms(decoded, parms_dict.as_ref(), names)?
             }
@@ -173,7 +255,7 @@ fn decode_stream_inner(
                 if i == 0 {
                     budget.charge(data.len())?;
                 }
-                return Ok((data.into_owned(), Some(canonical.to_owned())));
+                return Ok((Decoded::Cow(data), Some(canonical.to_owned())));
             }
             other => {
                 return Err(DecodeError::UnsupportedFilter(
@@ -182,7 +264,7 @@ fn decode_stream_inner(
             }
         });
     }
-    Ok((data.into_owned(), None))
+    Ok((Decoded::Cow(data), None))
 }
 
 /// Read predictor parameters out of a `/DecodeParms` dict and apply them.
@@ -191,9 +273,16 @@ fn apply_parms(
     parms: Option<&Dictionary>,
     names: &NameTable,
 ) -> Result<Vec<u8>, DecodeError> {
-    let Some(parms) = parms else {
+    let Some(p) = predictor_parms(parms, names) else {
         return Ok(data);
     };
+    Ok(apply_predictor(data, &p)?)
+}
+
+/// The predictor parameters a `/DecodeParms` dict names; `None` (no
+/// predictor) when there is no parms dict.
+fn predictor_parms(parms: Option<&Dictionary>, names: &NameTable) -> Option<PredictorParms> {
+    let parms = parms?;
     let get_int = |key: &[u8], default: i64| -> i64 {
         names
             .lookup(key)
@@ -201,13 +290,327 @@ fn apply_parms(
             .and_then(PdfObject::as_int)
             .unwrap_or(default)
     };
-    let p = PredictorParms {
+    Some(PredictorParms {
         predictor: get_int(b"Predictor", 1),
         colors: get_int(b"Colors", 1),
         bits_per_component: get_int(b"BitsPerComponent", 8),
         columns: get_int(b"Columns", 1),
+    })
+}
+
+/// `/EarlyChange` (default 1) from an LZW filter's `/DecodeParms`.
+fn lzw_early_change(parms: Option<&Dictionary>, names: &NameTable) -> bool {
+    parms
+        .and_then(|d| names.lookup(b"EarlyChange").and_then(|id| d.get(id)))
+        .and_then(PdfObject::as_int)
+        .unwrap_or(1)
+        != 0
+}
+
+// ── Exactly-sized decoding of the last filter ──────────────────────────────
+//
+// The ordinary path grows a `Vec` geometrically — capacity ends anywhere in
+// (S, 2S] with the old and new buffers both alive across every reallocation —
+// then un-predicts a PNG stream into a second buffer, and the caller copies
+// the result into an `Arc<[u8]>`. For a well-formed image whose decoded size
+// is known up front, everything below produces the same bytes in one shared
+// buffer of exactly that size. Each attempt either commits (charging the
+// budget exactly what the ordinary path would have) or returns `None` having
+// charged nothing, so the ordinary path then runs unchanged.
+
+/// Most bytes one input byte can expand to under each filter, used to refuse
+/// a hint the input cannot possibly fill before allocating for it: deflate
+/// tops out near 1032:1, a 9-bit LZW code emits at most 4096 bytes, and a
+/// two-byte RunLength repeat emits 128.
+const FLATE_MAX_RATIO: usize = 1100;
+const LZW_MAX_RATIO: usize = 4096;
+const RUN_LENGTH_MAX_RATIO: usize = 64;
+/// Headroom on top of those ratios for headers, checksums and tiny inputs.
+const HINT_SLACK: usize = 8 * 1024;
+
+/// How the last filter's output becomes the final bytes.
+enum Unpredict {
+    /// No predictor (absent, or `/Predictor 1`).
+    None,
+    /// TIFF predictor 2: same length, undone in place afterwards.
+    Tiff(PredictorParms),
+    /// PNG predictors 10–15: `rows` rows of `row_len` bytes, each preceded in
+    /// the filter output by its one-byte filter tag.
+    Png {
+        row_len: usize,
+        bpp: usize,
+        rows: usize,
+    },
+}
+
+impl Unpredict {
+    /// The plan for producing `expected` final bytes, and how many bytes the
+    /// filter itself must output for it. `None` when the parameters are ones
+    /// the ordinary path rejects, or a PNG geometry `expected` is not a whole
+    /// number of rows of.
+    fn plan(parms: Option<PredictorParms>, expected: usize) -> Option<(Self, usize)> {
+        let Some(p) = parms else {
+            return Some((Unpredict::None, expected));
+        };
+        match p.predictor {
+            1 => Some((Unpredict::None, expected)),
+            2 => {
+                geometry(&p).ok()?;
+                Some((Unpredict::Tiff(p), expected))
+            }
+            10..=15 => {
+                let (bpp, row_len) = geometry(&p).ok()?;
+                if !expected.is_multiple_of(row_len) {
+                    return None;
+                }
+                let rows = expected / row_len;
+                let produced = rows.checked_mul(row_len.checked_add(1)?)?;
+                Some((Unpredict::Png { row_len, bpp, rows }, produced))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Try to decode the chain's last filter (`filter`, over `input`) straight
+/// into an exactly `expected`-byte shared buffer. See the section comment.
+fn decode_last_exact(
+    filter: &[u8],
+    input: &[u8],
+    parms: Option<&Dictionary>,
+    names: &NameTable,
+    budget: &mut DecodeBudget,
+    expected: usize,
+) -> Option<Arc<[u8]>> {
+    if expected == 0 {
+        return None;
+    }
+    let (ratio, plan, produced) = match filter {
+        b"FlateDecode" | b"Fl" => {
+            let (plan, produced) = Unpredict::plan(predictor_parms(parms, names), expected)?;
+            (FLATE_MAX_RATIO, plan, produced)
+        }
+        b"LZWDecode" | b"LZW" => {
+            let (plan, produced) = Unpredict::plan(predictor_parms(parms, names), expected)?;
+            // A PNG-predicted LZW stream would need its tag bytes threaded
+            // through the code stream; rare enough to leave to the ordinary
+            // path.
+            if matches!(plan, Unpredict::Png { .. }) {
+                return None;
+            }
+            (LZW_MAX_RATIO, plan, produced)
+        }
+        // RunLength takes no predictor.
+        b"RunLengthDecode" | b"RL" => (RUN_LENGTH_MAX_RATIO, Unpredict::None, expected),
+        _ => return None,
     };
-    Ok(apply_predictor(data, &p)?)
+    // A hint the budget cannot cover would fail the ordinary way part-way
+    // through, charging what it had produced by then; leave that outcome to
+    // the ordinary path. A hint the input cannot fill is not worth an
+    // allocation of that size.
+    if produced > budget.remaining
+        || produced > input.len().saturating_mul(ratio).saturating_add(HINT_SLACK)
+    {
+        return None;
+    }
+    let mut out = zeroed_shared(expected);
+    let buf = Arc::get_mut(&mut out)?;
+    let filled = match filter {
+        b"FlateDecode" | b"Fl" => inflate_exact(input, &plan, buf),
+        b"LZWDecode" | b"LZW" => {
+            let mut sink = FixedSink { buf, len: 0 };
+            // The budget was checked above and is charged on commit; the
+            // decoder's own per-code charges go to a scratch budget the sink
+            // bounds long before it could matter.
+            let mut scratch = DecodeBudget::new(usize::MAX);
+            matches!(
+                lzw_decode_into(
+                    input,
+                    &mut scratch,
+                    lzw_early_change(parms, names),
+                    &mut sink
+                ),
+                Ok(true)
+            ) && sink.len == expected
+        }
+        _ => {
+            let mut sink = FixedSink { buf, len: 0 };
+            let mut scratch = DecodeBudget::new(usize::MAX);
+            matches!(run_length_into(input, &mut scratch, &mut sink), Ok(true))
+                && sink.len == expected
+        }
+    };
+    if !filled {
+        return None;
+    }
+    if let Unpredict::Tiff(p) = &plan {
+        tiff_in_place(Arc::get_mut(&mut out)?, p).ok()?;
+    }
+    budget.charge(produced).ok()?;
+    Some(out)
+}
+
+/// A zero-filled shared buffer of `len` bytes, allocated once at its final
+/// size (a trusted-length iterator collects straight into the `Arc`).
+fn zeroed_shared(len: usize) -> Arc<[u8]> {
+    std::iter::repeat_n(0u8, len).collect()
+}
+
+/// Inflate `input` into `out` per `plan`, succeeding only when the deflate
+/// stream ends cleanly (`StreamEnd`) exactly at the last byte the plan
+/// needs. A clean stream's output does not depend on how it was buffered, so
+/// that is precisely the case where these bytes and the ordinary path's
+/// agree; a truncated, corrupt or longer stream fails here and is decoded
+/// the ordinary way (whose salvage can depend on its buffer sizes).
+fn inflate_exact(input: &[u8], plan: &Unpredict, out: &mut [u8]) -> bool {
+    let mut z = flate2::Decompress::new(true);
+    let ended = match *plan {
+        Unpredict::None | Unpredict::Tiff(_) => inflate_fill(&mut z, input, out),
+        Unpredict::Png { row_len, bpp, rows } => {
+            let zero_row = vec![0u8; row_len];
+            let mut tag = [0u8; 1];
+            let mut ended = Some(false);
+            for r in 0..rows {
+                // Each row's tag byte goes to scratch, its filtered bytes
+                // straight to their final place, where the row is un-filtered
+                // against the decoded row above it.
+                if inflate_fill(&mut z, input, &mut tag) != Some(false) {
+                    return false;
+                }
+                let (done, rest) = out.split_at_mut(r * row_len);
+                let Some(cur) = rest.get_mut(..row_len) else {
+                    return false;
+                };
+                ended = inflate_fill(&mut z, input, cur);
+                if ended.is_none() || (ended == Some(true) && r + 1 < rows) {
+                    return false;
+                }
+                let prev: &[u8] = if r == 0 {
+                    &zero_row
+                } else {
+                    &done[(r - 1) * row_len..]
+                };
+                unfilter_png_row(tag[0], cur, prev, bpp);
+            }
+            ended
+        }
+    };
+    match ended {
+        Some(true) => true,
+        Some(false) => inflate_at_end(&mut z, input),
+        None => false,
+    }
+}
+
+/// Inflate into all of `out`. `Some(true)`: filled, and the deflate stream
+/// ended with its last byte; `Some(false)`: filled, stream not (yet) ended;
+/// `None`: the stream ended, stalled or failed before `out` was full.
+fn inflate_fill(z: &mut flate2::Decompress, input: &[u8], out: &mut [u8]) -> Option<bool> {
+    let mut pos = 0usize;
+    while pos < out.len() {
+        let before_in = z.total_in();
+        let before_out = z.total_out();
+        let rest = input.get(usize::try_from(before_in).ok()?..)?;
+        let status = z
+            .decompress(rest, &mut out[pos..], flate2::FlushDecompress::None)
+            .ok()?;
+        let produced = usize::try_from(z.total_out() - before_out).ok()?;
+        pos = pos.checked_add(produced)?;
+        match status {
+            flate2::Status::StreamEnd => return (pos == out.len()).then_some(true),
+            _ if produced == 0 && z.total_in() == before_in => return None,
+            _ => {}
+        }
+    }
+    Some(false)
+}
+
+/// After `out` is full: whether the deflate stream now ends (it may still
+/// have its checksum to consume) without producing one more byte.
+fn inflate_at_end(z: &mut flate2::Decompress, input: &[u8]) -> bool {
+    let mut probe = [0u8; 1];
+    loop {
+        let before_in = z.total_in();
+        let before_out = z.total_out();
+        let Some(rest) = usize::try_from(before_in)
+            .ok()
+            .and_then(|start| input.get(start..))
+        else {
+            return false;
+        };
+        let Ok(status) = z.decompress(rest, &mut probe, flate2::FlushDecompress::None) else {
+            return false;
+        };
+        if z.total_out() != before_out {
+            return false; // longer than expected
+        }
+        match status {
+            flate2::Status::StreamEnd => return true,
+            _ if z.total_in() == before_in => return false, // stalled: truncated
+            _ => {}
+        }
+    }
+}
+
+/// Where the LZW and RunLength decoders put their output: a growable `Vec`
+/// (the ordinary path) or a fixed buffer that reports overflow.
+trait ByteSink {
+    /// Append `bytes`; `false` when the sink is full.
+    fn put(&mut self, bytes: &[u8]) -> bool;
+    /// Append `bytes` in reverse order.
+    fn put_rev(&mut self, bytes: &[u8]) -> bool;
+    /// Append `count` copies of `byte`.
+    fn put_run(&mut self, byte: u8, count: usize) -> bool;
+}
+
+impl ByteSink for Vec<u8> {
+    fn put(&mut self, bytes: &[u8]) -> bool {
+        self.extend_from_slice(bytes);
+        true
+    }
+    fn put_rev(&mut self, bytes: &[u8]) -> bool {
+        self.extend(bytes.iter().rev());
+        true
+    }
+    fn put_run(&mut self, byte: u8, count: usize) -> bool {
+        self.extend(std::iter::repeat_n(byte, count));
+        true
+    }
+}
+
+/// A fixed-size output buffer and how much of it is written.
+struct FixedSink<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl FixedSink<'_> {
+    fn next(&mut self, count: usize) -> Option<&mut [u8]> {
+        let end = self.len.checked_add(count)?;
+        let dst = self.buf.get_mut(self.len..end)?;
+        self.len = end;
+        Some(dst)
+    }
+}
+
+impl ByteSink for FixedSink<'_> {
+    fn put(&mut self, bytes: &[u8]) -> bool {
+        self.next(bytes.len())
+            .map(|dst| dst.copy_from_slice(bytes))
+            .is_some()
+    }
+    fn put_rev(&mut self, bytes: &[u8]) -> bool {
+        self.next(bytes.len())
+            .map(|dst| {
+                for (d, s) in dst.iter_mut().zip(bytes.iter().rev()) {
+                    *d = *s;
+                }
+            })
+            .is_some()
+    }
+    fn put_run(&mut self, byte: u8, count: usize) -> bool {
+        self.next(count).map(|dst| dst.fill(byte)).is_some()
+    }
 }
 
 /// FlateDecode. Tries zlib format first, then raw deflate (headerless
@@ -372,6 +775,17 @@ fn ascii85_decode(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>, Dec
 /// RunLengthDecode per ISO 32000-1 §7.4.5.
 fn run_length_decode(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>, DecodeError> {
     let mut out = Vec::new();
+    run_length_into(data, budget, &mut out)?;
+    Ok(out)
+}
+
+/// [`run_length_decode`] into any [`ByteSink`]; `Ok(false)` when the sink
+/// filled up first.
+fn run_length_into<S: ByteSink>(
+    data: &[u8],
+    budget: &mut DecodeBudget,
+    out: &mut S,
+) -> Result<bool, DecodeError> {
     let mut i = 0usize;
     while i < data.len() {
         let l = data[i];
@@ -384,7 +798,9 @@ fn run_length_decode(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>, 
                     return Err(DecodeError::Corrupt("run-length literal overruns data"));
                 }
                 budget.charge(count)?;
-                out.extend_from_slice(&data[i..i + count]);
+                if !out.put(&data[i..i + count]) {
+                    return Ok(false);
+                }
                 i += count;
             }
             129..=255 => {
@@ -394,11 +810,13 @@ fn run_length_decode(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>, 
                 };
                 i += 1;
                 budget.charge(count)?;
-                out.extend(std::iter::repeat_n(b, count));
+                if !out.put_run(b, count) {
+                    return Ok(false);
+                }
             }
         }
     }
-    Ok(out)
+    Ok(true)
 }
 
 /// LZWDecode per ISO 32000-1 §7.4.4 (the TIFF/PDF variable-width LZW variant).
@@ -417,6 +835,19 @@ fn lzw_decode(
     budget: &mut DecodeBudget,
     early_change: bool,
 ) -> Result<Vec<u8>, DecodeError> {
+    let mut out = Vec::new();
+    lzw_decode_into(data, budget, early_change, &mut out)?;
+    Ok(out)
+}
+
+/// [`lzw_decode`] into any [`ByteSink`]; `Ok(false)` when the sink filled up
+/// first.
+fn lzw_decode_into<S: ByteSink>(
+    data: &[u8],
+    budget: &mut DecodeBudget,
+    early_change: bool,
+    out: &mut S,
+) -> Result<bool, DecodeError> {
     const CLEAR: usize = 256;
     const EOD: usize = 257;
     const FIRST: usize = 258;
@@ -426,7 +857,6 @@ fn lzw_decode(
     let mut prefix = [0u16; MAX];
     let mut suffix = [0u8; MAX];
     let mut stack: Vec<u8> = Vec::with_capacity(MAX);
-    let mut out = Vec::new();
 
     let mut bit_buf: u32 = 0;
     let mut bit_count: u32 = 0;
@@ -480,7 +910,9 @@ fn lzw_decode(
         stack.push(first_byte);
 
         budget.charge(stack.len())?;
-        out.extend(stack.iter().rev());
+        if !out.put_rev(&stack) {
+            return Ok(false);
+        }
 
         // Add prev + first_byte as the next table entry (§7.4.4.2).
         if old_code >= 0 && next < MAX {
@@ -493,7 +925,7 @@ fn lzw_decode(
         }
         old_code = code as i32;
     }
-    Ok(out)
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -902,5 +1334,407 @@ mod tests {
             lzw_decode(&encoded, &mut tiny, true),
             Err(DecodeError::BudgetExceeded)
         ));
+    }
+
+    // ── Shared (hinted) decoding against the ordinary path ─────────────────
+
+    /// Deterministic pseudo-random bytes with some structure, so deflate
+    /// compresses them and PNG filters have something to undo.
+    fn image_like(len: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        (0..len)
+            .map(|i| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                // Smooth ramps plus a little noise.
+                ((i / 7) as u8).wrapping_add(((x >> 28) as u8) & 3)
+            })
+            .collect()
+    }
+
+    /// PNG-filter `rows` of `row_len` bytes (`bpp` bytes per pixel), cycling
+    /// the filter type per row through `tags` (an unknown tag is emitted as
+    /// unfiltered, which is how decoders treat it).
+    fn png_encode(data: &[u8], row_len: usize, bpp: usize, tags: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let zero = vec![0u8; row_len];
+        for (r, row) in data.chunks(row_len).enumerate() {
+            let prev = if r == 0 {
+                &zero[..]
+            } else {
+                &data[(r - 1) * row_len..r * row_len]
+            };
+            let tag = tags[r % tags.len()];
+            out.push(tag);
+            for i in 0..row.len() {
+                let left = if i >= bpp { row[i - bpp] } else { 0 };
+                let up = prev[i];
+                let up_left = if i >= bpp { prev[i - bpp] } else { 0 };
+                let pred = match tag {
+                    1 => left,
+                    2 => up,
+                    3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
+                    4 => crate::structure::predictor::paeth(left, up, up_left),
+                    _ => 0,
+                };
+                out.push(row[i].wrapping_sub(pred));
+            }
+        }
+        out
+    }
+
+    fn tiff_encode_8bit(data: &[u8], row_len: usize, bpp: usize) -> Vec<u8> {
+        let mut out = data.to_vec();
+        for row in out.chunks_exact_mut(row_len) {
+            for i in (bpp..row.len()).rev() {
+                row[i] = row[i].wrapping_sub(row[i - bpp]);
+            }
+        }
+        out
+    }
+
+    fn stream_dict(names: &NameTable, filters: &[&[u8]], parms: Option<PdfObject>) -> Dictionary {
+        let filter = if filters.len() == 1 {
+            PdfObject::Name(names.intern(filters[0]))
+        } else {
+            PdfObject::Array(
+                filters
+                    .iter()
+                    .map(|f| PdfObject::Name(names.intern(f)))
+                    .collect(),
+            )
+        };
+        let mut pairs = vec![(names.known.filter, filter)];
+        if let Some(p) = parms {
+            pairs.push((names.known.decode_parms, p));
+        }
+        Dictionary::from_pairs(pairs)
+    }
+
+    fn predictor_dict(
+        names: &NameTable,
+        predictor: i64,
+        colors: i64,
+        bpc: i64,
+        columns: i64,
+    ) -> PdfObject {
+        PdfObject::Dictionary(Arc::new(Dictionary::from_pairs([
+            (names.intern(b"Predictor"), PdfObject::Integer(predictor)),
+            (names.intern(b"Colors"), PdfObject::Integer(colors)),
+            (names.intern(b"BitsPerComponent"), PdfObject::Integer(bpc)),
+            (names.intern(b"Columns"), PdfObject::Integer(columns)),
+        ])))
+    }
+
+    /// One decode's observable outcome: bytes (or codec payload) or error,
+    /// plus the budget it charged.
+    type Outcome = (Result<(Vec<u8>, Option<String>), String>, usize);
+
+    fn ordinary(raw: &[u8], dict: &Dictionary, names: &NameTable, budget: usize) -> Outcome {
+        let mut b = DecodeBudget::new(budget);
+        let r = decode_stream_to_codec(raw, dict, names, &mut b).map_err(|e| format!("{e:?}"));
+        (r, b.used())
+    }
+
+    fn shared(
+        raw: &[u8],
+        dict: &Dictionary,
+        names: &NameTable,
+        budget: usize,
+        hint: Option<usize>,
+    ) -> Outcome {
+        let mut b = DecodeBudget::new(budget);
+        let r = decode_stream_to_codec_shared(raw, None, dict, names, &mut b, hint)
+            .map(|d| match d {
+                SharedDecoded::Bytes(bytes) => (bytes.to_vec(), None),
+                SharedDecoded::Codec(bytes, name) => (bytes, Some(name)),
+            })
+            .map_err(|e| format!("{e:?}"));
+        (r, b.used())
+    }
+
+    /// The shared path must match the ordinary one for every hint — right,
+    /// short, long, absurd — and under budgets around the decode's need.
+    fn assert_same_as_ordinary(label: &str, raw: &[u8], dict: &Dictionary, names: &NameTable) {
+        let (reference, used) = ordinary(raw, dict, names, 1 << 30);
+        let exact = reference
+            .as_ref()
+            .map(|(bytes, _)| bytes.len())
+            .unwrap_or(4096);
+        let hints = [
+            None,
+            Some(exact),
+            Some(exact.saturating_sub(1)),
+            Some(exact + 1),
+            Some(exact / 2),
+            Some(exact * 2),
+            Some(1),
+            Some(1 << 40),
+        ];
+        let budgets = [1 << 30, used, used.saturating_sub(1), used / 2, 0];
+        for budget in budgets {
+            let expected = ordinary(raw, dict, names, budget);
+            for hint in hints {
+                let got = shared(raw, dict, names, budget, hint);
+                assert_eq!(
+                    got, expected,
+                    "{label}: budget {budget}, hint {hint:?} diverged from the ordinary path"
+                );
+            }
+        }
+    }
+
+    fn flate_cases() -> Vec<(&'static str, Vec<u8>)> {
+        let data = image_like(30_000, 7);
+        let full = zlib_compress(&data);
+        let mut corrupt_middle = full.clone();
+        let mid = corrupt_middle.len() / 2;
+        for b in &mut corrupt_middle[mid..mid + 6] {
+            *b ^= 0x5a;
+        }
+        let mut bad_adler = full.clone();
+        if let Some(last) = bad_adler.last_mut() {
+            *last ^= 0xff;
+        }
+        let mut overlong_trailer = full.clone();
+        overlong_trailer.extend_from_slice(b"garbage after the stream");
+        let mut raw_deflate =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        raw_deflate.write_all(&data).unwrap();
+        vec![
+            ("well-formed", full.clone()),
+            ("truncated 3/4", full[..full.len() * 3 / 4].to_vec()),
+            ("missing adler", full[..full.len() - 4].to_vec()),
+            ("half adler", full[..full.len() - 2].to_vec()),
+            ("corrupt middle", corrupt_middle),
+            ("bad adler", bad_adler),
+            ("trailing garbage", overlong_trailer),
+            ("raw deflate", raw_deflate.finish().unwrap()),
+            ("not deflate", b"\xff\xff\xff\xff not a stream".to_vec()),
+            ("empty", Vec::new()),
+        ]
+    }
+
+    #[test]
+    fn shared_flate_matches_ordinary_without_predictor() {
+        let names = NameTable::new();
+        let dict = dict_with_filter(&names, b"FlateDecode");
+        for (label, raw) in flate_cases() {
+            assert_same_as_ordinary(label, &raw, &dict, &names);
+        }
+    }
+
+    #[test]
+    fn shared_flate_matches_ordinary_with_png_predictor() {
+        let names = NameTable::new();
+        // 3 colours × 8 bits, 50 columns: 150-byte rows, 200 rows.
+        let (row_len, bpp) = (150, 3);
+        let data = image_like(row_len * 200, 11);
+        let filtered = png_encode(&data, row_len, bpp, &[0, 1, 2, 3, 4, 2, 9]);
+        let full = zlib_compress(&filtered);
+        let dict = stream_dict(
+            &names,
+            &[b"FlateDecode"],
+            Some(predictor_dict(&names, 15, 3, 8, 50)),
+        );
+        // The well-formed stream decodes to the original samples.
+        let (ok, _) = shared(&full, &dict, &names, 1 << 30, Some(data.len()));
+        assert_eq!(ok.unwrap().0, data);
+        // A partial trailing row: the ordinary path keeps the complete rows.
+        let mut ragged = filtered.clone();
+        ragged.truncate(filtered.len() - 40);
+        let mut cases = vec![
+            ("png well-formed", full.clone()),
+            ("png ragged tail", zlib_compress(&ragged)),
+            ("png truncated", full[..full.len() / 2].to_vec()),
+            ("png missing adler", full[..full.len() - 4].to_vec()),
+        ];
+        let mut corrupt = full.clone();
+        let at = corrupt.len() / 3;
+        corrupt[at] ^= 0x33;
+        cases.push(("png corrupt", corrupt));
+        for (label, raw) in cases {
+            assert_same_as_ordinary(label, &raw, &dict, &names);
+        }
+        // Mismatched geometry: /Columns says 49, the hint 150-byte rows.
+        let skewed = stream_dict(
+            &names,
+            &[b"FlateDecode"],
+            Some(predictor_dict(&names, 12, 3, 8, 49)),
+        );
+        assert_same_as_ordinary("png skewed columns", &full, &skewed, &names);
+        // A /DecodeParms array parallel to the filter array.
+        let arrayed = stream_dict(
+            &names,
+            &[b"FlateDecode"],
+            Some(PdfObject::Array(
+                vec![predictor_dict(&names, 15, 3, 8, 50)].into(),
+            )),
+        );
+        assert_same_as_ordinary("png parms array", &full, &arrayed, &names);
+    }
+
+    #[test]
+    fn shared_flate_matches_ordinary_with_tiff_predictor() {
+        let names = NameTable::new();
+        let data = image_like(4 * 64 * 40, 3);
+        let filtered = tiff_encode_8bit(&data, 4 * 64, 4);
+        let full = zlib_compress(&filtered);
+        let dict = stream_dict(
+            &names,
+            &[b"FlateDecode"],
+            Some(predictor_dict(&names, 2, 4, 8, 64)),
+        );
+        let (ok, _) = shared(&full, &dict, &names, 1 << 30, Some(data.len()));
+        assert_eq!(ok.unwrap().0, data);
+        assert_same_as_ordinary("tiff 8-bit", &full, &dict, &names);
+        assert_same_as_ordinary("tiff truncated", &full[..full.len() / 2], &dict, &names);
+        // Sub-byte TIFF: 2-bit gray, 37 columns (a padded final byte).
+        let packed = image_like(10 * 40, 5);
+        let dict2 = stream_dict(
+            &names,
+            &[b"FlateDecode"],
+            Some(predictor_dict(&names, 2, 1, 2, 37)),
+        );
+        assert_same_as_ordinary("tiff 2-bit", &zlib_compress(&packed), &dict2, &names);
+        // An unsupported predictor fails the same way.
+        let bad = stream_dict(
+            &names,
+            &[b"FlateDecode"],
+            Some(predictor_dict(&names, 7, 1, 8, 1)),
+        );
+        assert_same_as_ordinary("predictor 7", &full, &bad, &names);
+    }
+
+    #[test]
+    fn shared_lzw_and_run_length_match_ordinary() {
+        let names = NameTable::new();
+        let data = image_like(9_000, 13);
+        let lzw = lzw_encode(&data, true);
+        let dict = dict_with_filter(&names, b"LZWDecode");
+        assert_same_as_ordinary("lzw", &lzw, &dict, &names);
+        assert_same_as_ordinary("lzw truncated", &lzw[..lzw.len() / 2], &dict, &names);
+        let mut bad = lzw.clone();
+        bad[lzw.len() / 3] = 0xff;
+        bad[lzw.len() / 3 + 1] = 0xff;
+        assert_same_as_ordinary("lzw corrupt", &bad, &dict, &names);
+        let tiff = lzw_encode(&tiff_encode_8bit(&data, 90, 3), true);
+        let tiff_dict = stream_dict(
+            &names,
+            &[b"LZWDecode"],
+            Some(predictor_dict(&names, 2, 3, 8, 30)),
+        );
+        assert_same_as_ordinary("lzw tiff", &tiff, &tiff_dict, &names);
+        let png = lzw_encode(&png_encode(&data, 90, 3, &[1, 2, 4]), true);
+        let png_dict = stream_dict(
+            &names,
+            &[b"LZWDecode"],
+            Some(predictor_dict(&names, 12, 3, 8, 30)),
+        );
+        assert_same_as_ordinary("lzw png", &png, &png_dict, &names);
+
+        let rl_dict = dict_with_filter(&names, b"RunLengthDecode");
+        let rl: Vec<u8> = vec![2, b'a', b'b', b'c', 250, b'z', 0, b'q', 128];
+        assert_same_as_ordinary("run length", &rl, &rl_dict, &names);
+        assert_same_as_ordinary("run length overrun", &[5, b'a'], &rl_dict, &names);
+        assert_same_as_ordinary("run length no eod", &rl[..rl.len() - 1], &rl_dict, &names);
+    }
+
+    #[test]
+    fn shared_chains_codecs_and_raw_bodies_match_ordinary() {
+        let names = NameTable::new();
+        let data = image_like(5_000, 17);
+        let deflated = zlib_compress(&data);
+        let hex: Vec<u8> = deflated
+            .iter()
+            .flat_map(|b| format!("{b:02X}").into_bytes())
+            .collect();
+        let chain = stream_dict(&names, &[b"ASCIIHexDecode", b"FlateDecode"], None);
+        assert_same_as_ordinary("hex then flate", &hex, &chain, &names);
+        let codec = stream_dict(&names, &[b"FlateDecode", b"DCTDecode"], None);
+        assert_same_as_ordinary("flate then dct", &deflated, &codec, &names);
+        let codec_first = dict_with_filter(&names, b"DCTDecode");
+        assert_same_as_ordinary("dct", &data, &codec_first, &names);
+        assert_same_as_ordinary("unfiltered", &data, &Dictionary::new(), &names);
+
+        // An unfiltered `Owned` body comes back as that very buffer.
+        let body: Arc<[u8]> = Arc::from(data.clone());
+        let mut b = budget();
+        let out = decode_stream_to_codec_shared(
+            &body,
+            Some(&body),
+            &Dictionary::new(),
+            &names,
+            &mut b,
+            Some(data.len()),
+        )
+        .unwrap();
+        let SharedDecoded::Bytes(out) = out else {
+            panic!("no codec in the chain");
+        };
+        assert!(Arc::ptr_eq(&out, &body));
+        assert_eq!(b.used(), data.len());
+    }
+
+    /// The exactly-sized path actually commits for the well-formed cases it
+    /// exists for, and declines (charging nothing) otherwise.
+    #[test]
+    fn exact_path_commits_only_on_an_exact_clean_stream() {
+        let names = NameTable::new();
+        let data = image_like(150 * 40, 23);
+        let png = zlib_compress(&png_encode(&data, 150, 3, &[4, 1, 2]));
+        let parms = Dictionary::from_pairs([
+            (names.intern(b"Predictor"), PdfObject::Integer(15)),
+            (names.intern(b"Colors"), PdfObject::Integer(3)),
+            (names.intern(b"Columns"), PdfObject::Integer(50)),
+        ]);
+        let mut b = budget();
+        let out = decode_last_exact(
+            b"FlateDecode",
+            &png,
+            Some(&parms),
+            &names,
+            &mut b,
+            data.len(),
+        )
+        .expect("well-formed PNG-predicted flate commits");
+        assert_eq!(&out[..], &data[..]);
+        assert_eq!(b.used(), data.len() + 40, "charged the inflated length");
+        assert_eq!(Arc::strong_count(&out), 1);
+
+        let plain = zlib_compress(&data);
+        for hint in [data.len() - 1, data.len() + 1] {
+            let mut b = budget();
+            assert!(
+                decode_last_exact(b"FlateDecode", &plain, None, &names, &mut b, hint).is_none()
+            );
+            assert_eq!(b.used(), 0, "a declined attempt charges nothing");
+        }
+        let mut b = budget();
+        assert!(
+            decode_last_exact(
+                b"FlateDecode",
+                &plain[..plain.len() - 4],
+                None,
+                &names,
+                &mut b,
+                data.len()
+            )
+            .is_none(),
+            "a stream without its checksum is left to the ordinary path"
+        );
+        let mut b = budget();
+        let lzw = lzw_encode(&data, true);
+        assert!(decode_last_exact(b"LZWDecode", &lzw, None, &names, &mut b, data.len()).is_some());
+        let mut b = budget();
+        assert!(
+            decode_last_exact(b"RunLengthDecode", &[1, 7, 8, 128], None, &names, &mut b, 2)
+                .is_some()
+        );
+        // Over budget: declined before allocating.
+        let mut tight = DecodeBudget::new(data.len() - 1);
+        assert!(
+            decode_last_exact(b"FlateDecode", &plain, None, &names, &mut tight, data.len())
+                .is_none()
+        );
     }
 }

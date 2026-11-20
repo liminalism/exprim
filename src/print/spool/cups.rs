@@ -128,9 +128,11 @@ impl CupsSpooler {
         }
         let mut files = Vec::with_capacity(sheets.len());
         for (n, sheet) in sheets.iter().enumerate() {
-            let raster = crate::print::compose::compose_sheet(session, sheet, &compose)?;
             let path = staging.join(format!("sheet-{:04}.png", n + 1));
-            super::file::write_sheet_png(&path, &raster)?;
+            // Composed band by band straight into the PNG encoder, so no
+            // whole composed sheet is held; the staging directory, partial
+            // file included, is removed by the caller on any failure.
+            super::file::write_composed_sheet_png(&path, session, sheet, &compose)?;
             files.push(path);
         }
         let args = build_lp_args(

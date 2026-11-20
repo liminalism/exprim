@@ -25,6 +25,7 @@ pub use session::{
     DeviceCrop, GraySuitability, GraySurface, Jbig2StencilPolarity, OcrTarget, PageGeometry,
     PageOutputPlan, PageRasterProducts, PreservedJbig2Smask, RasterFormat, RasterPlane,
     RasterProduct, ReadError, RegionTarget, RenderSession, RenderedRegion, RgbSurface,
+    SessionOptions,
 };
 pub use text::{
     DirectScanImage, NativeTextWord, PageContentKind, PageTextEvidence, has_text_layer, page_text,

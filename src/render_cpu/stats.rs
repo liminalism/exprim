@@ -44,6 +44,10 @@ pub struct RenderStats {
     /// Bytes in the final host pixel buffer. During output conversion this can
     /// overlap with the internal surface allocation.
     pub output_bytes: u64,
+    /// Most bytes of clip-mask coverage resident at once during the page. The
+    /// executor holds them under a budget of eight full-page planes (at least
+    /// 64 MiB); one mask larger than that is still built, alone.
+    pub clip_mask_peak_bytes: u64,
     /// Image draws dropped because their codec (JPX/DCT/JBIG2/CCITT) could not
     /// decode. A page with `covered_pixels == 0` **and** `degraded_draws > 0`
     /// is a *silent blank* — content PDFium would paint that we dropped — not a
