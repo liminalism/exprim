@@ -8,16 +8,20 @@ the `jbig2enc` Python wheel.
 The canonical source is the
 [exprim repository](https://github.com/liminalism/exprim/tree/main/codecs/jbig2enc-rust).
 
-## 0.6.0 (unreleased)
+## What's new in 0.6
 
-Since 0.5.4: faster byte-preserving generic encoding; explicit pixel-exact
-symbol presets; measured compression planning, residual packing and PDF
-dictionary policies; bounded multi-page PDF groups; refinement
-interoperability and opt-in canonical arithmetic termination; the Python
-binding ships inside the crate. The DjVu-derived component code and tests are
-replaced, leaving MIT project contributions plus retained Apache-2.0
-arithmetic-coder notices. Existing constructors and entry points remain; new
-configuration fields affect exhaustive struct literals only. The
+0.6.0 (released 2026-11-02) brought faster byte-preserving generic encoding;
+explicit pixel-exact symbol presets; measured compression planning, residual
+packing and PDF dictionary policies; bounded multi-page PDF groups; refinement
+interoperability and opt-in canonical arithmetic termination; the in-crate
+Python binding; and replacement of the DjVu-derived component code and tests,
+leaving MIT project contributions plus retained Apache-2.0 arithmetic-coder
+notices. 0.6.1 added a windowed generic-region decoder; 0.6.2 extends those
+decoder optimisations across the MQ arithmetic decoder, bitmap composition,
+refinement, halftone, text-region, Huffman and MMR paths and fixes
+pattern-dictionary `HDPW >= 128` and large region-coordinate clipping.
+Existing constructors and entry points remain; new configuration fields affect
+exhaustive struct literals only. The
 [changelog](https://github.com/liminalism/exprim/blob/main/codecs/jbig2enc-rust/CHANGELOG.md)
 has the full list.
 
@@ -58,7 +62,7 @@ gives `encode`, `encode_for_pdf`, `encode_document`, `decode`,
 
 ```toml
 [dependencies]
-jbig2enc-rust = "0.6.0"            # encoder + decoder + symbol mode
+jbig2enc-rust = "0.6.2"            # encoder + decoder + symbol mode
 ```
 
 One page, pixel-exact, as a standalone JBIG2 file. Input is one byte per
@@ -244,10 +248,10 @@ See [python/README.md](python/README.md).
 - **Decoders.** Streams from the shipping presets are verified against the
   native decoder, jbig2dec, PDFium and Poppler in the test and benchmark
   tooling. New presets use canonical `FF AC` termination; legacy presets keep
-  the historical extra `FF`, which every tested reader accepts. One known
-  decoder-side difference remains: GRTEMPLATE 1 with TPGRON disagrees with
-  jbig2dec 0.20 while agreeing with PDFium; production encoding never emits
-  that combination.
+  the historical extra `FF`, which every tested reader accepts. On
+  GRTEMPLATE 1 with TPGRON, the native decoder matches ITU-T T.88 §6.3.5.6
+  (Figure 15) and PDFium, whereas `jbig2dec 0.20` has an upstream SLTP-context
+  bug; production encoding never emits that combination.
 - **Streams.** Template-0 generic coding (arithmetic, or MMR through
   `generic.mmr`), symbol/text regions with arithmetic coding, refinement
   template 0, halftone regions with MMR or arithmetic pattern dictionaries,
@@ -299,7 +303,7 @@ generic, symbol and halftone decode times on the current machine.
 
 ```sh
 cargo test                                             # full suite
-cargo test --features parallel --lib --tests -- --skip grtemplate1_tpgron   # the release gate
+cargo test --features parallel --lib --tests           # the release gate
 cargo test --no-default-features --features decode     # decoder half alone
 cargo test --test encode_byte_identical                # 40-stream byte manifest
 SYMBOL_SPEED_DIR=/path/to/pbms cargo test --release --features parallel \

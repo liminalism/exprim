@@ -228,7 +228,7 @@ pub(crate) struct TextArithParams {
 /// or is carrying across an aggregate invocation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_text_region_arith(
-    dec: &mut ArithmeticDecoder<'_>,
+    decoder: &mut ArithmeticDecoder<'_>,
     p: &TextArithParams,
     symbols: &[Arc<MonoBitmap>],
     int_ctx: &mut IntegerContexts,
@@ -239,16 +239,19 @@ pub(crate) fn decode_text_region_arith(
     let sb_strips: i64 = 1i64 << (p.log_strips & 0x03);
     let symbol_op = comb_op(p.sb_comb_op);
     let mut bitmap = MonoBitmap::new(p.width, p.height, p.sb_def_pixel, limits)?;
+    // Keep the MQ registers in a local copy so the compiler holds them in
+    // machine registers across the integer/IAID decode calls.
+    let mut dec = decoder.clone();
 
     // §6.4.5 1) initial STRIPT.
-    let dt0 = decode_value(int_ctx.decode(dec, IntProc::Iadt))?;
+    let dt0 = decode_value(int_ctx.decode(&mut dec, IntProc::Iadt))?;
     let mut strip_t: i64 = -(dt0 as i64 * sb_strips);
     let mut first_s: i64 = 0;
     let mut n_inst: u32 = 0;
 
     while n_inst < p.num_instances {
         // §6.4.5 3b) strip T delta.
-        let dt = decode_value(int_ctx.decode(dec, IntProc::Iadt))?;
+        let dt = decode_value(int_ctx.decode(&mut dec, IntProc::Iadt))?;
         strip_t = strip_t
             .checked_add(dt as i64 * sb_strips)
             .ok_or(DecodeError::Overflow {
@@ -256,7 +259,7 @@ pub(crate) fn decode_text_region_arith(
             })?;
 
         // §6.4.5 3c) first symbol S coordinate.
-        let dfs = decode_value(int_ctx.decode(dec, IntProc::Iafs))?;
+        let dfs = decode_value(int_ctx.decode(&mut dec, IntProc::Iafs))?;
         first_s = first_s
             .checked_add(dfs as i64)
             .ok_or(DecodeError::Overflow {
@@ -268,7 +271,7 @@ pub(crate) fn decode_text_region_arith(
         loop {
             if !first_in_strip {
                 // §6.4.5 3c) subsequent S: IADS, OOB ends the strip.
-                match int_ctx.decode(dec, IntProc::Iads) {
+                match int_ctx.decode(&mut dec, IntProc::Iads) {
                     DecodedInteger::OutOfBand => break,
                     DecodedInteger::Value(ids) => {
                         cur_s = cur_s
@@ -291,14 +294,14 @@ pub(crate) fn decode_text_region_arith(
             let cur_t = if sb_strips == 1 {
                 0
             } else {
-                decode_value(int_ctx.decode(dec, IntProc::Iait))? as i64
+                decode_value(int_ctx.decode(&mut dec, IntProc::Iait))? as i64
             };
             let t_i = strip_t.checked_add(cur_t).ok_or(DecodeError::Overflow {
                 operation: "T coordinate",
             })?;
 
             // §6.4.5 3c x) symbol id.
-            let id = iaid_ctx.decode(dec, p.code_len);
+            let id = iaid_ctx.decode(&mut dec, p.code_len);
             let symbol = symbols.get(id as usize).ok_or(DecodeError::Malformed {
                 reason: "symbol id out of range",
             })?;
@@ -306,7 +309,7 @@ pub(crate) fn decode_text_region_arith(
 
             // §6.4.11 refinement indicator (only present when SBREFINE=1).
             let ri = if p.sbrefine {
-                decode_value(int_ctx.decode(dec, IntProc::Iari))?
+                decode_value(int_ctx.decode(&mut dec, IntProc::Iari))?
             } else {
                 0
             };
@@ -314,10 +317,10 @@ pub(crate) fn decode_text_region_arith(
             // The glyph actually placed: the reference symbol, or a decoded
             // refinement of it. `placed_height` anchors bottom reference corners.
             let (placed, placed_height): (PlacedSymbol<'_>, i64) = if ri != 0 {
-                let rdw = decode_value(int_ctx.decode(dec, IntProc::Iardw))? as i64;
-                let rdh = decode_value(int_ctx.decode(dec, IntProc::Iardh))? as i64;
-                let rdx = decode_value(int_ctx.decode(dec, IntProc::Iardx))?;
-                let rdy = decode_value(int_ctx.decode(dec, IntProc::Iardy))?;
+                let rdw = decode_value(int_ctx.decode(&mut dec, IntProc::Iardw))? as i64;
+                let rdh = decode_value(int_ctx.decode(&mut dec, IntProc::Iardh))? as i64;
+                let rdx = decode_value(int_ctx.decode(&mut dec, IntProc::Iardx))?;
+                let rdy = decode_value(int_ctx.decode(&mut dec, IntProc::Iardy))?;
                 let grw = symbol.width() as i64 + rdw;
                 let grh = symbol.height() as i64 + rdh;
                 if grw <= 0
@@ -334,7 +337,7 @@ pub(crate) fn decode_text_region_arith(
                 let grdx = (rdw.div_euclid(2) as i32).saturating_add(rdx);
                 let grdy = (rdh.div_euclid(2) as i32).saturating_add(rdy);
                 let refined = decode_refinement_region_templated(
-                    dec,
+                    &mut dec,
                     symbol,
                     grw as u32,
                     grh as u32,
@@ -373,6 +376,7 @@ pub(crate) fn decode_text_region_arith(
             // stream with the enclosing dictionary.
         }
     }
+    *decoder = dec;
     Ok(bitmap)
 }
 
@@ -827,9 +831,7 @@ pub(crate) fn decode_huffman_text_core(
                     limits,
                 )?;
                 // §6.4.11.5 7): skip exactly BMSIZE bytes, then byte-align.
-                for _ in 0..bmsize {
-                    let _ = br.read_bits(8);
-                }
+                br.skip_bytes(bmsize);
                 br.align_to_byte();
                 (PlacedSymbol::Owned(refined), grw, grh)
             } else {

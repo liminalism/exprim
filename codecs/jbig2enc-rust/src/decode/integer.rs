@@ -73,11 +73,20 @@ impl IntegerContexts {
     #[inline]
     pub fn decode(&mut self, dec: &mut ArithmeticDecoder<'_>, proc: IntProc) -> DecodedInteger {
         let bank = &mut self.procedures[proc.index()];
+        // `prev` starts at 1 and doubles on each step; for the first 8 steps
+        // (sign + up to 5 range-selector bits + the short 2-bit / 4-bit value
+        // ranges) `prev` is guaranteed `< 0x100`, avoiding the wrap branch.
         let mut prev: usize = 1;
 
-        // Decode one bit under context `prev & 0x1ff`, then advance `PREV`
-        // exactly as the encoder does (`update_prev`).
-        macro_rules! bit {
+        macro_rules! bit_short {
+            () => {{
+                let b = dec.decode_bit(&mut bank[prev & 0x1ff]);
+                prev = (prev << 1) | (b as usize);
+                b
+            }};
+        }
+
+        macro_rules! bit_general {
             () => {{
                 let b = dec.decode_bit(&mut bank[prev & 0x1ff]);
                 prev = if prev < 0x100 {
@@ -89,27 +98,36 @@ impl IntegerContexts {
             }};
         }
 
-        let sign = bit!();
-        let (n_bits, offset): (u32, i64) = if !bit!() {
-            (2, 0)
-        } else if !bit!() {
-            (4, 4)
-        } else if !bit!() {
-            (6, 20)
-        } else if !bit!() {
-            (8, 84)
-        } else if !bit!() {
-            (12, 340)
+        let sign = bit_short!();
+        let magnitude: i64 = if !bit_short!() {
+            // 2-bit value, offset 0 (total 4 bits: prev stays <= 15).
+            let b1 = bit_short!() as i64;
+            let b0 = dec.decode_bit(&mut bank[prev & 0x1ff]) as i64;
+            (b1 << 1) | b0
+        } else if !bit_short!() {
+            // 4-bit value, offset 4 (total 7 bits: prev stays <= 127).
+            let mut v = 0u32;
+            for _ in 0..4 {
+                v = (v << 1) | (bit_short!() as u32);
+            }
+            4 + v as i64
         } else {
-            (32, 4436)
+            let (n_bits, offset): (u32, i64) = if !bit_short!() {
+                (6, 20)
+            } else if !bit_short!() {
+                (8, 84)
+            } else if !bit_short!() {
+                (12, 340)
+            } else {
+                (32, 4436)
+            };
+            let mut v: u32 = 0;
+            for _ in 0..n_bits {
+                v = (v << 1) | (bit_general!() as u32);
+            }
+            offset + v as i64
         };
 
-        let mut v: u32 = 0;
-        for _ in 0..n_bits {
-            v = (v << 1) | (bit!() as u32);
-        }
-
-        let magnitude = offset + v as i64;
         if sign {
             if magnitude == 0 {
                 DecodedInteger::OutOfBand

@@ -218,6 +218,34 @@ pub fn decode_generic_region_into(
     Ok(())
 }
 
+/// Decode a single generic bitmap from an *existing* arithmetic decoder,
+/// without resetting `contexts`, allowing wide `i16` horizontal AT offsets
+/// (needed by arithmetic pattern dictionaries where `AT1 = (-HDPW, 0)` spans
+/// `-1..=-255`, T.88 §6.7.5).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_generic_bitmap_wide_at(
+    decoder: &mut ArithmeticDecoder<'_>,
+    width: u32,
+    height: u32,
+    template: u8,
+    at: [(i16, i8); 4],
+    contexts: &mut [MqContext],
+    limits: &DecodeLimits,
+    scratch: &mut GenericScratch,
+) -> Result<MonoBitmap, DecodeError> {
+    if (contexts.len() as u64) < (1u64 << 16) {
+        return Err(DecodeError::Overflow {
+            operation: "generic bitmap context array too small",
+        });
+    }
+    let mut bitmap = MonoBitmap::new(width, height, false, limits)?;
+    if width == 0 || height == 0 {
+        return Ok(bitmap);
+    }
+    decode_into_wide(&mut bitmap, decoder, template, at, false, contexts, scratch);
+    Ok(bitmap)
+}
+
 /// Decode a single template-0 generic bitmap from an *existing* arithmetic
 /// decoder, without resetting `contexts` (jbig2decplan.md §16).
 ///
@@ -236,18 +264,10 @@ pub fn decode_generic_bitmap(
     limits: &DecodeLimits,
     scratch: &mut GenericScratch,
 ) -> Result<MonoBitmap, DecodeError> {
-    if (contexts.len() as u64) < (1u64 << 16) {
-        return Err(DecodeError::Overflow {
-            operation: "generic bitmap context array too small",
-        });
-    }
-    let mut bitmap = MonoBitmap::new(width, height, false, limits)?;
-    if width == 0 || height == 0 {
-        return Ok(bitmap);
-    }
-    // Symbol-dictionary and refinement generic bitmaps never use TPGDON.
-    decode_into(&mut bitmap, decoder, template, at, false, contexts, scratch);
-    Ok(bitmap)
+    let wide_at = at.map(|(dx, dy)| (i16::from(dx), dy));
+    decode_generic_bitmap_wide_at(
+        decoder, width, height, template, wide_at, contexts, limits, scratch,
+    )
 }
 
 /// Skip-aware generic bitmap decode (T.88 §6.2.5.7 USESKIP / halftone
@@ -418,20 +438,38 @@ fn decode_into(
     contexts: &mut [MqContext],
     scratch: &mut GenericScratch,
 ) {
+    let wide_at = at.map(|(dx, dy)| (i16::from(dx), dy));
+    decode_into_wide(
+        bitmap, decoder, template, wide_at, tpgdon, contexts, scratch,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_into_wide(
+    bitmap: &mut MonoBitmap,
+    decoder: &mut ArithmeticDecoder<'_>,
+    template: u8,
+    at: [(i16, i8); 4],
+    tpgdon: bool,
+    contexts: &mut [MqContext],
+    scratch: &mut GenericScratch,
+) {
+    let nom0 = NOMINAL_AT0.map(|(dx, dy)| (i16::from(dx), dy));
+    let nom1 = NOMINAL_AT1.map(|(dx, dy)| (i16::from(dx), dy));
     match template {
-        0 if at == NOMINAL_AT0 => {
+        0 if at == nom0 => {
             decode_windowed::<0, false>(bitmap, decoder, contexts, at, tpgdon, scratch)
         }
         0 => decode_windowed::<0, true>(bitmap, decoder, contexts, at, tpgdon, scratch),
-        1 if at[0] == NOMINAL_AT1[0] => {
+        1 if at[0] == nom1[0] => {
             decode_windowed::<1, false>(bitmap, decoder, contexts, at, tpgdon, scratch)
         }
         1 => decode_windowed::<1, true>(bitmap, decoder, contexts, at, tpgdon, scratch),
-        2 if at[0] == NOMINAL_AT1[1] => {
+        2 if at[0] == nom1[1] => {
             decode_windowed::<2, false>(bitmap, decoder, contexts, at, tpgdon, scratch)
         }
         2 => decode_windowed::<2, true>(bitmap, decoder, contexts, at, tpgdon, scratch),
-        _ if at[0] == NOMINAL_AT1[2] => {
+        _ if at[0] == nom1[2] => {
             decode_windowed::<3, false>(bitmap, decoder, contexts, at, tpgdon, scratch)
         }
         _ => decode_windowed::<3, true>(bitmap, decoder, contexts, at, tpgdon, scratch),
@@ -542,8 +580,11 @@ enum AtSource {
     Zero,
     /// Row `y + Ay` (`Ay < 0`), read through a 32-pixel window per block.
     Row(u32),
-    /// The current row, `-Ax` (1..=128) pixels to the left.
+    /// The current row, `-Ax` (1..=128) pixels to the left (read from `hist`).
     Current(u32),
+    /// The current row, `-Ax` (> 128, up to 255 for pattern dictionaries) pixels
+    /// to the left — always in an already-written word of the current row.
+    CurrentFar(u32),
 }
 
 /// Word `index` of a packed row with the padding bits past `width` cleared,
@@ -601,7 +642,7 @@ fn decode_windowed<const T: u8, const GENERAL: bool>(
     bitmap: &mut MonoBitmap,
     decoder: &mut ArithmeticDecoder<'_>,
     contexts: &mut [MqContext],
-    at: [(i8, i8); 4],
+    at: [(i16, i8); 4],
     tpgdon: bool,
     scratch: &mut GenericScratch,
 ) {
@@ -624,7 +665,9 @@ fn decode_windowed<const T: u8, const GENERAL: bool>(
         0 => u32::MAX,
         bits => u32::MAX << (32 - bits),
     };
-    let (zero_row, cur) = scratch.rows(stride);
+    scratch.zero.clear();
+    scratch.zero.resize(stride, 0);
+    let zero_row: &[u32] = &scratch.zero;
     // Every context index is masked to 16 bits, so this fixed-size view lets
     // the indexing compile without bounds checks (`len >= 1 << 16` is checked
     // by every public entry point).
@@ -637,13 +680,27 @@ fn decode_windowed<const T: u8, const GENERAL: bool>(
             let sltp = dec.decode_bit(&mut ctxs[g.sltp & 0xFFFF]);
             ltp ^= sltp;
             if ltp {
-                copy_prev_row(bitmap, y, cur);
+                if y >= 1 {
+                    bitmap.copy_row(y - 1, y);
+                } else {
+                    bitmap.clear_row(0);
+                }
                 continue;
             }
         }
-        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { zero_row };
+
+        // Borrow all previously decoded rows `0..y` alongside row `y` mutably
+        // so decoded words land directly in `bitmap` with no per-row scratch copy.
+        let (above, cur) = bitmap.rows_above_and_mut(y);
+        let prev1: &[u32] = if y >= 1 {
+            let start = (y as usize - 1) * stride;
+            &above[start..start + stride]
+        } else {
+            zero_row
+        };
         let prev2: &[u32] = if g.has_p2 && y >= 2 {
-            bitmap.row(y - 2)
+            let start = (y as usize - 2) * stride;
+            &above[start..start + stride]
         } else {
             zero_row
         };
@@ -662,8 +719,13 @@ fn decode_windowed<const T: u8, const GENERAL: bool>(
                         AtSource::Row(yy as u32)
                     }
                 } else if dy == 0 && dx < 0 {
-                    any_current = true;
-                    AtSource::Current((-dx) as u32)
+                    let dist = (-dx) as u32;
+                    if dist <= 128 {
+                        any_current = true;
+                        AtSource::Current(dist)
+                    } else {
+                        AtSource::CurrentFar(dist)
+                    }
                 } else {
                     AtSource::Zero
                 };
@@ -701,9 +763,21 @@ fn decode_windowed<const T: u8, const GENERAL: bool>(
             let mut at_win = [0u32; 4];
             if GENERAL {
                 for k in 0..g.at_count {
-                    if let AtSource::Row(yy) = at_src[k] {
-                        let start = (block * 32) as i64 + at[k].0 as i64;
-                        at_win[k] = row_window(bitmap.row(yy), start, tail_mask);
+                    match at_src[k] {
+                        AtSource::Row(yy) => {
+                            let start = (block * 32) as i64 + at[k].0 as i64;
+                            let row_start = (yy as usize) * stride;
+                            at_win[k] =
+                                row_window(&above[row_start..row_start + stride], start, tail_mask);
+                        }
+                        AtSource::CurrentFar(dist) => {
+                            // `dist > 128`, so `block * 32 - dist + 31 < block * 32`:
+                            // all 32 pixels of this window live in already-written
+                            // words `cur[..block]`.
+                            let start = (block * 32) as i64 - dist as i64;
+                            at_win[k] = row_window(&cur[..block], start, u32::MAX);
+                        }
+                        AtSource::Zero | AtSource::Current(_) => {}
                     }
                 }
             }
@@ -761,7 +835,7 @@ fn decode_windowed<const T: u8, const GENERAL: bool>(
                     for k in 0..g.at_count {
                         let bit = match at_src[k] {
                             AtSource::Zero => 0,
-                            AtSource::Row(_) => at_win[k] >> 31,
+                            AtSource::Row(_) | AtSource::CurrentFar(_) => at_win[k] >> 31,
                             AtSource::Current(sh) => ((hist >> (sh - 1)) & 1) as u32,
                         };
                         a |= bit << g.at_bits[k];
@@ -788,14 +862,13 @@ fn decode_windowed<const T: u8, const GENERAL: bool>(
             // `count` is 1..=32, so the shift is 0..=31.
             cur[block] = pixels << (32 - count);
         }
-        bitmap.row_mut(y).copy_from_slice(cur);
     }
     *decoder = dec;
 }
 
-/// Copy row `y-1` into row `y` (a TPGDON duplicated row). `scratch` is a stride
-/// sized buffer used to break the aliasing borrow. For `y == 0` the copied row
-/// is all-zero.
+/// Copy row `y-1` into row `y` (a TPGDON duplicated row). Used by the
+/// pre-optimisation reference decoders in tests.
+#[cfg(all(test, feature = "encode"))]
 #[inline]
 fn copy_prev_row(bitmap: &mut MonoBitmap, y: u32, scratch: &mut [u32]) {
     if y >= 1 {
@@ -840,6 +913,7 @@ fn at_pixel(bitmap: &MonoBitmap, cur: &[u32], width: u32, y: u32, x: i64, dx: i6
 #[cfg(all(test, feature = "encode"))]
 pub(crate) mod reference {
     use super::*;
+    use crate::decode::arith::ReferenceArithmeticDecoder;
 
     /// Dispatch to the correct template decoder. `template` selects the pixel
     /// neighbourhood (0–3); values outside that range are clamped to 3's behaviour
@@ -848,7 +922,7 @@ pub(crate) mod reference {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn decode_into(
         bitmap: &mut MonoBitmap,
-        decoder: &mut ArithmeticDecoder<'_>,
+        decoder: &mut ReferenceArithmeticDecoder<'_>,
         template: u8,
         at: [(i8, i8); 4],
         tpgdon: bool,
@@ -872,7 +946,7 @@ pub(crate) mod reference {
     /// verbatim from the row above (all-zero for the first row).
     pub(crate) fn decode_template0_nominal(
         bitmap: &mut MonoBitmap,
-        decoder: &mut ArithmeticDecoder<'_>,
+        decoder: &mut ReferenceArithmeticDecoder<'_>,
         contexts: &mut [MqContext],
         tpgdon: bool,
         scratch: &mut GenericScratch,
@@ -930,7 +1004,7 @@ pub(crate) mod reference {
     /// context values to the rolling path when `at == NOMINAL_AT0`.
     pub(crate) fn decode_template0_general(
         bitmap: &mut MonoBitmap,
-        decoder: &mut ArithmeticDecoder<'_>,
+        decoder: &mut ReferenceArithmeticDecoder<'_>,
         contexts: &mut [MqContext],
         at: [(i8, i8); 4],
         tpgdon: bool,
@@ -1022,7 +1096,7 @@ pub(crate) mod reference {
     /// spec value.
     fn decode_template1(
         bitmap: &mut MonoBitmap,
-        decoder: &mut ArithmeticDecoder<'_>,
+        decoder: &mut ReferenceArithmeticDecoder<'_>,
         contexts: &mut [MqContext],
         at1: (i8, i8),
         tpgdon: bool,
@@ -1080,7 +1154,7 @@ pub(crate) mod reference {
     /// Generic template 2 (T.88 §6.2.5.3, Figure 6): 10-bit context, one AT pixel.
     fn decode_template2(
         bitmap: &mut MonoBitmap,
-        decoder: &mut ArithmeticDecoder<'_>,
+        decoder: &mut ReferenceArithmeticDecoder<'_>,
         contexts: &mut [MqContext],
         at1: (i8, i8),
         tpgdon: bool,
@@ -1136,7 +1210,7 @@ pub(crate) mod reference {
     /// two rows only (no `y-2` line).
     fn decode_template3(
         bitmap: &mut MonoBitmap,
-        decoder: &mut ArithmeticDecoder<'_>,
+        decoder: &mut ReferenceArithmeticDecoder<'_>,
         contexts: &mut [MqContext],
         at1: (i8, i8),
         tpgdon: bool,
@@ -1266,12 +1340,12 @@ mod tests {
 
         let mut scratch = GenericScratch::default();
         let mut bm_fast = MonoBitmap::new(37, 20, false, &limits).unwrap();
-        let mut d1 = ArithmeticDecoder::new(&data);
+        let mut d1 = crate::decode::arith::ReferenceArithmeticDecoder::new(&data);
         let mut c1 = contexts();
         reference::decode_template0_nominal(&mut bm_fast, &mut d1, &mut c1, false, &mut scratch);
 
         let mut bm_gen = MonoBitmap::new(37, 20, false, &limits).unwrap();
-        let mut d2 = ArithmeticDecoder::new(&data);
+        let mut d2 = crate::decode::arith::ReferenceArithmeticDecoder::new(&data);
         let mut c2 = contexts();
         reference::decode_template0_general(
             &mut bm_gen,
@@ -1398,7 +1472,7 @@ mod tests {
         let mut scratch = GenericScratch::default();
         let (mut c_new, mut c_ref) = (initial.to_vec(), initial.to_vec());
         let mut d_new = ArithmeticDecoder::new(data);
-        let mut d_ref = ArithmeticDecoder::new(data);
+        let mut d_ref = crate::decode::arith::ReferenceArithmeticDecoder::new(data);
         for (n, &(w, h)) in sizes.iter().enumerate() {
             let mut bm_new = MonoBitmap::new(w, h, false, &limits).unwrap();
             let mut bm_ref = MonoBitmap::new(w, h, false, &limits).unwrap();
@@ -1423,12 +1497,17 @@ mod tests {
             let ctx =
                 format!("{what}: bitmap {n} {w}x{h} template {template} at {at:?} tpgdon {tpgdon}");
             assert!(bm_new == bm_ref, "bitmap differs ({ctx})");
-            assert_eq!(
-                d_new.registers(),
-                d_ref.registers(),
-                "registers differ ({ctx})"
-            );
             assert!(c_new == c_ref, "context states differ ({ctx})");
+        }
+        // Verify decoder states remain observationally identical after all bitmaps.
+        let mut probe_new = MqContext::default();
+        let mut probe_ref = MqContext::default();
+        for bit_i in 0..64 {
+            assert_eq!(
+                d_new.decode_bit(&mut probe_new),
+                d_ref.decode_bit_reference(&mut probe_ref),
+                "trailing decoder bit {bit_i} differs ({what})"
+            );
         }
     }
 

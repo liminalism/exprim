@@ -48,11 +48,53 @@ impl<'a> BitReader<'a> {
     /// Read `n` bits (0..=32) MSB-first into a `u32`.
     #[inline]
     pub fn read_bits(&mut self, n: u32) -> u32 {
+        let mut rem = n;
         let mut v = 0u32;
-        for _ in 0..n {
-            v = (v << 1) | self.read_bit();
+        while rem > 0 {
+            let byte_idx = self.bit_pos >> 3;
+            if byte_idx >= self.data.len() {
+                self.bit_pos = self.bit_pos.saturating_add(rem as usize);
+                return if rem >= 32 { 0 } else { v << rem };
+            }
+            let bit_off = (self.bit_pos & 7) as u32;
+            let avail = 8 - bit_off;
+            let take = rem.min(avail);
+            let shift = avail - take;
+            let mask = ((1u32 << take) - 1) as u8;
+            let bits = ((self.data[byte_idx] >> shift) & mask) as u32;
+            v = (v << take) | bits;
+            self.bit_pos += take as usize;
+            rem -= take;
         }
         v
+    }
+
+    /// Peek the next 8 bits MSB-first without advancing (zero-padded past EOF).
+    #[inline(always)]
+    fn peek_u8(&self) -> u8 {
+        let byte_idx = self.bit_pos >> 3;
+        if byte_idx >= self.data.len() {
+            return 0;
+        }
+        let bit_off = self.bit_pos & 7;
+        let hi = self.data[byte_idx] as u16;
+        if bit_off == 0 {
+            return hi as u8;
+        }
+        let lo = self.data.get(byte_idx + 1).copied().unwrap_or(0) as u16;
+        (((hi << 8) | lo) >> (8 - bit_off)) as u8
+    }
+
+    /// Advance the bit cursor by `n` bits.
+    #[inline(always)]
+    fn skip_bits(&mut self, n: usize) {
+        self.bit_pos = self.bit_pos.saturating_add(n);
+    }
+
+    /// Advance the bit cursor by `n` whole bytes.
+    #[inline]
+    pub fn skip_bytes(&mut self, n: usize) {
+        self.bit_pos = self.bit_pos.saturating_add(n.saturating_mul(8));
     }
 
     /// Advance to the next byte boundary (§6.4/§7.4.3.1: some sub-streams are
@@ -133,12 +175,39 @@ const fn oob(pref_len: u8) -> RawLine {
     }
 }
 
-/// A built Huffman table: lines with assigned canonical prefix codes.
+/// Fast prefix lookup width for [`HuffmanTable::decode`].
+const HUFF_LUT_BITS: usize = 8;
+const HUFF_LUT_SIZE: usize = 1 << HUFF_LUT_BITS;
+
+/// Heap-allocated canonical decode tables for [`HuffmanTable`], boxed so the
+/// table handle itself stays compact when wrapped in `TableRef` / `TrTable`.
+#[derive(Clone, Debug)]
+struct HuffmanDecodeTables {
+    /// Active lines (`pref_len > 0`) sorted by ascending `pref_len` (and code).
+    sorted_lines: Vec<RawLine>,
+    /// 8-bit prefix LUT: `0` = miss, else `(pref_len << 8) | sorted_idx`.
+    /// Every code of length `<= 8` has `sorted_idx < 256`.
+    lut: [u16; HUFF_LUT_SIZE],
+    /// Canonical first code per prefix length `1..=32` (stored as `u64` to
+    /// prevent overflow on malformed oversubscribed tables).
+    first_code: [u64; 33],
+    /// Number of codes of each prefix length `1..=32`.
+    len_count: [u32; 33],
+    /// Starting index in `sorted_lines` for each prefix length `1..=32`.
+    len_offset: [usize; 33],
+    /// Longest prefix length present (`0..=32`).
+    max_len: usize,
+}
+
+/// A built Huffman table: lines with assigned canonical prefix codes, plus
+/// an 8-bit fast lookup table and canonical per-length decode bounds so
+/// decoding is O(1) for short codes and O(length) for longer codes.
 #[derive(Clone, Debug)]
 pub struct HuffmanTable {
     lines: Vec<RawLine>,
     /// Assigned prefix code per line (only meaningful when `pref_len > 0`).
     codes: Vec<u32>,
+    tables: Box<HuffmanDecodeTables>,
     pub has_oob: bool,
 }
 
@@ -159,21 +228,49 @@ impl HuffmanTable {
                 reason: "Huffman prefix length exceeds 32 bits",
             });
         }
-        let mut len_count = vec![0u32; len_max + 1];
+        let mut len_count = [0u32; 33];
         for l in &lines {
             len_count[l.pref_len as usize] += 1;
         }
-        // B.3 step 2/3: canonical first-code per length.
+        len_count[0] = 0;
+
+        let mut first_code = [0u64; 33];
+        let mut len_offset = [0usize; 33];
+        let active_total: usize = len_count[1..=len_max].iter().map(|&c| c as usize).sum();
+        let mut sorted_lines = Vec::with_capacity(active_total);
+        let mut lut = [0u16; HUFF_LUT_SIZE];
         let mut codes = vec![0u32; lines.len()];
+
         if len_max >= 1 {
-            let mut first_code = vec![0u32; len_max + 2];
-            len_count[0] = 0;
+            // B.3 step 2/3: canonical first-code per length, populating both
+            // `codes` (in original line order) and `sorted_lines` (grouped by
+            // length for O(1)/O(L) decode).
             for cur_len in 1..=len_max {
-                first_code[cur_len] = (first_code[cur_len - 1] + len_count[cur_len - 1]) << 1;
+                first_code[cur_len] =
+                    (first_code[cur_len - 1] + len_count[cur_len - 1] as u64) << 1;
+                len_offset[cur_len] = sorted_lines.len();
                 let mut cur_code = first_code[cur_len];
                 for (i, l) in lines.iter().enumerate() {
                     if l.pref_len as usize == cur_len {
-                        codes[i] = cur_code;
+                        let sorted_idx = sorted_lines.len();
+                        codes[i] = cur_code as u32;
+                        sorted_lines.push(*l);
+                        if cur_len <= HUFF_LUT_BITS
+                            && sorted_idx < HUFF_LUT_SIZE
+                            && cur_code < (1u64 << cur_len)
+                        {
+                            let shift = HUFF_LUT_BITS - cur_len;
+                            let base = (cur_code as usize) << shift;
+                            let fill = 1usize << shift;
+                            let entry = ((cur_len as u16) << 8) | (sorted_idx as u16);
+                            for slot in &mut lut[base..base + fill] {
+                                // First matching code wins (matching the prior
+                                // linear scan if a malformed table repeats codes).
+                                if *slot == 0 {
+                                    *slot = entry;
+                                }
+                            }
+                        }
                         cur_code += 1;
                     }
                 }
@@ -183,6 +280,14 @@ impl HuffmanTable {
         Ok(HuffmanTable {
             lines,
             codes,
+            tables: Box::new(HuffmanDecodeTables {
+                sorted_lines,
+                lut,
+                first_code,
+                len_count,
+                len_offset,
+                max_len: len_max,
+            }),
             has_oob,
         })
     }
@@ -210,25 +315,40 @@ impl HuffmanTable {
     }
 
     /// Decode one value (B.4). Returns [`HuffmanValue::Oob`] for the OOB line.
+    #[inline]
     pub fn decode(&self, r: &mut BitReader<'_>) -> Result<HuffmanValue, DecodeError> {
-        // Accumulate bits until (length, code) matches a line. Bounded by the
-        // longest prefix present (build() capped it at 32).
-        let mut code = 0u32;
-        let mut len = 0u32;
-        loop {
-            code = (code << 1) | r.read_bit();
-            len += 1;
-            if len > 32 {
-                return Err(DecodeError::Malformed {
-                    reason: "no Huffman code matched within 32 bits",
-                });
-            }
-            for (i, l) in self.lines.iter().enumerate() {
-                if l.pref_len as u32 == len && self.codes[i] == code {
-                    return self.emit(l, r);
+        let t = &*self.tables;
+        let peek8 = r.peek_u8();
+        let entry = t.lut[peek8 as usize];
+        if entry != 0 {
+            let len = (entry >> 8) as usize;
+            let idx = (entry & 0xFF) as usize;
+            r.skip_bits(len);
+            return self.emit(&t.sorted_lines[idx], r);
+        }
+        if t.max_len <= HUFF_LUT_BITS {
+            return Err(DecodeError::Malformed {
+                reason: "no Huffman code matched within 32 bits",
+            });
+        }
+        // Code length > 8: consume the 8 peeked bits and extend one bit at a
+        // time up to `max_len` using the canonical first-code bounds.
+        r.skip_bits(HUFF_LUT_BITS);
+        let mut code = peek8 as u64;
+        for len in (HUFF_LUT_BITS + 1)..=t.max_len {
+            code = (code << 1) | r.read_bit() as u64;
+            let count = t.len_count[len] as u64;
+            if count != 0 {
+                let first = t.first_code[len];
+                if code >= first && (code - first) < count {
+                    let idx = t.len_offset[len] + (code - first) as usize;
+                    return self.emit(&t.sorted_lines[idx], r);
                 }
             }
         }
+        Err(DecodeError::Malformed {
+            reason: "no Huffman code matched within 32 bits",
+        })
     }
 
     /// Test/encoder helper: the bits to emit for `value` — `(prefix_code,

@@ -111,6 +111,9 @@ pub struct DecoderContext {
     pub segment_store: crate::decode::store::SegmentStore,
     /// Per-document "unknown height" flags (one per page), pooled likewise.
     pub unknown_height_scratch: Vec<bool>,
+    /// Per-document "clean all-white page" flags (one per page), pooled so
+    /// full-cover `Or` composition avoids scanning the whole page bitmap.
+    pub(crate) clean_white_scratch: Vec<bool>,
     /// Pooled `DecodedPage` list for the zero-copy `decode_embedded_into` path,
     /// swapped out and drained back each call so the `Vec` allocation is reused.
     pub pages_scratch: Vec<crate::decode::page::DecodedPage>,

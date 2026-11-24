@@ -76,6 +76,31 @@ fn grtemplate0_tpgron() {
 
 #[test]
 fn grtemplate1_tpgron() {
+    // T.88 §6.3.5.6 Figure 15 sets the SLTP context for GRTEMPLATE=1 to the
+    // centre reference pixel GRREFERENCE(0,0) alone ("GR0000001000" in reading
+    // order, 0x080 in this crate's bit numbering). Native decode matches the
+    // spec and PDFium (see `grtemplate1_tpgron_pdfium_control` below);
+    // jbig2dec 0.20 has an upstream bug using the wrong SLTP context index for
+    // template 1, so the jbig2dec check lives in the ignored test below.
+    let reference = bordered(22, 20, 3);
+    let target = toggled(&reference, &[(7, 7), (11, 12), (3, 15)]);
+    let stream = refinement_page(&reference, &target, 1, true);
+    let got = decode_embedded(None, &stream, &opts())
+        .unwrap_or_else(|e| panic!("gr1-tpgron: native decode failed: {e}"));
+    for y in 0..target.height {
+        for x in 0..target.width {
+            assert_eq!(
+                got.get(x, y),
+                target.get(x, y),
+                "gr1-tpgron: native ({x},{y})"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "known jbig2dec 0.20 upstream bug: wrong SLTP context for GRTEMPLATE=1 TPGRON; native matches T.88 §6.3.5.6 Figure 15 and PDFium"]
+fn grtemplate1_tpgron_jbig2dec_known_bug() {
     let reference = bordered(22, 20, 3);
     let target = toggled(&reference, &[(7, 7), (11, 12), (3, 15)]);
     check(&reference, &target, 1, true, "gr1-tpgron");

@@ -224,6 +224,36 @@ impl MonoBitmap {
         &mut self.words[start..start + self.stride_words as usize]
     }
 
+    /// Borrow all previously decoded rows `0..y` (flat packed words, stride
+    /// `stride_words`) alongside row `y` mutably, so decoders can write
+    /// directly into the bitmap with no intermediate scratch copy.
+    #[cfg(feature = "decode")]
+    #[inline]
+    pub(crate) fn rows_above_and_mut(&mut self, y: u32) -> (&[u32], &mut [u32]) {
+        let stride = self.stride_words as usize;
+        let split = (y as usize) * stride;
+        let (above, rest) = self.words.split_at_mut(split);
+        (above, &mut rest[..stride])
+    }
+
+    /// Copy row `src_y` directly into row `dst_y` in one `copy_within` (used
+    /// for TPGDON duplicate rows).
+    #[cfg(feature = "decode")]
+    #[inline]
+    pub(crate) fn copy_row(&mut self, src_y: u32, dst_y: u32) {
+        let stride = self.stride_words as usize;
+        let src = (src_y as usize) * stride;
+        let dst = (dst_y as usize) * stride;
+        self.words.copy_within(src..src + stride, dst);
+    }
+
+    /// Zero every word of row `y`.
+    #[cfg(feature = "decode")]
+    #[inline]
+    pub(crate) fn clear_row(&mut self, y: u32) {
+        self.row_mut(y).fill(0);
+    }
+
     /// Read pixel `(x, y)`. Out-of-range coordinates read as white (`false`)
     /// so decoded coordinates can never trigger a panic.
     #[inline]
@@ -264,24 +294,165 @@ impl MonoBitmap {
         // Negate in i64 so `x == i32::MIN` (reachable from a mutated region
         // coordinate) cannot overflow.
         let sx_start = if x < 0 { -(x as i64) } else { 0 };
-        let sx_end = {
-            let by_width = self.width as i64 - x as i64;
-            (source.width as i64).min(by_width)
-        };
+        let sx_end = (source.width as i64).min(self.width as i64 - x as i64);
         if sx_start >= sx_end {
             return;
         }
-        let dx_start = x as i64 + sx_start; // >= 0
-        let dx_end = x as i64 + sx_end; // <= width
+        // Clip the source row range [sy_start, sy_end) once up front.
+        let sy_start = if y < 0 { -(y as i64) } else { 0 };
+        let sy_end = (source.height as i64).min(self.height as i64 - y as i64);
+        if sy_start >= sy_end {
+            return;
+        }
 
-        for sy in 0..source.height {
-            let dy = y as i64 + sy as i64;
-            if dy < 0 || dy >= self.height as i64 {
-                continue;
+        let dx_start = (x as i64 + sx_start) as usize;
+        let dx_end = (x as i64 + sx_end) as usize;
+        let dy_start = (y as i64 + sy_start) as usize;
+        let sy_start_u = sy_start as usize;
+        let sy_end_u = sy_end as usize;
+        let dst_stride = self.stride_words as usize;
+        let src_stride = source.stride_words as usize;
+
+        // Fast path for single-word, horizontally unclipped sources (covers
+        // nearly every text-region glyph and halftone pattern). `MonoBitmap`
+        // keeps padding bits past `source.width` zero, so OR and XOR need no
+        // masking at all.
+        if src_stride == 1 && sx_start == 0 && sx_end == source.width as i64 {
+            let w_idx = dx_start >> 5;
+            let shift = (dx_start & 31) as u32;
+            let spans_two = shift + source.width > 32;
+            let src_slice = &source.words[sy_start_u..sy_end_u];
+            let mut dst_pos = dy_start * dst_stride + w_idx;
+            match operator {
+                CombinationOperator::Or => {
+                    if !spans_two {
+                        for &sw in src_slice {
+                            self.words[dst_pos] |= sw >> shift;
+                            dst_pos += dst_stride;
+                        }
+                    } else {
+                        let rshift = 32 - shift;
+                        for &sw in src_slice {
+                            self.words[dst_pos] |= sw >> shift;
+                            self.words[dst_pos + 1] |= sw << rshift;
+                            dst_pos += dst_stride;
+                        }
+                    }
+                    return;
+                }
+                CombinationOperator::Xor => {
+                    if !spans_two {
+                        for &sw in src_slice {
+                            self.words[dst_pos] ^= sw >> shift;
+                            dst_pos += dst_stride;
+                        }
+                    } else {
+                        let rshift = 32 - shift;
+                        for &sw in src_slice {
+                            self.words[dst_pos] ^= sw >> shift;
+                            self.words[dst_pos + 1] ^= sw << rshift;
+                            dst_pos += dst_stride;
+                        }
+                    }
+                    return;
+                }
+                CombinationOperator::Replace => {
+                    if !spans_two {
+                        let mask = mask_range(shift, shift + source.width);
+                        let inv = !mask;
+                        for &sw in src_slice {
+                            self.words[dst_pos] = (self.words[dst_pos] & inv) | (sw >> shift);
+                            dst_pos += dst_stride;
+                        }
+                    } else {
+                        let rshift = 32 - shift;
+                        let mask0 = mask_range(shift, 32);
+                        let inv0 = !mask0;
+                        let mask1 = mask_range(0, shift + source.width - 32);
+                        let inv1 = !mask1;
+                        for &sw in src_slice {
+                            self.words[dst_pos] = (self.words[dst_pos] & inv0) | (sw >> shift);
+                            self.words[dst_pos + 1] =
+                                (self.words[dst_pos + 1] & inv1) | (sw << rshift);
+                            dst_pos += dst_stride;
+                        }
+                    }
+                    return;
+                }
+                CombinationOperator::And => {
+                    if !spans_two {
+                        let inv = !mask_range(shift, shift + source.width);
+                        for &sw in src_slice {
+                            self.words[dst_pos] &= (sw >> shift) | inv;
+                            dst_pos += dst_stride;
+                        }
+                    } else {
+                        let rshift = 32 - shift;
+                        let inv0 = !mask_range(shift, 32);
+                        let inv1 = !mask_range(0, shift + source.width - 32);
+                        for &sw in src_slice {
+                            self.words[dst_pos] &= (sw >> shift) | inv0;
+                            self.words[dst_pos + 1] &= (sw << rshift) | inv1;
+                            dst_pos += dst_stride;
+                        }
+                    }
+                    return;
+                }
+                CombinationOperator::Xnor => {
+                    if !spans_two {
+                        let mask = mask_range(shift, shift + source.width);
+                        let inv = !mask;
+                        for &sw in src_slice {
+                            let d = self.words[dst_pos];
+                            self.words[dst_pos] = (d & inv) | (!(d ^ (sw >> shift)) & mask);
+                            dst_pos += dst_stride;
+                        }
+                    } else {
+                        let rshift = 32 - shift;
+                        let mask0 = mask_range(shift, 32);
+                        let inv0 = !mask0;
+                        let mask1 = mask_range(0, shift + source.width - 32);
+                        let inv1 = !mask1;
+                        for &sw in src_slice {
+                            let d0 = self.words[dst_pos];
+                            self.words[dst_pos] = (d0 & inv0) | (!(d0 ^ (sw >> shift)) & mask0);
+                            let d1 = self.words[dst_pos + 1];
+                            self.words[dst_pos + 1] =
+                                (d1 & inv1) | (!(d1 ^ (sw << rshift)) & mask1);
+                            dst_pos += dst_stride;
+                        }
+                    }
+                    return;
+                }
             }
-            let src_row = source.row(sy);
-            let dst_row = self.row_mut(dy as u32);
-            combine_row(dst_row, src_row, x as i64, dx_start, dx_end, operator);
+        }
+
+        // General multi-word / clipped path: precompute column parameters once
+        // outside the row loop.
+        let w_first = dx_start >> 5;
+        let w_last = (dx_end - 1) >> 5;
+        let first_lo = (dx_start & 31) as u32;
+        let last_hi = (((dx_end - 1) & 31) + 1) as u32;
+        let first_mask = if w_first == w_last {
+            mask_range(first_lo, last_hi)
+        } else {
+            mask_range(first_lo, 32)
+        };
+        let last_mask = mask_range(0, last_hi);
+        let a_first = 32 * (w_first as i64) - x as i64;
+        let off = a_first.rem_euclid(32) as u32;
+        let wi_first = a_first.div_euclid(32);
+
+        let mut dst_row_start = dy_start * dst_stride;
+        let mut src_row_start = sy_start_u * src_stride;
+        for _ in sy_start_u..sy_end_u {
+            let dst_row = &mut self.words[dst_row_start..dst_row_start + dst_stride];
+            let src_row = &source.words[src_row_start..src_row_start + src_stride];
+            combine_row_fast(
+                dst_row, src_row, w_first, w_last, first_mask, last_mask, wi_first, off, operator,
+            );
+            dst_row_start += dst_stride;
+            src_row_start += src_stride;
         }
     }
 
@@ -356,36 +527,51 @@ fn fill_black_rows(words: &mut [u32], width: u32, stride_words: u32) {
     }
 }
 
-/// Combine one source row's clipped span into one destination row.
-///
-/// `x` is the signed destination offset of source bit 0; `[dx_start, dx_end)`
-/// is the already-clipped destination column range (0 ≤ dx_start < dx_end ≤
-/// dest width).
-fn combine_row(
+/// Combine one source row's clipped span into one destination row using
+/// precomputed word range, edge masks, and bit alignment.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn combine_row_fast(
     dst_row: &mut [u32],
     src_row: &[u32],
-    x: i64,
-    dx_start: i64,
-    dx_end: i64,
+    w_first: usize,
+    w_last: usize,
+    first_mask: u32,
+    last_mask: u32,
+    wi_first: i64,
+    off: u32,
     operator: CombinationOperator,
 ) {
-    let w_first = (dx_start / 32) as usize;
-    let w_last = ((dx_end - 1) / 32) as usize;
-
-    for (i, dword) in dst_row[w_first..=w_last].iter_mut().enumerate() {
-        let w = w_first + i;
-        // Source bit position aligned to this destination word's bit 0.
-        let a = 32 * (w as i64) - x;
-        let src_val = read_window(src_row, a);
-
-        // Mask of destination bits in [dx_start, dx_end) that fall in word w.
-        let word_lo = 32 * (w as i64);
-        let word_hi = word_lo + 32;
-        let lo = dx_start.max(word_lo);
-        let hi = dx_end.min(word_hi);
-        let mask = mask_range((lo - word_lo) as u32, (hi - word_lo) as u32);
-
-        *dword = apply_operator(*dword, src_val, mask, operator);
+    let words = &mut dst_row[w_first..=w_last];
+    let count = words.len();
+    if off == 0 {
+        for (i, dword) in words.iter_mut().enumerate() {
+            let src_val = get_word(src_row, wi_first + i as i64);
+            let mask = if i == 0 {
+                first_mask
+            } else if i + 1 == count {
+                last_mask
+            } else {
+                !0u32
+            };
+            *dword = apply_operator(*dword, src_val, mask, operator);
+        }
+    } else {
+        let rshift = 32 - off;
+        let mut hi = get_word(src_row, wi_first);
+        for (i, dword) in words.iter_mut().enumerate() {
+            let lo = get_word(src_row, wi_first + i as i64 + 1);
+            let src_val = (hi << off) | (lo >> rshift);
+            hi = lo;
+            let mask = if i == 0 {
+                first_mask
+            } else if i + 1 == count {
+                last_mask
+            } else {
+                !0u32
+            };
+            *dword = apply_operator(*dword, src_val, mask, operator);
+        }
     }
 }
 
@@ -402,21 +588,6 @@ fn mask_range(from: u32, to: u32) -> u32 {
     let high = if from == 0 { !0u32 } else { !0u32 >> from };
     let low = if to == 32 { 0 } else { !0u32 >> to };
     high & !low
-}
-
-/// Read 32 bits of `row` starting at absolute bit position `a` (MSB-first),
-/// treating positions outside the stored words as zero.
-#[inline]
-fn read_window(row: &[u32], a: i64) -> u32 {
-    let off = a.rem_euclid(32) as u32;
-    let wi = a.div_euclid(32);
-    let hi = get_word(row, wi);
-    if off == 0 {
-        hi
-    } else {
-        let lo = get_word(row, wi + 1);
-        (hi << off) | (lo >> (32 - off))
-    }
 }
 
 #[inline]

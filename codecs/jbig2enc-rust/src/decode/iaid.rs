@@ -44,21 +44,34 @@ impl IaidContexts {
     /// same `bits` first. `bits == 0` returns `0` without consuming any bits.
     #[inline]
     pub fn decode(&mut self, dec: &mut ArithmeticDecoder<'_>, bits: u8) -> u32 {
-        if bits == 0 {
+        if bits == 0 || bits > 24 {
             return 0;
         }
-        let len = self.states.len();
-        if len == 0 {
-            return 0;
-        }
+        let needed = 1usize << bits;
+        let Some(states) = self.states.get_mut(..needed) else {
+            // Fallback when called without a matching `reset_for_bits`.
+            let len = self.states.len();
+            if len == 0 {
+                return 0;
+            }
+            let mut prev: usize = 1;
+            for _ in 0..bits {
+                let idx = prev.min(len - 1);
+                let b = dec.decode_bit(&mut self.states[idx]);
+                prev = (prev << 1) | (b as usize);
+            }
+            return (prev - needed) as u32;
+        };
+        let mask = needed - 1;
         let mut prev: usize = 1;
         for _ in 0..bits {
-            let idx = prev.min(len - 1);
-            let b = dec.decode_bit(&mut self.states[idx]);
+            // `prev` stays in `1..needed`, so `prev & mask == prev` and the
+            // mask eliminates bounds checks inside the hot loop.
+            let b = dec.decode_bit(&mut states[prev & mask]);
             prev = (prev << 1) | (b as usize);
         }
         // After `bits` steps `prev == (1 << bits) | value`.
-        (prev - (1usize << bits)) as u32
+        (prev - needed) as u32
     }
 }
 

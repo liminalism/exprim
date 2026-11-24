@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "jbig2enc-rust"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "fax",

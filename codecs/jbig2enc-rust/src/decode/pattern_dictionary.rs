@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use crate::decode::arith::ArithmeticDecoder;
 use crate::decode::error::{DecodeError, LimitError};
-use crate::decode::generic::{GenericScratch, decode_generic_bitmap};
+use crate::decode::generic::{GenericScratch, decode_generic_bitmap_wide_at};
 use crate::decode::mmr::decode_mmr_bitmap;
-use crate::shared::bitmap::MonoBitmap;
+use crate::shared::bitmap::{CombinationOperator, MonoBitmap};
 use crate::shared::limits::DecodeLimits;
 use crate::shared::mq_table::MqContext;
 use crate::shared::reader::Reader;
@@ -141,9 +141,10 @@ pub fn decode_pattern_dictionary(
         decode_mmr_bitmap(data, collective_width, collective_height, limits)?
     } else {
         // §6.7.5 fixed AT pixels for the pattern-dictionary collective bitmap
-        // (GBTEMPLATE = HDTEMPLATE). AT1 = (-HDPW, 0); templates 1–3 use AT1 only.
-        let hdpw_i8 = i8::try_from(hdr.hdpw).unwrap_or(i8::MIN);
-        let at = [(-hdpw_i8, 0i8), (-3, -1), (2, -2), (-2, -2)];
+        // (GBTEMPLATE = HDTEMPLATE). AT1 = (-HDPW, 0) spans -1..=-255 (HDPW is
+        // an unsigned byte, so i8 would overflow at HDPW >= 128); templates 1–3
+        // use AT1 only.
+        let at = [(-(hdr.hdpw as i16), 0i8), (-3, -1), (2, -2), (-2, -2)];
         if generic_ctx.len() < (1usize << 16) {
             return Err(DecodeError::Overflow {
                 operation: "pattern dictionary context array too small",
@@ -153,7 +154,7 @@ pub fn decode_pattern_dictionary(
             *c = MqContext::default();
         }
         let mut dec = ArithmeticDecoder::new(data);
-        decode_generic_bitmap(
+        decode_generic_bitmap_wide_at(
             &mut dec,
             collective_width,
             collective_height,
@@ -165,18 +166,19 @@ pub fn decode_pattern_dictionary(
         )?
     };
 
-    // Split the collective bitmap into individual immutable patterns.
+    // Split the collective bitmap into individual immutable patterns word-wise.
     let num_patterns = num_patterns as usize;
     let mut patterns: Vec<Arc<MonoBitmap>> = Vec::with_capacity(num_patterns.min(4096));
     for i in 0..num_patterns {
         let x0 = (i as u32) * hdr.hdpw;
         let mut pat = MonoBitmap::new(hdr.hdpw, hdr.hdph, false, limits)?;
-        for y in 0..hdr.hdph {
-            for x in 0..hdr.hdpw {
-                if collective.get(x0 + x, y) {
-                    pat.set(x, y, true);
-                }
-            }
+        if let Ok(x0_i32) = i32::try_from(x0) {
+            pat.combine(
+                &collective,
+                x0_i32.wrapping_neg(),
+                0,
+                CombinationOperator::Replace,
+            );
         }
         patterns.push(Arc::new(pat));
     }
@@ -186,4 +188,35 @@ pub fn decode_pattern_dictionary(
         pattern_width: hdr.hdpw,
         pattern_height: hdr.hdph,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::decode::context::GENERIC_CONTEXT_COUNT;
+
+    /// Regression: arithmetic pattern dictionaries have `AT1 = (-HDPW, 0)`
+    /// (T.88 §6.7.5) where `HDPW` is a `u8` (1..=255). Previously `HDPW == 128`
+    /// overflowed `-i8::MIN` in debug builds and `HDPW > 128` silently clamped
+    /// AT1 to -128.
+    #[test]
+    fn arithmetic_pattern_dict_hdpw_128_and_130_do_not_overflow() {
+        let limits = DecodeLimits::default();
+        let mut ctx = vec![MqContext::default(); GENERIC_CONTEXT_COUNT];
+        let mut scratch = GenericScratch::default();
+        for hdpw in [128u8, 130u8] {
+            let mut payload = Vec::new();
+            payload.push(0x00); // HDMMR = 0, HDTEMPLATE = 0
+            payload.push(hdpw); // HDPW
+            payload.push(2); // HDPH
+            payload.extend_from_slice(&1u32.to_be_bytes()); // GRAYMAX = 1 (2 patterns)
+            payload.extend_from_slice(&[0x00, 0x11, 0x22, 0xFF, 0xAC]);
+            let dict = decode_pattern_dictionary(&payload, &limits, &mut ctx, &mut scratch)
+                .expect("decode arithmetic pattern dictionary with wide HDPW");
+            assert_eq!(dict.len(), 2);
+            assert_eq!(dict.pattern_width, hdpw as u32);
+            assert_eq!(dict.pattern_height, 2);
+        }
+    }
 }

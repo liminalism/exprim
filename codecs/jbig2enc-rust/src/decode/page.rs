@@ -248,6 +248,7 @@ fn annotate(segment: u32, err: DecodeError) -> DecodeError {
 struct SegmentScratch {
     pages: Vec<DecodedPage>,
     unknown_height: Vec<bool>,
+    clean_white: Vec<bool>,
     store: SegmentStore,
     bitmap_pool: Vec<MonoBitmap>,
 }
@@ -279,13 +280,16 @@ pub fn process_document_with_globals(
     limits: &DecodeLimits,
     ctx: &mut DecoderContext,
 ) -> Result<Vec<DecodedPage>, DecodeError> {
-    // By-value entry point: pool the store and height flags across documents,
-    // but allocate page bitmaps fresh (they are moved out to the caller) — the
-    // empty pool makes `acquire_bitmap` always allocate.
+    // By-value entry point: pool the store, flags, and any spare region bitmaps
+    // across documents so reused workers do not allocate and drop a spare page
+    // buffer on every page; page bitmaps themselves are moved out to the caller.
     let mut unknown_height = std::mem::take(&mut ctx.unknown_height_scratch);
     unknown_height.clear();
+    let mut clean_white = std::mem::take(&mut ctx.clean_white_scratch);
+    clean_white.clear();
     let mut store = std::mem::take(&mut ctx.segment_store);
     store.clear();
+    let bitmap_pool = std::mem::take(&mut ctx.bitmap_pool);
     let scratch = run_segments(
         doc,
         globals,
@@ -294,20 +298,25 @@ pub fn process_document_with_globals(
         SegmentScratch {
             pages: Vec::new(),
             unknown_height,
+            clean_white,
             store,
-            bitmap_pool: Vec::new(),
+            bitmap_pool,
         },
     )?;
     let SegmentScratch {
         pages,
         mut unknown_height,
+        mut clean_white,
         mut store,
-        bitmap_pool: _,
+        bitmap_pool,
     } = scratch;
+    ctx.bitmap_pool = bitmap_pool;
     store.clear();
     ctx.segment_store = store;
     unknown_height.clear();
     ctx.unknown_height_scratch = unknown_height;
+    clean_white.clear();
+    ctx.clean_white_scratch = clean_white;
     Ok(pages)
 }
 
@@ -332,6 +341,8 @@ pub fn process_document_into(
     }
     let mut unknown_height = std::mem::take(&mut ctx.unknown_height_scratch);
     unknown_height.clear();
+    let mut clean_white = std::mem::take(&mut ctx.clean_white_scratch);
+    clean_white.clear();
     let mut store = std::mem::take(&mut ctx.segment_store);
     store.clear();
 
@@ -343,6 +354,7 @@ pub fn process_document_into(
         SegmentScratch {
             pages,
             unknown_height,
+            clean_white,
             store,
             bitmap_pool,
         },
@@ -350,6 +362,7 @@ pub fn process_document_into(
     let SegmentScratch {
         mut pages,
         mut unknown_height,
+        mut clean_white,
         mut store,
         mut bitmap_pool,
     } = scratch;
@@ -371,6 +384,8 @@ pub fn process_document_into(
     ctx.segment_store = store;
     unknown_height.clear();
     ctx.unknown_height_scratch = unknown_height;
+    clean_white.clear();
+    ctx.clean_white_scratch = clean_white;
     Ok(produced)
 }
 
@@ -388,6 +403,7 @@ fn run_segments(
     let SegmentScratch {
         mut pages,
         mut unknown_height,
+        mut clean_white,
         mut store,
         mut bitmap_pool,
     } = scratch;
@@ -449,6 +465,7 @@ fn run_segments(
                     &mut store,
                     &mut pages,
                     &unknown_height,
+                    &mut clean_white,
                     current,
                     seg.header.page_association,
                     result.bitmap,
@@ -488,6 +505,7 @@ fn run_segments(
                     bitmap,
                 });
                 unknown_height.push(is_unknown);
+                clean_white.push(!info.default_pixel);
                 current = Some(pages.len() - 1);
             }
             Some(
@@ -520,25 +538,60 @@ fn run_segments(
                     region.height = row_count;
                     region.data = &region.data[..dlen - 4];
                 }
-                let mut region_bm =
-                    acquire_bitmap(&mut bitmap_pool, region.width, region.height, false, limits)?;
-                let (gctx, scr) = ctx.generic_and_scratch();
-                decode_generic_region_into(&region, limits, gctx, scr, &mut region_bm)?;
-                if let Some(spare) = place_or_store(
-                    matches!(ty, Some(SegmentType::IntermediateGenericRegion)),
-                    seg.header.number,
-                    &mut store,
-                    &mut pages,
-                    &unknown_height,
-                    current,
-                    seg.header.page_association,
-                    region_bm,
-                    region.x,
-                    region.y,
-                    region.comb_operator,
-                    limits,
-                )? {
-                    bitmap_pool.push(spare);
+                let intermediate = matches!(ty, Some(SegmentType::IntermediateGenericRegion));
+                // Fast path: an immediate generic region covering the entire
+                // page at (0,0) with Replace, or with Or on an untouched white
+                // page, decodes straight into the page buffer without allocating
+                // or zeroing a second page-sized region bitmap.
+                let direct_target = if !intermediate && region.x == 0 && region.y == 0 {
+                    resolve_page(&mut pages, current, seg.header.page_association)
+                        .ok()
+                        .filter(|&idx| {
+                            let page = &pages[idx].bitmap;
+                            let op = combination_operator(region.comb_operator);
+                            region.width == page.width()
+                                && region.height == page.height()
+                                && (matches!(op, CombinationOperator::Replace)
+                                    || (matches!(op, CombinationOperator::Or) && clean_white[idx]))
+                        })
+                } else {
+                    None
+                };
+                if let Some(target_idx) = direct_target {
+                    let page = &mut pages[target_idx].bitmap;
+                    if region.mmr && !clean_white[target_idx] {
+                        page.reset(region.width, region.height, false, limits)?;
+                    }
+                    let (gctx, scr) = ctx.generic_and_scratch();
+                    decode_generic_region_into(&region, limits, gctx, scr, page)?;
+                    clean_white[target_idx] = false;
+                } else {
+                    let mut region_bm = acquire_bitmap(
+                        &mut bitmap_pool,
+                        region.width,
+                        region.height,
+                        false,
+                        limits,
+                    )?;
+                    let (gctx, scr) = ctx.generic_and_scratch();
+                    decode_generic_region_into(&region, limits, gctx, scr, &mut region_bm)?;
+                    if let Some(spare) = place_or_store(
+                        intermediate,
+                        seg.header.number,
+                        &mut store,
+                        &mut pages,
+                        &unknown_height,
+                        &mut clean_white,
+                        current,
+                        seg.header.page_association,
+                        region_bm,
+                        region.x,
+                        region.y,
+                        region.comb_operator,
+                        limits,
+                    )? {
+                        bitmap_pool.push(spare);
+                    }
                 }
             }
             // §7.4.10 end of stripe: a 4-byte end row. For an unknown-height
@@ -599,6 +652,7 @@ fn run_segments(
                     &mut store,
                     &mut pages,
                     &unknown_height,
+                    &mut clean_white,
                     current,
                     seg.header.page_association,
                     region_bm,
@@ -624,7 +678,7 @@ fn run_segments(
                 let intermediate =
                     matches!(ty, Some(SegmentType::IntermediateGenericRefinementRegion));
 
-                let (reference, ext_comb) = if seg.header.referred_to.is_empty() {
+                let (owned_ref, borrowed_ref, ext_comb) = if seg.header.referred_to.is_empty() {
                     // No referred region: refine the page buffer window in place;
                     // §7.4.7.5 step 1 external combination operator is REPLACE.
                     let target = resolve_page(&mut pages, current, seg.header.page_association)?;
@@ -643,16 +697,23 @@ fn run_segments(
                         region.height,
                         limits,
                     )?;
-                    (reference, 4u8)
+                    (Some(reference), None, 4u8)
                 } else {
-                    // Referred region: its retained bitmap is GRREFERENCE.
+                    // Referred region: its retained bitmap is GRREFERENCE (borrow
+                    // directly without cloning the bitmap).
                     let src = store
                         .referred_region(&seg.header.referred_to, globals_store)
                         .ok_or(DecodeError::MissingReferredSegment {
                             segment: seg.header.number,
                             referred: seg.header.referred_to.first().copied().unwrap_or(0),
-                        })?;
-                    ((**src).clone(), region.comb_operator)
+                        })?
+                        .clone();
+                    (None, Some(src), region.comb_operator)
+                };
+                let reference: &MonoBitmap = match (&owned_ref, &borrowed_ref) {
+                    (Some(bm), _) => bm,
+                    (None, Some(arc)) => arc.as_ref(),
+                    (None, None) => unreachable!(),
                 };
 
                 // §7.4.7.5 step 2: fresh arithmetic statistics per segment.
@@ -660,7 +721,7 @@ fn run_segments(
                 let mut dec = ArithmeticDecoder::new(region.data);
                 let refined = decode_refinement_region_templated(
                     &mut dec,
-                    &reference,
+                    reference,
                     region.width,
                     region.height,
                     0,
@@ -679,6 +740,7 @@ fn run_segments(
                     &mut store,
                     &mut pages,
                     &unknown_height,
+                    &mut clean_white,
                     current,
                     seg.header.page_association,
                     refined,
@@ -705,6 +767,7 @@ fn run_segments(
     Ok(SegmentScratch {
         pages,
         unknown_height,
+        clean_white,
         store,
         bitmap_pool,
     })
@@ -743,14 +806,16 @@ fn resolve_page(
     )))
 }
 
-/// Composite a decoded region onto a page. When the region exactly covers a
-/// blank page at the origin with an OR/REPLACE operator, move it in with no
-/// per-word combine.
 /// Compose `region` onto `page` and return the now-spare bitmap for recycling:
 /// the region buffer after a combine, or (for the full-cover fast path that
 /// swaps the region in) the page's former buffer.
+///
+/// `page_clean_white` tracks whether `page` is still known to be all-white so a
+/// full-cover `Or` can swap in O(1) without scanning the page bitmap; `Replace`
+/// always overwrites every pixel and swaps unconditionally on full cover.
 fn compose_region(
     page: &mut MonoBitmap,
+    page_clean_white: &mut bool,
     mut region: MonoBitmap,
     x: u32,
     y: u32,
@@ -759,15 +824,25 @@ fn compose_region(
     let op = combination_operator(comb_operator);
     let full_cover =
         x == 0 && y == 0 && region.width() == page.width() && region.height() == page.height();
-    let movable =
-        matches!(op, CombinationOperator::Or | CombinationOperator::Replace) && page_is_blank(page);
+    let movable = matches!(op, CombinationOperator::Replace)
+        || (matches!(op, CombinationOperator::Or) && *page_clean_white);
     if full_cover && movable {
+        *page_clean_white = false;
         // Swap rather than assign so the page's old buffer is returned for reuse
         // instead of dropped.
         std::mem::swap(page, &mut region);
         return region;
     }
-    page.combine(&region, x as i32, y as i32, op);
+    // Region coordinates are unsigned 32-bit (T.88 §7.4.1). If `x` or `y` is
+    // outside the page (including values > i32::MAX), the region clips away
+    // completely — do not cast `x as i32` where high values would wrap negative.
+    if x < page.width()
+        && y < page.height()
+        && let (Ok(xi), Ok(yi)) = (i32::try_from(x), i32::try_from(y))
+    {
+        *page_clean_white = false;
+        page.combine(&region, xi, yi, op);
+    }
     region
 }
 
@@ -780,6 +855,7 @@ fn place_or_store(
     store: &mut SegmentStore,
     pages: &mut [DecodedPage],
     unknown_height: &[bool],
+    clean_white: &mut [bool],
     current: Option<usize>,
     page_association: u32,
     region_bm: MonoBitmap,
@@ -807,6 +883,7 @@ fn place_or_store(
         )?;
         Ok(Some(compose_region(
             &mut pages[target].bitmap,
+            &mut clean_white[target],
             region_bm,
             x,
             y,
@@ -834,16 +911,6 @@ fn grow_if_unknown(
         page.grow_to_height(needed, limits.max_page_pixels, limits)?;
     }
     Ok(())
-}
-
-/// Whether every word of the page is zero (blank / all-white default).
-fn page_is_blank(page: &MonoBitmap) -> bool {
-    for y in 0..page.height() {
-        if page.row(y).iter().any(|&w| w != 0) {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(all(test, feature = "encode"))]
@@ -885,5 +952,21 @@ mod tests {
         .to_bytes();
         let info = parse_page_info(&payload).unwrap();
         assert!(info.default_pixel);
+    }
+
+    #[test]
+    fn large_region_coordinates_clip_instead_of_wrapping() {
+        let limits = DecodeLimits::default();
+        let mut page = MonoBitmap::new(16, 16, false, &limits).unwrap();
+        let mut clean_white = true;
+        let region = MonoBitmap::new(8, 8, true, &limits).unwrap();
+        // u32::MAX must be clipped away as off-page, never cast to -1i32.
+        let _ = compose_region(&mut page, &mut clean_white, region.clone(), u32::MAX, 0, 0);
+        let _ = compose_region(&mut page, &mut clean_white, region, 0, u32::MAX, 0);
+        for y in 0..16 {
+            for x in 0..16 {
+                assert!(!page.get(x, y), "off-page region wrapped onto ({x},{y})");
+            }
+        }
     }
 }

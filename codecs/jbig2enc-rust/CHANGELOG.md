@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.6.2 — 2026-11-24
+
+Decoder-side optimisations, two decoder edge-case fixes, and README updates
+(replacing the stale `0.6.0 (unreleased)` section). Decoded bitmaps, decoder
+state and context states are bit-identical to 0.6.1 on all valid streams; the
+public API and the `decode`-only feature build are unchanged.
+
+### Decoding
+
+- 64-bit buffered Annex E MQ arithmetic decoder (`src/decode/arith.rs`) with a
+  packed state table, branch-free conditional exchange, `leading_zeros()`
+  single-shift renormalisation, two-byte plain refill, and deferred handling of
+  carry-bearing `0xFF 0x80..=0x8F` stuffed bytes so malformed streams remain
+  bit-identical to byte-at-a-time Annex E (retained under `cfg(test)` as
+  `ReferenceArithmeticDecoder`).
+- Fast word-level `MonoBitmap::combine` (`src/shared/bitmap.rs`) with up-front
+  X/Y clipping, a specialised single-word fast path for unclipped glyphs and
+  patterns, and word-aligned multi-word row blending.
+- Windowed refinement-region decoder (`src/decode/refinement.rs`) for
+  `GRTEMPLATE` 0 and 1 (nominal and custom `GRAT1`/`GRAT2`, 2-op `TPGRON`
+  typical-pixel test, word-wise `page_reference_window`), verified against the
+  previous per-pixel decoder kept under `cfg(test)`.
+- Direct-into-bitmap row writes and single-copy `TPGDON` duplicate rows in the
+  generic decoder (`src/decode/generic.rs`), direct-into-page decoding for
+  full-cover immediate generic regions and O(1) clean-page tracking in
+  `src/decode/page.rs`.
+- Word-wise halftone Gray-to-binary plane decoding without duplicate plane
+  allocation (`src/decode/halftone_region.rs`), 8-bit prefix-LUT + canonical
+  Huffman decoding (`src/decode/huffman.rs`), word-wise MMR black-run filling
+  (`src/decode/mmr.rs`), word-wise symbol/pattern extraction
+  (`src/decode/symbol_dictionary.rs`, `src/decode/pattern_dictionary.rs`), and
+  tighter integer/IAID arithmetic decoding (`src/decode/integer.rs`,
+  `src/decode/iaid.rs`, `src/decode/text_region.rs`).
+- On `benches/decode.rs` (i7-13700H): `decode_generic_a4_300dpi` 14.05 →
+  11.99 ms (~1.17× faster), `decode_symbol_page` 6.38 → 2.54 ms (~2.5×
+  faster), `decode_refined_symbol_page` 6.80 → 2.52 ms (~2.7× faster),
+  `decode_halftone_page` 13.59 → 5.91 ms (~2.3× faster).
+
+### Correctness
+
+- Pattern dictionary (`src/decode/pattern_dictionary.rs`): `HDPW == 128`
+  previously panicked on `-i8::MIN` overflow in debug builds, and
+  `HDPW = 129..=255` truncated `AT1 = (-HDPW, 0)` to `-128`. The generic
+  decoder now supports wide current-row AT offsets down to `-255`.
+- Page composition (`src/decode/page.rs`): unsigned `u32` region coordinates
+  greater than `i32::MAX` previously wrapped to negative signed coordinates via
+  `as i32` instead of clipping outside the page.
+
+### Documentation and tests
+
+- `README.md`: replaced the inaccurate `0.6.0 (unreleased)` heading with a
+  `0.6` summary covering `0.6.0`–`0.6.2`, bumped the quick-start dependency
+  snippet to `0.6.2`, and updated the compatibility and test notes.
+- `tests/decode_refine_templates.rs`: verified `GRTEMPLATE = 1` + `TPGRON`
+  against ITU-T T.88 §6.3.5.6 Figure 15 (`SLTP` context `"GR0000001000"`,
+  matching PDFium and pdf.js). `grtemplate1_tpgron` now tests native decoding
+  and passes under plain `cargo test`; the comparison against `jbig2dec 0.20`
+  (known upstream bug) is kept as an `#[ignore]` test.
+
 ## 0.6.1 — 2026-11-10
 
 Changes since 0.6.0. Decoded bitmaps, decoder state and context states are

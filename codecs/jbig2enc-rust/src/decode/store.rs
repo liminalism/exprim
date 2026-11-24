@@ -357,14 +357,17 @@ fn decoded_segment_bytes(seg: &DecodedSegment) -> usize {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod limit_tests {
     use super::*;
 
     #[test]
     fn aggregate_retained_bytes_and_dependency_depth_are_enforced() {
-        let mut limits = DecodeLimits::default();
-        limits.max_retained_bytes = 4;
-        limits.max_dependency_depth = 2;
+        let limits = DecodeLimits {
+            max_retained_bytes: 4,
+            max_dependency_depth: 2,
+            ..DecodeLimits::default()
+        };
         let mut store = SegmentStore::new();
         store
             .record_dependency_depth(1, &[], None, &limits)

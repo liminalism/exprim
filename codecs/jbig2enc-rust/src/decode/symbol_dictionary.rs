@@ -26,7 +26,7 @@ use crate::decode::text_region::{
     HuffTextParams, HuffTextTables, TextArithParams, decode_huffman_text_core,
     decode_text_region_arith,
 };
-use crate::shared::bitmap::MonoBitmap;
+use crate::shared::bitmap::{CombinationOperator, MonoBitmap};
 use crate::shared::int_proc::IntProc;
 use crate::shared::limits::DecodeLimits;
 use crate::shared::mq_table::MqContext;
@@ -679,9 +679,7 @@ fn decode_symbol_dictionary_huffman_refagg(
                     refine_ctx,
                     limits,
                 )?;
-                for _ in 0..bmsize {
-                    let _ = r.read_bits(8);
-                }
+                r.skip_bytes(bmsize);
                 r.align_to_byte();
                 refined
             } else if refagg_ninst > 1 {
@@ -765,7 +763,6 @@ fn decode_symbol_dictionary_huffman(
 
     let mut r = BitReader::new(data);
     let mut new_symbols: Vec<Arc<MonoBitmap>> = Vec::with_capacity(num_new.min(4096));
-    let mut widths: Vec<u32> = Vec::with_capacity(num_new.min(4096));
     let mut hc_height: i64 = 0;
     let mut total_pixels: u64 = 0;
 
@@ -788,7 +785,7 @@ fn decode_symbol_dictionary_huffman(
             });
         }
 
-        let hc_first = new_symbols.len();
+        let mut hc_widths: Vec<u32> = Vec::new();
         let mut sym_width: i64 = 0;
         let mut tot_width: i64 = 0;
         // §6.5.5 4c) width loop, terminated by OOB(DW).
@@ -808,7 +805,7 @@ fn decode_symbol_dictionary_huffman(
                     reason: "non-positive or oversized symbol width",
                 });
             }
-            if new_symbols.len() >= num_new {
+            if new_symbols.len() + hc_widths.len() >= num_new {
                 return Err(DecodeError::Malformed {
                     reason: "more symbols coded than SDNUMNEWSYMS",
                 });
@@ -841,9 +838,7 @@ fn decode_symbol_dictionary_huffman(
                     limit: limits.max_total_dictionary_pixels,
                 }));
             }
-            // Reserve a slot; the bitmap is filled from the collective bitmap.
-            new_symbols.push(Arc::new(MonoBitmap::new(1, 1, false, limits)?));
-            widths.push(sym_width as u32);
+            hc_widths.push(sym_width as u32);
         }
 
         // §6.5.9 height class collective bitmap.
@@ -883,10 +878,9 @@ fn decode_symbol_dictionary_huffman(
 
         // Split the collective bitmap into the height class's symbols.
         let mut x0 = 0u32;
-        for i in hc_first..new_symbols.len() {
-            let w = widths[i];
+        for w in hc_widths {
             let sym = extract_columns(&collective, x0, w, hc_height_u, limits)?;
-            new_symbols[i] = Arc::new(sym);
+            new_symbols.push(Arc::new(sym));
             x0 += w;
         }
     }
@@ -911,10 +905,7 @@ fn take_bytes<'a>(r: &mut BitReader<'a>, n: usize) -> Result<&'a [u8], DecodeErr
             },
         ));
     }
-    // Advance the reader past the consumed bytes.
-    for _ in 0..n {
-        let _ = r.read_bits(8);
-    }
+    r.skip_bytes(n);
     Ok(&slice[..n])
 }
 
@@ -927,20 +918,33 @@ fn bitmap_from_uncompressed(
     limits: &DecodeLimits,
 ) -> Result<MonoBitmap, DecodeError> {
     let mut bm = MonoBitmap::new(width, height, false, limits)?;
+    if width == 0 || height == 0 {
+        return Ok(bm);
+    }
+    let tail_mask = match width & 31 {
+        0 => u32::MAX,
+        rem => u32::MAX << (32 - rem),
+    };
     for y in 0..height {
         let row = &bytes[(y as usize) * row_bytes..(y as usize + 1) * row_bytes];
-        for x in 0..width {
-            let byte = row[(x as usize) >> 3];
-            let bit = 7 - (x & 7);
-            if (byte >> bit) & 1 != 0 {
-                bm.set(x, y, true);
-            }
+        let dst = bm.row_mut(y);
+        let (chunks, rem_bytes) = row.as_chunks::<4>();
+        for (i, &chunk) in chunks.iter().enumerate() {
+            dst[i] = u32::from_be_bytes(chunk);
+        }
+        if !rem_bytes.is_empty() {
+            let mut b = [0u8; 4];
+            b[..rem_bytes.len()].copy_from_slice(rem_bytes);
+            dst[chunks.len()] = u32::from_be_bytes(b);
+        }
+        if let Some(last) = dst.last_mut() {
+            *last &= tail_mask;
         }
     }
     Ok(bm)
 }
 
-/// Extract columns `[x0, x0+width)` of `src` as a new bitmap.
+/// Extract columns `[x0, x0+width)` of `src` as a new bitmap (word-wise).
 fn extract_columns(
     src: &MonoBitmap,
     x0: u32,
@@ -949,12 +953,8 @@ fn extract_columns(
     limits: &DecodeLimits,
 ) -> Result<MonoBitmap, DecodeError> {
     let mut bm = MonoBitmap::new(width, height, false, limits)?;
-    for y in 0..height {
-        for x in 0..width {
-            if src.get(x0 + x, y) {
-                bm.set(x, y, true);
-            }
-        }
+    if let Ok(x0_i32) = i32::try_from(x0) {
+        bm.combine(src, x0_i32.wrapping_neg(), 0, CombinationOperator::Replace);
     }
     Ok(bm)
 }

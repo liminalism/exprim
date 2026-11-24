@@ -18,8 +18,53 @@
 //! bitmap) rather than crashing, and this wrapper turns a hard failure into a
 //! typed [`DecodeError`].
 
-use fax::Color;
-use fax::decoder::{decode_g4, pels};
+use fax::decoder::decode_g4;
+
+/// Set bits `[start, end)` (MSB-first) in a packed `u32` row word-by-word.
+#[inline]
+fn fill_black_run(dst: &mut [u32], start: u32, end: u32) {
+    if start >= end {
+        return;
+    }
+    let w_first = (start >> 5) as usize;
+    let w_last = ((end - 1) >> 5) as usize;
+    let first_bit = start & 31;
+    let last_bit = ((end - 1) & 31) + 1;
+    let hi_mask = if first_bit == 0 {
+        u32::MAX
+    } else {
+        u32::MAX >> first_bit
+    };
+    let lo_mask = if last_bit == 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - last_bit)
+    };
+    if w_first == w_last {
+        dst[w_first] |= hi_mask & lo_mask;
+    } else {
+        dst[w_first] |= hi_mask;
+        for w in &mut dst[w_first + 1..w_last] {
+            *w = u32::MAX;
+        }
+        dst[w_last] |= lo_mask;
+    }
+}
+
+/// Write a `fax` transition list (alternating white/black run endpoints) into
+/// a packed `MonoBitmap` row word-by-word.
+#[inline]
+fn write_transitions_row(dst: &mut [u32], transitions: &[u32], width: u32) {
+    dst.fill(0);
+    // `fax` transitions start with a white run: transitions[0] is the start of
+    // the first black run, transitions[1] is its end, etc.
+    let mut iter = transitions.iter();
+    while let Some(&start_raw) = iter.next() {
+        let start = start_raw.min(width);
+        let end = iter.next().map_or(width, |&e| e.min(width));
+        fill_black_run(dst, start, end);
+    }
+}
 
 use crate::decode::error::DecodeError;
 use crate::shared::bitmap::MonoBitmap;
@@ -81,17 +126,7 @@ pub fn decode_mmr_into(
             if row >= height {
                 return;
             }
-            let dst = output.row_mut(row);
-            for w in dst.iter_mut() {
-                *w = 0;
-            }
-            // `pels` yields exactly `width` items.
-            for (x, color) in pels(transitions, width).enumerate() {
-                if color == Color::Black {
-                    let wi = x >> 5;
-                    dst[wi] |= 1u32 << (31 - (x as u32 & 31));
-                }
-            }
+            write_transitions_row(output.row_mut(row), transitions, width);
             row += 1;
         });
         (result, row)
@@ -211,17 +246,7 @@ pub fn decode_mmr_plane(
         if row >= height {
             return;
         }
-        let dst = bitmap.row_mut(row);
-        for w in dst.iter_mut() {
-            *w = 0;
-        }
-        // `pels` yields exactly `width` items.
-        for (x, color) in pels(transitions, width).enumerate() {
-            if color == Color::Black {
-                let wi = x >> 5;
-                dst[wi] |= 1u32 << (31 - (x as u32 & 31));
-            }
-        }
+        write_transitions_row(bitmap.row_mut(row), transitions, width);
         row += 1;
     });
     if result.is_none() {
@@ -240,6 +265,7 @@ pub fn decode_mmr_plane(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use fax::Color;
     use fax::VecWriter;
     use fax::encoder::Encoder as FaxEncoder;
 

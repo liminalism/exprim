@@ -18,20 +18,38 @@
 
 use crate::shared::mq_table::{MQ_STATES, MqContext};
 
+/// Packed MQ state entry for branch-free decoding:
+/// `(qe << 16) | (next_lps << 8) | next_mps`.
+const MQ_DECODE_STATES: [u32; 94] = {
+    let mut table = [0u32; 94];
+    let mut i = 0;
+    while i < 94 {
+        let e = MQ_STATES[i];
+        table[i] = ((e.qe as u32) << 16) | ((e.next_lps as u32) << 8) | (e.next_mps as u32);
+        i += 1;
+    }
+    table
+};
+
+/// A renormalisation shifts by at most 15 bits (`A >= 1` after exchange).
+const MAX_RENORM_SHIFT: u32 = 15;
+
 /// MQ arithmetic decoder over a borrowed coded-data slice.
 ///
-/// `c` and `a` are the standard 32-bit code and interval registers (`a` carries
-/// its value in the low 16 bits, with `0x8000` the renormalisation threshold);
-/// `ct` is the bit-countdown; `bp` indexes the *current* byte `b = data[bp]`.
+/// Uses a 64-bit code register `c` with `Chigh` in the top 16 bits and up to
+/// 32 buffered input bits below it, so renormalisation (`RENORMD`) is a single
+/// shift with `leading_zeros()` and `BYTEIN` refills multiple bytes at a time.
+/// `a` carries the 16-bit interval register (`0x8000..=0xFFFF`); `ct` counts the
+/// buffered bits; `bp` indexes the *current* byte `B = data[bp]`.
 #[derive(Clone, Debug)]
 pub struct ArithmeticDecoder<'a> {
     data: &'a [u8],
     /// Index of the current byte `B`. May advance one past `data.len()`, after
     /// which reads yield the `0xFF` past-end convention.
     bp: usize,
-    c: u32,
+    c: u64,
     a: u32,
-    ct: i32,
+    ct: u32,
 }
 
 impl<'a> ArithmeticDecoder<'a> {
@@ -41,10 +59,234 @@ impl<'a> ArithmeticDecoder<'a> {
             data,
             bp: 0,
             c: 0,
+            a: 0x8000,
+            ct: 0,
+        };
+        // C = B << 48 (B is the first byte, or 0xFF past the end).
+        let b0 = dec.byte_at(0);
+        dec.c = u64::from(b0) << 48;
+        dec.fill();
+        dec.c <<= 7;
+        dec.ct -= 7;
+        if dec.ct < MAX_RENORM_SHIFT {
+            dec.fill();
+        }
+        dec
+    }
+
+    /// The byte at absolute index `i`, or `0xFF` past the end (T.88 marker
+    /// convention for running past the coded data).
+    #[inline(always)]
+    fn byte_at(&self, i: usize) -> u8 {
+        match self.data.get(i) {
+            Some(&b) => b,
+            None => 0xFF,
+        }
+    }
+
+    /// Buffer input bytes into `c` using T.88 Figure E.19 (`BYTEIN`), stopping
+    /// once at least 25 bits are buffered (`ct > 24`).
+    ///
+    /// A stuffed byte `b1` in `0x80..=0x8F` after `0xFF` adds `b1 << 9`, whose
+    /// bit 7 carries into the preceding byte's position; we only consume it
+    /// once `ct == 0` so `Chigh` never observes that carry earlier than
+    /// byte-at-a-time Annex E does (preserving bit-exact equivalence even on
+    /// arbitrary malformed streams).
+    #[inline(always)]
+    fn fill(&mut self) {
+        while self.ct <= 24 {
+            let pos = 32 - self.ct;
+            let b0 = self.byte_at(self.bp);
+            if b0 != 0xFF {
+                let b1 = self.byte_at(self.bp + 1);
+                // Fast two-byte refill when the next byte is also plain and we
+                // have room for 16 bits in the 32-bit buffer below Chigh.
+                if b1 != 0xFF && self.ct <= 16 {
+                    let b2 = self.byte_at(self.bp + 2);
+                    let pair = (u64::from(b1) << 8) | u64::from(b2);
+                    self.bp += 2;
+                    self.c = self.c.wrapping_add(pair << pos);
+                    self.ct += 16;
+                } else {
+                    self.bp += 1;
+                    self.c = self.c.wrapping_add(u64::from(b1) << (8 + pos));
+                    self.ct += 8;
+                }
+            } else {
+                let b1 = self.byte_at(self.bp + 1);
+                if b1 > 0x8F {
+                    // Marker (or past-end): feed 1-bits without consuming the byte.
+                    self.c = self.c.wrapping_add(0xFF00u64 << pos);
+                    self.ct += 8;
+                } else if b1 >= 0x80 && self.ct > 0 {
+                    // Defer carry-bearing stuffed byte until `ct == 0`.
+                    break;
+                } else {
+                    self.bp += 1;
+                    self.c = self.c.wrapping_add(u64::from(b1) << (9 + pos));
+                    self.ct += 7;
+                }
+            }
+        }
+    }
+
+    /// Renormalise `c` when a deferred `0xFF 0x80..=0x8F` byte left fewer than
+    /// `shift` bits buffered.
+    #[cold]
+    #[inline(never)]
+    fn renorm_c_slow(&mut self, mut shift: u32) {
+        if self.ct > 0 {
+            let s = self.ct;
+            self.c <<= s;
+            shift -= s;
+            self.ct = 0;
+        }
+        loop {
+            self.fill();
+            if shift <= self.ct {
+                self.c <<= shift;
+                self.ct -= shift;
+                break;
+            }
+            let s = self.ct;
+            self.c <<= s;
+            shift -= s;
+            self.ct = 0;
+        }
+        if self.ct < MAX_RENORM_SHIFT {
+            self.fill();
+        }
+    }
+
+    /// Decode one bit under `context`, updating the context state in place
+    /// (T.88 DECODE / MPS_EXCHANGE / LPS_EXCHANGE, Figures E.15–E.17).
+    ///
+    /// The common case, an MPS that leaves `A` normalised, is tested first
+    /// and needs no context write and no renormalisation; every other case
+    /// takes [`Self::decode_exchange`], which is branch-free and renormalises
+    /// in one shift.
+    #[inline(always)]
+    pub fn decode_bit(&mut self, context: &mut MqContext) -> bool {
+        let s = context.0 as usize;
+        let packed = match MQ_DECODE_STATES.get(s) {
+            Some(&p) => p,
+            None => return false,
+        };
+        let qe = packed >> 16;
+        let a = self.a.wrapping_sub(qe);
+        let chigh = (self.c >> 48) as u32;
+        if chigh >= qe && a & 0x8000 != 0 {
+            self.a = a;
+            self.c = self.c.wrapping_sub(u64::from(qe) << 48);
+            return s >= 47;
+        }
+        self.decode_exchange(context, packed, s >= 47, a, chigh)
+    }
+
+    /// The exchange half of DECODE: an LPS sub-interval, or an MPS that needs
+    /// the conditional exchange and renormalisation. `a` is `A - Qe`.
+    #[inline(always)]
+    fn decode_exchange(
+        &mut self,
+        context: &mut MqContext,
+        packed: u32,
+        mps: bool,
+        a: u32,
+        chigh: u32,
+    ) -> bool {
+        let qe = packed >> 16;
+        let lps = u32::from(chigh < qe);
+        let lps_mask = lps.wrapping_neg();
+        // MPS exchange subtracts Qe from Chigh; LPS exchange leaves C unchanged.
+        self.c = self.c.wrapping_sub(u64::from(qe & !lps_mask) << 48);
+        // Conditional exchange swaps the meaning of the two sub-intervals when
+        // `A - Qe < Qe`, so the decoded symbol is the LPS iff exactly one of
+        // "LPS sub-interval" and "exchanged" holds.
+        let is_lps_symbol = lps ^ u32::from(a < qe);
+        context.0 = ((packed >> (8 * is_lps_symbol)) & 0x7F) as u8;
+        let a = (a & !lps_mask) | (qe & lps_mask);
+        // RENORMD: `a` is in `1..=0x7FFF`, so `shift` is in `1..=15`.
+        let shift = a.leading_zeros() - 16;
+        self.a = a << shift;
+        if shift <= self.ct {
+            self.c <<= shift;
+            self.ct -= shift;
+            if self.ct < MAX_RENORM_SHIFT {
+                self.fill();
+            }
+        } else {
+            self.renorm_c_slow(shift);
+        }
+        (u32::from(mps) ^ is_lps_symbol) != 0
+    }
+
+    /// Decode a run of up to `count` symbols under `context` that are each the
+    /// context's MPS, equal to `value`, *without* renormalisation, and return
+    /// how many were decoded (all of them equal `value`).
+    ///
+    /// Each such step of [`Self::decode_bit`] subtracts the same `Qe` from `A`
+    /// and from the high half of `C` and leaves the context state unchanged,
+    /// so `n` steps fold into one subtraction of `n * Qe`. The run stops before
+    /// the first symbol that would take the exchange path (an LPS, or `A`
+    /// falling below 0x8000) or when the context's MPS is not `value`; the
+    /// caller decodes that symbol with [`Self::decode_bit`]. The decoder state
+    /// and context afterwards are observationally identical to `n` `decode_bit`
+    /// calls.
+    #[inline(always)]
+    pub(crate) fn decode_mps_run(&mut self, context: MqContext, value: bool, count: u32) -> u32 {
+        let s = context.0 as usize;
+        let packed = match MQ_DECODE_STATES.get(s) {
+            Some(&p) => p,
+            None => return 0,
+        };
+        if (s >= 47) != value || self.a < 0x8000 {
+            return 0;
+        }
+        let qe = packed >> 16;
+        let chigh = (self.c >> 48) as u32;
+        let avail = chigh.min(self.a - 0x8000);
+        if avail < qe {
+            return 0;
+        }
+        // count <= 32 and Qe <= 0x5601, so the product cannot overflow.
+        let total = qe * count;
+        let n = if avail >= total { count } else { avail / qe };
+        let d = n * qe;
+        self.a -= d;
+        self.c = self.c.wrapping_sub(u64::from(d) << 48);
+        n
+    }
+
+    /// Bytes consumed so far (index of the current byte `B`). Informational;
+    /// the generic region does not rely on exact terminator alignment.
+    #[inline]
+    pub fn bytes_consumed(&self) -> usize {
+        self.bp
+    }
+}
+
+/// The pre-optimisation byte-at-a-time 32-bit Annex E MQ decoder, kept
+/// verbatim as the equivalence reference for tests.
+#[cfg(all(test, feature = "encode"))]
+#[derive(Clone, Debug)]
+pub(crate) struct ReferenceArithmeticDecoder<'a> {
+    data: &'a [u8],
+    bp: usize,
+    c: u32,
+    a: u32,
+    ct: i32,
+}
+
+#[cfg(all(test, feature = "encode"))]
+impl<'a> ReferenceArithmeticDecoder<'a> {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
+        let mut dec = Self {
+            data,
+            bp: 0,
+            c: 0,
             a: 0,
             ct: 0,
         };
-        // C = B << 16 (B is the first byte, or 0xFF past the end).
         let b0 = dec.byte_at(0);
         dec.c = (b0 as u32) << 16;
         dec.byte_in();
@@ -54,25 +296,19 @@ impl<'a> ArithmeticDecoder<'a> {
         dec
     }
 
-    /// The byte at absolute index `i`, or `0xFF` past the end (T.88 marker
-    /// convention for running past the coded data).
     #[inline(always)]
     fn byte_at(&self, i: usize) -> u8 {
-        // `copied().unwrap_or(0xFF)` is not an input-reachable unwrap.
         match self.data.get(i) {
             Some(&b) => b,
             None => 0xFF,
         }
     }
 
-    /// BYTEIN (T.88 Figure E.19, software-conventions form with byte stuffing
-    /// after `0xFF`).
     #[inline(always)]
     fn byte_in(&mut self) {
         if self.byte_at(self.bp) == 0xFF {
             let b1 = self.byte_at(self.bp + 1);
             if b1 > 0x8F {
-                // Marker (or past-end): feed 1-bits without consuming the byte.
                 self.c = self.c.wrapping_add(0xFF00);
                 self.ct = 8;
             } else {
@@ -88,7 +324,6 @@ impl<'a> ArithmeticDecoder<'a> {
         }
     }
 
-    /// RENORMD (T.88 Figure E.18).
     #[inline(always)]
     fn renorm(&mut self) {
         loop {
@@ -104,108 +339,6 @@ impl<'a> ArithmeticDecoder<'a> {
         }
     }
 
-    /// Decode one bit under `context`, updating the context state in place
-    /// (T.88 DECODE / MPS_EXCHANGE / LPS_EXCHANGE, Figures E.15–E.17).
-    ///
-    /// The common case, an MPS that leaves `A` normalised, is tested first
-    /// and needs no context write and no renormalisation; every other case
-    /// takes [`Self::decode_exchange`], which is exactly the T.88 flow.
-    #[inline(always)]
-    pub fn decode_bit(&mut self, context: &mut MqContext) -> bool {
-        let s = context.0 as usize;
-        // Bounds: state indices are always < 94 (table invariant, checked in
-        // mq_table tests); use get to stay panic-free regardless.
-        let entry = match MQ_STATES.get(s) {
-            Some(e) => *e,
-            None => return false,
-        };
-        let qe = entry.qe as u32;
-        let a = self.a.wrapping_sub(qe);
-        if (self.c >> 16) >= qe && a & 0x8000 != 0 {
-            self.a = a;
-            self.c = self.c.wrapping_sub(qe << 16);
-            return s >= 47;
-        }
-        self.decode_exchange(context, entry, s >= 47, a)
-    }
-
-    /// The exchange half of DECODE: an LPS sub-interval, or an MPS that needs
-    /// the conditional exchange and renormalisation. `a` is `A - Qe`.
-    #[inline(always)]
-    fn decode_exchange(
-        &mut self,
-        context: &mut MqContext,
-        entry: crate::shared::mq_table::MqEntry,
-        mps: bool,
-        a: u32,
-    ) -> bool {
-        let qe = entry.qe as u32;
-        self.a = a;
-        let d;
-        if (self.c >> 16) < qe {
-            // LPS exchange.
-            if self.a < qe {
-                d = mps;
-                context.0 = entry.next_mps;
-            } else {
-                d = !mps;
-                context.0 = entry.next_lps;
-            }
-            self.a = qe;
-        } else {
-            // MPS exchange (`A` dropped below 0x8000).
-            self.c = self.c.wrapping_sub(qe << 16);
-            if self.a < qe {
-                d = !mps;
-                context.0 = entry.next_lps;
-            } else {
-                d = mps;
-                context.0 = entry.next_mps;
-            }
-        }
-        self.renorm();
-        d
-    }
-
-    /// Decode a run of up to `count` symbols under `context` that are each the
-    /// context's MPS, equal to `value`, *without* renormalisation, and return
-    /// how many were decoded (all of them equal `value`).
-    ///
-    /// Each such step of [`Self::decode_bit`] subtracts the same `Qe` from `A`
-    /// and from the high half of `C` and leaves the context state unchanged,
-    /// so `n` steps fold into one subtraction of `n * Qe`. The run stops before
-    /// the first symbol that would take the exchange path (an LPS, or `A`
-    /// falling below 0x8000) or when the context's MPS is not `value`; the
-    /// caller decodes that symbol with [`Self::decode_bit`]. The registers and
-    /// the context afterwards are exactly those of `n` `decode_bit` calls.
-    #[inline(always)]
-    pub(crate) fn decode_mps_run(&mut self, context: MqContext, value: bool, count: u32) -> u32 {
-        let s = context.0 as usize;
-        let qe = match MQ_STATES.get(s) {
-            Some(e) => e.qe as u32,
-            None => return 0,
-        };
-        if (s >= 47) != value || self.a < 0x8000 || qe == 0 {
-            return 0;
-        }
-        let chigh = self.c >> 16;
-        // count <= 32 and Qe < 0x5602, so the product cannot overflow.
-        let total = qe * count;
-        // Step i (1-based) stays on the fast path iff C_high >= i * Qe and
-        // A - i * Qe >= 0x8000 (A < 0x10000 always holds after INITDEC/RENORMD).
-        let n = if chigh >= total && self.a - 0x8000 >= total {
-            count
-        } else {
-            (chigh / qe).min((self.a - 0x8000) / qe).min(count)
-        };
-        let d = n * qe;
-        self.a -= d;
-        self.c = self.c.wrapping_sub(d << 16);
-        n
-    }
-
-    /// The pre-optimisation DECODE, kept verbatim as the equivalence reference.
-    #[cfg(all(test, feature = "encode"))]
     pub(crate) fn decode_bit_reference(&mut self, context: &mut MqContext) -> bool {
         let s = context.0 as usize;
         let entry = match MQ_STATES.get(s) {
@@ -219,7 +352,6 @@ impl<'a> ArithmeticDecoder<'a> {
 
         let d;
         if (self.c >> 16) < qe {
-            // LPS exchange.
             if self.a < qe {
                 d = mps;
                 context.0 = entry.next_mps;
@@ -232,7 +364,6 @@ impl<'a> ArithmeticDecoder<'a> {
         } else {
             self.c = self.c.wrapping_sub(qe << 16);
             if self.a & 0x8000 == 0 {
-                // MPS exchange.
                 if self.a < qe {
                     d = !mps;
                     context.0 = entry.next_lps;
@@ -246,19 +377,6 @@ impl<'a> ArithmeticDecoder<'a> {
             }
         }
         d
-    }
-
-    /// Bytes consumed so far (index of the current byte `B`). Informational;
-    /// the generic region does not rely on exact terminator alignment.
-    #[inline]
-    pub fn bytes_consumed(&self) -> usize {
-        self.bp
-    }
-
-    /// The full register state `(BP, C, A, CT)`, for equivalence tests.
-    #[cfg(all(test, feature = "encode"))]
-    pub(crate) fn registers(&self) -> (usize, u32, u32, i32) {
-        (self.bp, self.c, self.a, self.ct)
     }
 }
 
@@ -364,6 +482,38 @@ mod tests {
         let mut ctx = MqContext::default();
         for _ in 0..1000 {
             let _ = dec.decode_bit(&mut ctx);
+        }
+    }
+
+    #[test]
+    fn fast_decoder_matches_reference_on_adversarial_bytes() {
+        let cases: &[&[u8]] = &[
+            &[],
+            &[0xFF],
+            &[0xFF, 0x00],
+            &[0xFF, 0x7F],
+            &[0xFF, 0x80],
+            &[0xFF, 0x8F],
+            &[0xFF, 0x90],
+            &[0xFF, 0xAC],
+            &[0x00, 0xFF, 0x80, 0x00, 0xFF, 0x8F, 0x12, 0x34],
+            &[0xFF, 0x80, 0xFF, 0x81, 0xFF, 0x8F, 0xFF, 0xFF, 0xAC],
+            &[0x80, 0x00, 0x00, 0xFF, 0x8E, 0x55, 0xAA, 0xFF, 0x00],
+        ];
+        for (ci, data) in cases.iter().enumerate() {
+            let mut fast = ArithmeticDecoder::new(data);
+            let mut refd = ReferenceArithmeticDecoder::new(data);
+            let mut cf = [MqContext::default(); 8];
+            let mut cr = [MqContext::default(); 8];
+            for step in 0..400usize {
+                let idx = (step * 5 + ci) & 7;
+                assert_eq!(
+                    fast.decode_bit(&mut cf[idx]),
+                    refd.decode_bit_reference(&mut cr[idx]),
+                    "case {ci} step {step}"
+                );
+                assert_eq!(cf[idx], cr[idx], "case {ci} step {step} ctx");
+            }
         }
     }
 }
