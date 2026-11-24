@@ -5,6 +5,46 @@ exprim was developed inside the Lege repository as the renderer workspace
 `lege-pdf-print` and `lege-pdf-agent` crates over it. Versions below 0.4.0
 were internal and never published.
 
+## 0.4.5 — 2026-11-24
+
+Output is byte-identical throughout across the repository test suites and
+synthetic and corpus verification gates.
+
+### Image decoding and memory, 2026-11-24
+
+- Axis-aligned 8-bit grayscale images paint directly from their single-channel
+  plane across nearest, bilinear, opaque box-average, and masked area-min
+  resamplers (scalar and AVX2), removing the three-byte-per-pixel RGB8
+  promotion allocation and cutting grayscale resampling work three-fold.
+  Minified CMYK row-band conversion allocates only the strip's touched rows
+  instead of a full-image backing buffer.
+- Codec-backed images that promote to RGB8 (indexed palettes, ICC RGB/CMYK,
+  Lab, DeviceN tint LUTs, and eligible 16-bit rasters) are keyed in the shared
+  image cache before promotion so only the single 3-byte-per-pixel RGB8 raster
+  is retained and raw uncompressed pixels are never hashed.
+- `/JPXDecode` streams with `/SMaskInData 0` skip trailing opacity channels at
+  Tier-2/Tier-1 instead of decoding four channels and de-interleaving, inspect
+  wavelet reduction levels from the main header without walking tile-parts or
+  copying embedded ICC profiles, parse container framing once per cold decode
+  via `jp2lam::prepare_jp2`, and honour cooperative render cancellation inside
+  the codec.
+- The render scheduler's per-job estimate projects DCT image draws through each
+  placement transform so scaled JPEG scans are budgeted at their reduced decode
+  footprint rather than full native size, and drops the obsolete RGB8 promotion
+  charge on 8-bit grayscale images.
+- Text extraction owns a session-scoped glyph-cache pool instead of a
+  process-lifetime thread-local, and `RenderSession::clear_resource_caches` /
+  `release_idle_memory` release JBIG2 global-segment caches, JPX worker
+  scratch, and CPU auxiliary caches.
+
+### Dependencies, 2026-11-24
+
+- `jp2lam` 0.4.0: streaming four-row reversible 5/3 wavelet with runtime AVX2
+  lifting and fused RCT byte packing (active with default features off),
+  subband-tight Tier-1 planes, inline Tier-2 block merging, single-component
+  streaming for non-MCT packed decodes, `PreparedJp2`, and cooperative
+  cancellation.
+
 ## 0.4.1 — 2026-11-20
 
 ### Gray8 output, 2026-11-20

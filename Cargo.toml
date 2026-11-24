@@ -1,6 +1,6 @@
 [package]
 name = "exprim"
-version = "0.4.1"
+version = "0.4.5"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -55,7 +55,7 @@ crossbeam-channel = "0.5"
 flate2 = { version = "1.1.9", features = ["zlib-rs"] }
 foldhash = "0.2.0"
 jbig2enc-rust = { version = "0.6.1", path = "codecs/jbig2enc-rust", default-features = false, features = ["decode"] }
-jp2lam = { version = "0.3.1", path = "codecs/jp2lam", default-features = false }
+jp2lam = { version = "0.4.0", path = "codecs/jp2lam", default-features = false }
 jpeg-encoder = { version = "=0.7.1", features = ["simd"] }
 memmap2 = "0.9"
 png = "0.18"

@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "exprim"
-version = "0.4.1"
+version = "0.4.5"
 dependencies = [
  "bitflags",
  "crossbeam-channel",
@@ -179,14 +179,14 @@ dependencies = [
 
 [[package]]
 name = "exprim-chaos-tests"
-version = "0.4.1"
+version = "0.4.5"
 dependencies = [
  "exprim",
 ]
 
 [[package]]
 name = "exprim-cli"
-version = "0.4.1"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "jp2lam"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "jpxl-perceptual",
  "memmap2",
