@@ -23,6 +23,41 @@ pub(crate) struct TilePartView<'a> {
     pub(crate) payload: &'a [u8],
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MainHeaderView<'a> {
+    pub(crate) main_header_segments: Vec<&'a [u8]>,
+    pub(crate) first_tile_header: TilePartHeader,
+}
+
+/// Parse only the codestream main header and the first `SOT` marker segment,
+/// stopping before scanning tile-part headers or packet payloads.
+pub(crate) fn parse_main_header_view(
+    bytes: &[u8],
+    max_structural_bytes: usize,
+) -> Result<MainHeaderView<'_>> {
+    let mut cursor = Cursor::new(bytes, max_structural_bytes);
+    let soc = cursor.read_u16()?;
+    if soc != MARKER_SOC {
+        return Err(invalid("codestream did not start with SOC"));
+    }
+    let mut main_header_segments = Vec::new();
+    loop {
+        let marker_start = cursor.position();
+        let marker = cursor.read_u16()?;
+        if marker == MARKER_SOT {
+            let sot_segment = cursor.read_segment(marker_start, marker)?;
+            let first_tile_header = read_tile_part_header(sot_segment)
+                .ok_or_else(|| invalid("missing tile-part fields in SOT segment"))?;
+            return Ok(MainHeaderView {
+                main_header_segments,
+                first_tile_header,
+            });
+        }
+        let segment = cursor.read_segment(marker_start, marker)?;
+        cursor.push_structural(&mut main_header_segments, segment)?;
+    }
+}
+
 pub(crate) fn parse_codestream_view(
     bytes: &[u8],
     max_structural_bytes: usize,

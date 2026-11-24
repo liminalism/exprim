@@ -2,7 +2,40 @@ mod irrev97;
 pub(crate) mod norms;
 pub(crate) mod pcrd;
 mod rev53;
+mod stream53;
 mod stream97;
+
+/// Subband storage that separates the coarse `LL1` quadrant (`0..sn` x `0..sv`)
+/// from the finest detail bands (`HL1` and `LH1/HH1`).
+///
+/// Synthesizing `LL1` from `coarse` consumes and drops `coarse` before the
+/// finest synthesis level begins, avoiding the extra quarter-plane (`+1 B/px`
+/// per component, `+3 B/px` for RGB) that monolithic nested-subband storage
+/// retains alongside `data`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SplitSubbands<T> {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) coarse: Vec<T>,
+    pub(crate) hl1: Vec<T>,
+    pub(crate) lh_hh1: Vec<T>,
+}
+
+impl<T: Default + Clone> SplitSubbands<T> {
+    pub(crate) fn new_zeroed(width: usize, height: usize) -> Self {
+        let sn = width.div_ceil(2);
+        let dn = width - sn;
+        let sv = height.div_ceil(2);
+        let dv = height - sv;
+        Self {
+            width,
+            height,
+            coarse: vec![T::default(); sn * sv],
+            hl1: vec![T::default(); dn * sv],
+            lh_hh1: vec![T::default(); width * dv],
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct InverseDwtTiming {
@@ -50,4 +83,11 @@ pub(crate) use rev53::inverse_53_2d_in_place_at;
 pub(crate) use rev53::inverse_53_2d_in_place_profiled;
 #[cfg(feature = "simd")]
 pub(crate) use rev53::inverse_53_2d_in_place_wide;
-pub(crate) use stream97::{SynthesisPrefix, inverse_97_2d_even, inverse_97_2d_even_but_last};
+pub(crate) use stream53::{
+    LevelSynth53Scratch, SynthesisPrefix53, i32_lifting_is_safe, inverse_53_2d_even,
+    inverse_53_2d_even_but_last, inverse_53_2d_even_but_last_split, inverse_53_2d_even_split,
+};
+pub(crate) use stream97::{
+    LevelSynthScratch, SynthesisPrefix, inverse_97_2d_even, inverse_97_2d_even_but_last,
+    inverse_97_2d_even_but_last_split, inverse_97_2d_even_split,
+};

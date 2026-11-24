@@ -319,14 +319,9 @@ pub enum DecodeResult {
 
 struct DecodeScratch {
     tier1: t1::Tier1Scratch,
-    /// Worker budget of the active request: the most Tier-1 tasks it
-    /// contributes to the shared executor, and whether the post-Tier-1 stages
-    /// (per-plane inverse DWT, fused packing) may fan out at all. A budget of
-    /// one keeps every stage on the calling thread. This is explicit rather
-    /// than inferred from `rayon::current_num_threads()`: budgeted requests
-    /// share one process-wide executor, and a serial request may be running on
-    /// a worker of some other multi-thread pool (a renderer's), whose size says
-    /// nothing about this request's budget.
+    /// Persistent per-worker Tier-1 scratch buffers reused across tiles and
+    /// across calls on the same [`Jp2Decoder`].
+    tier1_workers: Vec<t1::Tier1Scratch>,
     workers: usize,
 }
 
@@ -334,9 +329,124 @@ impl DecodeScratch {
     fn new() -> Self {
         Self {
             tier1: t1::Tier1Scratch::new(),
+            tier1_workers: Vec::new(),
             workers: 1,
         }
     }
+}
+
+/// Borrowed, pre-parsed JP2/J2K container + codestream view for zero-reparse
+/// inspection followed by decode.
+///
+/// Unlike [`inspect_jp2_with_limits`], preparing this handle never heap-copies
+/// embedded ICC profile bytes; the codestream and tile-part slices borrow
+/// directly from `bytes`.
+#[derive(Debug)]
+pub struct PreparedJp2<'a> {
+    core: ParsedJp2Core<'a>,
+}
+
+impl<'a> PreparedJp2<'a> {
+    pub fn width(&self) -> u32 {
+        self.core.header.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.core.header.height
+    }
+
+    pub fn colorspace(&self) -> ColorSpace {
+        self.core.header.colorspace
+    }
+
+    pub fn in_data_alpha(&self) -> Option<InDataAlpha> {
+        self.core.header.alpha.map(|alpha| InDataAlpha {
+            component: alpha.component as u16,
+            premultiplied: alpha.premultiplied,
+        })
+    }
+
+    pub fn container_palette_channels(&self) -> Option<u8> {
+        self.core
+            .header
+            .palette
+            .as_ref()
+            .map(|palette| palette.channel_count() as u8)
+    }
+
+    pub fn codestream(&self) -> &CodestreamHeader {
+        &self.core.codestream
+    }
+
+    pub fn reduce_levels(&self, resolution: DecodeResolution) -> Result<u8> {
+        select_reduce_levels(&self.core.codestream, resolution)
+    }
+
+    pub fn decoded_dimensions(&self, resolution: DecodeResolution) -> Result<(u32, u32)> {
+        let reduce_levels = self.reduce_levels(resolution)?;
+        let siz = &self.core.codestream.siz;
+        let (x0, x1) = reduced_axis_bounds(
+            siz.x_origin,
+            siz.x_origin.saturating_add(siz.width),
+            reduce_levels,
+        );
+        let (y0, y1) = reduced_axis_bounds(
+            siz.y_origin,
+            siz.y_origin.saturating_add(siz.height),
+            reduce_levels,
+        );
+        Ok((x1 - x0, y1 - y0))
+    }
+}
+
+/// Parse JP2/J2K framing and main headers once into a borrowed [`PreparedJp2`]
+/// handle without copying embedded ICC profiles.
+pub fn prepare_jp2<'a>(bytes: &'a [u8], limits: &DecodeLimits) -> Result<PreparedJp2<'a>> {
+    validate_input_bytes(bytes.len(), limits)?;
+    let mut stats = StatsSink::disabled();
+    let core = parse_jp2_core_with_options(bytes, &mut stats, false, false, true, false, limits)?;
+    Ok(PreparedJp2 { core })
+}
+
+/// Compute the wavelet reduction level for `resolution` by reading only up to
+/// the first `SOT` marker, without copying ICC profiles or scanning tile-parts.
+pub fn inspect_jp2_header_for_reduction(
+    bytes: &[u8],
+    resolution: DecodeResolution,
+    limits: &DecodeLimits,
+) -> Result<u8> {
+    validate_input_bytes(bytes.len(), limits)?;
+    if resolution == DecodeResolution::Full {
+        return Ok(0);
+    }
+    let codestream_bytes = if bytes.starts_with(&MARKER_SOC) {
+        bytes
+    } else {
+        jp2_parse::parse_jp2_with_options(
+            bytes,
+            jp2_parse::ParseOptions {
+                materialize_palette: false,
+                retain_icc: false,
+            },
+        )?
+        .codestream
+    };
+    let main_view = codestream::parse_main_header_view(codestream_bytes, limits.max_working_bytes)?;
+    let codestream = CodestreamHeader::from_marker_segments(
+        main_view.main_header_segments.iter().copied(),
+        main_view.first_tile_header,
+        1,
+    )?;
+    let pixels = u64::from(codestream.siz.width)
+        .checked_mul(u64::from(codestream.siz.height))
+        .ok_or_else(|| crate::Jp2LamError::DecodeFailed("image pixel count overflow".into()))?;
+    if pixels > limits.max_pixels {
+        return Err(crate::Jp2LamError::DecodeFailed(format!(
+            "image pixel count {pixels} exceeds decode limit {}",
+            limits.max_pixels
+        )));
+    }
+    select_reduce_levels(&codestream, resolution)
 }
 
 pub struct Jp2Decoder {
@@ -365,13 +475,80 @@ impl Jp2Decoder {
 
     /// Decode one image while retaining bounded Tier-1 scratch for later calls.
     pub fn decode(&mut self, bytes: &[u8], request: &DecodeRequest) -> Result<DecodeResult> {
+        self.decode_with_cancel_opt(bytes, request, None)
+    }
+
+    /// Cooperative-cancellation variant of [`Self::decode`].
+    pub fn decode_cancellable(
+        &mut self,
+        bytes: &[u8],
+        request: &DecodeRequest,
+        is_cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DecodeResult> {
+        self.decode_with_cancel_opt(bytes, request, Some(is_cancelled))
+    }
+
+    /// Decode a pre-parsed [`PreparedJp2`] handle without re-parsing container
+    /// or codestream framing.
+    pub fn decode_prepared(
+        &mut self,
+        prepared: &PreparedJp2<'_>,
+        request: &DecodeRequest,
+    ) -> Result<DecodeResult> {
+        self.decode_prepared_with_cancel_opt(prepared, request, None)
+    }
+
+    /// Cooperative-cancellation variant of [`Self::decode_prepared`].
+    pub fn decode_prepared_cancellable(
+        &mut self,
+        prepared: &PreparedJp2<'_>,
+        request: &DecodeRequest,
+        is_cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DecodeResult> {
+        self.decode_prepared_with_cancel_opt(prepared, request, Some(is_cancelled))
+    }
+
+    fn decode_with_cancel_opt(
+        &mut self,
+        bytes: &[u8],
+        request: &DecodeRequest,
+        cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    ) -> Result<DecodeResult> {
+        if cancel.is_some_and(|f| f()) {
+            return Err(crate::Jp2LamError::Cancelled);
+        }
         validate_decode_request(request)?;
         validate_input_bytes(bytes.len(), &request.limits)?;
         let thread_count = decode_thread_count(request.concurrency)?;
         run_with_decode_workers(thread_count, |worker_count| {
             self.scratch.workers = worker_count;
             let mut stats = StatsSink::disabled();
-            decode_jp2_request_with_scratch(bytes, request, &mut self.scratch, &mut stats)
+            decode_jp2_request_with_scratch(bytes, request, &mut self.scratch, cancel, &mut stats)
+        })
+    }
+
+    fn decode_prepared_with_cancel_opt(
+        &mut self,
+        prepared: &PreparedJp2<'_>,
+        request: &DecodeRequest,
+        cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    ) -> Result<DecodeResult> {
+        if cancel.is_some_and(|f| f()) {
+            return Err(crate::Jp2LamError::Cancelled);
+        }
+        validate_decode_request(request)?;
+        let core = prepared_core_view(&prepared.core, request.ignore_container_palette)?;
+        let thread_count = decode_thread_count(request.concurrency)?;
+        run_with_decode_workers(thread_count, |worker_count| {
+            self.scratch.workers = worker_count;
+            let mut stats = StatsSink::disabled();
+            decode_prepared_request_with_scratch(
+                &core,
+                request,
+                &mut self.scratch,
+                cancel,
+                &mut stats,
+            )
         })
     }
 
@@ -395,7 +572,7 @@ impl Jp2Decoder {
             // Tier-1 stays serial under an enabled sink whatever the budget;
             // the budget still decides whether later stages may fan out.
             self.scratch.workers = decode_thread_count(request.concurrency)?;
-            decode_jp2_request_with_scratch(bytes, request, &mut self.scratch, &mut sink)?
+            decode_jp2_request_with_scratch(bytes, request, &mut self.scratch, None, &mut sink)?
         };
         stats.total_ns = u64::try_from(total_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         Ok((result, stats))
@@ -414,6 +591,42 @@ impl Jp2Decoder {
         request: &DecodeRequest,
         target: DecodeTarget<'_>,
     ) -> Result<DecodeIntoInfo> {
+        self.decode_into_with_cancel_opt(bytes, request, target, None)
+    }
+
+    /// Cooperative-cancellation variant of [`Self::decode_into`].
+    pub fn decode_into_cancellable(
+        &mut self,
+        bytes: &[u8],
+        request: &DecodeRequest,
+        target: DecodeTarget<'_>,
+        is_cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DecodeIntoInfo> {
+        self.decode_into_with_cancel_opt(bytes, request, target, Some(is_cancelled))
+    }
+
+    /// Decode a pre-parsed [`PreparedJp2`] handle directly into `target`.
+    pub fn decode_prepared_into(
+        &mut self,
+        prepared: &PreparedJp2<'_>,
+        request: &DecodeRequest,
+        target: DecodeTarget<'_>,
+    ) -> Result<DecodeIntoInfo> {
+        self.decode_prepared_into_with_cancel_opt(prepared, request, target, None)
+    }
+
+    /// Cooperative-cancellation variant of [`Self::decode_prepared_into`].
+    pub fn decode_prepared_into_cancellable(
+        &mut self,
+        prepared: &PreparedJp2<'_>,
+        request: &DecodeRequest,
+        target: DecodeTarget<'_>,
+        is_cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DecodeIntoInfo> {
+        self.decode_prepared_into_with_cancel_opt(prepared, request, target, Some(is_cancelled))
+    }
+
+    fn validate_decode_target(target: &DecodeTarget<'_>) -> Result<()> {
         if target.premultiplied {
             return Err(crate::Jp2LamError::InvalidInput(
                 "decode_into premultiplied output is not implemented".into(),
@@ -446,7 +659,20 @@ impl Jp2Decoder {
                 target.data.len()
             )));
         }
+        Ok(())
+    }
 
+    fn decode_into_with_cancel_opt(
+        &mut self,
+        bytes: &[u8],
+        request: &DecodeRequest,
+        target: DecodeTarget<'_>,
+        cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    ) -> Result<DecodeIntoInfo> {
+        if cancel.is_some_and(|f| f()) {
+            return Err(crate::Jp2LamError::Cancelled);
+        }
+        Self::validate_decode_target(&target)?;
         let mut into_request = request.clone();
         into_request.output = target.format;
         validate_decode_request(&into_request)?;
@@ -455,7 +681,41 @@ impl Jp2Decoder {
         let thread_count = decode_thread_count(into_request.concurrency)?;
         run_with_decode_workers(thread_count, |worker_count| {
             self.scratch.workers = worker_count;
-            decode_jp2_into_with_scratch(bytes, &into_request, target, &mut self.scratch)
+            decode_jp2_into_with_scratch(bytes, &into_request, target, &mut self.scratch, cancel)
+        })
+    }
+
+    fn decode_prepared_into_with_cancel_opt(
+        &mut self,
+        prepared: &PreparedJp2<'_>,
+        request: &DecodeRequest,
+        target: DecodeTarget<'_>,
+        cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    ) -> Result<DecodeIntoInfo> {
+        if cancel.is_some_and(|f| f()) {
+            return Err(crate::Jp2LamError::Cancelled);
+        }
+        Self::validate_decode_target(&target)?;
+        let mut into_request = request.clone();
+        into_request.output = target.format;
+        validate_decode_request(&into_request)?;
+        let core = prepared_core_view(&prepared.core, into_request.ignore_container_palette)?;
+
+        let thread_count = decode_thread_count(into_request.concurrency)?;
+        run_with_decode_workers(thread_count, |worker_count| {
+            self.scratch.workers = worker_count;
+            if let Some(info) = decode_packed_direct_core_into(
+                &core,
+                &into_request,
+                target,
+                &mut self.scratch,
+                cancel,
+            )? {
+                return Ok(info);
+            }
+            Err(crate::Jp2LamError::DecodeFailed(
+                "decode_into requires the packed 8-bit direct path; palette expansion or this colorspace/format combination needs planar output".into(),
+            ))
         })
     }
 }
@@ -465,11 +725,9 @@ fn decode_jp2_into_with_scratch(
     request: &DecodeRequest,
     target: DecodeTarget<'_>,
     scratch: &mut DecodeScratch,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> Result<DecodeIntoInfo> {
-    // Full-image and ROI packed decoding reconstruct directly into the caller's
-    // destination. ROI geometry clips each full-IDWT tile while packing, so no
-    // intermediate full packed canvas or crop buffer is materialized.
-    if let Some(info) = decode_packed_direct_into(bytes, request, target, scratch)? {
+    if let Some(info) = decode_packed_direct_into(bytes, request, target, scratch, cancel)? {
         return Ok(info);
     }
     Err(crate::Jp2LamError::DecodeFailed(
@@ -574,7 +832,7 @@ pub fn decode_jp2_request(bytes: &[u8], request: &DecodeRequest) -> Result<Decod
     run_with_decode_workers(thread_count, |worker_count| {
         scratch.workers = worker_count;
         let mut stats = StatsSink::disabled();
-        decode_jp2_request_with_scratch(bytes, request, &mut scratch, &mut stats)
+        decode_jp2_request_with_scratch(bytes, request, &mut scratch, None, &mut stats)
     })
 }
 
@@ -692,33 +950,56 @@ fn decode_jp2_request_with_scratch(
     bytes: &[u8],
     request: &DecodeRequest,
     scratch: &mut DecodeScratch,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<DecodeResult> {
-    if request.region.is_some() {
-        return decode_region_request(bytes, request, scratch);
-    }
+    let core = parse_jp2_core(
+        bytes,
+        stats,
+        request.ignore_container_palette,
+        true,
+        &request.limits,
+    )?;
+    decode_prepared_request_with_scratch(&core, request, scratch, cancel, stats)
+}
+
+fn decode_prepared_request_with_scratch(
+    core: &ParsedJp2Core<'_>,
+    request: &DecodeRequest,
+    scratch: &mut DecodeScratch,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    stats: &mut StatsSink<'_>,
+) -> Result<DecodeResult> {
+    let region_spatial = match request.region {
+        Some(region) => {
+            let reduce_levels = select_reduce_levels(&core.codestream, request.resolution)?;
+            let (spatial, _) = project_region(&core.codestream.siz, region, reduce_levels)?;
+            Some(spatial)
+        }
+        None => None,
+    };
     if request.output != DecodeOutputFormat::NativePlanarI32 {
-        if let Some(raster) = decode_packed_direct(
-            bytes,
+        if let Some(raster) = decode_packed_direct_core(
+            core,
             request.resolution,
             request.output,
-            None,
+            region_spatial,
             scratch,
-            request.ignore_container_palette,
             &request.limits,
+            cancel,
             stats,
         )? {
             return Ok(DecodeResult::Raster(raster));
         }
     }
-    let image = decode_jp2_impl(
-        bytes,
+    let image = decode_jp2_core_impl(
+        core,
         request.resolution,
-        None,
+        region_spatial,
         stats,
         scratch,
-        request.ignore_container_palette,
         &request.limits,
+        cancel,
     )?;
     match request.output {
         DecodeOutputFormat::NativePlanarI32 => Ok(DecodeResult::Native(image)),
@@ -734,18 +1015,17 @@ fn decode_jp2_request_with_scratch(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_packed_direct(
-    bytes: &[u8],
+fn decode_packed_direct_core(
+    core: &ParsedJp2Core<'_>,
     resolution: DecodeResolution,
     format: DecodeOutputFormat,
     region: Option<RegionSpatial>,
     scratch: &mut DecodeScratch,
-    ignore_container_palette: bool,
     limits: &DecodeLimits,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<Option<DecodedRaster>> {
-    let core = parse_jp2_core(bytes, stats, ignore_container_palette, true, limits)?;
-    let Some(parameters) = packed_direct_parameters(&core, resolution, format)? else {
+    let Some(parameters) = packed_direct_parameters(core, resolution, format)? else {
         return Ok(None);
     };
     let (canvas_x0, canvas_y0, out_width, out_height) =
@@ -758,7 +1038,7 @@ fn decode_packed_direct(
         .ok_or_else(|| crate::Jp2LamError::DecodeFailed("packed output size overflow".into()))?;
     let mut data = vec![0u8; total];
     decode_packed_direct_to_target(
-        &core,
+        core,
         region,
         scratch,
         limits,
@@ -767,6 +1047,7 @@ fn decode_packed_direct(
         canvas_y0,
         &mut data,
         stride,
+        cancel,
         stats,
     )?;
 
@@ -784,6 +1065,7 @@ fn decode_packed_direct_into(
     request: &DecodeRequest,
     target: DecodeTarget<'_>,
     scratch: &mut DecodeScratch,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> Result<Option<DecodeIntoInfo>> {
     let mut stats = StatsSink::disabled();
     let core = parse_jp2_core(
@@ -793,7 +1075,18 @@ fn decode_packed_direct_into(
         true,
         &request.limits,
     )?;
-    let Some(parameters) = packed_direct_parameters(&core, request.resolution, target.format)?
+    decode_packed_direct_core_into(&core, request, target, scratch, cancel)
+}
+
+fn decode_packed_direct_core_into(
+    core: &ParsedJp2Core<'_>,
+    request: &DecodeRequest,
+    target: DecodeTarget<'_>,
+    scratch: &mut DecodeScratch,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+) -> Result<Option<DecodeIntoInfo>> {
+    let mut stats = StatsSink::disabled();
+    let Some(parameters) = packed_direct_parameters(core, request.resolution, target.format)?
     else {
         return Ok(None);
     };
@@ -811,7 +1104,7 @@ fn decode_packed_direct_into(
         )));
     }
     decode_packed_direct_to_target(
-        &core,
+        core,
         region,
         scratch,
         &request.limits,
@@ -820,6 +1113,7 @@ fn decode_packed_direct_into(
         canvas_y0,
         target.data,
         target.stride,
+        cancel,
         &mut stats,
     )?;
     Ok(Some(DecodeIntoInfo {
@@ -836,6 +1130,7 @@ struct PackedDirectParameters {
     reduce_levels: u8,
     channels: usize,
     colour_channels: usize,
+    active_components: usize,
     layout: reconstruct::PackedLayout,
 }
 
@@ -873,11 +1168,19 @@ fn packed_direct_parameters(
     let channels = format.component_count();
     let colour_channels = format.colour_component_count();
     let layout = reconstruct::PackedLayout::from_format(format);
+    let total_components = core.codestream.siz.components.len();
+    let active_components = match format {
+        DecodeOutputFormat::Gray8 => 1,
+        DecodeOutputFormat::Rgbx8 => colour_channels.min(total_components),
+        DecodeOutputFormat::Bgra8 => total_components.min(colour_channels + 1),
+        _ => channels.min(total_components),
+    };
     Ok(Some(PackedDirectParameters {
         expected_space,
         reduce_levels,
         channels,
         colour_channels,
+        active_components,
         layout,
     }))
 }
@@ -929,11 +1232,13 @@ fn decode_packed_direct_to_target(
     canvas_y0: u32,
     data: &mut [u8],
     stride: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
-    // Every tile reconstructs directly into its final canvas rectangle. The
-    // one-tile case is the same zero-intermediate fast path with origin (0, 0).
     for (tile_index, part_indices) in core.tile_parts_by_tile.iter().enumerate() {
+        if cancel.is_some_and(|f| f()) {
+            return Err(crate::Jp2LamError::Cancelled);
+        }
         let tile_index = u16::try_from(tile_index).map_err(|_| {
             crate::Jp2LamError::DecodeFailed("tile index exceeds Isot range".into())
         })?;
@@ -951,16 +1256,6 @@ fn decode_packed_direct_to_target(
                 continue;
             }
         }
-        let (header, components) = decode_tile_components(
-            core,
-            tile_index,
-            part_indices,
-            parameters.reduce_levels,
-            region,
-            stats,
-            scratch,
-            limits,
-        )?;
         let clip_x0 = region.map_or(reduced_x0, |region| reduced_x0.max(region.x0));
         let clip_y0 = region.map_or(reduced_y0, |region| reduced_y0.max(region.y0));
         let clip_x1 = region.map_or(reduced_x1, |region| reduced_x1.min(region.x1));
@@ -971,6 +1266,113 @@ fn decode_packed_direct_to_target(
         let source_y = (clip_y0 - reduced_y0) as usize;
         let write_width = (clip_x1 - clip_x0) as usize;
         let write_height = (clip_y1 - clip_y0) as usize;
+
+        let (header, packets) = decode_tile_packets_filtered(
+            core,
+            tile_index,
+            part_indices,
+            parameters.reduce_levels,
+            parameters.active_components,
+            region,
+            stats,
+            limits,
+            cancel,
+        )?;
+        let allow_split = reconstruct::use_common_even_dwt(&header);
+        let sequential_non_mct = parameters.active_components >= 2
+            && parameters.expected_space != ColorSpace::YCbCr
+            && !header.cod.use_mct
+            && header
+                .siz
+                .components
+                .iter()
+                .take(parameters.active_components)
+                .all(|c| c.precision == 8 && c.dx == 1 && c.dy == 1);
+
+        if sequential_non_mct {
+            let mut target = reconstruct::PackedWriteTarget {
+                data,
+                stride,
+                channels: parameters.channels,
+                origin_x,
+                origin_y,
+                source_x,
+                source_y,
+                width: write_width,
+                height: write_height,
+                layout: parameters.layout,
+            };
+            for c in 0..parameters.active_components {
+                let tier1_start = stats.start();
+                let mut one = t1::decode_tile_component_range_with_scratch(
+                    &header,
+                    &packets,
+                    c..c + 1,
+                    allow_split,
+                    stats,
+                    &mut scratch.tier1,
+                    &mut scratch.tier1_workers,
+                    scratch.workers,
+                    cancel,
+                )?;
+                stats.finish(tier1_start, |stats, elapsed| {
+                    stats.tier1_total_ns = stats.tier1_total_ns.saturating_add(elapsed);
+                });
+                let tile = one.remove(0);
+                let dst_channel = match parameters.layout {
+                    reconstruct::PackedLayout::Bgra => match c {
+                        0 => 2,
+                        1 => 1,
+                        2 => 0,
+                        _ => 3,
+                    },
+                    reconstruct::PackedLayout::Sequential | reconstruct::PackedLayout::Rgbx => c,
+                };
+                reconstruct::reconstruct_component_channel_u8_into(
+                    &header,
+                    tile,
+                    dst_channel,
+                    &mut target,
+                    scratch.workers,
+                    cancel,
+                    stats,
+                )?;
+            }
+            if matches!(parameters.layout, reconstruct::PackedLayout::Rgbx)
+                || (matches!(parameters.layout, reconstruct::PackedLayout::Bgra)
+                    && parameters.active_components == 3)
+            {
+                for y in 0..write_height {
+                    let row = &mut target.data[(origin_y + y) * stride + origin_x * 4
+                        ..(origin_y + y) * stride + (origin_x + write_width) * 4];
+                    for px in row.chunks_exact_mut(4) {
+                        px[3] = 255;
+                    }
+                }
+            }
+            stats.update(|s| {
+                s.output_pixels = s
+                    .output_pixels
+                    .saturating_add((write_width * write_height) as u64);
+            });
+            continue;
+        }
+
+        let tier1_start = stats.start();
+        let components = t1::decode_tile_component_range_with_scratch(
+            &header,
+            &packets,
+            0..parameters.active_components,
+            allow_split,
+            stats,
+            &mut scratch.tier1,
+            &mut scratch.tier1_workers,
+            scratch.workers,
+            cancel,
+        )?;
+        stats.finish(tier1_start, |stats, elapsed| {
+            stats.tier1_total_ns = stats.tier1_total_ns.saturating_add(elapsed);
+        });
         let stitch_start = stats.start();
         reconstruct::reconstruct_packed_u8_into(
             &header,
@@ -992,6 +1394,7 @@ fn decode_packed_direct_to_target(
                 layout: parameters.layout,
             },
             scratch.workers,
+            cancel,
             stats,
         )?;
         stats.finish(stitch_start, |stats, elapsed| {
@@ -1084,57 +1487,6 @@ fn project_region(
     ))
 }
 
-fn decode_region_request(
-    bytes: &[u8],
-    request: &DecodeRequest,
-    scratch: &mut DecodeScratch,
-) -> Result<DecodeResult> {
-    let region = request.region.expect("region decode requires a region");
-    let mut stats = StatsSink::disabled();
-    let core = parse_jp2_core(
-        bytes,
-        &mut stats,
-        request.ignore_container_palette,
-        true,
-        &request.limits,
-    )?;
-    let reduce_levels = select_reduce_levels(&core.codestream, request.resolution)?;
-    let (region_spatial, _) = project_region(&core.codestream.siz, region, reduce_levels)?;
-    drop(core);
-
-    // Packed direct output allocates and fills only the projected ROI canvas.
-    if request.output != DecodeOutputFormat::NativePlanarI32 {
-        if let Some(raster) = decode_packed_direct(
-            bytes,
-            request.resolution,
-            request.output,
-            Some(region_spatial),
-            scratch,
-            request.ignore_container_palette,
-            &request.limits,
-            &mut StatsSink::disabled(),
-        )? {
-            return Ok(DecodeResult::Raster(raster));
-        }
-    }
-
-    // Native (or packed-ineligible) path returns an ROI-sized image. The IDWT
-    // remains whole-tile; only the multi-tile canvas and final ownership shrink.
-    let image = decode_jp2_impl(
-        bytes,
-        request.resolution,
-        Some(region_spatial),
-        &mut stats,
-        scratch,
-        request.ignore_container_palette,
-        &request.limits,
-    )?;
-    match request.output {
-        DecodeOutputFormat::NativePlanarI32 => Ok(DecodeResult::Native(image)),
-        format => Ok(DecodeResult::Raster(pack_image_8bit(&image, format)?)),
-    }
-}
-
 /// Crop a reconstructed planar image to a reduced-pixel rectangle.
 fn crop_image(image: &Image, crop: CropRect) -> Result<Image> {
     let width = image.width as usize;
@@ -1225,10 +1577,19 @@ fn decode_jp2_impl(
     limits: &DecodeLimits,
 ) -> Result<Image> {
     let core = parse_jp2_core(bytes, stats, ignore_container_palette, true, limits)?;
+    decode_jp2_core_impl(&core, resolution, region, stats, scratch, limits, None)
+}
+
+fn decode_jp2_core_impl(
+    core: &ParsedJp2Core<'_>,
+    resolution: DecodeResolution,
+    region: Option<RegionSpatial>,
+    stats: &mut StatsSink<'_>,
+    scratch: &mut DecodeScratch,
+    limits: &DecodeLimits,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+) -> Result<Image> {
     let reduce_levels = select_reduce_levels(&core.codestream, resolution)?;
-    // A palettized image decodes as its single index component (grayscale-like)
-    // and is expanded to the container's channels afterwards; the codestream
-    // itself carries one component, not the container's channel count.
     let reconstruct_space = if core.header.palette.is_some() {
         ColorSpace::Gray
     } else {
@@ -1236,12 +1597,9 @@ fn decode_jp2_impl(
     };
     let tile_parts = &core.tile_parts_by_tile;
 
-    // The overwhelmingly common JP2/PDF case is one tile covering the image.
-    // Return that reconstructed tile directly instead of allocating a second
-    // full-image set of planes and copying every sample into it.
     if tile_parts.len() == 1 {
         let mut image = decode_tile(
-            &core,
+            core,
             reconstruct_space,
             0,
             &tile_parts[0],
@@ -1250,6 +1608,7 @@ fn decode_jp2_impl(
             stats,
             scratch,
             limits,
+            cancel,
         )?;
         if let Some(region) = region {
             let (x0, y0, width, height) = tile_rect(&core.codestream, 0)?;
@@ -1271,12 +1630,6 @@ fn decode_jp2_impl(
         return Ok(image);
     }
 
-    // Multi-tile: build the (possibly reduced) full-image canvas, then place
-    // each tile's reduced reconstruction at its phase-aware reduced origin.
-    // Adjacent tiles share a full-resolution boundary `b`; both tiles derive
-    // their reduced edge from `ceil(b / 2^reduce)` (see `reduced_axis_bounds`),
-    // so the reduced tiles still partition the reduced canvas with no gap or
-    // overlap.
     let siz = &core.codestream.siz;
     let (full_canvas_x0, _) =
         reduced_axis_bounds(siz.x_origin, siz.x_origin + siz.width, reduce_levels);
@@ -1289,15 +1642,15 @@ fn decode_jp2_impl(
         None => empty_decoded_image_reduced(&core.codestream, reconstruct_space, reduce_levels)?,
     };
     for (tile_index, part_indices) in tile_parts.iter().enumerate() {
+        if cancel.is_some_and(|f| f()) {
+            return Err(crate::Jp2LamError::Cancelled);
+        }
         let tile_index = u16::try_from(tile_index).map_err(|_| {
             crate::Jp2LamError::DecodeFailed("tile index exceeds Isot range".into())
         })?;
         let (x0, y0, width, height) = tile_rect(&core.codestream, tile_index)?;
         let (reduced_x0, reduced_x1) = reduced_axis_bounds(x0, x0 + width, reduce_levels);
         let (reduced_y0, reduced_y1) = reduced_axis_bounds(y0, y0 + height, reduce_levels);
-        // Region decode across tiles: decode only the tiles whose reduced rect
-        // intersects the region window, leaving the rest zero in the canvas
-        // (the final crop only reads region pixels, which those tiles cover).
         if let Some(region) = region {
             if reduced_x0 >= region.x1
                 || region.x0 >= reduced_x1
@@ -1308,7 +1661,7 @@ fn decode_jp2_impl(
             }
         }
         let tile_image = decode_tile(
-            &core,
+            core,
             reconstruct_space,
             tile_index,
             part_indices,
@@ -1317,6 +1670,7 @@ fn decode_jp2_impl(
             stats,
             scratch,
             limits,
+            cancel,
         )?;
         let stitch_start = stats.start();
         let clip_x0 = region.map_or(reduced_x0, |region| reduced_x0.max(region.x0));
@@ -1345,6 +1699,7 @@ fn decode_jp2_impl(
     Ok(image)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_tile(
     core: &ParsedJp2Core<'_>,
     colorspace: ColorSpace,
@@ -1355,6 +1710,7 @@ fn decode_tile(
     stats: &mut StatsSink<'_>,
     scratch: &mut DecodeScratch,
     limits: &DecodeLimits,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> Result<Image> {
     let (reconstruction_header, components) = decode_tile_components(
         core,
@@ -1365,25 +1721,24 @@ fn decode_tile(
         stats,
         scratch,
         limits,
+        cancel,
     )?;
     reconstruct::reconstruct_image_profiled(&reconstruction_header, colorspace, components, stats)
 }
 
-fn decode_tile_components(
-    core: &ParsedJp2Core<'_>,
+#[allow(clippy::too_many_arguments)]
+fn decode_tile_packets_filtered<'a>(
+    core: &ParsedJp2Core<'a>,
     tile_index: u16,
     part_indices: &[usize],
     reduce_levels: u8,
+    active_components: usize,
     region: Option<RegionSpatial>,
     stats: &mut StatsSink<'_>,
-    scratch: &mut DecodeScratch,
     limits: &DecodeLimits,
-) -> Result<(CodestreamHeader, Vec<t1::DecodedTileCoefficients>)> {
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+) -> Result<(CodestreamHeader, t2::DecodedTilePackets<'a>)> {
     let (x0, y0, width, height) = tile_rect(&core.codestream, tile_index)?;
-    // Fold this tile's tile-part header overrides (QCD/QCC/COC, or a redundant
-    // COD restatement) onto the main-header defaults before deriving the
-    // tile-local geometry. Gathering across all of the tile's parts is safe:
-    // the markers only appear in the TPsot==0 part (Annex A.4.2).
     let overridden = core.codestream.with_tile_overrides(
         part_indices
             .iter()
@@ -1407,6 +1762,7 @@ fn decode_tile_components(
         highest_resolution,
         limits,
     )?;
+    packet_decoder.set_active_components(active_components);
     stats.finish(setup_start, |stats, elapsed| {
         stats.tier2_setup_ns = stats.tier2_setup_ns.saturating_add(elapsed);
     });
@@ -1414,13 +1770,19 @@ fn decode_tile_components(
         let part = &core.parts.tile_parts[part_index];
         let packet_start = stats.start();
         let merge_before = packet_decoder.merge_ns();
-        packet_decoder.push_tile_part(part.payload).map_err(|err| {
-            crate::Jp2LamError::DecodeFailed(format!(
-                "tile {tile_index} tile-part {}: {}",
-                part.header.part_index,
-                err.message()
-            ))
-        })?;
+        packet_decoder
+            .push_tile_part_cancellable(part.payload, cancel)
+            .map_err(|err| {
+                if err.is_cancelled() {
+                    err
+                } else {
+                    crate::Jp2LamError::DecodeFailed(format!(
+                        "tile {tile_index} tile-part {}: {}",
+                        part.header.part_index,
+                        err.message()
+                    ))
+                }
+            })?;
         let merge_elapsed = packet_decoder.merge_ns().saturating_sub(merge_before);
         stats.finish(packet_start, |stats, elapsed| {
             stats.tier2_packet_headers_ns = stats
@@ -1435,11 +1797,6 @@ fn decode_tile_components(
         stats.tier2_concat_ns = stats.tier2_concat_ns.saturating_add(elapsed);
     });
     let reconstruction_header = reduced_tile_header(&full_tile_header, reduce_levels);
-    // Region decode: retain only the code blocks whose subband footprints
-    // influence the requested region's output pixels (the inverse-DWT support).
-    // The dropped blocks stay zero in the coefficient plane; because the inverse
-    // DWT is local, region pixels depend only on retained coefficients and match
-    // a full decode exactly.
     if let Some(region) = region {
         if reconstruction_header
             .siz
@@ -1494,13 +1851,45 @@ fn decode_tile_components(
             stats.peak_scratch_bytes = stats.peak_scratch_bytes.max(pixels.saturating_mul(6));
         }
     });
+    Ok((reconstruction_header, packets))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_tile_components(
+    core: &ParsedJp2Core<'_>,
+    tile_index: u16,
+    part_indices: &[usize],
+    reduce_levels: u8,
+    region: Option<RegionSpatial>,
+    stats: &mut StatsSink<'_>,
+    scratch: &mut DecodeScratch,
+    limits: &DecodeLimits,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+) -> Result<(CodestreamHeader, Vec<t1::DecodedTileCoefficients>)> {
+    let all_components = core.codestream.siz.components.len();
+    let (reconstruction_header, packets) = decode_tile_packets_filtered(
+        core,
+        tile_index,
+        part_indices,
+        reduce_levels,
+        all_components,
+        region,
+        stats,
+        limits,
+        cancel,
+    )?;
+    let allow_split = reconstruct::use_common_even_dwt(&reconstruction_header);
     let tier1_start = stats.start();
-    let components = t1::decode_tile_components_with_scratch(
+    let components = t1::decode_tile_component_range_with_scratch(
         &reconstruction_header,
         &packets,
+        0..all_components,
+        allow_split,
         stats,
         &mut scratch.tier1,
+        &mut scratch.tier1_workers,
         scratch.workers,
+        cancel,
     )?;
     stats.finish(tier1_start, |stats, elapsed| {
         stats.tier1_total_ns = stats.tier1_total_ns.saturating_add(elapsed);
@@ -1508,11 +1897,30 @@ fn decode_tile_components(
     Ok((reconstruction_header, components))
 }
 
+#[derive(Debug, Clone)]
 struct ParsedJp2Core<'a> {
     header: jp2_parse::Jp2Header,
     codestream: CodestreamHeader,
     parts: codestream::CodestreamView<'a>,
     tile_parts_by_tile: Vec<Vec<usize>>,
+}
+
+fn prepared_core_view<'a>(
+    base: &ParsedJp2Core<'a>,
+    ignore_container_palette: bool,
+) -> Result<ParsedJp2Core<'a>> {
+    let mut header = base.header.clone();
+    if ignore_container_palette && header.palette.is_some() {
+        header.palette = None;
+        header.colorspace = ColorSpace::Gray;
+    }
+    validate_jp2_decode_scope(&header, &base.codestream)?;
+    Ok(ParsedJp2Core {
+        header,
+        codestream: base.codestream.clone(),
+        parts: base.parts.clone(),
+        tile_parts_by_tile: base.tile_parts_by_tile.clone(),
+    })
 }
 
 /// The SOC (start of codestream) marker. A `/JPXDecode` stream may be a bare
@@ -1527,9 +1935,28 @@ fn parse_jp2_core<'a>(
     validate: bool,
     limits: &DecodeLimits,
 ) -> Result<ParsedJp2Core<'a>> {
+    parse_jp2_core_with_options(
+        bytes,
+        stats,
+        ignore_container_palette,
+        validate,
+        validate && !ignore_container_palette,
+        !validate,
+        limits,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_jp2_core_with_options<'a>(
+    bytes: &'a [u8],
+    stats: &mut StatsSink<'_>,
+    ignore_container_palette: bool,
+    validate: bool,
+    materialize_palette: bool,
+    retain_icc: bool,
+    limits: &DecodeLimits,
+) -> Result<ParsedJp2Core<'a>> {
     validate_input_bytes(bytes.len(), limits)?;
-    // Raw J2K codestream (no JP2 boxes): decode the codestream directly and
-    // synthesize the container-level header from SIZ.
     let (header, codestream_bytes) = if bytes.starts_with(&MARKER_SOC) {
         (None, bytes)
     } else {
@@ -1537,13 +1964,8 @@ fn parse_jp2_core<'a>(
         let parsed = jp2_parse::parse_jp2_with_options(
             bytes,
             jp2_parse::ParseOptions {
-                // Inspection and ignored-palette decoding only need the
-                // validated output-channel count. Actual palette expansion is
-                // the sole consumer of PCLR values.
-                materialize_palette: validate && !ignore_container_palette,
-                // Pixel decoding never consumes ICC bytes. Inspection retains
-                // them because ColorEncoding is part of its public metadata.
-                retain_icc: !validate,
+                materialize_palette,
+                retain_icc,
             },
         )?;
         stats.finish(start, |stats, elapsed| {

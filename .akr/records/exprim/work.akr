@@ -1,6 +1,58 @@
 akr 0.1
 project exprim
 
+record exprim.memory.image-decode-045/1 : work {
+    title "0.4.5 image decode and memory optimizations"
+    state completed
+    scope [
+        path "src/content/**",
+        path "src/image/**",
+        path "src/page_ir/**",
+        path "src/reader/**",
+        path "src/render_cpu/**",
+        path "src/render_scheduler/**"
+    ]
+    intent """
+        Cut peak and retained image-decoding memory and resampling overhead for the 0.4.5 release while keeping the crate-root API backwards-compatible and every rendered pixel byte-identical. Axis-aligned grayscale draws previously widened their source to three channels, minified CMYK draws allocated full-height backing buffers even for narrow strips, promoted codec images cached raw and promoted rasters side by side, JPEG scheduler estimates ignored reduced decode footprints, and text extraction plus codec scratch held thread-local state past session teardown.
+        """
+    trace [
+        "Native single-channel grayscale kernels replace three-channel promotion across nearest, bilinear, box-average and masked area-min, cutting resampling work three-fold and removing per-strip commit.",
+        "Kept the three-channel grayscale promotion helper under test configuration as the reference oracle so scalar and vectorised single-channel kernels are checked byte-for-byte against it.",
+        "Minified CMYK row-band conversion now allocates only the touched strip rows with a row offset, bounding virtual commit to the strip height.",
+        "Keying codec promotions before decode avoids caching raw four-channel or 16-bit rasters beside their promoted three-channel form and skips hashing uncompressed pixels.",
+        "Multi-scan progressive JPEG banding was rejected: holding coefficients beside the output buffer raises 4:2:0 peak memory from 4.5 to 6.0 bytes per pixel.",
+        "Deferred filter-image inflation was held back from 0.4.5: existing snapshot budget tests require compile-time decode accounting, making lazy streams a 0.5 change.",
+        "Ignoring in-data alpha when PDF disables soft-masking skips the opacity channel before wavelet synthesis, avoiding an eight-byte-per-pixel de-interleave spike.",
+        "Cold JPEG 2000 misses inspect only the main header for wavelet reduction and pass a borrowed prepared view into decode, avoiding duplicate parses and profile copies.",
+        "Scheduler JPEG memory estimates project each draw placement to its reduced decode footprint, preventing four-to-sixty-four-fold overcharges on scaled scan renders.",
+        "Moved text extraction glyph caching into a session-owned pool and wired global JBIG2, JPEG 2000 scratch, and auxiliary CPU caches into session cache release."
+    ]
+    after [ @exprim.memory.remaining-levers ]
+    supported_by [ @exprim.memory.peak-after-20261120 ]
+    author "dk"
+}
+
+record exprim.memory.jp2lam-decode-040/1 : work {
+    title "0.4.0 jp2lam decode memory, SIMD 5/3 reconstruction, and header/cancel optimizations"
+    state completed
+    scope [ path "codecs/jp2lam/**", path "src/image/jpx.rs" ]
+    intent """
+        Cut peak working memory and wall time across JPEG 2000 decoding while keeping every decoded pixel byte-identical across all feature modes, reduction levels, regions and worker budgets. Reversible 5/3 synthesis previously materialised full-resolution integer planes, scanned whole planes to test integer lifting safety, and ran serially without runtime vectorisation when built with default features disabled. Lossy and lossless multi-component decodes also held coarse and fine subbands simultaneously, decoded ignored trailing opacity channels, kept every plane resident at once even when no multiple-component transform linked them, re-parsed container headers and copied embedded colour profiles between inspection and decode, and could not abort mid-tile when a page render was cancelled.
+        """
+    trace [
+        "Reversible 5/3 vertical synthesis needs only a four-row ring buffer: even and odd lifting targets have opposite parity to their mirrored neighbours, so active slots never alias for heights of at least two.",
+        "Static header bounds over-estimate 16-bit reversible magnitudes beyond 32-bit signed range; tracking the maximum magnitude during block output gives the exact plane bound with no extra memory pass.",
+        "Splitting the coarsest quarter-plane from the finest detail subbands lets prefix synthesis free the coarse input before allocating the reconstructed quarter-plane, saving one byte per sample per channel.",
+        "When the codestream signals no multiple-component transform, packed output channels are independent; decoding and streaming one component at a time bounds working storage to a single component.",
+        "Preparing a borrowed container and main-header view avoids copying embedded colour profiles and reparsing boxes or tile-part headers; deferred scope validation preserves PDF palette overrides.",
+        "Measured on 12.5 MP RGB with default features off: reversible 5/3 wavelet stage dropped from 154 ms to 98 ms (-36%), lossless wall time from 3706 ms to 3399 ms.",
+        "On the same 12.5 MP fixture, lossy 9/7 single-thread wall time dropped from 157.0 ms to 142.8 ms (-9%), with identical output hashes across both lossless and lossy."
+    ]
+    after [ @exprim.memory.image-decode-045 ]
+    supported_by [ @exprim.memory.peak-after-20261120 ]
+    author "dk"
+}
+
 record exprim.memory.next-levers/1 : work {
     title "Peak-memory levers after the 2026-11-20 audit"
     state proposed

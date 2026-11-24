@@ -830,36 +830,6 @@ fn paint_image(
     // general compositor; every fast path below is source-over.
     let blend = choose_blend(img.blend);
     let blend_is_normal = matches!(blend, BlendChoice::Normal);
-    // Eight-bit gray sources (book scans, MRC pages) are one byte per texel
-    // where every fast path below reads three. Promote the axis-aligned
-    // opaque ones to RGB8 once so they qualify; sampling the promoted image
-    // is byte-identical (see `PreparedImage::gray8_promoted_to_rgb8`). A
-    // magnified draw under a mask has no fast path either way, so it is not
-    // expanded for nothing.
-    let promoted_gray;
-    let img = if blend_is_normal
-        && cmask.is_none()
-        && soft.is_none()
-        && img.alpha == 255
-        && img.inv.b == 0.0
-        && img.inv.c == 0.0
-        && matches!(img.color_space, crate::page_ir::ImageColorSpace::Gray)
-        && (img.footprint[0] > 1.0
-            || img.footprint[1] > 1.0
-            || (img.smask.is_none() && img.mask.is_none()))
-    {
-        // Only the source rows this draw's rows read: a strip of a page scan
-        // expands its own share of the image, not all of it.
-        match img.gray8_promoted_to_rgb8(img.source_rows_for(y0, y1)) {
-            Some(rgb) => {
-                promoted_gray = rgb;
-                &promoted_gray
-            }
-            None => img,
-        }
-    } else {
-        img
-    };
     // Indexed (palette) sources are one byte (or less) per texel resolved
     // through a palette, which no fast path reads. Expand them to RGB8 once
     // through the palette; sampling the promoted image is byte-identical (see
@@ -920,6 +890,29 @@ fn paint_image(
     // as nearest, with bilinear taps matching `PreparedImage::bilinear`.
     let fast_rgb8_bilinear =
         fast_rgb8_base && img.interpolation == crate::page_ir::InterpolationMode::Bilinear;
+    // Native one-byte-per-texel twins of `fast_rgb8` / `fast_rgb8_bilinear`:
+    // 8-bit grayscale scans and MRC layers sample straight from `img.samples`
+    // without allocating a `3 * width * height` RGB8 promotion copy.
+    let fast_gray8_base = blend_is_normal
+        && cmask.is_none()
+        && soft.is_none()
+        && img.alpha == 255
+        && img.smask.is_none()
+        && img.mask.is_none()
+        && !img.is_stencil
+        && img.bpc == 8
+        && img.decode.is_none()
+        && img.sample_lut.is_none()
+        && matches!(img.color_space, crate::page_ir::ImageColorSpace::Gray)
+        && img.footprint[0] <= 1.0
+        && img.footprint[1] <= 1.0
+        && img.inv.b.abs() < 1e-12
+        && img.inv.c.abs() < 1e-12
+        && img.samples.len() >= img.width as usize * img.height as usize;
+    let fast_gray8 =
+        fast_gray8_base && img.interpolation == crate::page_ir::InterpolationMode::Nearest;
+    let fast_gray8_bilinear =
+        fast_gray8_base && img.interpolation == crate::page_ir::InterpolationMode::Bilinear;
     // The low-bit-depth twin of `fast_rgb8`: a 1-, 2- or 4-bit single-component
     // image — the bilevel JBIG2 or CCITT page of a scan, an MRC producer or
     // A preprocessor's own output — drawn axis-aligned at or above its own resolution,
@@ -968,7 +961,27 @@ fn paint_image(
     // generic per-pixel loop and pays a fresh inverse map, two base tap boxes,
     // and a mask lookup for every destination pixel — all of which depend only
     // on the destination column or row once the placement is axis-aligned.
-    let area_min_mask = if rgb8_area_shape {
+    let rgb8_area_min_mask = if rgb8_area_shape {
+        area_min_mask(img)
+    } else {
+        None
+    };
+    let gray8_area_shape = blend_is_normal
+        && cmask.is_none()
+        && soft.is_none()
+        && img.alpha == 255
+        && !img.is_stencil
+        && img.bpc == 8
+        && img.decode.is_none()
+        && img.sample_lut.is_none()
+        && !matches!(img.mask, Some(crate::page_ir::ImageMask::ColorKey(_)))
+        && matches!(img.color_space, crate::page_ir::ImageColorSpace::Gray)
+        && (img.footprint[0] > 1.0 || img.footprint[1] > 1.0)
+        && img.inv.b == 0.0
+        && img.inv.c == 0.0
+        && img.samples.len() >= img.width as usize * img.height as usize;
+    let fast_gray8_area = gray8_area_shape && img.smask.is_none() && img.mask.is_none();
+    let gray8_area_min_mask = if gray8_area_shape {
         area_min_mask(img)
     } else {
         None
@@ -1013,8 +1026,24 @@ fn paint_image(
             sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
             sample_taps = result.1;
         }
+    } else if fast_gray8 {
+        let result = paint_axis_aligned_gray8_nearest_opaque(img, surface, x0, y0, x1, y1);
+        covered = result.0;
+        #[cfg(feature = "profiling")]
+        {
+            sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
+            sample_taps = result.1;
+        }
     } else if fast_rgb8_bilinear {
         let result = paint_axis_aligned_rgb8_bilinear_opaque(img, surface, x0, y0, x1, y1);
+        covered = result.0;
+        #[cfg(feature = "profiling")]
+        {
+            sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
+            sample_taps = result.1;
+        }
+    } else if fast_gray8_bilinear {
+        let result = paint_axis_aligned_gray8_bilinear_opaque(img, surface, x0, y0, x1, y1);
         covered = result.0;
         #[cfg(feature = "profiling")]
         {
@@ -1037,8 +1066,24 @@ fn paint_image(
             sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
             sample_taps = result.1;
         }
-    } else if let Some(mask) = area_min_mask {
+    } else if fast_gray8_area {
+        let result = paint_axis_aligned_gray8_area_min_opaque(img, surface, x0, y0, x1, y1);
+        covered = result.0;
+        #[cfg(feature = "profiling")]
+        {
+            sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
+            sample_taps = result.1;
+        }
+    } else if let Some(mask) = rgb8_area_min_mask {
         let result = paint_axis_aligned_rgb8_area_min_masked(img, mask, surface, x0, y0, x1, y1);
+        covered = result.0;
+        #[cfg(feature = "profiling")]
+        {
+            sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
+            sample_taps = result.1;
+        }
+    } else if let Some(mask) = gray8_area_min_mask {
+        let result = paint_axis_aligned_gray8_area_min_masked(img, mask, surface, x0, y0, x1, y1);
         covered = result.0;
         #[cfg(feature = "profiling")]
         {
@@ -1099,19 +1144,19 @@ fn paint_image(
         profile.increment("image.sample_attempts", sample_attempts);
         profile.increment("image.source_sample_taps", sample_taps);
         profile.increment("image.painted_pixels", covered);
-        if fast_rgb8 {
+        if fast_rgb8 || fast_gray8 {
             profile.increment("image.fast_rgb8_nearest_pixels", covered);
         }
-        if fast_rgb8_bilinear {
+        if fast_rgb8_bilinear || fast_gray8_bilinear {
             profile.increment("image.fast_rgb8_bilinear_pixels", covered);
         }
         if lut_nearest.is_some() {
             profile.increment("image.fast_lut_nearest_pixels", covered);
         }
-        if fast_rgb8_area {
+        if fast_rgb8_area || fast_gray8_area {
             profile.increment("image.fast_rgb8_area_min_pixels", covered);
             profile.add_duration("render.image.area_min", image_start.elapsed());
-        } else if let Some(mask) = area_min_mask {
+        } else if let Some(mask) = rgb8_area_min_mask.or(gray8_area_min_mask) {
             profile.increment("image.fast_rgb8_area_min_masked_pixels", covered);
             profile.add_duration("render.image.area_min_masked", image_start.elapsed());
             profile.increment(
@@ -2189,6 +2234,61 @@ fn paint_axis_aligned_rgb8_nearest_opaque(
     (painted, painted)
 }
 
+/// Native 1-byte-per-texel twin of [`paint_axis_aligned_rgb8_nearest_opaque`]
+/// for opaque 8-bit grayscale images, avoiding a `3 * width * height` RGB8
+/// promotion allocation per draw.
+fn paint_axis_aligned_gray8_nearest_opaque(
+    img: &crate::render_cpu::image::PreparedImage,
+    surface: &mut Surface,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> (u64, u64) {
+    let mut first_x = None;
+    let mut columns: Vec<u32> = Vec::with_capacity(x1 - x0);
+    for x in x0..x1 {
+        let u = img.inv.a * (x as f64 + 0.5) + img.inv.e;
+        if !(0.0..1.0).contains(&u) {
+            if first_x.is_some() {
+                break;
+            }
+            continue;
+        }
+        first_x.get_or_insert(x);
+        let fx = u * img.width as f64 - 0.5;
+        columns.push((fx.round() as i64).clamp(0, img.width.saturating_sub(1) as i64) as u32);
+    }
+    let Some(first_x) = first_x else {
+        return (0, 0);
+    };
+    let runs = consecutive_runs(&columns);
+    let n = columns.len();
+
+    let source_stride = img.width as usize;
+    let samples: &[u8] = &img.samples;
+    let output_origin = surface.origin_x;
+    let kernel = image_kernel();
+    let mut painted = 0u64;
+    for y in y0..y1 {
+        let v = img.inv.d * (y as f64 + 0.5) + img.inv.f;
+        if !(0.0..1.0).contains(&v) {
+            continue;
+        }
+        let fy = (1.0 - v) * img.height as f64 - 0.5;
+        let source_row = (fy.round() as i64).clamp(0, img.height.saturating_sub(1) as i64) as usize;
+        let source_base = source_row * source_stride;
+        let row = surface.row_mut(y);
+        let dst = &mut row[(first_x - output_origin) * 4..][..n * 4];
+        for &(start, len) in &runs {
+            let src_off = source_base + columns[start] as usize;
+            widen_gray8_to_rgba8_opaque(kernel, samples, src_off, &mut dst[start * 4..][..len * 4]);
+        }
+        painted += n as u64;
+    }
+    (painted, painted)
+}
+
 /// Fast path for an axis-aligned magnified or 1:1 low-bit-depth image that
 /// samples through a prepared lookup table (`PreparedImage::sample_lut`): the
 /// one-bit JBIG2 or CCITT page a scanner, or an MRC producer
@@ -2374,6 +2474,72 @@ unsafe fn widen_rgb8_to_rgba8_avx2(src: &[u8], src_off: usize, n: usize, dst: &m
     }
 }
 
+/// Write `dst.len() / 4` opaque RGBA pixels from the packed 8-bit gray texels
+/// at `src[src_off..]`: `g` → `[g, g, g, 255]`.
+#[inline]
+#[allow(
+    unsafe_code,
+    reason = "dispatches the AVX2 widen kernel behind a runtime probe; see SAFETY comment"
+)]
+fn widen_gray8_to_rgba8_opaque(kernel: ImageKernel, src: &[u8], src_off: usize, dst: &mut [u8]) {
+    let n = dst.len() / 4;
+    let run = &src[src_off..src_off + n];
+    match kernel {
+        #[cfg(target_arch = "x86_64")]
+        ImageKernel::Avx2 => {
+            // SAFETY: AVX2 is present (`image_kernel` probed it); `run` is a
+            // valid `n` byte slice and `dst` holds at least `4n` bytes.
+            unsafe { widen_gray8_to_rgba8_avx2(run, dst) }
+        }
+        ImageKernel::Scalar => widen_gray8_to_rgba8_scalar(run, dst),
+    }
+}
+
+/// Scalar reference for [`widen_gray8_to_rgba8_opaque`].
+#[inline]
+fn widen_gray8_to_rgba8_scalar(run: &[u8], dst: &mut [u8]) {
+    for (&g, out) in run.iter().zip(dst.chunks_exact_mut(4)) {
+        out[0] = g;
+        out[1] = g;
+        out[2] = g;
+        out[3] = 255;
+    }
+}
+
+/// AVX2 gray widen: eight texels per iteration (one 8-byte load, zero-extend to
+/// 32-bit lanes, byte-shuffle broadcast to RGB, alpha OR, one 32-byte store).
+///
+/// # Safety
+/// The CPU must support AVX2. `dst.len() >= run.len() * 4`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+unsafe fn widen_gray8_to_rgba8_avx2(run: &[u8], dst: &mut [u8]) {
+    use core::arch::x86_64::*;
+    let n = run.len();
+    debug_assert!(dst.len() >= n * 4);
+    let broadcast_rgb = _mm256_setr_epi8(
+        0, 0, 0, -1, 4, 4, 4, -1, 8, 8, 8, -1, 12, 12, 12, -1, //
+        0, 0, 0, -1, 4, 4, 4, -1, 8, 8, 8, -1, 12, 12, 12, -1,
+    );
+    let alpha = _mm256_set1_epi32(0xFF00_0000u32 as i32);
+    let mut i = 0usize;
+    while i + 8 <= n {
+        // SAFETY: `i + 8 <= n` bounds both the 8-byte load from `run` and the
+        // 32-byte store into `dst`.
+        unsafe {
+            let lo64 = _mm_loadl_epi64(run.as_ptr().add(i).cast::<__m128i>());
+            let v = _mm256_cvtepu8_epi32(lo64);
+            let out = _mm256_or_si256(_mm256_shuffle_epi8(v, broadcast_rgb), alpha);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 4).cast(), out);
+        }
+        i += 8;
+    }
+    if i < n {
+        widen_gray8_to_rgba8_scalar(&run[i..n], &mut dst[i * 4..n * 4]);
+    }
+}
+
 /// The present destination columns of an axis-aligned bilinear draw, as
 /// structure-of-arrays tables the row kernels stream through. Present columns
 /// (those whose centre maps inside the image) form one interval starting at
@@ -2418,6 +2584,15 @@ fn bilinear_columns(
     x0: usize,
     x1: usize,
 ) -> Option<BilinearColumns> {
+    bilinear_columns_with_bpp(img, x0, x1, 3)
+}
+
+fn bilinear_columns_with_bpp(
+    img: &crate::render_cpu::image::PreparedImage,
+    x0: usize,
+    x1: usize,
+    bpp: i64,
+) -> Option<BilinearColumns> {
     let w = img.width;
     let last = (w as i64 - 1).max(0);
     let mut cols = BilinearColumns {
@@ -2442,8 +2617,8 @@ fn bilinear_columns(
         let tx = (fx - x_floor) as f32;
         let ix0 = (x_floor as i64).clamp(0, last);
         let ix1 = (x_floor as i64 + 1).clamp(0, last);
-        cols.off0.push((ix0 * 3) as i32);
-        cols.off1.push((ix1 * 3) as i32);
+        cols.off0.push((ix0 * bpp) as i32);
+        cols.off1.push((ix1 * bpp) as i32);
         cols.t.push(tx);
         cols.one_minus_t.push(1.0 - tx);
     }
@@ -2960,6 +3135,346 @@ unsafe fn vlerp_row_avx2(p0: &[f32], p1: &[f32], n: usize, t: f32, omt: f32, dst
     }
 }
 
+/// Native 1-channel twin of [`paint_axis_aligned_rgb8_bilinear_opaque`] for
+/// opaque 8-bit grayscale scans/MRC layers: eliminates the `3 * W * H` RGB8
+/// promotion copy and cuts horizontal/vertical lerp work and row-cache memory
+/// to one channel instead of three.
+fn paint_axis_aligned_gray8_bilinear_opaque(
+    img: &crate::render_cpu::image::PreparedImage,
+    surface: &mut Surface,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> (u64, u64) {
+    let (Some(columns), Some(rows)) = (
+        bilinear_columns_with_bpp(img, x0, x1, 1),
+        bilinear_rows(img, y0, y1),
+    ) else {
+        return (0, 0);
+    };
+    let painted = paint_gray8_bilinear_rows(image_kernel(), img, surface, &columns, &rows);
+    (painted, painted.saturating_mul(4))
+}
+
+fn paint_gray8_bilinear_rows(
+    kernel: ImageKernel,
+    img: &crate::render_cpu::image::PreparedImage,
+    surface: &mut Surface,
+    columns: &BilinearColumns,
+    rows: &BilinearRows,
+) -> u64 {
+    let source_stride = img.width as usize;
+    let samples: &[u8] = &img.samples;
+    let n = columns.len();
+    let dst_x = (columns.first_x - surface.origin_x) * 4;
+
+    let unit_blit = columns.t.iter().all(|&t| t == 0.0) && rows.t.iter().all(|&t| t == 0.0);
+
+    let (buf, first_abs_y, stride) = surface.rows_mut_abs(rows.first_y, rows.first_y + rows.len());
+    let row_offset = first_abs_y.saturating_sub(rows.first_y);
+    let dest_rows = rows
+        .len()
+        .saturating_sub(row_offset)
+        .min(buf.len() / stride.max(1));
+    if dest_rows == 0 || n == 0 {
+        return 0;
+    }
+    let buf = &mut buf[..dest_rows * stride];
+    let parallel = image_row_parallel_enabled()
+        && n.saturating_mul(dest_rows) >= IMAGE_ROW_PAR_PIXEL_THRESHOLD;
+
+    if unit_blit {
+        let texels: Vec<u32> = columns.off0.iter().map(|&o| o as u32).collect();
+        let runs = consecutive_runs(&texels);
+        let paint_row = |i: usize, row: &mut [u8]| {
+            let base = rows.i0[row_offset + i] as usize * source_stride;
+            let dst = &mut row[dst_x..dst_x + n * 4];
+            for &(start, len) in &runs {
+                let src_off = base + columns.off0[start] as usize;
+                widen_gray8_to_rgba8_opaque(
+                    kernel,
+                    samples,
+                    src_off,
+                    &mut dst[start * 4..][..len * 4],
+                );
+            }
+        };
+        if parallel {
+            buf.par_chunks_mut(stride)
+                .enumerate()
+                .for_each(|(i, row)| paint_row(i, row));
+        } else {
+            buf.chunks_exact_mut(stride)
+                .enumerate()
+                .for_each(|(i, row)| paint_row(i, row));
+        }
+        return (n * dest_rows) as u64;
+    }
+
+    const BAND_ROWS: usize = 32;
+    let band_rows = if parallel { BAND_ROWS } else { dest_rows };
+    let paint_band = |band: usize, band_buf: &mut [u8]| {
+        let mut cache = HLerpCacheGray::new(n);
+        for (i, row) in band_buf.chunks_exact_mut(stride).enumerate() {
+            let r = row_offset + band * band_rows + i;
+            let (iy0, iy1) = (rows.i0[r], rows.i1[r]);
+            let s0 = cache.ensure(iy0, None, |plane| {
+                hlerp_row_gray8(
+                    kernel,
+                    samples,
+                    iy0 as usize * source_stride,
+                    columns,
+                    plane,
+                )
+            });
+            let s1 = cache.ensure(iy1, Some(s0), |plane| {
+                hlerp_row_gray8(
+                    kernel,
+                    samples,
+                    iy1 as usize * source_stride,
+                    columns,
+                    plane,
+                )
+            });
+            let (p0, p1) = (cache.plane(s0), cache.plane(s1));
+            vlerp_row_gray8(
+                kernel,
+                p0,
+                p1,
+                n,
+                rows.t[r],
+                rows.one_minus_t[r],
+                &mut row[dst_x..dst_x + n * 4],
+            );
+        }
+    };
+    if parallel {
+        buf.par_chunks_mut(stride * band_rows)
+            .enumerate()
+            .for_each(|(band, band_buf)| paint_band(band, band_buf));
+    } else {
+        buf.chunks_mut(stride * band_rows)
+            .enumerate()
+            .for_each(|(band, band_buf)| paint_band(band, band_buf));
+    }
+    (n * dest_rows) as u64
+}
+
+struct HLerpCacheGray {
+    n: usize,
+    keys: [Option<u32>; 2],
+    planes: [Vec<f32>; 2],
+    next_evict: usize,
+}
+
+impl HLerpCacheGray {
+    fn new(n: usize) -> Self {
+        Self {
+            n,
+            keys: [None, None],
+            planes: [vec![0.0; n], vec![0.0; n]],
+            next_evict: 0,
+        }
+    }
+
+    fn ensure(&mut self, row: u32, keep: Option<usize>, fill: impl FnOnce(&mut [f32])) -> usize {
+        if let Some(slot) = (0..2).find(|&s| self.keys[s] == Some(row)) {
+            return slot;
+        }
+        let mut slot = self.next_evict;
+        if keep == Some(slot) {
+            slot = 1 - slot;
+        }
+        fill(&mut self.planes[slot][..self.n]);
+        self.keys[slot] = Some(row);
+        self.next_evict = 1 - slot;
+        slot
+    }
+
+    fn plane(&self, slot: usize) -> &[f32] {
+        &self.planes[slot][..self.n]
+    }
+}
+
+#[inline]
+#[allow(
+    unsafe_code,
+    reason = "dispatches the AVX2 gray horizontal lerp kernel behind a runtime probe"
+)]
+fn hlerp_row_gray8(
+    kernel: ImageKernel,
+    samples: &[u8],
+    base: usize,
+    columns: &BilinearColumns,
+    plane: &mut [f32],
+) {
+    match kernel {
+        #[cfg(target_arch = "x86_64")]
+        ImageKernel::Avx2 => {
+            // SAFETY: AVX2 is present (`image_kernel` probed it). The kernel
+            // bounds every load/gather against `samples.len()`.
+            unsafe { hlerp_row_gray8_avx2(samples, base, columns, plane) }
+        }
+        ImageKernel::Scalar => hlerp_row_gray8_scalar(samples, base, columns, plane, 0),
+    }
+}
+
+#[inline]
+fn hlerp_row_gray8_scalar(
+    samples: &[u8],
+    base: usize,
+    columns: &BilinearColumns,
+    plane: &mut [f32],
+    start: usize,
+) {
+    let n = columns.len();
+    for (k, out) in plane.iter_mut().enumerate().take(n).skip(start) {
+        let s0 = base + columns.off0[k] as usize;
+        let s1 = base + columns.off1[k] as usize;
+        *out = samples[s0] as f32 * columns.one_minus_t[k] + samples[s1] as f32 * columns.t[k];
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+unsafe fn hlerp_row_gray8_avx2(
+    samples: &[u8],
+    base: usize,
+    columns: &BilinearColumns,
+    plane: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    let n = columns.len();
+    debug_assert!(plane.len() >= n);
+    let avail = samples.len().saturating_sub(base);
+    let gather_cols = if avail >= 4 {
+        columns.off1.partition_point(|&o| (o as usize) + 4 <= avail)
+    } else {
+        0
+    };
+    let byte_mask = _mm256_set1_epi32(0xFF);
+    let texel_ramp = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let mut k = 0usize;
+    // SAFETY: `gather_cols` guarantees `base + off + 4 <= samples.len()` for
+    // every gathered lane, and the consecutive fast path explicitly checks
+    // `base + o1 + 8 <= samples.len()`.
+    unsafe {
+        let row_ptr = samples.as_ptr().add(base).cast::<i32>();
+        while k + 8 <= gather_cols {
+            let omt = _mm256_loadu_ps(columns.one_minus_t.as_ptr().add(k));
+            let t = _mm256_loadu_ps(columns.t.as_ptr().add(k));
+            let (o0, o1) = (columns.off0[k], columns.off1[k]);
+            let idx0 = _mm256_loadu_si256(columns.off0.as_ptr().add(k).cast());
+            let idx1 = _mm256_loadu_si256(columns.off1.as_ptr().add(k).cast());
+            let consecutive = |idx: __m256i, o: i32| {
+                let expected = _mm256_add_epi32(_mm256_set1_epi32(o), texel_ramp);
+                _mm256_movemask_epi8(_mm256_cmpeq_epi32(idx, expected)) == -1
+            };
+            let run = consecutive(idx0, o0)
+                && consecutive(idx1, o1)
+                && base + o1 as usize + 8 <= samples.len();
+            let (g0, g1) = if run {
+                let load8 = |o: i32| {
+                    let p = samples.as_ptr().add(base + o as usize).cast::<__m128i>();
+                    _mm256_cvtepu8_epi32(_mm_loadl_epi64(p))
+                };
+                (load8(o0), load8(o1))
+            } else {
+                (
+                    _mm256_and_si256(_mm256_i32gather_epi32::<1>(row_ptr, idx0), byte_mask),
+                    _mm256_and_si256(_mm256_i32gather_epi32::<1>(row_ptr, idx1), byte_mask),
+                )
+            };
+            let fa = _mm256_cvtepi32_ps(g0);
+            let fb = _mm256_cvtepi32_ps(g1);
+            let out = _mm256_add_ps(_mm256_mul_ps(fa, omt), _mm256_mul_ps(fb, t));
+            _mm256_storeu_ps(plane.as_mut_ptr().add(k), out);
+            k += 8;
+        }
+    }
+    if k < n {
+        hlerp_row_gray8_scalar(samples, base, columns, plane, k);
+    }
+}
+
+#[inline]
+#[allow(
+    unsafe_code,
+    reason = "dispatches the AVX2 gray vertical lerp + pack kernel behind a runtime probe"
+)]
+fn vlerp_row_gray8(
+    kernel: ImageKernel,
+    p0: &[f32],
+    p1: &[f32],
+    n: usize,
+    t: f32,
+    one_minus_t: f32,
+    dst: &mut [u8],
+) {
+    assert!(p0.len() >= n && p1.len() >= n && dst.len() >= n * 4);
+    match kernel {
+        #[cfg(target_arch = "x86_64")]
+        ImageKernel::Avx2 => {
+            // SAFETY: AVX2 is present and slice bounds are asserted above.
+            unsafe { vlerp_row_gray8_avx2(p0, p1, n, t, one_minus_t, dst) }
+        }
+        ImageKernel::Scalar => vlerp_row_gray8_scalar(p0, p1, n, t, one_minus_t, dst, 0),
+    }
+}
+
+#[inline]
+fn vlerp_row_gray8_scalar(
+    p0: &[f32],
+    p1: &[f32],
+    n: usize,
+    t: f32,
+    omt: f32,
+    dst: &mut [u8],
+    start: usize,
+) {
+    for k in start..n {
+        let g = (p0[k] * omt + p1[k] * t).clamp(0.0, 255.0) as u8;
+        dst[k * 4..k * 4 + 4].copy_from_slice(&[g, g, g, 255]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+unsafe fn vlerp_row_gray8_avx2(p0: &[f32], p1: &[f32], n: usize, t: f32, omt: f32, dst: &mut [u8]) {
+    use core::arch::x86_64::*;
+    debug_assert!(p0.len() >= n && p1.len() >= n && dst.len() >= n * 4);
+    let tv = _mm256_set1_ps(t);
+    let omtv = _mm256_set1_ps(omt);
+    let zero = _mm256_setzero_si256();
+    let max = _mm256_set1_epi32(255);
+    let broadcast_rgb = _mm256_setr_epi8(
+        0, 0, 0, -1, 4, 4, 4, -1, 8, 8, 8, -1, 12, 12, 12, -1, //
+        0, 0, 0, -1, 4, 4, 4, -1, 8, 8, 8, -1, 12, 12, 12, -1,
+    );
+    let alpha = _mm256_set1_epi32(0xFF00_0000u32 as i32);
+    let mut k = 0usize;
+    // SAFETY: Caller asserted `p0.len() >= n`, `p1.len() >= n`, and
+    // `dst.len() >= n * 4`; each loop body reads 8 `f32`s from `p0`/`p1` at `k`
+    // and writes 32 `u8`s to `dst` at `k * 4` while `k + 8 <= n`.
+    unsafe {
+        while k + 8 <= n {
+            let a = _mm256_loadu_ps(p0.as_ptr().add(k));
+            let b = _mm256_loadu_ps(p1.as_ptr().add(k));
+            let v = _mm256_add_ps(_mm256_mul_ps(a, omtv), _mm256_mul_ps(b, tv));
+            let g = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvttps_epi32(v), zero), max);
+            let px = _mm256_or_si256(_mm256_shuffle_epi8(g, broadcast_rgb), alpha);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(k * 4).cast(), px);
+            k += 8;
+        }
+    }
+    if k < n {
+        vlerp_row_gray8_scalar(p0, p1, n, t, omt, dst, k);
+    }
+}
+
 /// Fast path for an opaque, unmasked, axis-aligned RGB8 image being
 /// area-minified. The minification twin of `paint_axis_aligned_rgb8_nearest_opaque`:
 /// each destination pixel averages the inclusive source-texel box that
@@ -2985,15 +3500,27 @@ fn paint_axis_aligned_rgb8_area_min_opaque(
     y1: usize,
 ) -> (u64, u64) {
     // RGB8 source samples are already the exact output component representation.
-    area_min_box_average_opaque(img, surface, &img.samples, x0, y0, x1, y1)
+    area_min_box_average_opaque::<3>(img, surface, &img.samples, 0, x0, y0, x1, y1)
 }
 
-/// Area-minify an opaque axis-aligned CMYK image. The source is converted to
-/// packed RGB8 **once** (each pixel through the identical `cmyk_to_rgb`/`to_u8`
-/// as the generic `pixel()`), then box-averaged like the RGB8 path. This is
-/// byte-identical to the generic convert-each-tap-then-average, but the
-/// conversion is hoisted out of the per-destination-pixel loop. `None` (→ the
-/// caller keeps the generic path) if the source is not convertible or too large.
+/// Native 1-channel twin of [`paint_axis_aligned_rgb8_area_min_opaque`]:
+/// box-averages 8-bit gray samples directly without a `3 * width * height`
+/// RGB8 promotion buffer and with one-third the horizontal/vertical filter math.
+fn paint_axis_aligned_gray8_area_min_opaque(
+    img: &crate::render_cpu::image::PreparedImage,
+    surface: &mut Surface,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> (u64, u64) {
+    area_min_box_average_opaque::<1>(img, surface, &img.samples, 0, x0, y0, x1, y1)
+}
+
+/// Area-minify an opaque axis-aligned CMYK image. The source rows touched by
+/// this draw are converted into a compact `(last - first) * width * 3` RGB8
+/// band **once** (each pixel through the identical `cmyk_to_rgb`/`to_u8` as
+/// the generic `pixel()`), then box-averaged like the RGB8 path.
 fn paint_axis_aligned_cmyk_area_min_opaque(
     img: &crate::render_cpu::image::PreparedImage,
     surface: &mut Surface,
@@ -3003,10 +3530,10 @@ fn paint_axis_aligned_cmyk_area_min_opaque(
     y1: usize,
 ) -> Option<(u64, u64)> {
     // Only the source rows these device rows read: a strip of a CMYK scan
-    // converts its own share of the image.
-    let rgb = img.cmyk_source_as_rgb8(img.source_rows_for(y0, y1))?;
-    Some(area_min_box_average_opaque(
-        img, surface, &rgb, x0, y0, x1, y1,
+    // allocates and converts only its own row band, not the full image.
+    let (rgb, first_row) = img.cmyk_source_as_rgb8(img.source_rows_for(y0, y1))?;
+    Some(area_min_box_average_opaque::<3>(
+        img, surface, &rgb, first_row, x0, y0, x1, y1,
     ))
 }
 
@@ -3091,7 +3618,32 @@ fn paint_axis_aligned_rgb8_area_min_masked(
     x1: usize,
     y1: usize,
 ) -> (u64, u64) {
-    let stride = img.width as usize * 3;
+    paint_axis_aligned_area_min_masked::<3>(img, mask, surface, x0, y0, x1, y1)
+}
+
+#[inline(never)]
+fn paint_axis_aligned_gray8_area_min_masked(
+    img: &crate::render_cpu::image::PreparedImage,
+    mask: AreaMinMask<'_>,
+    surface: &mut Surface,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> (u64, u64) {
+    paint_axis_aligned_area_min_masked::<1>(img, mask, surface, x0, y0, x1, y1)
+}
+
+fn paint_axis_aligned_area_min_masked<const BPP: usize>(
+    img: &crate::render_cpu::image::PreparedImage,
+    mask: AreaMinMask<'_>,
+    surface: &mut Surface,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> (u64, u64) {
+    let stride = img.width as usize * BPP;
     let rgb: &[u8] = &img.samples;
     // `edge_coverage` returns `None` — provably interior, full weight — exactly
     // when the mapped pixel square stays inside the unit square on both axes.
@@ -3251,7 +3803,7 @@ fn paint_axis_aligned_rgb8_area_min_masked(
         .max();
     let template = max_row_total
         .filter(|_| !body_taps.is_empty())
-        .and_then(|rt| RowBoxFilter::new(rgb, stride, &body_taps, rt));
+        .and_then(|rt| RowBoxFilter::<BPP>::new(rgb, stride, &body_taps, rt));
 
     let (output, first_output_y, output_stride) = surface.rows_mut_abs(y0, y1);
     // Align the row table with the clipped output window.
@@ -3459,6 +4011,9 @@ fn paint_axis_aligned_rgb8_area_min_masked(
                 }
                 let color = if dense {
                     [colors[k * 4], colors[k * 4 + 1], colors[k * 4 + 2]]
+                } else if BPP == 1 {
+                    let g = gray8_box_average(rgb, stride, tx, &ty, tx.total * ty.total);
+                    [g, g, g]
                 } else {
                     rgb8_box_average(rgb, stride, tx, &ty, tx.total * ty.total)
                 };
@@ -3489,16 +4044,18 @@ fn paint_axis_aligned_rgb8_area_min_masked(
 /// an RGB image; a converted buffer for CMYK). Prepares per-column source X
 /// boxes and per-row Y boxes, then box-averages each destination pixel exactly
 /// as `image.rs::area_average` does and writes it opaque.
-fn area_min_box_average_opaque(
+#[allow(clippy::too_many_arguments)]
+fn area_min_box_average_opaque<const BPP: usize>(
     img: &crate::render_cpu::image::PreparedImage,
     surface: &mut Surface,
     rgb: &[u8],
+    row_base: usize,
     x0: usize,
     y0: usize,
     x1: usize,
     y1: usize,
 ) -> (u64, u64) {
-    let stride = img.width as usize * 3;
+    let stride = img.width as usize * BPP;
 
     let mut source_columns: Vec<Option<crate::render_cpu::image::AxisTaps>> =
         Vec::with_capacity(x1 - x0);
@@ -3512,6 +4069,7 @@ fn area_min_box_average_opaque(
         source_columns.push(img.box_taps_x(fx));
     }
 
+    let rb = row_base as u32;
     let mut source_rows: Vec<Option<crate::render_cpu::image::AxisTaps>> =
         Vec::with_capacity(y1 - y0);
     for y in y0..y1 {
@@ -3521,7 +4079,11 @@ fn area_min_box_average_opaque(
             continue;
         }
         let fy = (1.0 - v) * img.height as f64 - 0.5;
-        source_rows.push(img.box_taps_y(fy));
+        source_rows.push(img.box_taps_y(fy).map(|mut t| {
+            t.lo = t.lo.saturating_sub(rb);
+            t.hi = t.hi.saturating_sub(rb);
+            t
+        }));
     }
 
     let output_origin = surface.origin_x;
@@ -3538,7 +4100,7 @@ fn area_min_box_average_opaque(
     let filter_template = body_taps
         .as_deref()
         .zip(max_row_total)
-        .and_then(|(cols, rt)| RowBoxFilter::new(rgb, stride, cols, rt));
+        .and_then(|(cols, rt)| RowBoxFilter::<BPP>::new(rgb, stride, cols, rt));
     if let (Some(template), Some((bx0, _))) = (&filter_template, body) {
         let cols = template.cols;
         let col_span: u64 = cols.iter().map(|t| (t.hi - t.lo + 1) as u64).sum();
@@ -3556,7 +4118,12 @@ fn area_min_box_average_opaque(
                     let Some(ty) = ty else { continue };
                     if !filter.average_row(ty, &mut row[first_target..]) {
                         for (x, tx) in cols.iter().enumerate() {
-                            let c = rgb8_box_average(rgb, stride, tx, ty, tx.total * ty.total);
+                            let c = if BPP == 1 {
+                                let g = gray8_box_average(rgb, stride, tx, ty, tx.total * ty.total);
+                                [g, g, g]
+                            } else {
+                                rgb8_box_average(rgb, stride, tx, ty, tx.total * ty.total)
+                            };
                             let t = first_target + x * 4;
                             row[t..t + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
                         }
@@ -3596,7 +4163,12 @@ fn area_min_box_average_opaque(
                 if weight == 0 {
                     continue;
                 }
-                let color = rgb8_box_average(rgb, stride, &tx, &ty, weight);
+                let color = if BPP == 1 {
+                    let g = gray8_box_average(rgb, stride, &tx, &ty, weight);
+                    [g, g, g]
+                } else {
+                    rgb8_box_average(rgb, stride, &tx, &ty, weight)
+                };
                 let target = (x0 + local_x - output_origin) * 4;
                 row[target..target + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
                 painted += 1;
@@ -3662,6 +4234,26 @@ fn rgb8_box_average(
     ]
 }
 
+#[inline(always)]
+fn gray8_box_average(
+    gray: &[u8],
+    stride: usize,
+    tx: &crate::render_cpu::image::AxisTaps,
+    ty: &crate::render_cpu::image::AxisTaps,
+    weight: u64,
+) -> u8 {
+    let mut a0 = 0u64;
+    for sr in ty.lo..=ty.hi {
+        let wy = ty.weight_at(sr);
+        let base = sr as usize * stride + tx.lo as usize;
+        let end = sr as usize * stride + (tx.hi as usize + 1);
+        for (col, &texel) in (tx.lo..).zip(&gray[base..end]) {
+            a0 += wy * tx.weight_at(col) * texel as u64;
+        }
+    }
+    ((a0 + weight / 2) / weight).min(255) as u8
+}
+
 /// The single run of `true` in `flags` as `(start, end)`, or `None` when
 /// there is none or more than one.
 fn body_run(flags: impl Iterator<Item = bool>) -> Option<(usize, usize)> {
@@ -3700,7 +4292,7 @@ fn body_run(flags: impl Iterator<Item = bool>) -> Option<(usize, usize)> {
 /// below 256 where the rounding error is under 2⁻⁴⁶, and a quotient that is
 /// not an integer is at least `1/w > 2⁻⁴⁰` from the next one, so truncation
 /// never crosses an integer. The bytes are the per-pixel filter's.
-struct RowBoxFilter<'a> {
+struct RowBoxFilter<'a, const BPP: usize = 3> {
     rgb: &'a [u8],
     stride: usize,
     cols: &'a [crate::render_cpu::image::AxisTaps],
@@ -3713,7 +4305,7 @@ struct RowBoxFilter<'a> {
     /// horizontal pass sums each box's taps in a loop.
     taps4: Vec<([usize; 4], [u32; 4])>,
     taps_used: usize,
-    /// Cached horizontal passes: `(source row, last use, R | G | B planes)`.
+    /// Cached horizontal passes: `(source row, last use, planar f64 sums)`.
     slots: Vec<(u32, u64, Vec<f64>)>,
     clock: u64,
     /// The weighted sums of the current destination row, planar.
@@ -3721,7 +4313,7 @@ struct RowBoxFilter<'a> {
     kernel: ImageKernel,
 }
 
-impl<'a> RowBoxFilter<'a> {
+impl<'a, const BPP: usize> RowBoxFilter<'a, BPP> {
     /// Tallest box the filter serves; a taller one (a minification of more
     /// than ~15× on Y) is left to the per-pixel filter.
     const MAX_ROWS: usize = 16;
@@ -3744,11 +4336,11 @@ impl<'a> RowBoxFilter<'a> {
             cols.iter()
                 .map(|t| {
                     let (lo, span) = (t.lo as usize, (t.hi - t.lo) as usize);
-                    let mut offsets = [lo * 3; 4];
+                    let mut offsets = [lo * BPP; 4];
                     let mut weights = [0u32; 4];
                     for (k, (o, w)) in offsets.iter_mut().zip(&mut weights).enumerate() {
                         if k <= span {
-                            *o = (lo + k) * 3;
+                            *o = (lo + k) * BPP;
                             *w = t.weight_at((lo + k) as u32) as u32;
                         }
                     }
@@ -3767,7 +4359,7 @@ impl<'a> RowBoxFilter<'a> {
             taps_used,
             slots: Vec::new(),
             clock: 0,
-            acc: vec![0.0; 3 * n],
+            acc: vec![0.0; BPP * n],
             kernel: image_kernel(),
         })
     }
@@ -3790,11 +4382,38 @@ impl<'a> RowBoxFilter<'a> {
 
     /// `Σ wx · texel` of source row `row` for every column, planar.
     fn horizontal(&self, row: u32, planes: &mut [f64]) {
+        let row_base = row as usize * self.stride;
+        let src = &self.rgb[row_base..row_base + self.stride];
+        if BPP == 1 {
+            let fixed = |taps: usize, out: &mut [f64]| {
+                for (x, (o, w)) in self.taps4.iter().enumerate() {
+                    let mut sum = 0u32;
+                    for k in 0..taps {
+                        sum += w[k] * src[o[k]] as u32;
+                    }
+                    out[x] = sum as f64;
+                }
+            };
+            match (self.taps4.is_empty(), self.taps_used) {
+                (false, 1..=2) => return fixed(2, planes),
+                (false, 3) => return fixed(3, planes),
+                (false, _) => return fixed(4, planes),
+                (true, _) => {}
+            }
+            for (x, tx) in self.cols.iter().enumerate() {
+                let base = row_base + tx.lo as usize;
+                let end = row_base + tx.hi as usize + 1;
+                let mut a0 = 0u64;
+                for (col, &texel) in (tx.lo..).zip(&self.rgb[base..end]) {
+                    a0 += tx.weight_at(col) * texel as u64;
+                }
+                planes[x] = a0 as f64;
+            }
+            return;
+        }
         let n = self.cols.len();
         let (r, rest) = planes.split_at_mut(n);
         let (g, b) = rest.split_at_mut(n);
-        let row_base = row as usize * self.stride;
-        let src = &self.rgb[row_base..row_base + self.stride];
         // Weights are at most `S` and texels 255, so four products fit `u32`;
         // the absent taps add `0 · texel`. The tap count is fixed per draw so
         // the loop body is straight-line code.
@@ -3843,7 +4462,7 @@ impl<'a> RowBoxFilter<'a> {
             return i;
         }
         let i = if self.slots.len() <= Self::MAX_ROWS {
-            self.slots.push((row, 0, vec![0.0; 3 * self.cols.len()]));
+            self.slots.push((row, 0, vec![0.0; BPP * self.cols.len()]));
             self.slots.len() - 1
         } else {
             // More slots than the tallest box, so one lies outside it.
@@ -3877,13 +4496,23 @@ impl<'a> RowBoxFilter<'a> {
                 ty.weight_at(r) as f64,
             );
         }
-        box_finish(
-            self.kernel,
-            &self.acc,
-            &self.col_total,
-            ty.total as f64,
-            dst,
-        );
+        if BPP == 1 {
+            box_finish_gray8(
+                self.kernel,
+                &self.acc,
+                &self.col_total,
+                ty.total as f64,
+                dst,
+            );
+        } else {
+            box_finish(
+                self.kernel,
+                &self.acc,
+                &self.col_total,
+                ty.total as f64,
+                dst,
+            );
+        }
         true
     }
 }
@@ -3997,6 +4626,75 @@ fn box_finish_avx2(acc: &[f64], col_total: &[f64], row_total: f64, dst: &mut [u8
         x += 4;
     }
     box_finish_scalar(acc, col_total, row_total, dst, x);
+}
+
+#[inline]
+#[allow(
+    unsafe_code,
+    reason = "dispatches the AVX2 gray box_finish kernel behind a runtime probe"
+)]
+fn box_finish_gray8(
+    kernel: ImageKernel,
+    acc: &[f64],
+    col_total: &[f64],
+    row_total: f64,
+    dst: &mut [u8],
+) {
+    let n = col_total.len();
+    let dst = &mut dst[..n * 4];
+    let acc = &acc[..n];
+    match kernel {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: AVX2 is present and slice bounds are checked above.
+        ImageKernel::Avx2 => unsafe { box_finish_gray8_avx2(acc, col_total, row_total, dst) },
+        ImageKernel::Scalar => box_finish_gray8_scalar(acc, col_total, row_total, dst, 0),
+    }
+}
+
+#[inline]
+fn box_finish_gray8_scalar(
+    acc: &[f64],
+    col_total: &[f64],
+    row_total: f64,
+    dst: &mut [u8],
+    start: usize,
+) {
+    let n = col_total.len();
+    for x in start..n {
+        let w = row_total * col_total[x];
+        let g = ((acc[x] + 0.5 * w) / w) as i32 as u8;
+        dst[x * 4..x * 4 + 4].copy_from_slice(&[g, g, g, 255]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(
+    unsafe_code,
+    reason = "AVX2 intrinsics over bounds-checked slices; see SAFETY comments"
+)]
+fn box_finish_gray8_avx2(acc: &[f64], col_total: &[f64], row_total: f64, dst: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let n = col_total.len();
+    let rt = _mm256_set1_pd(row_total);
+    let half = _mm256_set1_pd(0.5);
+    let broadcast_rgb = _mm_setr_epi8(0, 0, 0, -1, 4, 4, 4, -1, 8, 8, 8, -1, 12, 12, 12, -1);
+    let alpha = _mm_set1_epi32(0xFF00_0000u32 as i32);
+    let mut x = 0;
+    while x + 4 <= n {
+        // SAFETY: `x + 4 <= n`, `acc` and `col_total` hold `n` entries, and
+        // `dst` holds `4n` bytes.
+        unsafe {
+            let w = _mm256_mul_pd(rt, _mm256_loadu_pd(col_total.as_ptr().add(x)));
+            let hw = _mm256_mul_pd(half, w);
+            let a = _mm256_loadu_pd(acc.as_ptr().add(x));
+            let g = _mm256_cvttpd_epi32(_mm256_div_pd(_mm256_add_pd(a, hw), w));
+            let px = _mm_or_si128(_mm_shuffle_epi8(g, broadcast_rgb), alpha);
+            _mm_storeu_si128(dst.as_mut_ptr().add(x * 4).cast::<__m128i>(), px);
+        }
+        x += 4;
+    }
+    box_finish_gray8_scalar(acc, col_total, row_total, dst, x);
 }
 
 /// The union and intersection of the soft-mask rows one destination row's
@@ -6516,14 +7214,15 @@ mod rgb8_area_min_tests {
                     })
                     .collect();
                 let max_row_total = rows.iter().map(|t| t.total).max().unwrap_or(1);
-                let mut filter = RowBoxFilter::new(&rgb, stride, &cols, max_row_total).unwrap();
+                let mut filter =
+                    RowBoxFilter::<3>::new(&rgb, stride, &cols, max_row_total).unwrap();
                 filter.kernel = kernel;
                 let mut dst = vec![0u8; cols.len() * 4];
                 for ty in &rows {
                     let served = filter.average_row(ty, &mut dst);
                     assert_eq!(
                         served,
-                        ((ty.hi - ty.lo) as usize) < RowBoxFilter::MAX_ROWS,
+                        ((ty.hi - ty.lo) as usize) < RowBoxFilter::<3>::MAX_ROWS,
                         "{kernel:?} {ty:?}"
                     );
                     if !served {
@@ -7178,7 +7877,134 @@ mod rgb8_area_min_tests {
                     widen_rgb8_to_rgba8_scalar(&src[off..off + n * 3], &mut expected);
                     let mut got = vec![0xAAu8; n * 4];
                     widen_rgb8_to_rgba8_opaque(kernel, &src, off, &mut got);
-                    assert_eq!(got, expected, "{kernel:?} n={n} off={off}");
+                    assert_eq!(got, expected, "{kernel:?} rgb n={n} off={off}");
+                }
+                for &off in &[0usize, 1, 5, 4096 - n - 40, 4096 - n - 1, 4096 - n] {
+                    if off + n > src.len() {
+                        continue;
+                    }
+                    let mut expected = vec![0xAAu8; n * 4];
+                    widen_gray8_to_rgba8_scalar(&src[off..off + n], &mut expected);
+                    let mut got = vec![0xAAu8; n * 4];
+                    widen_gray8_to_rgba8_opaque(kernel, &src, off, &mut got);
+                    assert_eq!(got, expected, "{kernel:?} gray n={n} off={off}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gray8_native_kernels_match_promoted_rgb8_and_scalar_bit_exact() {
+        let mut rng = Rng(0x6ea7_8888_1234_5678);
+        let cases: [(u32, u32, f64, f64, f64, f64); 6] = [
+            // Unit 1:1 integer blit (exercises unit_blit + widen_gray8)
+            (37, 19, 2.0, 3.0, 37.0, 19.0),
+            // Magnified (exercises nearest & bilinear gather + consecutive runs)
+            (19, 13, 0.5, 1.25, 53.7, 39.4),
+            (64, 17, 0.0, 0.0, 64.0, 34.0),
+            // Minified <= 4 taps and > 4 taps (exercises RowBoxFilter::<1> fixed & general)
+            (91, 67, 1.3, 0.7, 29.5, 21.8),
+            (150, 110, 0.25, 0.5, 21.0, 16.0),
+            // Tall minification >= MAX_ROWS (exercises gray8_box_average fallback)
+            (40, 200, 1.0, 1.0, 20.0, 9.0),
+        ];
+        for &(sw, sh, ox, oy, w, h) in &cases {
+            let side = (ox + w).max(oy + h).ceil() as u32 + 3;
+            let samples: Vec<u8> = (0..sw as usize * sh as usize).map(|_| rng.byte()).collect();
+            let base = place(
+                make_image_cs(sw, sh, 1, 1, ImageColorSpace::Gray, samples),
+                ox,
+                oy,
+                w,
+                h,
+            );
+            let promoted_base = base
+                .gray8_promoted_to_rgb8(0..sh as usize)
+                .expect("promotable gray8");
+
+            // Check scalar vs AVX2 bilinear directly when magnified / 1:1.
+            if base.footprint[0] <= 1.0 && base.footprint[1] <= 1.0 {
+                let cols = bilinear_columns_with_bpp(&base, 0, side as usize, 1).unwrap();
+                let rows = bilinear_rows(&base, 0, side as usize).unwrap();
+                let mut surf_scalar = Surface::new(side as usize, side as usize, Background::White);
+                paint_gray8_bilinear_rows(
+                    ImageKernel::Scalar,
+                    &base,
+                    &mut surf_scalar,
+                    &cols,
+                    &rows,
+                );
+                for kernel in available_kernels() {
+                    let mut surf_k = Surface::new(side as usize, side as usize, Background::White);
+                    paint_gray8_bilinear_rows(kernel, &base, &mut surf_k, &cols, &rows);
+                    assert_surfaces_equal(
+                        &mut surf_k,
+                        &mut surf_scalar,
+                        &format!("gray8 bilinear {kernel:?} sw={sw} sh={sh}"),
+                    );
+                }
+            } else {
+                // Check scalar vs AVX2 box_finish_gray8 directly.
+                let n = side as usize;
+                let acc: Vec<f64> = (0..n).map(|i| (i * 137 % 50_000) as f64).collect();
+                let col_total: Vec<f64> = (0..n).map(|i| (256 + (i % 7) * 33) as f64).collect();
+                let mut ref_dst = vec![0u8; n * 4];
+                box_finish_gray8_scalar(&acc, &col_total, 512.0, &mut ref_dst, 0);
+                for kernel in available_kernels() {
+                    let mut got_dst = vec![0u8; n * 4];
+                    box_finish_gray8(kernel, &acc, &col_total, 512.0, &mut got_dst);
+                    assert_eq!(got_dst, ref_dst, "box_finish_gray8 {kernel:?}");
+                }
+            }
+
+            for mask_kind in ["none", "stencil", "smask1", "smask8"] {
+                for interpolation in [InterpolationMode::Nearest, InterpolationMode::Bilinear] {
+                    let mut gray_img = base.clone();
+                    let mut rgb_img = promoted_base.clone();
+                    gray_img.interpolation = interpolation;
+                    rgb_img.interpolation = interpolation;
+                    let (mw, mh) = (sw.div_ceil(2) + 2, sh + 3);
+                    match mask_kind {
+                        "stencil" => {
+                            let m = Some(crate::page_ir::ImageMask::Stencil(bilevel(
+                                mw, mh, &mut rng,
+                            )));
+                            gray_img.mask = m.clone();
+                            rgb_img.mask = m;
+                        }
+                        "smask1" => {
+                            let m = Some(bilevel(mw, mh, &mut rng));
+                            gray_img.smask = m.clone();
+                            rgb_img.smask = m;
+                        }
+                        "smask8" => {
+                            let mask: Vec<u8> = (0..mw * mh)
+                                .map(|_| if rng.byte() < 80 { rng.byte() } else { 255 })
+                                .collect();
+                            let m = Some(Arc::new(crate::page_ir::ImageSMask {
+                                width: mw,
+                                height: mh,
+                                bits_per_component: 8,
+                                decode: None,
+                                samples: Arc::from(mask),
+                                codec: None,
+                                codec_data: None,
+                                codec_parms: None,
+                            }));
+                            gray_img.smask = m.clone();
+                            rgb_img.smask = m;
+                        }
+                        _ => {}
+                    }
+                    let mut got = dispatched(&gray_img, side);
+                    let mut expected = dispatched(&rgb_img, side);
+                    assert_surfaces_equal(
+                        &mut got,
+                        &mut expected,
+                        &format!(
+                            "gray8 vs promoted rgb8 sw={sw} sh={sh} mask={mask_kind} interp={interpolation:?}"
+                        ),
+                    );
                 }
             }
         }

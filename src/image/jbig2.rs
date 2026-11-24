@@ -194,6 +194,16 @@ impl ImageCodec for Jbig2Codec {
     ) -> Option<u8> {
         Some(0)
     }
+
+    fn clear_caches(&self) {
+        *lock_unpoisoned(&self.globals_cache) = None;
+    }
+
+    fn release_idle_memory(&self) {
+        JBIG2_CONTEXT.with(|ctx| {
+            *ctx.borrow_mut() = DecoderContext::new();
+        });
+    }
 }
 
 impl Jbig2Codec {

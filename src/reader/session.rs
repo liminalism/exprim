@@ -1,6 +1,5 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::content::{PageCompiler, SemanticPage};
 use crate::document::{DocumentLimits, DocumentSnapshot, PageIndex, ParseContext};
@@ -70,7 +69,29 @@ impl WorkerPool {
     }
 }
 
-static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+#[derive(Debug, Default)]
+struct TextGlyphPool {
+    idle: std::sync::Mutex<Vec<crate::text::GlyphCache>>,
+}
+
+impl TextGlyphPool {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<crate::text::GlyphCache>> {
+        self.idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn with<R>(&self, job: impl FnOnce(&mut crate::text::GlyphCache) -> R) -> R {
+        let mut cache = self.lock().pop().unwrap_or_default();
+        let result = job(&mut cache);
+        self.lock().push(cache);
+        result
+    }
+
+    fn clear(&self) {
+        self.lock().clear();
+    }
+}
 
 /// Cooperative cancellation token. The renderer token stays private
 /// to this crate while page jobs can cheaply clone, cancel, and checkpoint it.
@@ -652,7 +673,6 @@ fn retained_page_bytes(page: &CompiledDocumentPage) -> usize {
 /// Per-document immutable renderer state.
 #[derive(Debug)]
 pub struct RenderSession {
-    id: u64,
     pub(crate) snapshot: Arc<DocumentSnapshot>,
     pub(crate) compiler: Arc<PageCompiler>,
     // Constructed once per document now so Phase 3 does not accidentally
@@ -660,6 +680,7 @@ pub struct RenderSession {
     backend: Arc<CpuBackend>,
     pages: PageCache<CompiledDocumentPage>,
     workers: WorkerPool,
+    text_glyphs: TextGlyphPool,
     /// Timing detail applied to every worker a profiled render checks out.
     #[cfg(feature = "profiling")]
     profile_detail: std::sync::Mutex<crate::profiling::ProfileDetail>,
@@ -770,7 +791,6 @@ impl RenderSession {
             .with_strip_target_bytes(options.strip_bytes);
 
         Ok(Self {
-            id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             snapshot: Arc::new(snapshot),
             compiler: Arc::new(PageCompiler::new().with_annotations(true)),
             backend: Arc::new(backend),
@@ -780,6 +800,7 @@ impl RenderSession {
                 retained_page_bytes,
             ),
             workers: WorkerPool::default(),
+            text_glyphs: TextGlyphPool::default(),
             #[cfg(feature = "profiling")]
             profile_detail: std::sync::Mutex::new(crate::profiling::ProfileDetail::default()),
         })
@@ -805,6 +826,7 @@ impl RenderSession {
     /// open but idle document to little more than its parsed structure.
     /// Later renders decode, parse and rasterize again, to the same bytes.
     pub fn clear_resource_caches(&self) {
+        self.text_glyphs.clear();
         self.backend.clear_resource_caches();
     }
 
@@ -821,7 +843,15 @@ impl RenderSession {
     /// work in flight is unaffected. Output never depends on this.
     pub fn release_idle_memory(&self) {
         self.workers.clear();
+        self.text_glyphs.clear();
         self.backend.release_idle_memory();
+    }
+
+    pub(crate) fn with_text_glyphs<R>(
+        &self,
+        job: impl FnOnce(&mut crate::text::GlyphCache) -> R,
+    ) -> R {
+        self.text_glyphs.with(job)
     }
 
     /// Bytes of finished page buffers the session currently keeps for reuse
@@ -829,11 +859,6 @@ impl RenderSession {
     /// drops them).
     pub fn idle_surface_bytes(&self) -> usize {
         self.backend.idle_surface_bytes()
-    }
-
-    /// Distinguishes this session from every other one in the process.
-    pub(crate) fn id(&self) -> u64 {
-        self.id
     }
 
     /// Number of pages in the document.

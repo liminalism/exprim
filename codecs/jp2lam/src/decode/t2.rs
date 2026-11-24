@@ -5,8 +5,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::hash_map::Entry;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -89,11 +88,11 @@ pub(crate) struct DecodedCodewordSegment<'a> {
 }
 
 #[derive(Debug, Clone)]
-struct BandState {
+struct BandState<'a> {
     component: usize,
     resolution: u8,
     band: BandOrientation,
-    blocks: Vec<BlockState>,
+    blocks: Vec<BlockState<'a>>,
     precincts: Vec<BandPrecinctState>,
 }
 
@@ -133,7 +132,7 @@ struct BandGeometry {
 }
 
 #[derive(Debug, Clone)]
-struct BlockState {
+struct BlockState<'a> {
     x0: u32,
     y0: u32,
     x1: u32,
@@ -144,6 +143,9 @@ struct BlockState {
     /// Coding passes contributed so far, which fixes where the next
     /// contribution's codeword terminations fall (Table D.9).
     passes: u32,
+    /// Merged codeword contributions across layers, stored directly on the
+    /// block rather than in a separate tile-wide `HashMap`.
+    merged: Option<MergedBlock<'a>>,
 }
 #[derive(Debug, Clone)]
 struct Contribution {
@@ -257,7 +259,7 @@ impl<T> InlineValues<T> {
 /// tile-part. Feed every part for this tile to [`Self::push_tile_part`] in its
 /// `TPsot` order, then consume the result with [`Self::finish`].
 pub(crate) struct TilePacketDecoder<'a> {
-    bands: Vec<BandState>,
+    bands: Vec<BandState<'a>>,
     band_lookup: Vec<Vec<Vec<usize>>>,
     sop_markers: bool,
     eph_markers: bool,
@@ -268,15 +270,15 @@ pub(crate) struct TilePacketDecoder<'a> {
     packet_stats: PacketStats,
     #[cfg(test)]
     packet_records: Option<Vec<DecodedPacket>>,
-    // Contributions accumulate per code-block across layers. `order` keeps
-    // first-inclusion order so output is deterministic regardless of how the
-    // layers or tile-parts are distributed.
-    merged: HashMap<(usize, usize), MergedBlock<'a>>,
+    // `order` keeps first-inclusion `(band_index, block_index)` order so output
+    // is deterministic regardless of how layers or tile-parts are distributed;
+    // the `MergedBlock` itself lives inline on `BlockState`.
     order: Vec<(usize, usize)>,
     contribution_scratch: Vec<Contribution>,
     profile: bool,
     merge_ns: u64,
     highest_resolution: u8,
+    active_components: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,17 +591,26 @@ impl<'a> TilePacketDecoder<'a> {
             packet_stats: PacketStats::default(),
             #[cfg(test)]
             packet_records: None,
-            merged: HashMap::new(),
             order: Vec::new(),
             contribution_scratch: Vec::new(),
             profile,
             merge_ns: 0,
             highest_resolution,
+            active_components: component_count,
         })
+    }
+
+    pub(crate) fn set_active_components(&mut self, active_components: usize) {
+        self.active_components = active_components;
     }
 
     pub(crate) fn merge_ns(&self) -> u64 {
         self.merge_ns
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_tile_part(&mut self, payload: &'a [u8]) -> Result<()> {
+        self.push_tile_part_cancellable(payload, None)
     }
 
     /// Decode the complete compressed-data portion of one tile-part.
@@ -617,10 +628,17 @@ impl<'a> TilePacketDecoder<'a> {
     /// ([`PacketBioReader::inalign`], Annex B.10.1), and without that a
     /// header counted a byte short and sliced its body early. When a stream
     /// decodes to garbage, `JP2LAM_TRACE_T2` prints every packet's extent.
-    pub(crate) fn push_tile_part(&mut self, payload: &'a [u8]) -> Result<()> {
+    pub(crate) fn push_tile_part_cancellable(
+        &mut self,
+        payload: &'a [u8],
+        cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    ) -> Result<()> {
         let trace = packet_trace_enabled();
         let mut pos = 0usize;
         while pos < payload.len() {
+            if (self.next_packet_index & 255) == 0 && cancel.is_some_and(|f| f()) {
+                return Err(Jp2LamError::Cancelled);
+            }
             let Some(packet) = self.packet_positions.next()? else {
                 if trace {
                     eprintln!(
@@ -820,10 +838,10 @@ impl<'a> TilePacketDecoder<'a> {
         let codeblocks = self
             .order
             .into_iter()
-            .map(|key| {
-                let block = self
+            .map(|(band_index, block_index)| {
+                let block = self.bands[band_index].blocks[block_index]
                     .merged
-                    .remove(&key)
+                    .take()
                     .expect("merged entry present for ordered key");
                 let segments = block
                     .segments
@@ -873,7 +891,8 @@ impl<'a> TilePacketDecoder<'a> {
     ) -> Result<()> {
         let mut body_pos = 0usize;
         for contribution in contributions.drain(..) {
-            let retain = packet.resolution <= self.highest_resolution;
+            let retain = packet.resolution <= self.highest_resolution
+                && packet.component < self.active_components;
             let mut new_segments = if retain && contribution.segments.len() > 1 {
                 let mut values = Vec::new();
                 values
@@ -908,12 +927,13 @@ impl<'a> TilePacketDecoder<'a> {
                 continue;
             }
             let new_segments = new_segments.expect("retained contribution has segment storage");
-            let band_state = &self.bands[contribution.band_index];
-            let block = &band_state.blocks[contribution.block_index];
+            let band_state = &mut self.bands[contribution.band_index];
+            let band_component = band_state.component;
+            let band_orientation = band_state.band;
+            let block = &mut band_state.blocks[contribution.block_index];
             let key = (contribution.band_index, contribution.block_index);
-            match self.merged.entry(key) {
-                Entry::Occupied(mut slot) => {
-                    let existing = slot.get_mut();
+            match &mut block.merged {
+                Some(existing) => {
                     existing.passes += contribution.passes;
                     // A segment left open by the previous layer continues
                     // with this layer's first piece; every piece after a
@@ -933,14 +953,14 @@ impl<'a> TilePacketDecoder<'a> {
                         }
                     }
                 }
-                Entry::Vacant(slot) => {
+                None => {
                     self.order.push(key);
-                    slot.insert(MergedBlock {
-                        component: band_state.component,
+                    block.merged = Some(MergedBlock {
+                        component: band_component,
                         band_index: contribution.band_index,
                         block_index: contribution.block_index,
                         resolution: packet.resolution,
-                        band: band_state.band,
+                        band: band_orientation,
                         x0: block.x0,
                         y0: block.y0,
                         x1: block.x1,
@@ -1039,7 +1059,7 @@ fn read_band_contributions(
     precinct_index: usize,
     band_index: usize,
     style: CodeBlockStyle,
-    bands: &mut [BandState],
+    bands: &mut [BandState<'_>],
     contributions: &mut Vec<Contribution>,
 ) -> Result<()> {
     let band = bands
@@ -1138,7 +1158,7 @@ fn read_band_contributions(
 }
 
 fn build_band_lookup(
-    bands: &[BandState],
+    bands: &[BandState<'_>],
     component_count: usize,
     levels: u8,
 ) -> Vec<Vec<Vec<usize>>> {
@@ -1400,19 +1420,19 @@ fn precinct_reference_position(
     Ok((reference_x, reference_y))
 }
 
-fn build_band_states(
+fn build_band_states<'a>(
     header: &CodestreamHeader,
     precinct_grids: &[Vec<PrecinctGrid>],
     max_code_blocks: usize,
-) -> Result<Vec<BandState>> {
+) -> Result<Vec<BandState<'a>>> {
     build_precinct_band_states(header, precinct_grids, max_code_blocks)
 }
 
-fn build_precinct_band_states(
+fn build_precinct_band_states<'a>(
     header: &CodestreamHeader,
     precinct_grids: &[Vec<PrecinctGrid>],
     max_code_blocks: usize,
-) -> Result<Vec<BandState>> {
+) -> Result<Vec<BandState<'a>>> {
     let band_count = 1 + usize::from(header.cod.decomposition_levels) * 3;
     let mut bands = Vec::with_capacity(header.siz.components.len().saturating_mul(band_count));
     let mut remaining_code_blocks = max_code_blocks;
@@ -1435,13 +1455,13 @@ fn build_precinct_band_states(
     Ok(bands)
 }
 
-fn build_precinct_band(
+fn build_precinct_band<'a>(
     header: &CodestreamHeader,
     component: usize,
     geometry: BandGeometry,
     grid: PrecinctGrid,
     remaining_code_blocks: &mut usize,
-) -> Result<BandState> {
+) -> Result<BandState<'a>> {
     let band_pp_x = if geometry.resolution == 0 {
         grid.pp_x
     } else {
@@ -1532,6 +1552,7 @@ fn build_precinct_band(
                         numlenbits: 3,
                         zero_bitplanes: None,
                         passes: 0,
+                        merged: None,
                     });
                 }
             }

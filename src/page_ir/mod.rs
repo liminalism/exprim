@@ -880,6 +880,238 @@ impl PageComplexity {
     }
 }
 
+/// Unscaled device-footprint `(width, height)` of an image's unit square mapped
+/// through `ctm`, shared by backend reduced-resolution codec hints and
+/// scheduler decode-memory estimation so the two cannot drift.
+pub fn codec_footprint_size(ctm: Matrix) -> Option<(u32, u32)> {
+    use std::sync::OnceLock;
+    static REDUCE_DISABLED: OnceLock<bool> = OnceLock::new();
+    static HEADROOM: OnceLock<f32> = OnceLock::new();
+
+    if *REDUCE_DISABLED.get_or_init(|| {
+        std::env::var_os("PDF_RENDERER_JPX_REDUCE")
+            .is_some_and(|v| v == "0" || v == "off" || v == "false")
+    }) {
+        return None;
+    }
+    if !ctm.is_stably_invertible() {
+        return None;
+    }
+    let origin = ctm.apply(Point { x: 0.0, y: 0.0 });
+    let x_edge = ctm.apply(Point { x: 1.0, y: 0.0 });
+    let y_edge = ctm.apply(Point { x: 0.0, y: 1.0 });
+    let w = ((x_edge.x - origin.x).abs() + (x_edge.y - origin.y).abs()).ceil();
+    let h = ((y_edge.x - origin.x).abs() + (y_edge.y - origin.y).abs()).ceil();
+    if !w.is_finite() || !h.is_finite() || w < 1.0 || h < 1.0 {
+        return None;
+    }
+    let headroom = *HEADROOM.get_or_init(|| {
+        std::env::var("PDF_RENDERER_JPX_HEADROOM")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|h| h.is_finite() && *h >= 1.0)
+            .unwrap_or(1.0)
+    }) as f64;
+    Some((
+        (w * headroom).ceil().min(u32::MAX as f64) as u32,
+        (h * headroom).ceil().min(u32::MAX as f64) as u32,
+    ))
+}
+
+/// `(decoded, working)` bytes of one codec decode of a `width` x `height`
+/// raster with `components` components.
+pub fn estimate_codec_bytes(
+    codec: ImageCodecKind,
+    width: u32,
+    height: u32,
+    components: u64,
+    bits_per_component: u8,
+) -> (u64, u64) {
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    match codec {
+        ImageCodecKind::Jbig2 | ImageCodecKind::CcittFax => {
+            let packed = u64::from(width)
+                .div_ceil(8)
+                .saturating_mul(u64::from(height));
+            (packed, packed.saturating_mul(2))
+        }
+        ImageCodecKind::Dct | ImageCodecKind::Jpx => {
+            let bytes_per_sample = if bits_per_component > 8 { 2 } else { 1 };
+            let samples = pixels.saturating_mul(components);
+            (
+                samples.saturating_mul(bytes_per_sample),
+                samples.saturating_mul(4),
+            )
+        }
+    }
+}
+
+/// `(retained, working)` bytes of one image drawn at `target_size` (`None` =
+/// full source resolution).
+///
+/// For `/DCTDecode` (JPEG), `JpegCodec::pick_dct_size` unconditionally reduces
+/// spatial output to `1/2`, `1/4` or `1/8` when `target_size` allows, while
+/// progressive/multi-scan `i16` coefficients stay bounded by full-resolution
+/// blocks (`2 B/sample`); single-scan streaming JPEGs allocate even less.
+pub fn estimate_image_bytes_for_target(
+    image: &ImageIr,
+    target_size: Option<(u32, u32)>,
+) -> (u64, u64) {
+    let reduce_dct = |w: u32, h: u32| -> (u32, u32) {
+        let Some((tw, th)) = target_size else {
+            return (w, h);
+        };
+        let scaled =
+            |dim: u32, dct: u32| -> u32 { (u64::from(dim) * u64::from(dct)).div_ceil(8) as u32 };
+        let mut dct = 8u32;
+        while dct > 1 && scaled(w, dct / 2) >= tw.max(1) && scaled(h, dct / 2) >= th.max(1) {
+            dct /= 2;
+        }
+        (scaled(w, dct), scaled(h, dct))
+    };
+
+    let (out_w, out_h) = match image.codec {
+        Some(ImageCodecKind::Dct) => reduce_dct(image.width, image.height),
+        _ => (image.width, image.height),
+    };
+    let out_pixels = u64::from(out_w).saturating_mul(u64::from(out_h));
+    let bpc = image.bits_per_component;
+    let (decoded, working) = match image.codec {
+        None => (0, 0),
+        Some(ImageCodecKind::Dct) => {
+            let components = image.color_space.components() as u64;
+            let (dec, reduced_working) =
+                estimate_codec_bytes(ImageCodecKind::Dct, out_w, out_h, components, bpc);
+            // Multi-scan / progressive JPEGs still entropy-decode full-size
+            // i16 coefficients (2 B/sample) before scaled IDCT, so working
+            // memory never drops below `2 * native_samples + dec`.
+            let native_samples = u64::from(image.width)
+                .saturating_mul(u64::from(image.height))
+                .saturating_mul(components);
+            let prog_working = native_samples.saturating_mul(2);
+            (dec, reduced_working.max(prog_working))
+        }
+        Some(codec) => {
+            let components = (image.color_space.components() as u64)
+                .saturating_add(u64::from(image.smask_in_data != 0));
+            estimate_codec_bytes(codec, out_w, out_h, components, bpc)
+        }
+    };
+    let bilevel_codec = matches!(
+        image.codec,
+        Some(ImageCodecKind::Jbig2 | ImageCodecKind::CcittFax)
+    );
+    let gray8_in_place = bpc == 8
+        && image.color_space == ImageColorSpace::Gray
+        && image.decode.is_none()
+        && !matches!(image.mask, Some(ImageMask::ColorKey(_)));
+    let sampled_in_place = image.is_stencil
+        || bpc <= 1
+        || bilevel_codec
+        || (bpc <= 8 && image.color_space == ImageColorSpace::Rgb)
+        || gray8_in_place;
+    let promoted = if sampled_in_place {
+        0
+    } else {
+        out_pixels.saturating_mul(3)
+    };
+    let mut retained = decoded.saturating_add(promoted);
+    let mut working = working;
+    let masks = [
+        image.smask.as_deref(),
+        match image.mask.as_ref() {
+            Some(ImageMask::Stencil(mask)) => Some(mask.as_ref()),
+            _ => None,
+        },
+    ];
+    for mask in masks.into_iter().flatten() {
+        if let Some(codec) = mask.codec {
+            let (mw, mh) = match codec {
+                ImageCodecKind::Dct => reduce_dct(mask.width, mask.height),
+                _ => (mask.width, mask.height),
+            };
+            let (dec, mask_working) =
+                estimate_codec_bytes(codec, mw, mh, 1, mask.bits_per_component);
+            let mask_working = if codec == ImageCodecKind::Dct {
+                let native = u64::from(mask.width).saturating_mul(u64::from(mask.height)) * 2;
+                mask_working.max(native)
+            } else {
+                mask_working
+            };
+            retained = retained.saturating_add(dec);
+            working = working.max(mask_working);
+        }
+    }
+    (retained, working)
+}
+
+impl CompiledPage {
+    /// Image decode and promotion bytes a render job through `matrix` allocates
+    /// at its peak. Scales `/DCTDecode` rasters by each draw's transformed
+    /// device footprint; falls back to
+    /// [`PageComplexity::estimated_image_decode_peak_bytes`] when `images` is
+    /// empty (for synthetic pages that populate `complexity` directly).
+    pub fn estimated_image_decode_bytes(&self, matrix: &Matrix) -> u64 {
+        if self.images.is_empty() {
+            return self.complexity.estimated_image_decode_peak_bytes;
+        }
+        // Track whether each image is drawn and the largest device footprint
+        // across its draws on this page (`None` = drawn with degenerate/unbounded
+        // CTM, keep full source size).
+        #[derive(Clone, Copy)]
+        enum DrawFootprint {
+            Never,
+            Bounded(u32, u32),
+            Full,
+        }
+        let mut draws = vec![DrawFootprint::Never; self.images.len()];
+        let mut ctm = Matrix::IDENTITY;
+        let mut stack: Vec<Matrix> = Vec::new();
+        for op in self.operations.iter() {
+            match op {
+                DisplayOp::Save => stack.push(ctm),
+                DisplayOp::Restore => {
+                    if let Some(prev) = stack.pop() {
+                        ctm = prev;
+                    }
+                }
+                DisplayOp::ConcatTransform(m) => ctm = m.then(ctm),
+                DisplayOp::DrawImage {
+                    image, transform, ..
+                } => {
+                    let Some(slot) = draws.get_mut(image.index()) else {
+                        continue;
+                    };
+                    let placement = transform.then(ctm).then(*matrix);
+                    *slot = match (*slot, codec_footprint_size(placement)) {
+                        (DrawFootprint::Full, _) | (_, None) => DrawFootprint::Full,
+                        (DrawFootprint::Never, Some((w, h))) => DrawFootprint::Bounded(w, h),
+                        (DrawFootprint::Bounded(w0, h0), Some((w, h))) => {
+                            DrawFootprint::Bounded(w0.max(w), h0.max(h))
+                        }
+                    };
+                }
+                _ => {}
+            }
+        }
+        let (retained, working) = self
+            .images
+            .iter()
+            .zip(draws)
+            .filter_map(|(img, fp)| match fp {
+                DrawFootprint::Never => None,
+                DrawFootprint::Bounded(w, h) => {
+                    Some(estimate_image_bytes_for_target(img, Some((w, h))))
+                }
+                DrawFootprint::Full => Some(estimate_image_bytes_for_target(img, None)),
+            })
+            .fold((0u64, 0u64), |(r, w), (ir, iw)| {
+                (r.saturating_add(ir), w.max(iw))
+            });
+        retained.saturating_add(working)
+    }
+}
+
 /// `bytes` (an area measure in user space) mapped through `matrix`: times the
 /// absolute determinant, rounded up, saturating. A non-finite determinant
 /// saturates rather than dropping the term.

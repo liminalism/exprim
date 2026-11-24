@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use jp2lam::{
     ColorSpace, DecodeConcurrency, DecodeLimits as Jp2DecodeLimits, DecodeOutputFormat,
-    DecodeRequest, DecodeResolution, DecodeResult, DecodeTarget,
+    DecodeRequest, DecodeResolution, DecodeResult, DecodeTarget, PreparedJp2,
 };
 
 use crate::image::codec::{DecodeLimits, DecodedFormat, DecodedImage, ImageCodec};
@@ -183,17 +183,17 @@ impl ImageCodec for JpxCodec {
         limits: &DecodeLimits,
     ) -> Result<DecodedImage, ImageError> {
         limits.check_input(data.len())?;
-        // Inspect the container/codestream header first: it is cheap relative to
-        // the full decode and tells us the output colour space and component
-        // precision, which decide the packed-vs-native path below.
+        // Parse the JP2 container and codestream framing once into a borrowed
+        // `PreparedJp2` handle: zero ICC copy, zero duplicate header/tile-part
+        // parse when `decode_prepared_into_cancellable` runs below.
         let codec_limits = decoder_limits(limits);
-        let meta = jp2lam::inspect_jp2_with_limits(data, &codec_limits)
+        let prepared = jp2lam::prepare_jp2(data, &codec_limits)
             .map_err(|e| ImageError::Decode(format!("JPX: {e}")))?;
         if limits.is_cancelled() {
             return Err(ImageError::Cancelled);
         }
 
-        let (width, height) = (meta.width, meta.height);
+        let (width, height) = (prepared.width(), prepared.height());
         if width == 0 || height == 0 {
             return Err(ImageError::Decode("JPX: zero dimension".into()));
         }
@@ -201,39 +201,25 @@ impl ImageCodec for JpxCodec {
             return Err(ImageError::TooLarge { width, height });
         }
 
-        // A JP2 may carry its own `pclr` palette, but ISO 32000-1 §7.4.9 makes
-        // the PDF `/ColorSpace` authoritative over the one in the JPEG 2000
-        // data. With `/Indexed`, then, the codestream's single component is an
-        // index into the *PDF* palette and the container's palette must not be
-        // applied — its output channels are not a colour space at all. In
-        // `Tirpitz-and-the-Imperial-German-Navy.pdf` the `pclr` has three
-        // columns feeding a `/DeviceN [/Magenta /Yellow /Black]` base, so
-        // expanding it produced something that looked like RGB, was rejected as
-        // "Indexed over a multi-component codec output", and dropped the cover
-        // portrait entirely.
-        //
-        // Only when the container actually has a palette: a `/JPXDecode` image
-        // whose codestream is genuinely multi-component under an `/Indexed`
-        // space is a different defect, and the renderer still declines that one
-        // rather than painting channels neither space describes.
-        let ignore_container_palette = meta.container_palette_channels.is_some()
+        let all_8bit = prepared
+            .codestream()
+            .siz
+            .components
+            .iter()
+            .all(|component| component.precision == 8);
+        let has_palette = prepared.container_palette_channels().is_some();
+        let ignore_container_palette = has_palette
             && descriptor
                 .color_space
                 .as_ref()
                 .is_some_and(|cs| cs.family == crate::color::ColorSpaceFamily::Indexed);
 
         let (format, channels) = if ignore_container_palette {
-            // The palette's input is one 8-bit index component.
             (DecodedFormat::Gray8, 1usize)
         } else {
-            match meta.colorspace {
-                // ISO 32000-1 §7.4.9 makes the PDF `/ColorSpace` authoritative
-                // over the container's. A 2-component codestream under a
-                // 2-component space (a `/DeviceN` spot+black duotone) is two
-                // *colorants*, not gray+alpha: hand both channels over and let
-                // the declared space interpret them.
+            match prepared.colorspace() {
                 ColorSpace::Gray
-                    if meta.codestream.siz.components.len() == 2
+                    if prepared.codestream().siz.components.len() == 2
                         && descriptor
                             .color_space
                             .as_ref()
@@ -241,16 +227,20 @@ impl ImageCodec for JpxCodec {
                 {
                     (DecodedFormat::Multi2, 2usize)
                 }
-                // Grayscale with an in-data (`cdef`) opacity channel decodes to
-                // Gray+alpha, split the same way as RGBA below.
-                ColorSpace::Gray if meta.in_data_alpha.is_some() => (DecodedFormat::GrayA8, 2usize),
+                ColorSpace::Gray
+                    if prepared.in_data_alpha().is_some()
+                        && (!params.ignore_alpha || !all_8bit || has_palette) =>
+                {
+                    (DecodedFormat::GrayA8, 2usize)
+                }
                 ColorSpace::Gray => (DecodedFormat::Gray8, 1usize),
-                // An sRGB image with an in-data (`cdef`) opacity channel decodes to
-                // RGBA; the renderer splits the alpha into a soft mask when the PDF
-                // dict opts in via `/SMaskInData`.
-                ColorSpace::Srgb if meta.in_data_alpha.is_some() => (DecodedFormat::Rgba8, 4usize),
+                ColorSpace::Srgb
+                    if prepared.in_data_alpha().is_some()
+                        && (!params.ignore_alpha || !all_8bit || has_palette) =>
+                {
+                    (DecodedFormat::Rgba8, 4usize)
+                }
                 ColorSpace::Srgb => (DecodedFormat::Rgb8, 3usize),
-                // sYCC decodes to sRGB after the inverse sYCC matrix.
                 ColorSpace::YCbCr => (DecodedFormat::Rgb8, 3usize),
                 ColorSpace::Cmyk => (DecodedFormat::Cmyk8, 4usize),
                 other => {
@@ -263,39 +253,24 @@ impl ImageCodec for JpxCodec {
 
         let resolution = decode_resolution(params);
 
-        // Direct packed 8-bit output is bit-exact with the legacy planar
-        // interleave: both level-shift, clamp, and (for 8-bit) map identity to
-        // the output byte. Any other precision scales differently on the two
-        // paths — jp2lam's packed writer maps the full range, PDFium shifts —
-        // so non-8-bit components stay on the native planar path, which
-        // reproduces PDFium's widening exactly. See `decode_native_interleaved`.
-        let all_8bit = meta
-            .codestream
-            .siz
-            .components
-            .iter()
-            .all(|component| component.precision == 8);
-
-        // Size this decode's internal thread budget to current load: mark it
-        // in flight for the duration, then either honour a fixed override or
-        // pick load-aware. The guard's count includes this decode.
         let in_flight = InFlightGuard::enter();
         let concurrency =
             jpx_concurrency_override().unwrap_or_else(|| load_aware_budget(in_flight.current()));
 
-        // `decode_into` writes directly into the renderer's final Arc allocation.
-        // Container-palette expansion still needs jp2lam's planar fallback; an
-        // ignored PDF-overridden palette is eligible because the raw index
-        // component is decoded as Gray8.
-        let packed_direct =
-            all_8bit && (meta.container_palette_channels.is_none() || ignore_container_palette);
+        let packed_direct = all_8bit && (!has_palette || ignore_container_palette);
+        let decoded_dims = if packed_direct {
+            Some(
+                prepared
+                    .decoded_dimensions(resolution)
+                    .map_err(|e| ImageError::Decode(format!("JPX: {e}")))?,
+            )
+        } else {
+            None
+        };
         let trace_start = jpx_decode_trace_enabled().then(std::time::Instant::now);
-        let result = if packed_direct {
-            let (decoded_width, decoded_height) = meta
-                .decoded_dimensions(resolution)
-                .map_err(|e| ImageError::Decode(format!("JPX: {e}")))?;
+        let result = if let Some((decoded_width, decoded_height)) = decoded_dims {
             self.decode_packed(
-                data,
+                &prepared,
                 resolution,
                 format,
                 channels,
@@ -307,7 +282,7 @@ impl ImageCodec for JpxCodec {
             )
         } else {
             self.decode_native_interleaved(
-                data,
+                &prepared,
                 resolution,
                 format,
                 channels,
@@ -341,8 +316,8 @@ impl ImageCodec for JpxCodec {
     }
 
     /// The wavelet levels the decode drops for this draw, read from the main
-    /// header (SIZ/COD) through jp2lam's own selection rule. A full-resolution
-    /// request needs no header: it never drops a level.
+    /// header (SIZ/COD) through jp2lam's own selection rule without copying ICC
+    /// profiles or scanning tile-parts.
     fn reduction_level(
         &self,
         data: &[u8],
@@ -354,10 +329,14 @@ impl ImageCodec for JpxCodec {
         if resolution == DecodeResolution::Full {
             return Some(0);
         }
-        jp2lam::inspect_jp2_with_limits(data, &decoder_limits(limits))
-            .ok()?
-            .reduce_levels(resolution)
-            .ok()
+        let codec_limits = decoder_limits(limits);
+        jp2lam::inspect_jp2_header_for_reduction(data, resolution, &codec_limits).ok()
+    }
+
+    fn release_idle_memory(&self) {
+        JPX_DECODER.with(|decoder| {
+            *decoder.borrow_mut() = jp2lam::Jp2Decoder::new();
+        });
     }
 }
 
@@ -387,7 +366,7 @@ impl JpxCodec {
     #[allow(clippy::too_many_arguments)]
     fn decode_packed(
         &self,
-        data: &[u8],
+        prepared: &PreparedJp2<'_>,
         resolution: DecodeResolution,
         format: DecodedFormat,
         channels: usize,
@@ -399,7 +378,6 @@ impl JpxCodec {
     ) -> Result<DecodedImage, ImageError> {
         let output = match format {
             DecodedFormat::Gray8 => DecodeOutputFormat::Gray8,
-            // Both carry two interleaved planes; only their meaning differs.
             DecodedFormat::GrayA8 | DecodedFormat::Multi2 => DecodeOutputFormat::GrayA8,
             DecodedFormat::Rgb8 => DecodeOutputFormat::Rgb8,
             DecodedFormat::Rgba8 => DecodeOutputFormat::Rgba8,
@@ -433,10 +411,11 @@ impl JpxCodec {
                 "JPX: output allocation unexpectedly became shared".into(),
             ));
         };
+        let check_cancel = || limits.is_cancelled();
         let info = JPX_DECODER
             .with(|decoder| {
-                decoder.borrow_mut().decode_into(
-                    data,
+                decoder.borrow_mut().decode_prepared_into_cancellable(
+                    prepared,
                     &request,
                     DecodeTarget {
                         data: output_slice,
@@ -446,9 +425,16 @@ impl JpxCodec {
                         format: output,
                         premultiplied: false,
                     },
+                    &check_cancel,
                 )
             })
-            .map_err(|e| ImageError::Decode(format!("JPX: {e}")))?;
+            .map_err(|e| {
+                if e.is_cancelled() {
+                    ImageError::Cancelled
+                } else {
+                    ImageError::Decode(format!("JPX: {e}"))
+                }
+            })?;
         if limits.is_cancelled() {
             return Err(ImageError::Cancelled);
         }
@@ -461,13 +447,10 @@ impl JpxCodec {
         })
     }
 
-    /// Native planar decode + the historical hand interleave, preserving the
-    /// legacy `v >> (precision - 8)` scaling exactly. Used for non-8-bit
-    /// components.
     #[allow(clippy::too_many_arguments)]
     fn decode_native_interleaved(
         &self,
-        data: &[u8],
+        prepared: &PreparedJp2<'_>,
         resolution: DecodeResolution,
         format: DecodedFormat,
         channels: usize,
@@ -485,9 +468,20 @@ impl JpxCodec {
             ignore_container_palette,
             limits: decoder_limits(limits),
         };
+        let check_cancel = || limits.is_cancelled();
         let result = JPX_DECODER
-            .with(|decoder| decoder.borrow_mut().decode(data, &request))
-            .map_err(|e| ImageError::Decode(format!("JPX: {e}")))?;
+            .with(|decoder| {
+                decoder
+                    .borrow_mut()
+                    .decode_prepared_cancellable(prepared, &request, &check_cancel)
+            })
+            .map_err(|e| {
+                if e.is_cancelled() {
+                    ImageError::Cancelled
+                } else {
+                    ImageError::Decode(format!("JPX: {e}"))
+                }
+            })?;
         if limits.is_cancelled() {
             return Err(ImageError::Cancelled);
         }

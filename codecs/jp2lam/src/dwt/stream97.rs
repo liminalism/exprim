@@ -26,6 +26,7 @@
 //! `wide` kernels across sizes, levels, degenerate axes and band starts.
 
 use super::InverseDwtTiming;
+use super::SplitSubbands;
 use super::irrev97::{ALPHA, BETA, DELTA, GAMMA, INV_K, K};
 use crate::simd::Kernel;
 #[cfg(feature = "simd")]
@@ -82,6 +83,30 @@ pub(crate) fn inverse_97_2d_even(
     out
 }
 
+/// Inverse 9/7 synthesis from [`SplitSubbands<f32>`] to a full plane.
+pub(crate) fn inverse_97_2d_even_split(
+    split: SplitSubbands<f32>,
+    levels: u8,
+    kernel: Kernel,
+    mut timing: Option<&mut InverseDwtTiming>,
+) -> Vec<f32> {
+    let (width, height) = (split.width, split.height);
+    if width == 0 || height == 0 || levels == 0 {
+        return split.coarse;
+    }
+    let prefix = inverse_97_2d_even_but_last_split(split, levels, kernel, timing.as_deref_mut());
+    let level_start = timing.as_ref().map(|_| std::time::Instant::now());
+    let mut synth = prefix.final_level(kernel, 0);
+    let mut out = vec![0f32; width * height];
+    for y in 0..height {
+        out[y * width..(y + 1) * width].copy_from_slice(synth.next_row());
+    }
+    if let (Some(timing), Some(start)) = (timing, level_start) {
+        record_level(timing, start, synth.horizontal_ns);
+    }
+    out
+}
+
 fn record_level(timing: &mut InverseDwtTiming, start: std::time::Instant, horizontal_ns: u64) {
     let total = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let horizontal = horizontal_ns.min(total);
@@ -90,17 +115,26 @@ fn record_level(timing: &mut InverseDwtTiming, start: std::time::Instant, horizo
     timing.level_ns.push(total);
 }
 
+enum PrefixBands {
+    Monolithic {
+        data: Vec<f32>,
+        ll: Option<Vec<f32>>,
+        ll_width: usize,
+    },
+    Split {
+        ll1: Vec<f32>,
+        hl1: Vec<f32>,
+        lh_hh1: Vec<f32>,
+    },
+}
+
 /// A plane with every synthesis level but the finest applied: the finest
 /// level's LL input is `ll` (or the LL corner of `data` when there was only
-/// one level) and its HL/LH/HH bands are still in `data`.
+/// one level) and its HL/LH/HH bands are still in `data` or in split subbands.
 pub(crate) struct SynthesisPrefix {
-    data: Vec<f32>,
+    bands: PrefixBands,
     width: usize,
     height: usize,
-    /// Output of the second-finest level, `ll_width` wide; `None` for a
-    /// single-level transform.
-    ll: Option<Vec<f32>>,
-    ll_width: usize,
 }
 
 /// Run all levels but the last. `levels` must be at least 1 and the plane
@@ -136,7 +170,8 @@ pub(crate) fn inverse_97_2d_even_but_last(
         if out.len() < rw * rh {
             out.resize(rw * rh, 0.0);
         }
-        let mut synth = LevelSynth::new(source, &data, width, rw, rh, kernel, 0, timing.is_some());
+        let mut synth =
+            LevelSynth::new_monolithic(source, &data, width, rw, rh, kernel, 0, timing.is_some());
         for y in 0..rh {
             out[y * rw..(y + 1) * rw].copy_from_slice(synth.next_row());
         }
@@ -147,11 +182,41 @@ pub(crate) fn inverse_97_2d_even_but_last(
     }
     let ll_width = sizes[levels - 1].0;
     SynthesisPrefix {
-        data,
+        bands: PrefixBands::Monolithic {
+            data,
+            ll: prev,
+            ll_width,
+        },
         width,
         height,
-        ll: prev,
-        ll_width,
+    }
+}
+
+/// Run all levels but the last on [`SplitSubbands<f32>`], consuming and
+/// freeing `split.coarse` so retained prefix storage stays `width * height`
+/// (`4 B/px`) instead of `5/4 * width * height` (`5 B/px`).
+pub(crate) fn inverse_97_2d_even_but_last_split(
+    split: SplitSubbands<f32>,
+    levels: u8,
+    kernel: Kernel,
+    timing: Option<&mut InverseDwtTiming>,
+) -> SynthesisPrefix {
+    debug_assert!(levels >= 1 && split.width > 0 && split.height > 0);
+    let sn = split.width.div_ceil(2);
+    let sv = split.height.div_ceil(2);
+    let ll1 = if levels > 1 {
+        inverse_97_2d_even(split.coarse, sn, sv, levels - 1, kernel, timing)
+    } else {
+        split.coarse
+    };
+    SynthesisPrefix {
+        width: split.width,
+        height: split.height,
+        bands: PrefixBands::Split {
+            ll1,
+            hl1: split.hl1,
+            lh_hh1: split.lh_hh1,
+        },
     }
 }
 
@@ -159,26 +224,85 @@ impl SynthesisPrefix {
     /// A producer for the finest level's rows, starting at output row
     /// `first_row`.
     pub(crate) fn final_level(&self, kernel: Kernel, first_row: usize) -> LevelSynth<'_> {
-        let source = match &self.ll {
-            None => LlSource {
-                rows: &self.data,
-                stride: self.width,
-            },
-            Some(ll) => LlSource {
-                rows: ll,
-                stride: self.ll_width,
-            },
-        };
-        LevelSynth::new(
-            source,
-            &self.data,
-            self.width,
+        let (ll, hl, lh_hh) = self.final_slices();
+        LevelSynth::new_split(
+            ll,
+            hl,
+            lh_hh,
             self.width,
             self.height,
             kernel,
             first_row,
             false,
         )
+    }
+
+    /// Reuse an existing [`LevelSynthScratch`] across row bands so worker
+    /// threads do not reallocate ring buffers per band.
+    pub(crate) fn final_level_with_scratch<'a>(
+        &'a self,
+        kernel: Kernel,
+        first_row: usize,
+        scratch: &'a mut LevelSynthScratch,
+    ) -> LevelSynthBorrowed<'a> {
+        let (ll, hl, lh_hh) = self.final_slices();
+        LevelSynthBorrowed::new(
+            ll,
+            hl,
+            lh_hh,
+            self.width,
+            self.height,
+            kernel,
+            first_row,
+            scratch,
+        )
+    }
+
+    fn final_slices(&self) -> (LlSource<'_>, LlSource<'_>, LlSource<'_>) {
+        let sn = self.width.div_ceil(2);
+        let dn = self.width - sn;
+        let sv = self.height.div_ceil(2);
+        match &self.bands {
+            PrefixBands::Monolithic { data, ll, ll_width } => {
+                let source = match ll {
+                    None => LlSource {
+                        rows: data,
+                        stride: self.width,
+                    },
+                    Some(ll) => LlSource {
+                        rows: ll,
+                        stride: *ll_width,
+                    },
+                };
+                let hl = LlSource {
+                    rows: if dn > 0 { &data[sn..] } else { &[] },
+                    stride: self.width,
+                };
+                let lh_hh = LlSource {
+                    rows: if sv < self.height {
+                        &data[sv * self.width..]
+                    } else {
+                        &[]
+                    },
+                    stride: self.width,
+                };
+                (source, hl, lh_hh)
+            }
+            PrefixBands::Split { ll1, hl1, lh_hh1 } => (
+                LlSource {
+                    rows: ll1,
+                    stride: sn,
+                },
+                LlSource {
+                    rows: hl1,
+                    stride: dn,
+                },
+                LlSource {
+                    rows: lh_hh1,
+                    stride: self.width,
+                },
+            ),
+        }
     }
 
     /// Width of the finest level.
@@ -192,32 +316,53 @@ impl SynthesisPrefix {
     }
 }
 
-/// Where a level's LL rows come from: the caller's plane for the first level,
-/// the previous level's output afterwards.
+/// Where a level's subband rows come from.
 #[derive(Clone, Copy)]
 struct LlSource<'a> {
     rows: &'a [f32],
     stride: usize,
 }
 
+/// Reusable scratch buffers for [`LevelSynthBorrowed`].
+#[derive(Default)]
+pub(crate) struct LevelSynthScratch {
+    lo: Vec<f32>,
+    hi: Vec<f32>,
+    ring: Vec<f32>,
+}
+
+impl LevelSynthScratch {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn prepare(&mut self, rw: usize) {
+        let sn = rw.div_ceil(2);
+        let dn = rw - sn;
+        if self.lo.len() < sn + 2 {
+            self.lo.resize(sn + 2, 0.0);
+        }
+        if self.hi.len() < dn + 2 {
+            self.hi.resize(dn + 2, 0.0);
+        }
+        if self.ring.len() < rw * RING {
+            self.ring.resize(rw * RING, 0.0);
+        }
+    }
+}
+
 /// One synthesis level as a row producer: `next_row` returns the output rows
 /// in order from `first_row`.
 pub(crate) struct LevelSynth<'a> {
     source: LlSource<'a>,
-    bands: &'a [f32],
-    band_stride: usize,
+    hl: LlSource<'a>,
+    lh_hh: LlSource<'a>,
     rw: usize,
     rh: usize,
-    /// Low-pass sample counts horizontally and vertically.
+    /// Low-pass sample count horizontally.
     sn: usize,
-    sv: usize,
     kernel: Kernel,
-    /// Padded low-pass row: one guard sample on each side.
-    lo: Vec<f32>,
-    /// Padded high-pass row: one guard sample on each side.
-    hi: Vec<f32>,
-    /// `RING` interleaved rows, each `rw` long.
-    ring: Vec<f32>,
+    scratch: LevelSynthScratch,
     /// Next pipeline step (the input row it loads).
     step: usize,
     /// Next output row `next_row` returns.
@@ -229,7 +374,7 @@ pub(crate) struct LevelSynth<'a> {
 
 impl<'a> LevelSynth<'a> {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    fn new_monolithic(
         source: LlSource<'a>,
         bands: &'a [f32],
         band_stride: usize,
@@ -239,144 +384,284 @@ impl<'a> LevelSynth<'a> {
         first_row: usize,
         timed: bool,
     ) -> Self {
+        let sn = rw.div_ceil(2);
+        let dn = rw - sn;
+        let sv = rh.div_ceil(2);
+        let hl = LlSource {
+            rows: if dn > 0 { &bands[sn..] } else { &[] },
+            stride: band_stride,
+        };
+        let lh_hh = LlSource {
+            rows: if sv < rh {
+                &bands[sv * band_stride..]
+            } else {
+                &[]
+            },
+            stride: band_stride,
+        };
+        Self::new_split(source, hl, lh_hh, rw, rh, kernel, first_row, timed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_split(
+        source: LlSource<'a>,
+        hl: LlSource<'a>,
+        lh_hh: LlSource<'a>,
+        rw: usize,
+        rh: usize,
+        kernel: Kernel,
+        first_row: usize,
+        timed: bool,
+    ) -> Self {
         debug_assert!(rw > 0 && rh > 0 && first_row < rh);
         let sn = rw.div_ceil(2);
-        let sv = rh.div_ceil(2);
-        let mut synth = Self {
+        let mut scratch = LevelSynthScratch::new();
+        scratch.prepare(rw);
+        Self {
             source,
-            bands,
-            band_stride,
+            hl,
+            lh_hh,
             rw,
             rh,
             sn,
-            sv,
             kernel,
-            lo: vec![0.0; sn + 2],
-            hi: vec![0.0; (rw - sn) + 2],
-            ring: vec![0.0; rw * RING],
-            step: 0,
+            scratch,
+            step: first_row.saturating_sub(LAG),
             next: first_row,
             timed,
             horizontal_ns: 0,
-        };
-        // Output row `y` depends on input rows `y - LAG ..= y + LAG` only, so
-        // the pipeline can start `LAG` rows early: the rows it completes
-        // before `first_row` are contaminated by the never-loaded rows above
-        // the start, but nothing from `first_row` on reads them.
-        synth.step = first_row.saturating_sub(LAG);
-        synth
+        }
     }
 
     /// The next output row, as a slice into the ring (valid until the next
     /// call).
     pub(crate) fn next_row(&mut self) -> &[f32] {
-        debug_assert!(self.next < self.rh);
-        let y = self.next;
-        self.next += 1;
-        if self.rh < 2 {
-            // A one-row resolution is an identity vertically (no scaling
-            // either, see `irrev97::inverse_97_vertical_in_place`).
-            let (lo_row, hi_row) = self.input_row(0);
-            let row_start = self.timed.then(std::time::Instant::now);
-            synth_row(
-                lo_row,
-                hi_row,
-                &mut self.ring[..self.rw],
-                1.0,
-                &mut self.lo,
-                &mut self.hi,
-                self.kernel,
-            );
-            self.add_elapsed(row_start);
-            return &self.ring[..self.rw];
-        }
-        // Row `y` is final once step `y + LAG` has run.
-        while self.step <= y + LAG {
-            self.advance();
-        }
-        let slot = (y % RING) * self.rw;
-        &self.ring[slot..slot + self.rw]
+        step_next_row_97(
+            self.source,
+            self.hl,
+            self.lh_hh,
+            self.rw,
+            self.rh,
+            self.sn,
+            self.kernel,
+            &mut self.scratch,
+            &mut self.step,
+            &mut self.next,
+            self.timed,
+            &mut self.horizontal_ns,
+        )
     }
+}
 
-    /// The deinterleaved halves of interleaved input row `r` and the vertical
-    /// scale it carries: even rows come from the LL/HL pair (row `r / 2`),
-    /// odd rows from the LH/HH pair (row `sv + (r - 1) / 2`).
-    fn input_row(&self, r: usize) -> (&'a [f32], &'a [f32]) {
-        let (sn, rw) = (self.sn, self.rw);
-        if r % 2 == 0 {
-            let i = r / 2;
-            (
-                &self.source.rows[i * self.source.stride..i * self.source.stride + sn],
-                &self.bands[i * self.band_stride + sn..i * self.band_stride + rw],
-            )
-        } else {
-            let i = self.sv + (r - 1) / 2;
-            (
-                &self.bands[i * self.band_stride..i * self.band_stride + sn],
-                &self.bands[i * self.band_stride + sn..i * self.band_stride + rw],
-            )
-        }
-    }
+/// Borrowed-scratch synthesis producer for multi-band workers.
+pub(crate) struct LevelSynthBorrowed<'a> {
+    source: LlSource<'a>,
+    hl: LlSource<'a>,
+    lh_hh: LlSource<'a>,
+    rw: usize,
+    rh: usize,
+    sn: usize,
+    kernel: Kernel,
+    scratch: &'a mut LevelSynthScratch,
+    step: usize,
+    next: usize,
+    horizontal_ns: u64,
+}
 
-    /// One pipeline step: load input row `step` (if any) into the ring, then
-    /// run lifting stage `k` on row `step - k` for `k = 1 ..= 4`. Step `k` for
-    /// row `x` needs rows `x ± 1` at stage `k - 1`, which with rows arriving
-    /// in order is exactly one step behind per row of lag.
-    fn advance(&mut self) {
-        let r = self.step;
-        self.step += 1;
-        let rw = self.rw;
-        let rh = self.rh;
-        if r < rh {
-            let (lo_row, hi_row) = self.input_row(r);
-            let row_scale = if r % 2 == 0 { K } else { INV_K };
-            let row_start = self.timed.then(std::time::Instant::now);
-            let slot = (r % RING) * rw;
-            synth_row(
-                lo_row,
-                hi_row,
-                &mut self.ring[slot..slot + rw],
-                row_scale,
-                &mut self.lo,
-                &mut self.hi,
-                self.kernel,
-            );
-            self.add_elapsed(row_start);
-        }
-        let mirror = |x: isize| -> usize {
-            if x < 0 {
-                (-x) as usize
-            } else if x as usize >= rh {
-                2 * (rh - 1) - x as usize
-            } else {
-                x as usize
-            }
-        };
-        let r = r as isize;
-        for (back, parity, coeff) in [
-            (1isize, 0usize, -DELTA),
-            (2, 1, -GAMMA),
-            (3, 0, -BETA),
-            (4, 1, -ALPHA),
-        ] {
-            let x = r - back;
-            if x < 0 || x as usize >= rh || (x as usize) % 2 != parity {
-                continue;
-            }
-            let target = (x as usize % RING) * rw;
-            let above = (mirror(x - 1) % RING) * rw;
-            let below = (mirror(x + 1) % RING) * rw;
-            lift_ring_row(&mut self.ring, rw, target, above, below, coeff, self.kernel);
+impl<'a> LevelSynthBorrowed<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        source: LlSource<'a>,
+        hl: LlSource<'a>,
+        lh_hh: LlSource<'a>,
+        rw: usize,
+        rh: usize,
+        kernel: Kernel,
+        first_row: usize,
+        scratch: &'a mut LevelSynthScratch,
+    ) -> Self {
+        debug_assert!(rw > 0 && rh > 0 && first_row < rh);
+        scratch.prepare(rw);
+        Self {
+            source,
+            hl,
+            lh_hh,
+            rw,
+            rh,
+            sn: rw.div_ceil(2),
+            kernel,
+            scratch,
+            step: first_row.saturating_sub(LAG),
+            next: first_row,
+            horizontal_ns: 0,
         }
     }
 
-    #[inline]
-    fn add_elapsed(&mut self, start: Option<std::time::Instant>) {
-        if let Some(start) = start {
-            self.horizontal_ns = self
-                .horizontal_ns
+    pub(crate) fn next_row(&mut self) -> &[f32] {
+        step_next_row_97(
+            self.source,
+            self.hl,
+            self.lh_hh,
+            self.rw,
+            self.rh,
+            self.sn,
+            self.kernel,
+            self.scratch,
+            &mut self.step,
+            &mut self.next,
+            false,
+            &mut self.horizontal_ns,
+        )
+    }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn step_next_row_97<'s>(
+    source: LlSource<'_>,
+    hl: LlSource<'_>,
+    lh_hh: LlSource<'_>,
+    rw: usize,
+    rh: usize,
+    sn: usize,
+    kernel: Kernel,
+    scratch: &'s mut LevelSynthScratch,
+    step: &mut usize,
+    next: &mut usize,
+    timed: bool,
+    horizontal_ns: &mut u64,
+) -> &'s [f32] {
+    debug_assert!(*next < rh);
+    let y = *next;
+    *next += 1;
+    if rh < 2 {
+        // A one-row resolution is an identity vertically (no scaling
+        // either, see `irrev97::inverse_97_vertical_in_place`).
+        let (lo_row, hi_row) = input_row_slices_97(source, hl, lh_hh, rw, sn, 0);
+        let row_start = timed.then(std::time::Instant::now);
+        synth_row(
+            lo_row,
+            hi_row,
+            &mut scratch.ring[..rw],
+            1.0,
+            &mut scratch.lo,
+            &mut scratch.hi,
+            kernel,
+        );
+        if let Some(start) = row_start {
+            *horizontal_ns = horizontal_ns
                 .saturating_add(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
         }
+        return &scratch.ring[..rw];
+    }
+    // Row `y` is final once step `y + LAG` has run.
+    while *step <= y + LAG {
+        advance_step_97(
+            source,
+            hl,
+            lh_hh,
+            rw,
+            rh,
+            sn,
+            kernel,
+            scratch,
+            step,
+            timed,
+            horizontal_ns,
+        );
+    }
+    let slot = (y % RING) * rw;
+    &scratch.ring[slot..slot + rw]
+}
+
+#[inline]
+fn input_row_slices_97<'a>(
+    source: LlSource<'a>,
+    hl: LlSource<'a>,
+    lh_hh: LlSource<'a>,
+    rw: usize,
+    sn: usize,
+    r: usize,
+) -> (&'a [f32], &'a [f32]) {
+    let dn = rw - sn;
+    if r.is_multiple_of(2) {
+        let i = r / 2;
+        let lo = &source.rows[i * source.stride..i * source.stride + sn];
+        let hi = if dn > 0 {
+            &hl.rows[i * hl.stride..i * hl.stride + dn]
+        } else {
+            &[]
+        };
+        (lo, hi)
+    } else {
+        let j = (r - 1) / 2;
+        let base = j * lh_hh.stride;
+        (
+            &lh_hh.rows[base..base + sn],
+            &lh_hh.rows[base + sn..base + rw],
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advance_step_97(
+    source: LlSource<'_>,
+    hl: LlSource<'_>,
+    lh_hh: LlSource<'_>,
+    rw: usize,
+    rh: usize,
+    sn: usize,
+    kernel: Kernel,
+    scratch: &mut LevelSynthScratch,
+    step: &mut usize,
+    timed: bool,
+    horizontal_ns: &mut u64,
+) {
+    let r = *step;
+    *step += 1;
+    if r < rh {
+        let (lo_row, hi_row) = input_row_slices_97(source, hl, lh_hh, rw, sn, r);
+        let row_scale = if r.is_multiple_of(2) { K } else { INV_K };
+        let row_start = timed.then(std::time::Instant::now);
+        let slot = (r % RING) * rw;
+        synth_row(
+            lo_row,
+            hi_row,
+            &mut scratch.ring[slot..slot + rw],
+            row_scale,
+            &mut scratch.lo,
+            &mut scratch.hi,
+            kernel,
+        );
+        if let Some(start) = row_start {
+            *horizontal_ns = horizontal_ns
+                .saturating_add(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        }
+    }
+    let mirror = |x: isize| -> usize {
+        if x < 0 {
+            (-x) as usize
+        } else if x as usize >= rh {
+            2 * (rh - 1) - x as usize
+        } else {
+            x as usize
+        }
+    };
+    let r = r as isize;
+    for (back, parity, coeff) in [
+        (1isize, 0usize, -DELTA),
+        (2, 1, -GAMMA),
+        (3, 0, -BETA),
+        (4, 1, -ALPHA),
+    ] {
+        let x = r - back;
+        if x < 0 || x as usize >= rh || (x as usize) % 2 != parity {
+            continue;
+        }
+        let target = (x as usize % RING) * rw;
+        let above = (mirror(x - 1) % RING) * rw;
+        let below = (mirror(x + 1) % RING) * rw;
+        lift_ring_row(&mut scratch.ring, rw, target, above, below, coeff, kernel);
     }
 }
 
@@ -674,13 +959,46 @@ mod tests {
     fn check(width: usize, height: usize, levels: u8, kernel: Kernel) {
         let seed = (width * 131 + height * 7) as u32 + levels as u32;
         let (original, reference) = reference(width, height, levels, seed);
-        let streamed = inverse_97_2d_even(original, width, height, levels, kernel, None);
+        let streamed = inverse_97_2d_even(original.clone(), width, height, levels, kernel, None);
         assert_bits(
             &streamed,
             &reference,
             width,
             &format!("{width}x{height} levels={levels} {kernel:?}"),
         );
+        if levels >= 1 {
+            let sn = width.div_ceil(2);
+            let dn = width - sn;
+            let sv = height.div_ceil(2);
+            let dv = height - sv;
+            let mut coarse = vec![0.0f32; sn * sv];
+            let mut hl1 = vec![0.0f32; dn * sv];
+            let mut lh_hh1 = vec![0.0f32; width * dv];
+            for y in 0..sv {
+                coarse[y * sn..(y + 1) * sn].copy_from_slice(&original[y * width..y * width + sn]);
+                if dn > 0 {
+                    hl1[y * dn..(y + 1) * dn]
+                        .copy_from_slice(&original[y * width + sn..(y + 1) * width]);
+                }
+            }
+            if dv > 0 {
+                lh_hh1.copy_from_slice(&original[sv * width..]);
+            }
+            let split = crate::dwt::SplitSubbands {
+                width,
+                height,
+                coarse,
+                hl1,
+                lh_hh1,
+            };
+            let split_out = super::inverse_97_2d_even_split(split, levels, kernel, None);
+            assert_bits(
+                &split_out,
+                &reference,
+                width,
+                &format!("split {width}x{height} levels={levels} {kernel:?}"),
+            );
+        }
     }
 
     /// Row bands started part-way down must reproduce the full run exactly.

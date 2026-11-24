@@ -73,6 +73,11 @@ pub struct DecodeParameters {
     /// not scale (JBIG2, CCITT) ignore it. `None` means decode at full
     /// resolution.
     pub target_size: Option<(u32, u32)>,
+    /// True when the caller ignores any in-codestream opacity channel (for
+    /// example a JPX stream with PDF `/SMaskInData 0` or an explicit `/SMask`
+    /// that overrides it). Codecs that can drop the trailing opacity plane
+    /// before reconstruction avoid decoding and de-interleaving it.
+    pub ignore_alpha: bool,
     // Later: remaining filter-specific parms (K, Columns, BlackIs1, ...).
 }
 

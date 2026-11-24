@@ -170,6 +170,11 @@ impl SharedRgbImageCache {
             state.bytes = state.bytes.saturating_sub(removed.charge);
         }
     }
+
+    pub(crate) fn clear(&self) {
+        *self.state.lock().unwrap_or_else(|error| error.into_inner()) =
+            RgbImageCacheState::default();
+    }
 }
 
 impl Default for SharedRgbImageCache {
@@ -473,6 +478,11 @@ impl SharedOpacityImageCache {
             state.bytes = state.bytes.saturating_sub(removed.charge);
         }
     }
+
+    pub(crate) fn clear(&self) {
+        *self.state.lock().unwrap_or_else(|error| error.into_inner()) =
+            OpacityImageCacheState::default();
+    }
 }
 
 impl Default for SharedOpacityImageCache {
@@ -727,6 +737,7 @@ impl PreparedImage {
     /// draw reads rather than the image. A page scan drawn in strips expanded
     /// the whole image once per strip before this. `rows` must cover every
     /// row the draw can sample: see [`Self::source_rows_for`].
+    #[cfg(test)]
     pub(crate) fn gray8_promoted_to_rgb8(
         &self,
         rows: std::ops::Range<usize>,
@@ -940,12 +951,16 @@ impl PreparedImage {
     /// `None` if the image is not that shape or exceeds the size cap (then the
     /// generic path runs, unchanged).
     ///
-    /// Only the source rows in `rows` are converted, as for
-    /// [`Self::gray8_promoted_to_rgb8`]: the rest of the buffer stays zero
-    /// pages that are never touched, so a draw limited to a strip converts
-    /// its share of the image. `rows` must cover every row the draw samples
-    /// ([`Self::source_rows_for`]).
-    pub(crate) fn cmyk_source_as_rgb8(&self, rows: std::ops::Range<usize>) -> Option<Vec<u8>> {
+    /// Only the source rows in `rows` are allocated and converted, returning
+    /// `(rgb_band, first_row)` where row `sr` of the image begins at byte
+    /// `(sr - first_row) * width * 3`. Unlike allocating a full-frame zeroed
+    /// buffer and touching a slice of it, a band-sized buffer bounds committed
+    /// virtual memory on Windows to the strip's rows as well as resident RAM.
+    /// `rows` must cover every row the draw samples ([`Self::source_rows_for`]).
+    pub(crate) fn cmyk_source_as_rgb8(
+        &self,
+        rows: std::ops::Range<usize>,
+    ) -> Option<(Vec<u8>, usize)> {
         // 64 Mpx -> 192 MiB of RGB8; above this the generic per-tap path (whose
         // work is bounded by the footprint, not the source area) is preferred.
         const MAX_CONVERT_PIXELS: usize = 64 * 1024 * 1024;
@@ -968,13 +983,14 @@ impl PreparedImage {
         if n == 0 || n > MAX_CONVERT_PIXELS || self.samples.len() < n * 4 {
             return None;
         }
-        let mut out = vec![0u8; n * 3];
         let width = self.width as usize;
         let last = rows.end.min(self.height as usize);
         let first = rows.start.min(last);
+        let band_pixels = (last - first) * width;
+        let mut out = vec![0u8; band_pixels * 3];
         for (cmyk, rgb) in self.samples[first * width * 4..last * width * 4]
             .chunks_exact(4)
-            .zip(out[first * width * 3..last * width * 3].chunks_exact_mut(3))
+            .zip(out.chunks_exact_mut(3))
         {
             let [c, m, y, k] = match &luts {
                 None => [cmyk[0], cmyk[1], cmyk[2], cmyk[3]],
@@ -987,7 +1003,7 @@ impl PreparedImage {
             };
             rgb.copy_from_slice(&crate::color::cmyk::adobe_cmyk_to_srgb_u8(c, m, y, k));
         }
-        Some(out)
+        Some((out, first))
     }
 
     /// The palette entry a raw Indexed sample selects: `/Decode` (when
@@ -2559,9 +2575,11 @@ mod tests {
         for decode in decodes {
             let mut image = img(w, h, ImageColorSpace::Cmyk, samples.clone(), None);
             image.decode = decode.map(Arc::from);
-            let rgb = image
+            let (rgb, first_row) = image
                 .cmyk_source_as_rgb8(0..h as usize)
                 .expect("convertible");
+            assert_eq!(first_row, 0);
+            assert_eq!(rgb.len(), (w * h) as usize * 3);
             for row in 0..h {
                 for col in 0..w {
                     let want = image.pixel(col, row).unwrap();

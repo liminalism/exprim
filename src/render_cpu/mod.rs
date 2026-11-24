@@ -771,6 +771,11 @@ impl SharedPreparedSoftMaskCache {
         }
         masks
     }
+
+    fn clear(&self) {
+        *self.state.lock().unwrap_or_else(|error| error.into_inner()) =
+            PreparedSoftMaskCacheState::default();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -861,6 +866,11 @@ impl SharedPreparedPatternedStencilCache {
             }
         }
         prepared
+    }
+
+    fn clear(&self) {
+        *self.state.lock().unwrap_or_else(|error| error.into_inner()) =
+            PreparedPatternedStencilCacheState::default();
     }
 }
 
@@ -997,6 +1007,11 @@ impl SharedPreparedGpuPageCache {
             }
         }
         prepared
+    }
+
+    fn clear(&self) {
+        *self.state.lock().unwrap_or_else(|error| error.into_inner()) =
+            PreparedGpuPageCacheState::default();
     }
 }
 
@@ -1305,6 +1320,12 @@ impl CpuBackend {
         self.shared_images.clear();
         self.shared_fonts.clear();
         self.shared_glyphs.clear();
+        self.shared_rgb_images.clear();
+        self.shared_opacity_images.clear();
+        self.shared_prepared_soft_masks.clear();
+        self.shared_prepared_patterned_stencils.clear();
+        self.shared_prepared_gpu_pages.clear();
+        self.options.codecs.clear_caches();
     }
 
     /// Bytes the decoded-image cache currently retains.
@@ -1317,6 +1338,7 @@ impl CpuBackend {
     /// give the memory back. The next render allocates a fresh surface.
     pub fn release_idle_memory(&self) {
         self.surfaces.clear();
+        self.options.codecs.release_idle_memory();
     }
 
     /// Bytes of page buffers this backend currently keeps alive for reuse.

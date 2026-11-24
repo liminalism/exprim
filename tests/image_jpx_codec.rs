@@ -270,3 +270,158 @@ fn reduction_level_is_the_level_the_decode_drops() {
     );
     assert_eq!(by_level[0].as_ref().map(|d| &d.data), Some(&full.data));
 }
+
+#[test]
+fn rgba_jp2_ignore_alpha_decodes_rgb8_directly() {
+    let (w, h) = (16u32, 8u32);
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    let mut expected_rgb = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let r = (x * 15) as u8;
+            let g = (y * 29) as u8;
+            let b = ((x + y) * 9) as u8;
+            let a = ((x * 7 + y * 13) % 256) as u8;
+            rgba.extend_from_slice(&[r, g, b, a]);
+            expected_rgb.extend_from_slice(&[r, g, b]);
+        }
+    }
+    let image = jp2lam::Image::from_rgba_bytes(w, h, &rgba).expect("build rgba image");
+    let jp2 = jp2lam::encode(&image, &lossless()).expect("encode");
+
+    let with_alpha = JpxCodec
+        .decode(
+            &jp2,
+            &descriptor(w, h),
+            &DecodeParameters::default(),
+            &DecodeLimits::default(),
+        )
+        .expect("decode rgba");
+    assert_eq!(with_alpha.format, DecodedFormat::Rgba8);
+    assert_eq!(with_alpha.stride, w as usize * 4);
+    assert_eq!(&*with_alpha.data, &rgba[..]);
+
+    let without_alpha = JpxCodec
+        .decode(
+            &jp2,
+            &descriptor(w, h),
+            &DecodeParameters {
+                ignore_alpha: true,
+                ..DecodeParameters::default()
+            },
+            &DecodeLimits::default(),
+        )
+        .expect("decode rgb8 dropping alpha");
+    assert_eq!(without_alpha.format, DecodedFormat::Rgb8);
+    assert_eq!(without_alpha.stride, w as usize * 3);
+    assert_eq!(&*without_alpha.data, &expected_rgb[..]);
+
+    JpxCodec.release_idle_memory();
+}
+
+#[test]
+fn gray_alpha_jp2_ignore_alpha_decodes_gray8_directly() {
+    let (w, h) = (24u32, 18u32);
+    let mut gray_alpha = Vec::with_capacity((w * h * 2) as usize);
+    let mut expected_gray = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let luma = ((x * 11 + y * 23) % 256) as u8;
+            let alpha = ((x * 5 + y * 19 + 7) % 256) as u8;
+            gray_alpha.extend_from_slice(&[luma, alpha]);
+            expected_gray.push(luma);
+        }
+    }
+    let image =
+        jp2lam::Image::from_gray_alpha_bytes(w, h, &gray_alpha).expect("build gray+alpha image");
+    let jp2 = jp2lam::encode(&image, &lossless()).expect("encode");
+
+    let with_alpha = JpxCodec
+        .decode(
+            &jp2,
+            &descriptor(w, h),
+            &DecodeParameters::default(),
+            &DecodeLimits::default(),
+        )
+        .expect("decode gray+alpha");
+    assert_eq!(with_alpha.format, DecodedFormat::GrayA8);
+    assert_eq!(with_alpha.stride, w as usize * 2);
+    assert_eq!(&*with_alpha.data, &gray_alpha[..]);
+
+    let without_alpha = JpxCodec
+        .decode(
+            &jp2,
+            &descriptor(w, h),
+            &DecodeParameters {
+                ignore_alpha: true,
+                ..DecodeParameters::default()
+            },
+            &DecodeLimits::default(),
+        )
+        .expect("decode gray8 dropping alpha");
+    assert_eq!(without_alpha.format, DecodedFormat::Gray8);
+    assert_eq!(without_alpha.stride, w as usize);
+    assert_eq!(&*without_alpha.data, &expected_gray[..]);
+}
+
+#[test]
+fn jpx_decode_respects_cooperative_cancellation() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (w, h) = (256u32, 256u32);
+    let src: Vec<u8> = (0..w * h * 3)
+        .map(|i| ((i.wrapping_mul(73) ^ (i >> 4)) & 0xFF) as u8)
+        .collect();
+    let image = jp2lam::Image::from_rgb_bytes(w, h, &src).expect("build rgb image");
+    let options = jp2lam::EncodeOptions {
+        rate_control: Some(jp2lam::RateControl::Lossless),
+        coding: jp2lam::CodingOptions {
+            code_block_size: Some((16, 16)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let jp2 = jp2lam::encode(&image, &options).expect("encode");
+
+    // Pre-cancelled token trips before work begins.
+    let immediate = DecodeLimits {
+        should_cancel: Some(Arc::new(|| true)),
+        ..DecodeLimits::default()
+    };
+    let err = JpxCodec
+        .decode(
+            &jp2,
+            &descriptor(w, h),
+            &DecodeParameters::default(),
+            &immediate,
+        )
+        .expect_err("pre-cancelled decode must abort");
+    assert!(
+        matches!(err, exprim::image::ImageError::Cancelled),
+        "expected Cancelled, got {err:?}"
+    );
+
+    // Mid-decode trip: allow the initial entry checks and trip inside Tier-2 / Tier-1.
+    let polls = Arc::new(AtomicUsize::new(0));
+    let polls_clone = Arc::clone(&polls);
+    let mid_decode = DecodeLimits {
+        should_cancel: Some(Arc::new(move || {
+            polls_clone.fetch_add(1, Ordering::Relaxed) >= 4
+        })),
+        ..DecodeLimits::default()
+    };
+    let err = JpxCodec
+        .decode(
+            &jp2,
+            &descriptor(w, h),
+            &DecodeParameters::default(),
+            &mid_decode,
+        )
+        .expect_err("mid-decode cancellation must abort");
+    assert!(
+        matches!(err, exprim::image::ImageError::Cancelled),
+        "expected Cancelled, got {err:?}"
+    );
+    assert!(polls.load(Ordering::Relaxed) >= 5);
+}

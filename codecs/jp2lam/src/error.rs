@@ -11,6 +11,8 @@ pub enum Jp2LamError {
     DecodeFailed(String),
     UnsupportedFeature(String),
     Io(String),
+    /// Decode aborted cooperatively via a caller-supplied cancellation check.
+    Cancelled,
     /// Bounded search finished without a stream at or above the SSIMULACRA2 floor.
     PerceptualTargetMissed {
         achieved: f64,
@@ -27,6 +29,7 @@ impl Display for Jp2LamError {
             Self::DecodeFailed(msg) => write!(f, "decode failed: {msg}"),
             Self::UnsupportedFeature(msg) => write!(f, "unsupported feature: {msg}"),
             Self::Io(msg) => write!(f, "I/O error: {msg}"),
+            Self::Cancelled => write!(f, "decode cancelled"),
             Self::PerceptualTargetMissed {
                 achieved,
                 target,
@@ -51,6 +54,11 @@ impl Jp2LamError {
     }
 
     #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+
+    #[must_use]
     pub fn is_perceptual_target_missed(&self) -> bool {
         matches!(self, Self::PerceptualTargetMissed { .. })
     }
@@ -62,6 +70,7 @@ impl Jp2LamError {
             | Self::DecodeFailed(msg)
             | Self::UnsupportedFeature(msg)
             | Self::Io(msg) => msg,
+            Self::Cancelled => "decode cancelled",
             Self::PerceptualTargetMissed { .. } => {
                 "perceptual encode missed the requested SSIMULACRA2 floor"
             }

@@ -572,7 +572,11 @@ pub fn estimate_job_bytes_on(request: &RenderRequest, working_bytes: u64) -> u64
     surface
         .saturating_add(groups)
         .saturating_add(masks)
-        .saturating_add(complexity.estimated_image_decode_peak_bytes)
+        .saturating_add(
+            request
+                .page
+                .estimated_image_decode_bytes(&request.transform.matrix),
+        )
 }
 
 #[cfg(test)]
@@ -830,5 +834,113 @@ mod tests {
             ..PageComplexity::default()
         });
         assert_eq!(estimate_job_bytes(&request), u64::MAX);
+    }
+
+    #[test]
+    fn job_estimate_scales_dct_decode_by_request_transform() {
+        use crate::page_ir::{
+            Color, DisplayOp, ImageCodecKind, ImageColorSpace, ImageId, ImageIr, InterpolationMode,
+            Paint, PaintId, ResourceKey, SharedBytes,
+        };
+        let (native_w, native_h) = (4_000u32, 3_000u32);
+        let mut page = crate::page_ir::CompiledPage::empty(PageBounds {
+            crop: Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 100.0,
+                y1: 75.0,
+            },
+            rotate: 0,
+        });
+        let img = ImageIr {
+            key: ResourceKey {
+                object_number: 5,
+                generation: 0,
+                variant: 0,
+            },
+            width: native_w,
+            height: native_h,
+            is_stencil: false,
+            interpolation: InterpolationMode::Bilinear,
+            soft_mask: None,
+            bits_per_component: 8,
+            color_space: ImageColorSpace::Rgb,
+            decode: None,
+            samples: None,
+            codec: Some(ImageCodecKind::Dct),
+            codec_data: Some(SharedBytes::from(&b"jpeg"[..])),
+            codec_parms: None,
+            smask: None,
+            mask: None,
+            smask_in_data: 0,
+            lowering_degraded: false,
+        };
+        let (full_ret, full_work) = crate::page_ir::estimate_image_bytes_for_target(&img, None);
+        page.images = Arc::from([img]);
+        page.paints = Arc::from([Paint::Solid(Color::BLACK)]);
+        page.operations = Arc::from([
+            DisplayOp::ConcatTransform(Matrix {
+                a: 100.0,
+                b: 0.0,
+                c: 0.0,
+                d: 75.0,
+                e: 0.0,
+                f: 0.0,
+            }),
+            DisplayOp::DrawImage {
+                image: ImageId(0),
+                paint: PaintId(0),
+                transform: Matrix::IDENTITY,
+                alpha: 1.0,
+                blend: crate::page_ir::BlendMode::Normal,
+            },
+        ]);
+        page.complexity.estimated_image_decode_peak_bytes = full_ret + full_work;
+        let page = Arc::new(page);
+
+        // Thumbnail / 1x request: 100x75 footprint reduces 4000x3000 DCT by 1/8
+        // to 500x375, saving ~98% of retained raster memory vs native 180 MB.
+        let thumb_req = RenderRequest {
+            page: Arc::clone(&page),
+            transform: PageTransform {
+                matrix: Matrix::IDENTITY,
+            },
+            crop: None,
+            output_size: DeviceSize {
+                width: 100,
+                height: 75,
+            },
+            output_format: OutputFormat::Rgba8PremultipliedSrgb,
+            background: Background::White,
+            annotations: AnnotationMode::None,
+            color_policy: RenderColorPolicy::Original,
+            quality: RenderQuality::Normal,
+            limits: RenderLimits::default(),
+            residency: OutputResidency::HostRequired,
+        };
+        let full_req = RenderRequest {
+            transform: PageTransform {
+                matrix: Matrix {
+                    a: 40.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: 40.0,
+                    e: 0.0,
+                    f: 0.0,
+                },
+            },
+            output_size: DeviceSize {
+                width: 4_000,
+                height: 3_000,
+            },
+            ..thumb_req.clone()
+        };
+        let thumb_img_bytes = page.estimated_image_decode_bytes(&thumb_req.transform.matrix);
+        let full_img_bytes = page.estimated_image_decode_bytes(&full_req.transform.matrix);
+        assert_eq!(full_img_bytes, 4_000 * 3_000 * 15);
+        // Reduced 500x375 RGB8 retained + full-coeff progressive floor (2 B/sample = 72 MB),
+        // strictly far below full 180 MB.
+        assert_eq!(thumb_img_bytes, 500 * 375 * 3 + 4_000 * 3_000 * 3 * 2);
+        assert!(estimate_job_bytes(&thumb_req) < full_img_bytes);
     }
 }

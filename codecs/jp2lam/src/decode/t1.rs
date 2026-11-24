@@ -18,7 +18,7 @@ use crate::tier1::stripe::{
     T1_SIGMA_15, T1_SIGMA_16, T1_SIGMA_17, T1_SIGMA_THIS,
 };
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use super::stats::StatsSink;
 use super::t2::{DecodedCodewordSegment, DecodedTilePackets};
@@ -42,7 +42,9 @@ pub(crate) struct DecodedCodeBlockCoefficients {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CoefficientPlane {
     Integer(Vec<i32>),
+    SplitInteger(crate::dwt::SplitSubbands<i32>),
     Real(Vec<f32>),
+    SplitReal(crate::dwt::SplitSubbands<f32>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,7 +52,27 @@ pub(crate) struct DecodedTileCoefficients {
     pub(crate) component: usize,
     pub(crate) width: usize,
     pub(crate) height: usize,
+    pub(crate) max_abs: u32,
     pub(crate) plane: CoefficientPlane,
+}
+
+fn flatten_split<T: Copy + Default>(split: crate::dwt::SplitSubbands<T>) -> Vec<T> {
+    let (width, height) = (split.width, split.height);
+    let sn = width.div_ceil(2);
+    let dn = width - sn;
+    let sv = height.div_ceil(2);
+    let dv = height - sv;
+    let mut out = vec![T::default(); width * height];
+    for y in 0..sv {
+        out[y * width..y * width + sn].copy_from_slice(&split.coarse[y * sn..(y + 1) * sn]);
+        if dn > 0 {
+            out[y * width + sn..(y + 1) * width].copy_from_slice(&split.hl1[y * dn..(y + 1) * dn]);
+        }
+    }
+    if dv > 0 {
+        out[sv * width..].copy_from_slice(&split.lh_hh1);
+    }
+    out
 }
 
 impl DecodedTileCoefficients {
@@ -59,7 +81,8 @@ impl DecodedTileCoefficients {
     pub(crate) fn into_integer(self) -> Result<Vec<i32>> {
         match self.plane {
             CoefficientPlane::Integer(values) => Ok(values),
-            CoefficientPlane::Real(_) => Err(invalid(
+            CoefficientPlane::SplitInteger(split) => Ok(flatten_split(split)),
+            CoefficientPlane::Real(_) | CoefficientPlane::SplitReal(_) => Err(invalid(
                 "reversible reconstruction requested for an irreversible coefficient plane",
             )),
         }
@@ -70,7 +93,8 @@ impl DecodedTileCoefficients {
     pub(crate) fn into_real(self) -> Result<Vec<f32>> {
         match self.plane {
             CoefficientPlane::Real(values) => Ok(values),
-            CoefficientPlane::Integer(_) => Err(invalid(
+            CoefficientPlane::SplitReal(split) => Ok(flatten_split(split)),
+            CoefficientPlane::Integer(_) | CoefficientPlane::SplitInteger(_) => Err(invalid(
                 "irreversible reconstruction requested for a reversible coefficient plane",
             )),
         }
@@ -155,6 +179,7 @@ pub(crate) fn decode_tile_components_profiled(
     decode_tile_components_with_scratch(header, packets, stats, &mut scratch, 1)
 }
 
+#[cfg(test)]
 pub(crate) fn decode_tile_components_with_scratch(
     header: &CodestreamHeader,
     packets: &DecodedTilePackets<'_>,
@@ -162,46 +187,82 @@ pub(crate) fn decode_tile_components_with_scratch(
     scratch: &mut Tier1Scratch,
     worker_count: usize,
 ) -> Result<Vec<DecodedTileCoefficients>> {
+    let mut worker_scratches = Vec::new();
+    decode_tile_component_range_with_scratch(
+        header,
+        packets,
+        0..header.siz.components.len(),
+        false,
+        stats,
+        scratch,
+        &mut worker_scratches,
+        worker_count,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_tile_component_range_with_scratch(
+    header: &CodestreamHeader,
+    packets: &DecodedTilePackets<'_>,
+    component_range: std::ops::Range<usize>,
+    allow_split: bool,
+    stats: &mut StatsSink<'_>,
+    scratch: &mut Tier1Scratch,
+    worker_scratches: &mut Vec<Tier1Scratch>,
+    worker_count: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+) -> Result<Vec<DecodedTileCoefficients>> {
     let component_count = header.siz.components.len();
-    // Each component's coefficient plane is sized by ITS tile-component rectangle
-    // (Annex B.2): a subsampled chroma plane (`dx`/`dy` > 1) decodes at half
-    // resolution, while a non-subsampled component's dims equal the tile's, so
-    // the common path is byte-identical. Tier-2 already placed this component's
-    // code blocks in the same component-domain coordinate system.
-    let component_dims = (0..component_count)
-        .map(|component| header.tile_component_dims(component))
-        .collect::<Result<Vec<_>>>()?;
-    // Irreversible 9/7 code blocks are dequantized as they are written, so the
-    // tile plane is the final `f32` subband image. Reversible 5/3 has no
-    // quantization and keeps integer magnitudes for the inverse 5/3 lifting.
-    // The transform is per-component: a COC override (Annex A.6.2) can make one
-    // component reversible while the rest are 9/7, so each plane's storage type
-    // follows `transform_for(component)`, not a single tile-wide flag.
-    let mut components = (0..component_count)
-        .map(|component| {
-            let (cw, ch) = component_dims[component];
-            DecodedTileCoefficients {
-                component,
-                width: cw,
-                height: ch,
-                plane: match header.transform_for(component) {
-                    WaveletTransform::Irreversible97 => {
-                        CoefficientPlane::Real(vec![0.0f32; cw * ch])
-                    }
-                    WaveletTransform::Reversible53 => {
-                        CoefficientPlane::Integer(vec![0i32; cw * ch])
-                    }
-                },
+    let end_comp = component_range.end.min(component_count);
+    let start_comp = component_range.start.min(end_comp);
+    let active_range = start_comp..end_comp;
+    if cancel.is_some_and(|f| f()) {
+        return Err(Jp2LamError::Cancelled);
+    }
+    let levels = header.cod.decomposition_levels;
+    let split_ok = allow_split && levels >= 1;
+    let mut components = Vec::with_capacity(active_range.len());
+    for component in active_range.clone() {
+        let (cw, ch) = header.tile_component_dims(component)?;
+        let use_split = split_ok && cw > 0 && ch > 0;
+        let plane = match (header.transform_for(component), use_split) {
+            (WaveletTransform::Irreversible97, true) => {
+                CoefficientPlane::SplitReal(crate::dwt::SplitSubbands::new_zeroed(cw, ch))
             }
-        })
-        .collect::<Vec<_>>();
-    // Serial when profiling (per-pass attribution needs one timeline) or when
-    // the active worker budget is one. Otherwise fan the code blocks across
-    // exactly the request's task budget on the shared executor; each block
-    // writes into its own disjoint plane rectangle.
+            (WaveletTransform::Irreversible97, false) => {
+                CoefficientPlane::Real(vec![0.0f32; cw * ch])
+            }
+            (WaveletTransform::Reversible53, true) => {
+                CoefficientPlane::SplitInteger(crate::dwt::SplitSubbands::new_zeroed(cw, ch))
+            }
+            (WaveletTransform::Reversible53, false) => {
+                CoefficientPlane::Integer(vec![0i32; cw * ch])
+            }
+        };
+        components.push(DecodedTileCoefficients {
+            component,
+            width: cw,
+            height: ch,
+            max_abs: 0,
+            plane,
+        });
+    }
+    if components.is_empty() {
+        return Ok(components);
+    }
+
     if stats.is_enabled() || worker_count <= 1 {
-        let planes = BlockPlanes::new(&mut components);
+        let planes = BlockPlanes::new(&mut components, start_comp);
+        let mut decoded_idx = 0usize;
         for block in &packets.codeblocks {
+            if !active_range.contains(&block.component) {
+                continue;
+            }
+            if (decoded_idx & 15) == 0 && cancel.is_some_and(|f| f()) {
+                return Err(Jp2LamError::Cancelled);
+            }
+            decoded_idx += 1;
             let params = block_params(header, block)?;
             decode_codeblock_segments_into(
                 params.block_width,
@@ -230,8 +291,17 @@ pub(crate) fn decode_tile_components_with_scratch(
                 stats.tier1_block_output_ns = stats.tier1_block_output_ns.saturating_add(elapsed);
             });
         }
+        planes.store_max_abs(&mut components);
     } else {
-        decode_codeblocks_parallel(header, packets, &mut components, worker_count)?;
+        decode_codeblocks_parallel(
+            header,
+            packets,
+            active_range,
+            &mut components,
+            worker_scratches,
+            worker_count,
+            cancel,
+        )?;
     }
 
     Ok(components)
@@ -304,15 +374,59 @@ fn block_params(
 /// the parallel Tier-1 loop can write each code block into its own disjoint
 /// rectangle without a per-block result allocation.
 enum PlanePtr {
-    Integer(*mut i32),
-    Real(*mut f32),
+    Integer {
+        ptr: *mut i32,
+        stride: usize,
+        len: usize,
+    },
+    SplitInteger {
+        coarse: *mut i32,
+        hl1: *mut i32,
+        lh_hh1: *mut i32,
+        width: usize,
+        sn: usize,
+        dn: usize,
+        sv: usize,
+        dv: usize,
+    },
+    Real {
+        ptr: *mut f32,
+        stride: usize,
+        len: usize,
+    },
+    SplitReal {
+        coarse: *mut f32,
+        hl1: *mut f32,
+        lh_hh1: *mut f32,
+        width: usize,
+        sn: usize,
+        dn: usize,
+        sv: usize,
+        dv: usize,
+    },
+}
+
+enum ResolvedSubbandPtr {
+    Integer {
+        ptr: *mut i32,
+        stride: usize,
+        len: usize,
+        x0: usize,
+        y0: usize,
+    },
+    Real {
+        ptr: *mut f32,
+        stride: usize,
+        len: usize,
+        x0: usize,
+        y0: usize,
+    },
 }
 
 struct BlockPlanes {
+    start_component: usize,
     planes: Vec<PlanePtr>,
-    /// Per-component plane width and length, so a subsampled chroma plane uses
-    /// its own (smaller) row stride and bounds rather than the tile's.
-    dims: Vec<(usize, usize)>,
+    max_abs: Vec<AtomicU32>,
 }
 
 // SAFETY: `BlockPlanes` only ever hands out `&mut` to pairwise-disjoint plane
@@ -323,31 +437,171 @@ unsafe impl Send for BlockPlanes {}
 unsafe impl Sync for BlockPlanes {}
 
 impl BlockPlanes {
-    fn new(components: &mut [DecodedTileCoefficients]) -> Self {
-        let dims = components
-            .iter()
-            .map(|component| {
-                (
-                    component.width,
-                    component.width.saturating_mul(component.height),
-                )
-            })
-            .collect();
+    fn new(components: &mut [DecodedTileCoefficients], start_component: usize) -> Self {
+        let mut max_abs = Vec::with_capacity(components.len());
         let planes = components
             .iter_mut()
-            .map(|component| match &mut component.plane {
-                CoefficientPlane::Integer(values) => PlanePtr::Integer(values.as_mut_ptr()),
-                CoefficientPlane::Real(values) => PlanePtr::Real(values.as_mut_ptr()),
+            .map(|component| {
+                max_abs.push(AtomicU32::new(0));
+                let w = component.width;
+                let h = component.height;
+                match &mut component.plane {
+                    CoefficientPlane::Integer(values) => PlanePtr::Integer {
+                        ptr: values.as_mut_ptr(),
+                        stride: w,
+                        len: values.len(),
+                    },
+                    CoefficientPlane::SplitInteger(split) => {
+                        let sn = w.div_ceil(2);
+                        let sv = h.div_ceil(2);
+                        PlanePtr::SplitInteger {
+                            coarse: split.coarse.as_mut_ptr(),
+                            hl1: split.hl1.as_mut_ptr(),
+                            lh_hh1: split.lh_hh1.as_mut_ptr(),
+                            width: w,
+                            sn,
+                            dn: w - sn,
+                            sv,
+                            dv: h - sv,
+                        }
+                    }
+                    CoefficientPlane::Real(values) => PlanePtr::Real {
+                        ptr: values.as_mut_ptr(),
+                        stride: w,
+                        len: values.len(),
+                    },
+                    CoefficientPlane::SplitReal(split) => {
+                        let sn = w.div_ceil(2);
+                        let sv = h.div_ceil(2);
+                        PlanePtr::SplitReal {
+                            coarse: split.coarse.as_mut_ptr(),
+                            hl1: split.hl1.as_mut_ptr(),
+                            lh_hh1: split.lh_hh1.as_mut_ptr(),
+                            width: w,
+                            sn,
+                            dn: w - sn,
+                            sv,
+                            dv: h - sv,
+                        }
+                    }
+                }
             })
             .collect();
-        Self { planes, dims }
+        Self {
+            start_component,
+            planes,
+            max_abs,
+        }
+    }
+
+    fn store_max_abs(&self, components: &mut [DecodedTileCoefficients]) {
+        for (comp, max_slot) in components.iter_mut().zip(&self.max_abs) {
+            comp.max_abs = max_slot.load(Ordering::Relaxed);
+        }
+    }
+
+    fn resolve(&self, slot: usize, x0: usize, y0: usize) -> Result<ResolvedSubbandPtr> {
+        let plane = self
+            .planes
+            .get(slot)
+            .ok_or_else(|| invalid("decoded code-block references invalid component"))?;
+        Ok(match *plane {
+            PlanePtr::Integer { ptr, stride, len } => ResolvedSubbandPtr::Integer {
+                ptr,
+                stride,
+                len,
+                x0,
+                y0,
+            },
+            PlanePtr::SplitInteger {
+                coarse,
+                hl1,
+                lh_hh1,
+                width,
+                sn,
+                dn,
+                sv,
+                dv,
+            } => {
+                if y0 < sv {
+                    if x0 < sn {
+                        ResolvedSubbandPtr::Integer {
+                            ptr: coarse,
+                            stride: sn,
+                            len: sn * sv,
+                            x0,
+                            y0,
+                        }
+                    } else {
+                        ResolvedSubbandPtr::Integer {
+                            ptr: hl1,
+                            stride: dn,
+                            len: dn * sv,
+                            x0: x0 - sn,
+                            y0,
+                        }
+                    }
+                } else {
+                    ResolvedSubbandPtr::Integer {
+                        ptr: lh_hh1,
+                        stride: width,
+                        len: width * dv,
+                        x0,
+                        y0: y0 - sv,
+                    }
+                }
+            }
+            PlanePtr::Real { ptr, stride, len } => ResolvedSubbandPtr::Real {
+                ptr,
+                stride,
+                len,
+                x0,
+                y0,
+            },
+            PlanePtr::SplitReal {
+                coarse,
+                hl1,
+                lh_hh1,
+                width,
+                sn,
+                dn,
+                sv,
+                dv,
+            } => {
+                if y0 < sv {
+                    if x0 < sn {
+                        ResolvedSubbandPtr::Real {
+                            ptr: coarse,
+                            stride: sn,
+                            len: sn * sv,
+                            x0,
+                            y0,
+                        }
+                    } else {
+                        ResolvedSubbandPtr::Real {
+                            ptr: hl1,
+                            stride: dn,
+                            len: dn * sv,
+                            x0: x0 - sn,
+                            y0,
+                        }
+                    }
+                } else {
+                    ResolvedSubbandPtr::Real {
+                        ptr: lh_hh1,
+                        stride: width,
+                        len: width * dv,
+                        x0,
+                        y0: y0 - sv,
+                    }
+                }
+            }
+        })
     }
 
     /// # Safety
     /// The caller must guarantee that the `(component, rectangle)` written here
-    /// does not overlap any other rectangle written concurrently. Tier-1 code
-    /// blocks tile disjoint subband rectangles of each component plane, so this
-    /// invariant holds across the parallel loop.
+    /// does not overlap any other rectangle written concurrently.
     unsafe fn write_block(
         &self,
         component: usize,
@@ -356,46 +610,83 @@ impl BlockPlanes {
         block: &Tier1Scratch,
         step: Option<f32>,
     ) -> Result<()> {
-        let plane = self
-            .planes
-            .get(component)
-            .ok_or_else(|| invalid("decoded code-block references invalid component"))?;
-        let &(tile_width, tile_len) = self
-            .dims
-            .get(component)
-            .ok_or_else(|| invalid("decoded code-block references invalid component"))?;
-        for y in 0..block.height {
-            let dst = (y0 + y)
-                .checked_mul(tile_width)
-                .and_then(|row| row.checked_add(x0))
-                .ok_or_else(|| invalid("block copy offset overflow"))?;
-            if dst
-                .checked_add(block.width)
-                .is_none_or(|end| end > tile_len)
-            {
-                return Err(invalid("decoded block extends past tile"));
-            }
-            let (columns, ci) = block.row(y);
-            match *plane {
-                PlanePtr::Integer(ptr) => {
-                    // SAFETY: `dst..dst + block.width` is in-bounds (checked
-                    // above) and disjoint from every other task's rectangle.
-                    let dst_slice =
-                        unsafe { std::slice::from_raw_parts_mut(ptr.add(dst), block.width) };
-                    for (out, column) in dst_slice.iter_mut().zip(columns) {
-                        *out = column[ci];
-                    }
+        if block.width == 0 || block.height == 0 {
+            return Ok(());
+        }
+        let slot = component
+            .checked_sub(self.start_component)
+            .ok_or_else(|| invalid("decoded code-block references inactive component"))?;
+        match self.resolve(slot, x0, y0)? {
+            ResolvedSubbandPtr::Integer {
+                ptr,
+                stride,
+                len,
+                x0,
+                y0,
+            } => {
+                if x0
+                    .checked_add(block.width)
+                    .is_none_or(|end_x| end_x > stride)
+                {
+                    return Err(invalid("decoded block extends past subband width"));
                 }
-                PlanePtr::Real(ptr) => {
-                    let step = step.ok_or_else(|| {
-                        invalid("irreversible plane write missing quantization step")
-                    })?;
-                    // SAFETY: as above.
-                    let dst_slice =
-                        unsafe { std::slice::from_raw_parts_mut(ptr.add(dst), block.width) };
-                    for (out, column) in dst_slice.iter_mut().zip(columns) {
-                        *out = crate::simd::scalar::dequantize_i32_to_f32(column[ci], step);
-                    }
+                let last_row_end = (y0 + block.height - 1)
+                    .checked_mul(stride)
+                    .and_then(|row| row.checked_add(x0))
+                    .and_then(|start| start.checked_add(block.width))
+                    .ok_or_else(|| invalid("block copy offset overflow"))?;
+                if last_row_end > len {
+                    return Err(invalid("decoded block extends past subband"));
+                }
+                // SAFETY: bounds checked above and code blocks are pairwise disjoint.
+                let block_max = unsafe {
+                    write_integer_block(
+                        ptr,
+                        stride,
+                        x0,
+                        y0,
+                        block,
+                        crate::simd::PRIMITIVES.kernel == crate::simd::Kernel::Avx2,
+                    )
+                };
+                if block_max > 0 {
+                    self.max_abs[slot].fetch_max(block_max, Ordering::Relaxed);
+                }
+            }
+            ResolvedSubbandPtr::Real {
+                ptr,
+                stride,
+                len,
+                x0,
+                y0,
+            } => {
+                let step = step
+                    .ok_or_else(|| invalid("irreversible plane write missing quantization step"))?;
+                if x0
+                    .checked_add(block.width)
+                    .is_none_or(|end_x| end_x > stride)
+                {
+                    return Err(invalid("decoded block extends past subband width"));
+                }
+                let last_row_end = (y0 + block.height - 1)
+                    .checked_mul(stride)
+                    .and_then(|row| row.checked_add(x0))
+                    .and_then(|start| start.checked_add(block.width))
+                    .ok_or_else(|| invalid("block copy offset overflow"))?;
+                if last_row_end > len {
+                    return Err(invalid("decoded block extends past subband"));
+                }
+                // SAFETY: bounds checked above and code blocks are pairwise disjoint.
+                unsafe {
+                    write_real_block(
+                        ptr,
+                        stride,
+                        x0,
+                        y0,
+                        block,
+                        step,
+                        crate::simd::PRIMITIVES.kernel == crate::simd::Kernel::Avx2,
+                    );
                 }
             }
         }
@@ -403,26 +694,266 @@ impl BlockPlanes {
     }
 }
 
-/// Decode every code block across the active worker budget, writing each into
-/// its disjoint plane rectangle with a per-worker reusable [`Tier1Scratch`].
+/// Write a decoded reversible code-block from stripe-column scratch to row-major
+/// destination and return `max(|v|)` across all samples written.
+///
+/// # Safety
+/// `ptr` must be valid for writes over `(y0..y0 + block.height)` at row `stride`
+/// starting at `x0` for `block.width` elements, disjoint from concurrent writers.
+unsafe fn write_integer_block(
+    ptr: *mut i32,
+    stride: usize,
+    x0: usize,
+    y0: usize,
+    block: &Tier1Scratch,
+    use_avx2: bool,
+) -> u32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if use_avx2 {
+        // SAFETY: `use_avx2` is true only when `PRIMITIVES.kernel == Kernel::Avx2`.
+        return unsafe { block_out_avx2::write_integer_block(ptr, stride, x0, y0, block) };
+    }
+    let _ = use_avx2;
+    let mut max_abs = 0u32;
+    for y in 0..block.height {
+        let dst = (y0 + y) * stride + x0;
+        let (columns, ci) = block.row(y);
+        // SAFETY: caller verified bounds and disjointness.
+        let dst_slice = unsafe { std::slice::from_raw_parts_mut(ptr.add(dst), block.width) };
+        for (out, column) in dst_slice.iter_mut().zip(columns) {
+            let v = column[ci];
+            *out = v;
+            let u = v.unsigned_abs();
+            if u > max_abs {
+                max_abs = u;
+            }
+        }
+    }
+    max_abs
+}
+
+/// Dequantize and write an irreversible code-block from stripe-column scratch.
+///
+/// # Safety
+/// Same bounds and disjointness requirements as [`write_integer_block`].
+unsafe fn write_real_block(
+    ptr: *mut f32,
+    stride: usize,
+    x0: usize,
+    y0: usize,
+    block: &Tier1Scratch,
+    step: f32,
+    use_avx2: bool,
+) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if use_avx2 {
+        // SAFETY: `use_avx2` is true only when `PRIMITIVES.kernel == Kernel::Avx2`.
+        unsafe { block_out_avx2::write_real_block(ptr, stride, x0, y0, block, step) };
+        return;
+    }
+    let _ = use_avx2;
+    for y in 0..block.height {
+        let dst = (y0 + y) * stride + x0;
+        let (columns, ci) = block.row(y);
+        // SAFETY: caller verified bounds and disjointness.
+        let dst_slice = unsafe { std::slice::from_raw_parts_mut(ptr.add(dst), block.width) };
+        for (out, column) in dst_slice.iter_mut().zip(columns) {
+            *out = crate::simd::scalar::dequantize_i32_to_f32(column[ci], step);
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod block_out_avx2 {
+    use super::Tier1Scratch;
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    /// Load 8 `[i32; 4]` stripe columns starting at `cols_ptr` and transpose
+    /// them into four 8-wide row vectors `(r0, r1, r2, r3)`.
+    ///
+    /// # Safety
+    /// `cols_ptr` must point to at least 8 `[i32; 4]` columns (32 `i32`s), and
+    /// AVX2 must be enabled.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn transpose_8x4(cols_ptr: *const [i32; 4]) -> (__m256i, __m256i, __m256i, __m256i) {
+        // SAFETY: caller guarantees 8 `[i32; 4]` columns are readable.
+        unsafe {
+            let load_pair = |k: usize| {
+                let lo = _mm_loadu_si128(cols_ptr.add(k).cast());
+                let hi = _mm_loadu_si128(cols_ptr.add(k + 4).cast());
+                _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1)
+            };
+            let a0 = load_pair(0);
+            let a1 = load_pair(1);
+            let a2 = load_pair(2);
+            let a3 = load_pair(3);
+            let t0 = _mm256_unpacklo_epi32(a0, a1);
+            let t1 = _mm256_unpacklo_epi32(a2, a3);
+            let t2 = _mm256_unpackhi_epi32(a0, a1);
+            let t3 = _mm256_unpackhi_epi32(a2, a3);
+            (
+                _mm256_unpacklo_epi64(t0, t1),
+                _mm256_unpackhi_epi64(t0, t1),
+                _mm256_unpacklo_epi64(t2, t3),
+                _mm256_unpackhi_epi64(t2, t3),
+            )
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn write_integer_block(
+        ptr: *mut i32,
+        stride: usize,
+        x0: usize,
+        y0: usize,
+        block: &Tier1Scratch,
+    ) -> u32 {
+        let bw = block.width;
+        let bh = block.height;
+        let full_stripes = bh / 4;
+        let mut max_vec = _mm256_setzero_si256();
+        let mut scalar_max = 0u32;
+
+        for s in 0..full_stripes {
+            let (columns, _) = block.row(4 * s);
+            let row0 = (y0 + 4 * s) * stride + x0;
+            let mut x = 0usize;
+            while x + 8 <= bw {
+                // SAFETY: `x + 8 <= bw` and all 4 rows in `4*s .. 4*s + 4` are in bounds.
+                unsafe {
+                    let (r0, r1, r2, r3) = transpose_8x4(columns.as_ptr().add(x));
+                    max_vec = _mm256_max_epu32(max_vec, _mm256_abs_epi32(r0));
+                    max_vec = _mm256_max_epu32(max_vec, _mm256_abs_epi32(r1));
+                    max_vec = _mm256_max_epu32(max_vec, _mm256_abs_epi32(r2));
+                    max_vec = _mm256_max_epu32(max_vec, _mm256_abs_epi32(r3));
+                    _mm256_storeu_si256(ptr.add(row0 + x).cast(), r0);
+                    _mm256_storeu_si256(ptr.add(row0 + stride + x).cast(), r1);
+                    _mm256_storeu_si256(ptr.add(row0 + 2 * stride + x).cast(), r2);
+                    _mm256_storeu_si256(ptr.add(row0 + 3 * stride + x).cast(), r3);
+                }
+                x += 8;
+            }
+            while x < bw {
+                let col = columns[x];
+                for (ci, &v) in col.iter().enumerate() {
+                    // SAFETY: in bounds.
+                    unsafe { *ptr.add(row0 + ci * stride + x) = v };
+                    scalar_max = scalar_max.max(v.unsigned_abs());
+                }
+                x += 1;
+            }
+        }
+        for y in (full_stripes * 4)..bh {
+            let dst = (y0 + y) * stride + x0;
+            let (columns, ci) = block.row(y);
+            for (x, column) in columns.iter().enumerate() {
+                let v = column[ci];
+                // SAFETY: in bounds.
+                unsafe { *ptr.add(dst + x) = v };
+                scalar_max = scalar_max.max(v.unsigned_abs());
+            }
+        }
+        let mut lanes = [0u32; 8];
+        // SAFETY: `lanes` is 32 bytes.
+        unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), max_vec) };
+        lanes.into_iter().fold(scalar_max, u32::max)
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn write_real_block(
+        ptr: *mut f32,
+        stride: usize,
+        x0: usize,
+        y0: usize,
+        block: &Tier1Scratch,
+        step: f32,
+    ) {
+        let bw = block.width;
+        let bh = block.height;
+        let full_stripes = bh / 4;
+        let zero_i32 = _mm256_setzero_si256();
+        let half = _mm256_set1_ps(0.5);
+        let step_v = _mm256_set1_ps(step);
+        let sign_bit = _mm256_castsi256_ps(_mm256_set1_epi32(i32::MIN));
+
+        // Exact IEEE-754 match for `scalar::dequantize_i32_to_f32`:
+        // for q == 0 -> +0.0f32; for 0 < |q| <= i32::MAX -> sign * (|q| as f32 + 0.5) * step.
+        // Tier-1 guarantees `magnitude_bitplanes <= 31`, so `q != i32::MIN`.
+        let dequant = |qv: __m256i| -> __m256 {
+            let abs_q = _mm256_abs_epi32(qv);
+            let mag = _mm256_mul_ps(_mm256_add_ps(_mm256_cvtepi32_ps(abs_q), half), step_v);
+            let signed = _mm256_xor_ps(mag, _mm256_and_ps(_mm256_castsi256_ps(qv), sign_bit));
+            let is_zero = _mm256_castsi256_ps(_mm256_cmpeq_epi32(qv, zero_i32));
+            _mm256_andnot_ps(is_zero, signed)
+        };
+
+        for s in 0..full_stripes {
+            let (columns, _) = block.row(4 * s);
+            let row0 = (y0 + 4 * s) * stride + x0;
+            let mut x = 0usize;
+            while x + 8 <= bw {
+                // SAFETY: `x + 8 <= bw` and all 4 rows in `4*s .. 4*s + 4` are in bounds.
+                unsafe {
+                    let (r0, r1, r2, r3) = transpose_8x4(columns.as_ptr().add(x));
+                    _mm256_storeu_ps(ptr.add(row0 + x), dequant(r0));
+                    _mm256_storeu_ps(ptr.add(row0 + stride + x), dequant(r1));
+                    _mm256_storeu_ps(ptr.add(row0 + 2 * stride + x), dequant(r2));
+                    _mm256_storeu_ps(ptr.add(row0 + 3 * stride + x), dequant(r3));
+                }
+                x += 8;
+            }
+            while x < bw {
+                let col = columns[x];
+                for (ci, &v) in col.iter().enumerate() {
+                    // SAFETY: in bounds.
+                    unsafe {
+                        *ptr.add(row0 + ci * stride + x) =
+                            crate::simd::scalar::dequantize_i32_to_f32(v, step);
+                    }
+                }
+                x += 1;
+            }
+        }
+        for y in (full_stripes * 4)..bh {
+            let dst = (y0 + y) * stride + x0;
+            let (columns, ci) = block.row(y);
+            for (x, column) in columns.iter().enumerate() {
+                // SAFETY: in bounds.
+                unsafe {
+                    *ptr.add(dst + x) =
+                        crate::simd::scalar::dequantize_i32_to_f32(column[ci], step);
+                }
+            }
+        }
+    }
+}
+
+/// Decode every active code block across the active worker budget, reusing
+/// caller-owned [`Tier1Scratch`] instances across tiles and decodes.
 fn decode_codeblocks_parallel(
     header: &CodestreamHeader,
     packets: &DecodedTilePackets<'_>,
+    active_range: std::ops::Range<usize>,
     components: &mut [DecodedTileCoefficients],
+    worker_scratches: &mut Vec<Tier1Scratch>,
     worker_count: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> Result<()> {
-    let planes = BlockPlanes::new(components);
+    let start_comp = active_range.start;
+    let planes = BlockPlanes::new(components, start_comp);
     let style = header.cod.code_block_style;
     let blocks = &packets.codeblocks;
 
-    // Weighted largest-processing-time-first schedule. Code-block decode cost
-    // scales with the coefficient count times the number of coding passes, so
-    // decode the most expensive blocks first: their long MQ scans overlap the
-    // many cheap blocks instead of one big block stranding on a single worker
-    // at the tail. Every block writes a disjoint plane rectangle, so *any*
-    // completion order reproduces the serial output byte-for-byte â€” the
-    // invariant `serial_and_budgeted_tier1_are_byte_identical` guards.
-    let mut order: Vec<usize> = (0..blocks.len()).collect();
+    let mut order: Vec<usize> = (0..blocks.len())
+        .filter(|&i| active_range.contains(&blocks[i].component))
+        .collect();
+    if order.is_empty() {
+        return Ok(());
+    }
     order.sort_unstable_by_key(|&i| {
         let block = &blocks[i];
         let area = u64::from(block.x1.saturating_sub(block.x0))
@@ -430,26 +961,28 @@ fn decode_codeblocks_parallel(
         core::cmp::Reverse(area.saturating_mul(u64::from(block.passes)))
     });
 
-    // A shared cursor turns the sorted list into a greedy work queue: whenever a
-    // worker finishes a block it claims the next-largest remaining one. The
-    // `failed` flag lets peers stop pulling new work once any block errors.
     let cursor = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
+    let cancelled = AtomicBool::new(false);
 
-    // Contribute at most `worker_count` long-lived tasks to the shared pool.
-    // Each task allocates one [`Tier1Scratch`] for the whole tile and reuses it
-    // across every block it claims â€” no per-block scratch reallocation.
-    let task_count = worker_count.min(blocks.len()).max(1);
-    let results = (0..task_count)
-        .into_par_iter()
-        .map(|_| -> Result<()> {
-            let mut scratch = Tier1Scratch::new();
+    let task_count = worker_count.min(order.len()).max(1);
+    if worker_scratches.len() < task_count {
+        worker_scratches.resize_with(task_count, Tier1Scratch::new);
+    }
+    let results = worker_scratches[..task_count]
+        .par_iter_mut()
+        .map(|scratch| -> Result<()> {
             let mut sink = StatsSink::disabled();
             loop {
                 if failed.load(Ordering::Relaxed) {
                     return Ok(());
                 }
                 let next = cursor.fetch_add(1, Ordering::Relaxed);
+                if (next & 15) == 0 && cancel.is_some_and(|f| f()) {
+                    cancelled.store(true, Ordering::Relaxed);
+                    failed.store(true, Ordering::Relaxed);
+                    return Err(Jp2LamError::Cancelled);
+                }
                 let Some(&index) = order.get(next) else {
                     return Ok(());
                 };
@@ -470,7 +1003,7 @@ fn decode_codeblocks_parallel(
                     block.passes,
                     style,
                     &block.segments,
-                    &mut scratch,
+                    scratch,
                     &mut sink,
                 ) {
                     failed.store(true, Ordering::Relaxed);
@@ -483,7 +1016,7 @@ fn decode_codeblocks_parallel(
                         block.component,
                         block.x0 as usize,
                         block.y0 as usize,
-                        &scratch,
+                        scratch,
                         params.step,
                     )
                 };
@@ -495,9 +1028,13 @@ fn decode_codeblocks_parallel(
         })
         .collect::<Vec<_>>();
 
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(Jp2LamError::Cancelled);
+    }
     for result in results {
         result?;
     }
+    planes.store_max_abs(components);
     Ok(())
 }
 
@@ -911,10 +1448,11 @@ impl<'a> Stripe<'a> {
         }
     }
 
-    /// The sample of column `x` whose bit in a sample set is `shift`.
+    /// The sample of column `x` whose bit in a sample set is `shift` (`0, 3, 6, 9`).
     #[inline(always)]
     fn sample(&mut self, x: usize, shift: u32) -> &mut i32 {
-        &mut self.columns[x][(shift / 3) as usize & 3]
+        debug_assert!(matches!(shift, 0 | 3 | 6 | 9));
+        &mut self.columns[x][((shift + 3) >> 2) as usize & 3]
     }
 }
 

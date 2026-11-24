@@ -315,6 +315,14 @@ pub trait ImageCodec: Send + Sync + std::fmt::Debug {
         let _ = (data, descriptor, params, limits);
         None
     }
+
+    /// Drop any retained cross-decode resource cache (such as decoded
+    /// `/JBIG2Globals` symbol dictionaries). Output never depends on this.
+    fn clear_caches(&self) {}
+
+    /// Release idle per-thread scratch held by this codec on the calling
+    /// thread. Output never depends on this.
+    fn release_idle_memory(&self) {}
 }
 
 /// True for filters that require an image codec; false for general byte
@@ -397,6 +405,20 @@ impl CodecRegistry {
 
     pub fn supported_filters(&self) -> impl Iterator<Item = StreamFilter> + '_ {
         self.codecs.iter().map(|c| c.filter())
+    }
+
+    /// Clear any document/resource caches retained inside registered codecs.
+    pub fn clear_caches(&self) {
+        for codec in self.codecs.iter() {
+            codec.clear_caches();
+        }
+    }
+
+    /// Release idle scratch held on the calling thread by registered codecs.
+    pub fn release_idle_memory(&self) {
+        for codec in self.codecs.iter() {
+            codec.release_idle_memory();
+        }
     }
 }
 

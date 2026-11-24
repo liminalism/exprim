@@ -1,8 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-11-24
 
-Decoded output is bit-identical to 0.3.1 on every stream 0.3.1 decoded.
+Decoded output is bit-identical to 0.3.1 on every stream 0.3.1 decoded; the
+public API gains `PreparedJp2` / `prepare_jp2`,
+`inspect_jp2_header_for_reduction`, `Jp2LamError::Cancelled`, and cancellable
+`Jp2Decoder` entry points.
 
 ### Decoding performance
 
@@ -19,10 +22,39 @@ Decoded output is bit-identical to 0.3.1 on every stream 0.3.1 decoded.
   level with its conversion to bytes, and the 5/3 and planar 9/7 writers.
   The eight-bit conversion loop is separate from the rescaling one so the
   compiler vectorises it (about 3% of a 9/7 gray decode).
+- Streaming four-row inverse 5/3 wavelet with runtime AVX2 lifting and fused
+  finest-level RCT plus byte packing (active without the `simd` feature):
+  reversible decodes drop coarse subbands as `LL1` is built, track the integer
+  safety bound during Tier-1 block output instead of scanning full planes, and
+  reconstruct the finest level directly into the caller's packed destination
+  across budgeted row bands (`dwt_ms` 154 → 96 ms on 12.5 MP lossless RGB).
+- Subband-tight Tier-1 planes (`LL1` separate from `HL1` and `LH1/HH1`), inline
+  per-block merge state in Tier-2 (no per-tile hash map), pooled per-worker
+  Tier-1 scratch on `Jp2Decoder`, AVX2 8×4 stripe-to-row block transpose and
+  IEEE-754 midpoint dequantisation, active-component filtering when trailing
+  alpha is ignored, and single-component-at-a-time packed reconstruction when
+  `COD` signals no multiple-component transform (`4 B/px` working storage
+  instead of `8–16 B/px`).
 - Measured on 11-megapixel OpenJPEG-encoded streams, single thread, against
   0.3.1: lossless 5/3 RGB 3260 → about 2000-2300 ms, lossless gray scan
   1130 → 650 ms, 9/7 gray 276 → about 200 ms, 9/7 RGB 499 → 415 ms. With
   four workers 9/7 gray goes 107 → 62 ms.
+
+### API
+
+- `PreparedJp2` and `prepare_jp2` parse container and codestream framing once
+  without copying embedded ICC profiles, paired with
+  `Jp2Decoder::decode_prepared` and `Jp2Decoder::decode_prepared_into`.
+  `inspect_jp2_header_for_reduction` computes wavelet reduction levels from the
+  main header up to the first `SOT` marker without walking tile-parts.
+- Cooperative cancellation via `Jp2LamError::Cancelled` (`is_cancelled`) and
+  `Jp2Decoder::{decode_cancellable, decode_into_cancellable,
+  decode_prepared_cancellable, decode_prepared_into_cancellable}`, polled
+  across Tier-2 packet reading, serial and parallel Tier-1 code-blocks, and
+  post-Tier-1 synthesis bands.
+- Post-Tier-1 parallel synthesis and packing bands strictly honour
+  `DecodeConcurrency::Budgeted(n)` instead of fanning out to the full Rayon
+  pool when `n >= 2`.
 
 ### Decoding robustness
 

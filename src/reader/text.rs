@@ -1,6 +1,5 @@
 use crate::page_ir::{Rect, SharedBytes};
-use crate::text::{GlyphCache, TextPage, TextPageOptions};
-use std::cell::RefCell;
+use crate::text::{TextPage, TextPageOptions};
 use std::sync::Arc;
 
 use crate::reader::session::display_extent;
@@ -286,21 +285,9 @@ fn build_text_page(session: &RenderSession, page: u32) -> Result<TextPage, ReadE
     Ok(text_page_of(session, &semantic))
 }
 
-thread_local! {
-    /// The glyph bounds this thread has worked out, for the session it last
-    /// read text from. Without it every page parses its fonts again, which
-    /// is most of the cost of reading text from a long document.
-    static GLYPHS: RefCell<(Option<u64>, GlyphCache)> = RefCell::new((None, GlyphCache::new()));
-}
-
 fn text_page_of(session: &RenderSession, semantic: &crate::content::SemanticPage) -> TextPage {
-    GLYPHS.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        // Another document: let go of the fonts of the previous one.
-        if slot.0 != Some(session.id()) {
-            *slot = (Some(session.id()), GlyphCache::new());
-        }
-        TextPage::build_with_cache(semantic, &TextPageOptions::default(), &mut slot.1)
+    session.with_text_glyphs(|glyphs| {
+        TextPage::build_with_cache(semantic, &TextPageOptions::default(), glyphs)
     })
 }
 

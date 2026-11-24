@@ -620,6 +620,7 @@ struct ImageCacheKey {
     height: u32,
     bpc: u8,
     is_mask: bool,
+    want_alpha: bool,
     space: Option<(u8, u8)>,
     scale: DecodeScaleKey,
     parms: u64,
@@ -653,6 +654,7 @@ impl ImageCacheKey {
         height: u32,
         bpc: u8,
         is_mask: bool,
+        want_alpha: bool,
         space: Option<&crate::color::ColorSpaceDesc>,
         parms: Option<&crate::page_ir::CodecParms>,
         scale: DecodeScaleKey,
@@ -660,6 +662,9 @@ impl ImageCacheKey {
         let (h0, h1) = content_hash_128(data);
         // `ColorSpaceFamily` is fieldless, so its discriminant is a faithful tag.
         let space = space.map(|cs| (cs.family as u8, cs.components));
+        // Only `/JPXDecode` carries an optional codestream opacity plane whose
+        // inclusion changes the decoded layout (`Rgba8` vs `Rgb8`).
+        let want_alpha = want_alpha && matches!(kind, crate::page_ir::ImageCodecKind::Jpx);
         let parms_hash = match parms {
             None => 0,
             Some(p) => {
@@ -699,6 +704,7 @@ impl ImageCacheKey {
             height,
             bpc,
             is_mask,
+            want_alpha,
             space,
             scale,
             parms: parms_hash,
@@ -2009,6 +2015,7 @@ fn decode_page_images(
             image.height,
             image.bits_per_component,
             image.is_stencil,
+            !image.is_stencil && image.smask_in_data != 0,
             image.codec_parms.clone(),
         );
         if let Some(mask) = image.smask.as_deref() {
@@ -2038,6 +2045,7 @@ fn decode_unique_mask(
         mask.height,
         mask.bits_per_component,
         true,
+        false,
         mask.codec_parms.clone(),
     );
 }
@@ -2053,6 +2061,7 @@ fn decode_unique_payload(
     height: u32,
     bpc: u8,
     is_mask: bool,
+    want_alpha: bool,
     parms: Option<crate::page_ir::CodecParms>,
 ) {
     let (Some(kind), Some(data)) = (kind, data) else {
@@ -2077,7 +2086,7 @@ fn decode_unique_payload(
     };
     if seen.insert(key) {
         if let Some(decoded) = decode_codec_samples(
-            out, kind, data, width, height, bpc, is_mask, parms, None, None,
+            out, kind, data, width, height, bpc, is_mask, want_alpha, true, parms, None, None,
         ) {
             out.profile
                 .borrow_mut()
@@ -3281,13 +3290,95 @@ fn lower_image(
         return None;
     }
 
-    // Direct samples, or a codec decode through the injected registry (no
-    // resource cache yet — decoded per draw op, see DEFERRED.md). A
+    let ring_ok = placement_ring_unchanged_by_promotion(&ctm);
+    let alpha_u8 = to_u8(alpha);
+    let interpolation = if matches!(
+        ir.codec,
+        Some(crate::page_ir::ImageCodecKind::Dct | crate::page_ir::ImageCodecKind::Jpx)
+    ) && !ir.is_stencil
+        && ir.interpolation == crate::page_ir::InterpolationMode::Nearest
+    {
+        crate::page_ir::InterpolationMode::Bilinear
+    } else {
+        ir.interpolation
+    };
+
+    // Fast pre-decode promotion probe: when a codec-backed image is eligible to
+    // promote to RGB8 (`Indexed`, `IccRgb`, `IccCmyk`, `Lab`, `TintLut`,
+    // `TintLut2`, or 16-bit device spaces), key the promoted RGB8 entry directly
+    // off the compressed payload + colour-space/decode identity BEFORE running
+    // the codec. A cache hit skips both codec decoding and full-raster sample
+    // hashing; a miss decodes once without inserting the unpromoted intermediate
+    // (e.g. 32 MiB CMYK8 or 48 MiB RGB16) alongside the 24 MiB RGB8 result.
+    let mut pending_codec_promo: Option<(ImageCacheKey, Option<ImageDecodeFlightGuard<'_>>)> = None;
+    if ir.samples.is_none()
+        && codec_pre_promotion_candidate(ir, ring_ok, alpha_u8)
+        && let (Some(kind), Some(data)) = (ir.codec, ir.codec_data.as_deref())
+        && let Some(promo_key) = codec_promotion_cache_key(out, kind, data, ir, target_size)
+    {
+        if let Some(held) = &out.strip_decodes
+            && let Some(hit) = held.get(&promo_key)
+            && hit.width > 0
+            && hit.height > 0
+        {
+            return Some((
+                build_prepared_from_promoted(
+                    out,
+                    ir,
+                    hit,
+                    bounds,
+                    clip,
+                    clip_has_mask,
+                    inv,
+                    target_size,
+                    interpolation,
+                    stencil_rgb,
+                    alpha_u8,
+                    blend,
+                ),
+                bounds,
+            ));
+        }
+        match out.image_cache.as_ref() {
+            Some(cache) => match cache.probe(promo_key) {
+                ImageCacheProbe::Hit(hit) if hit.width > 0 && hit.height > 0 => {
+                    hold_for_later_strips(out, promo_key, &hit);
+                    return Some((
+                        build_prepared_from_promoted(
+                            out,
+                            ir,
+                            hit,
+                            bounds,
+                            clip,
+                            clip_has_mask,
+                            inv,
+                            target_size,
+                            interpolation,
+                            stencil_rgb,
+                            alpha_u8,
+                            blend,
+                        ),
+                        bounds,
+                    ));
+                }
+                ImageCacheProbe::Hit(_) => {}
+                ImageCacheProbe::Leader(flight) => {
+                    pending_codec_promo = Some((promo_key, Some(flight)));
+                }
+            },
+            None => {
+                pending_codec_promo = Some((promo_key, None));
+            }
+        }
+    }
+
+    // Direct samples, or a codec decode through the injected registry. A
     // zero-dimension image (malformed /Width or /Height) has no pixels to
     // sample regardless of its placement rectangle.
     // A JPX in-data opacity channel (`/SMaskInData`) is split out of the base
     // decode below and used as this image's soft mask.
     let mut in_data_smask: Option<std::sync::Arc<crate::page_ir::ImageSMask>> = None;
+    let cache_raw = pending_codec_promo.is_none();
     let (samples, img_w, img_h, bpc, color_space) = match ir.samples.clone() {
         Some(s) => (
             s,
@@ -3309,7 +3400,7 @@ fn lower_image(
                 return None;
             };
             // A codec-decode failure is already recorded inside `decode_codec_image`.
-            let mut d = decode_codec_image(out, ir, target_size)?;
+            let mut d = decode_codec_image(out, ir, target_size, cache_raw)?;
             // The codec reports a device format from its own channels (a
             // 1-component JPEG → Gray). A *reinterpreting* PDF color space —
             // Indexed, or a `/Separation` tint (`TintLut`) — governs how a
@@ -3440,24 +3531,6 @@ fn lower_image(
         ir.decode.as_deref(),
         ir.is_stencil,
     );
-    // PDFium and MuPDF both smooth continuous-tone images while magnifying
-    // them, including when `/Interpolate` is absent/false. Keeping the
-    // raw-image Nearest policy is important for bilevel and deliberately
-    // pixelated samples, but applying it to continuous-tone scans produces
-    // hard 2×2 sample blocks and materially overstates thresholded scan-tone
-    // deltas. Scope the compatibility policy to decoded continuous-tone codecs
-    // (JPEG and JPEG 2000); JBIG2/CCITT stay Nearest so bilevel ink keeps hard
-    // edges. Minification still takes the area-average branch regardless.
-    let interpolation = if matches!(
-        ir.codec,
-        Some(crate::page_ir::ImageCodecKind::Dct | crate::page_ir::ImageCodecKind::Jpx)
-    ) && !ir.is_stencil
-        && ir.interpolation == crate::page_ir::InterpolationMode::Nearest
-    {
-        crate::page_ir::InterpolationMode::Bilinear
-    } else {
-        ir.interpolation
-    };
     let prepared = Box::new(crate::render_cpu::image::PreparedImage {
         origin: crate::page_ir::PaintOrigin::default(),
         bounds,
@@ -3484,12 +3557,231 @@ fn lower_image(
         ],
         is_stencil: ir.is_stencil,
         stencil_rgb,
-        alpha: to_u8(alpha),
+        alpha: alpha_u8,
         blend,
     });
-    let ring_ok = placement_ring_unchanged_by_promotion(&ctm);
-    let prepared = promote_through_cache(out, prepared, ring_ok);
+    let prepared = match pending_codec_promo {
+        Some((promo_key, flight)) => {
+            finish_codec_promotion(out, prepared, ring_ok, promo_key, flight)
+        }
+        None => promote_through_cache(out, prepared, ring_ok),
+    };
     Some((prepared, bounds))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_prepared_from_promoted(
+    out: &CpuPreparedPage,
+    ir: &crate::page_ir::ImageIr,
+    hit: CodecSamples,
+    bounds: DeviceRect,
+    clip: Option<u32>,
+    clip_has_mask: bool,
+    inv: Matrix,
+    target_size: Option<(u32, u32)>,
+    interpolation: crate::page_ir::InterpolationMode,
+    stencil_rgb: [u8; 3],
+    alpha: u8,
+    blend: crate::page_ir::BlendMode,
+) -> Box<crate::render_cpu::image::PreparedImage> {
+    let (img_w, img_h) = (hit.width, hit.height);
+    Box::new(crate::render_cpu::image::PreparedImage {
+        origin: crate::page_ir::PaintOrigin::default(),
+        bounds,
+        clip,
+        clip_has_mask,
+        inv,
+        width: img_w,
+        height: img_h,
+        bpc: 8,
+        color_space: crate::page_ir::ImageColorSpace::Rgb,
+        decode: None,
+        samples: hit.samples,
+        sample_lut: None,
+        smask: resolve_smask(out, ir.smask.as_deref(), target_size),
+        mask: resolve_mask(out, ir.mask.as_ref(), target_size),
+        interpolation,
+        footprint: [
+            (inv.a.abs() + inv.c.abs()) * img_w as f64,
+            (inv.b.abs() + inv.d.abs()) * img_h as f64,
+        ],
+        is_stencil: ir.is_stencil,
+        stencil_rgb,
+        alpha,
+        blend,
+    })
+}
+
+fn codec_pre_promotion_candidate(
+    ir: &crate::page_ir::ImageIr,
+    ring_ok: bool,
+    alpha_u8: u8,
+) -> bool {
+    const MAX_PROMOTE_PIXELS: usize = 64 * 1024 * 1024;
+    if ir.smask_in_data != 0
+        || ir.is_stencil
+        || !matches!(ir.bits_per_component, 8 | 16)
+        || matches!(ir.mask, Some(crate::page_ir::ImageMask::ColorKey(_)))
+    {
+        return false;
+    }
+    if let Some(n) = (ir.width as usize).checked_mul(ir.height as usize)
+        && n > MAX_PROMOTE_PIXELS
+    {
+        return false;
+    }
+    let sixteen_bit_device = ir.bits_per_component == 16
+        && matches!(
+            ir.color_space,
+            crate::page_ir::ImageColorSpace::Gray
+                | crate::page_ir::ImageColorSpace::Rgb
+                | crate::page_ir::ImageColorSpace::Cmyk
+        );
+    if sixteen_bit_device {
+        let unmasked_opaque = ir.smask.is_none() && ir.mask.is_none() && alpha_u8 == 255;
+        return !unmasked_opaque || ring_ok;
+    }
+    matches!(
+        ir.color_space,
+        crate::page_ir::ImageColorSpace::Indexed { .. }
+            | crate::page_ir::ImageColorSpace::IccRgb { .. }
+            | crate::page_ir::ImageColorSpace::IccCmyk { .. }
+            | crate::page_ir::ImageColorSpace::Lab { .. }
+            | crate::page_ir::ImageColorSpace::TintLut { .. }
+            | crate::page_ir::ImageColorSpace::TintLut2 { .. }
+    )
+}
+
+fn codec_promotion_cache_key(
+    out: &CpuPreparedPage,
+    kind: crate::page_ir::ImageCodecKind,
+    data: &[u8],
+    ir: &crate::page_ir::ImageIr,
+    target_size: Option<(u32, u32)>,
+) -> Option<ImageCacheKey> {
+    use crate::image::{DecodeParameters, ImageDescriptor, StreamFilter};
+    if !(out.image_cache.is_some() || out.strip_decodes.is_some()) {
+        return None;
+    }
+    let filter = match kind {
+        crate::page_ir::ImageCodecKind::Dct => StreamFilter::DctDecode,
+        crate::page_ir::ImageCodecKind::Jpx => StreamFilter::Jpx,
+        crate::page_ir::ImageCodecKind::Jbig2 => StreamFilter::Jbig2,
+        crate::page_ir::ImageCodecKind::CcittFax => StreamFilter::CcittFax,
+    };
+    let codec = out.codecs.get(filter)?;
+    let space_desc = crate::color::ColorSpaceDesc {
+        family: declared_space_family(&ir.color_space),
+        components: ir.color_space.components() as u8,
+        object: None,
+    };
+    let descriptor = ImageDescriptor {
+        width: ir.width,
+        height: ir.height,
+        bits_per_component: ir.bits_per_component,
+        color_space: Some(space_desc),
+        is_mask: false,
+        interpolate: false,
+        filters: vec![filter],
+        object: None,
+    };
+    let params = match &ir.codec_parms {
+        Some(p) => DecodeParameters {
+            decode: None,
+            jbig2_globals: p.jbig2_globals.clone(),
+            ccitt: Some(crate::image::CcittParams {
+                k: p.k,
+                columns: p.columns,
+                rows: p.rows,
+                black_is_1: p.black_is_1,
+                byte_align: p.byte_align,
+                end_of_line: p.end_of_line,
+                end_of_block: p.end_of_block,
+            }),
+            target_size,
+            ignore_alpha: true,
+        },
+        None => DecodeParameters {
+            target_size,
+            ignore_alpha: true,
+            ..DecodeParameters::default()
+        },
+    };
+    let scale = match codec.reduction_level(data, &descriptor, &params, &out.decode_limits) {
+        Some(level) => DecodeScaleKey::Level(level),
+        None => DecodeScaleKey::Target(target_size),
+    };
+    let mut key = ImageCacheKey::new(
+        kind,
+        data,
+        ir.width,
+        ir.height,
+        ir.bits_per_component,
+        false,
+        false,
+        descriptor.color_space.as_ref(),
+        ir.codec_parms.as_ref(),
+        scale,
+    );
+    let mut h = key.parms ^ 0x9E37_79B9_7F4A_7C15;
+    let mut mix = |bytes: &[u8]| {
+        let (a, b) = content_hash_128(bytes);
+        h = (h ^ a).wrapping_mul(0xC2B2_AE3D_27D4_EB4F).rotate_left(29) ^ b;
+    };
+    mix_color_space_identity(&ir.color_space, &mut mix);
+    if let Some(d) = &ir.decode {
+        mix(b"decode");
+        let bytes: Vec<u8> = d
+            .iter()
+            .flatten()
+            .flat_map(|x| x.to_bits().to_le_bytes())
+            .collect();
+        mix(&bytes);
+    }
+    key.codec = PROMOTION_CACHE_CODEC | (1 + key.codec);
+    key.parms = h | 1;
+    Some(key)
+}
+
+fn finish_codec_promotion(
+    out: &CpuPreparedPage,
+    prepared: Box<crate::render_cpu::image::PreparedImage>,
+    ring_ok: bool,
+    promo_key: ImageCacheKey,
+    flight: Option<ImageDecodeFlightGuard<'_>>,
+) -> Box<crate::render_cpu::image::PreparedImage> {
+    let indexed = prepared.indexed_promotion_eligible();
+    let generic = !indexed && prepared.generic_promotion_eligible();
+    if !indexed && !generic {
+        return prepared;
+    }
+    let unmasked_opaque =
+        prepared.smask.is_none() && prepared.mask.is_none() && prepared.alpha == 255;
+    if prepared.is_sixteen_bit_device_family() && unmasked_opaque && !ring_ok {
+        return prepared;
+    }
+    let samples = if indexed {
+        prepared.indexed_source_as_rgb8()
+    } else {
+        prepared.generic_source_as_rgb8()
+    };
+    let Some(samples) = samples else {
+        return prepared;
+    };
+    let resolved = CodecSamples {
+        samples: samples.clone(),
+        width: prepared.width,
+        height: prepared.height,
+        bpc: 8,
+        color_space: crate::page_ir::ImageColorSpace::Rgb,
+        format: crate::image::DecodedFormat::Rgb8,
+        alpha: None,
+    };
+    if let Some(flight) = flight {
+        flight.complete(&resolved);
+    }
+    hold_for_later_strips(out, promo_key, &resolved);
+    Box::new(prepared.with_rgb8_samples(samples))
 }
 
 /// Sentinel `codec` byte of a promotion entry in the image cache (the real
@@ -3624,6 +3916,7 @@ fn promotion_cache_key(img: &crate::render_cpu::image::PreparedImage) -> ImageCa
         height: img.height,
         bpc: img.bpc,
         is_mask: false,
+        want_alpha: false,
         // The colour space is folded into `parms` below.
         space: None,
         // A promotion expands samples already at their final resolution,
@@ -3716,6 +4009,8 @@ fn resolve_smask(
         smask.width,
         smask.height,
         smask.bits_per_component,
+        true,
+        false,
         true,
         smask.codec_parms.clone(),
         target_size,
@@ -3829,6 +4124,7 @@ fn decode_codec_image(
     out: &CpuPreparedPage,
     ir: &crate::page_ir::ImageIr,
     target_size: Option<(u32, u32)>,
+    cache_raw: bool,
 ) -> Option<CodecSamples> {
     decode_codec_samples(
         out,
@@ -3838,6 +4134,8 @@ fn decode_codec_image(
         ir.height,
         ir.bits_per_component,
         ir.is_stencil,
+        !ir.is_stencil && ir.smask_in_data != 0,
+        cache_raw,
         ir.codec_parms.clone(),
         target_size,
         Some(&ir.color_space),
@@ -3877,6 +4175,8 @@ fn decode_codec_samples(
     height: u32,
     bits_per_component: u8,
     is_mask: bool,
+    want_alpha: bool,
+    cache_raw: bool,
     parms: Option<crate::page_ir::CodecParms>,
     target_size: Option<(u32, u32)>,
     declared_space: Option<&crate::page_ir::ImageColorSpace>,
@@ -3959,9 +4259,11 @@ fn decode_codec_samples(
                 end_of_block: p.end_of_block,
             }),
             target_size,
+            ignore_alpha: !want_alpha,
         },
         None => DecodeParameters {
             target_size,
+            ignore_alpha: !want_alpha,
             ..DecodeParameters::default()
         },
     };
@@ -3969,23 +4271,26 @@ fn decode_codec_samples(
     // The codec names the resolution it will decode this draw at, from the
     // same descriptor and parameters the decode below receives, so a reduced
     // decode is only ever served to draws the codec would reduce the same way.
-    let image_key = (out.image_cache.is_some() || out.strip_decodes.is_some()).then(|| {
-        let scale = match codec.reduction_level(data, &descriptor, &params, &out.decode_limits) {
-            Some(level) => DecodeScaleKey::Level(level),
-            None => DecodeScaleKey::Target(target_size),
-        };
-        ImageCacheKey::new(
-            kind,
-            data,
-            width,
-            height,
-            bits_per_component,
-            is_mask,
-            descriptor.color_space.as_ref(),
-            parms.as_ref(),
-            scale,
-        )
-    });
+    let image_key =
+        (cache_raw && (out.image_cache.is_some() || out.strip_decodes.is_some())).then(|| {
+            let scale = match codec.reduction_level(data, &descriptor, &params, &out.decode_limits)
+            {
+                Some(level) => DecodeScaleKey::Level(level),
+                None => DecodeScaleKey::Target(target_size),
+            };
+            ImageCacheKey::new(
+                kind,
+                data,
+                width,
+                height,
+                bits_per_component,
+                is_mask,
+                want_alpha,
+                descriptor.color_space.as_ref(),
+                parms.as_ref(),
+                scale,
+            )
+        });
     // An earlier strip of this render decoded it and kept it for this one.
     if let (Some(held), Some(key)) = (&out.strip_decodes, &image_key)
         && let Some(decoded) = held.get(key)
@@ -4142,6 +4447,8 @@ fn decode_codec_samples(
     let (samples, alpha) = match img.format {
         // The opacity plane is the last of `n` interleaved channels; the base
         // raster keeps the leading `n - 1` (RGB for Rgba8, gray for GrayA8).
+        // When `!want_alpha` (for example a GrayA8 JPX with `/SMaskInData 0`),
+        // skip allocating and populating the unused opacity buffer.
         DecodedFormat::Rgba8 | DecodedFormat::GrayA8 => {
             let n = if matches!(img.format, DecodedFormat::Rgba8) {
                 4
@@ -4151,15 +4458,23 @@ fn decode_codec_samples(
             let base_n = n - 1;
             let px = img.width as usize * img.height as usize;
             let mut base = zeroed_arc(px * base_n);
-            let mut opacity = zeroed_arc(px);
             let base_data = unique_arc_mut(&mut base);
-            let opacity_data = unique_arc_mut(&mut opacity);
-            for i in 0..px {
-                base_data[i * base_n..(i + 1) * base_n]
-                    .copy_from_slice(&samples[i * n..i * n + base_n]);
-                opacity_data[i] = samples[i * n + base_n];
+            if want_alpha {
+                let mut opacity = zeroed_arc(px);
+                let opacity_data = unique_arc_mut(&mut opacity);
+                for i in 0..px {
+                    base_data[i * base_n..(i + 1) * base_n]
+                        .copy_from_slice(&samples[i * n..i * n + base_n]);
+                    opacity_data[i] = samples[i * n + base_n];
+                }
+                (base, Some(opacity))
+            } else {
+                for i in 0..px {
+                    base_data[i * base_n..(i + 1) * base_n]
+                        .copy_from_slice(&samples[i * n..i * n + base_n]);
+                }
+                (base, None)
             }
-            (base, Some(opacity))
         }
         _ => (samples, None),
     };
@@ -6506,92 +6821,8 @@ fn flatten_polylines(path: &PathData, ctm: Matrix) -> Vec<(Vec<[f32; 2]>, bool)>
     out
 }
 
-/// Whether the reduced-resolution decode hint is disabled by environment. Read
-/// once; a measurement/debug switch, not a production toggle (default: enabled).
-/// Despite the variable's name it covers every codec that scales, DCT as well
-/// as JPX, since both read the same hint.
-fn jpx_reduce_disabled() -> bool {
-    use std::sync::OnceLock;
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        std::env::var_os("PDF_RENDERER_JPX_REDUCE")
-            .map(|v| v == "0" || v == "off" || v == "false")
-            .unwrap_or(false)
-    })
-}
-
-/// Destination footprint of a unit-square image placed by `ctm`, in device
-/// pixels, for codecs that can decode at reduced resolution (Phase 2).
-///
-/// The hint is read as (image width, image height), so it is the extent of
-/// each *image* axis: the unit square's x edge maps to the device vector
-/// `(a, b)` and its y edge to `(c, d)`, giving `(|a| + |b|, |c| + |d|)`. For an
-/// axis-aligned placement that is the device bounding box; a quarter turn
-/// (a /Rotate 90 page, a `cm` rotation) used to hand the codec the device box,
-/// i.e. a swapped pair, so a non-square image decoded one or two levels too
-/// large or too small (B6). For a pure rotation the L1 extent is the rotated
-/// edge's own projected box, which never under-reports the footprint.
-///
-/// The extent is deliberately **unclamped** to the surface: a partly
-/// off-screen image still covers its
-/// full device extent, and clamping would under-report it and risk decoding at
-/// too low a resolution. A degenerate or non-invertible placement yields `None`
-/// (decode at full resolution) — such draws paint nothing anyway.
 fn codec_target_size(ctm: Matrix) -> Option<(u32, u32)> {
-    // Measurement switch: `PDF_RENDERER_JPX_REDUCE=0` disables the reduced-
-    // resolution hint so a run reproduces full-resolution, byte-identical
-    // output (Phase-1 hash gate) from the same binary that ships reduction on
-    // by default. Read once.
-    if jpx_reduce_disabled() {
-        return None;
-    }
-    if !ctm.is_stably_invertible() {
-        return None;
-    }
-    // Mapped corner differences rather than the raw coefficients, so an
-    // axis-aligned placement gives exactly the same float extents (and decode
-    // level) as the device bounding box always did.
-    let origin = ctm.apply(Point { x: 0.0, y: 0.0 });
-    let x_edge = ctm.apply(Point { x: 1.0, y: 0.0 });
-    let y_edge = ctm.apply(Point { x: 0.0, y: 1.0 });
-    let w = ((x_edge.x - origin.x).abs() + (x_edge.y - origin.y).abs()).ceil();
-    let h = ((y_edge.x - origin.x).abs() + (y_edge.y - origin.y).abs()).ceil();
-    if !w.is_finite() || !h.is_finite() || w < 1.0 || h < 1.0 {
-        return None;
-    }
-    // The codecs reduce to the smallest scale that still covers the hint (a
-    // JPX wavelet level, a 1/2, 1/4 or 1/8 DCT scale), so hinting the bare
-    // footprint hands the resampler between 1 and 2 source texels per device
-    // pixel. An earlier 2x headroom asked for a full extra octave; on the MRC
-    // scan corpus that rejected the one-level reduction at viewer resolution
-    // (a 2929x4424 layer drawn at 1240x2020 was decoded in full, 300-380 ms
-    // per layer against ~45 ms reduced) and cost more than every
-    // renderer-side image optimisation combined, while PDFium itself decodes
-    // JPX at the reduced level for such draws. The headroom is therefore 1.0
-    // by default; `PDF_RENDERER_JPX_HEADROOM=<f32 >= 1>` restores the extra
-    // octave for paired quality A/B on one binary.
-    let headroom = jpx_headroom() as f64;
-    Some((
-        (w * headroom).ceil().min(u32::MAX as f64) as u32,
-        (h * headroom).ceil().min(u32::MAX as f64) as u32,
-    ))
-}
-
-/// The linear map from a render's device space (placed by `base`) to a
-/// reference render's device space (placed by `reference`), for a request's
-/// image decode floor. Only the size of a footprint matters, so translation
-/// is dropped. `None` when `base` cannot be inverted (a degenerate request,
-/// which paints nothing) or the map is not finite.
-pub(crate) fn decode_floor_map(base: Matrix, reference: Matrix) -> Option<Matrix> {
-    if !base.is_stably_invertible() {
-        return None;
-    }
-    let map = Matrix {
-        e: 0.0,
-        f: 0.0,
-        ..base.invert()?.then(reference)
-    };
-    map.is_finite().then_some(map)
+    crate::page_ir::codec_footprint_size(ctm)
 }
 
 /// The footprint hint for one image draw: its own device footprint
@@ -6617,19 +6848,21 @@ fn decode_target_size(ctm: Matrix, floor: Option<Matrix>) -> Option<(u32, u32)> 
     }
 }
 
-/// Multiplier applied to the device footprint before it is handed to the codec
-/// as a reduced-resolution hint. Read once from `PDF_RENDERER_JPX_HEADROOM`;
-/// values below 1 or non-finite fall back to the default of 1.0.
-fn jpx_headroom() -> f32 {
-    use std::sync::OnceLock;
-    static HEADROOM: OnceLock<f32> = OnceLock::new();
-    *HEADROOM.get_or_init(|| {
-        std::env::var("PDF_RENDERER_JPX_HEADROOM")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .filter(|h| h.is_finite() && *h >= 1.0)
-            .unwrap_or(1.0)
-    })
+/// The linear map from a render's device space (placed by `base`) to a
+/// reference render's device space (placed by `reference`), for a request's
+/// image decode floor. Only the size of a footprint matters, so translation
+/// is dropped. `None` when `base` cannot be inverted (a degenerate request,
+/// which paints nothing) or the map is not finite.
+pub(crate) fn decode_floor_map(base: Matrix, reference: Matrix) -> Option<Matrix> {
+    if !base.is_stably_invertible() {
+        return None;
+    }
+    let map = Matrix {
+        e: 0.0,
+        f: 0.0,
+        ..base.invert()?.then(reference)
+    };
+    map.is_finite().then_some(map)
 }
 
 /// The corrupt-geometry reference extent of a render: the largest absolute
@@ -8141,6 +8374,7 @@ mod image_cache_tests {
             height: 1,
             bpc: 8,
             is_mask: false,
+            want_alpha: false,
             space: None,
             scale: DecodeScaleKey::Level(0),
             parms: 0,
@@ -9172,5 +9406,45 @@ mod image_cache_tests {
         }));
         assert!(unwind.is_err());
         assert!(matches!(cache.probe(key), ImageCacheProbe::Leader(_)));
+    }
+
+    #[test]
+    fn promoted_codec_image_retains_only_single_rgb8_entry_in_cache() {
+        let size = 16u32;
+        let payload = jpeg_payload_sized(size as u16, 42);
+        let mut page = dct_page_sized(payload, size);
+        let mut lookup = Vec::with_capacity(256 * 3);
+        for i in 0..=255u8 {
+            lookup.extend_from_slice(&[i, 255 - i, i / 2]);
+        }
+        let mut img = page.images[0].clone();
+        img.color_space = ImageColorSpace::Indexed {
+            base: Box::new(ImageColorSpace::Rgb),
+            hival: 255,
+            lookup: Arc::from(lookup),
+        };
+        page.images = Arc::from([img]);
+
+        let uncached = lower_page_at(&page, 1.0, size, None);
+        let cache = Arc::new(SharedImageCache::default());
+        let first = lower_page_at(&page, 1.0, size, Some(&cache));
+        let expected_single_entry =
+            (size * size * 3) as usize + std::mem::size_of::<ImageCacheEntry>() + 64;
+        assert_eq!(
+            cache.retained_bytes(),
+            expected_single_entry,
+            "cache must hold only the 3 B/px RGB8 promotion, not raw + promoted"
+        );
+        assert_eq!(cache.stats(), (0, 1, 1));
+
+        let second = lower_page_at(&page, 1.0, size, Some(&cache));
+        assert_eq!(
+            cache.stats(),
+            (1, 1, 1),
+            "second draw hits pre-decode promotion key without decoding or hashing raw samples"
+        );
+        assert_eq!(cache.retained_bytes(), expected_single_entry);
+        assert_eq!(render_pixels(&first), render_pixels(&uncached));
+        assert_eq!(render_pixels(&second), render_pixels(&uncached));
     }
 }

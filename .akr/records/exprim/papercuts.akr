@@ -1,0 +1,90 @@
+akr 0.1
+project exprim
+
+record exprim.papercut.akr-propose-uses-a-specific-body-file-flag-not/1 : papercut {
+    title "akr propose uses a specific body-file flag (not --file), causing…"
+    state verified
+    statement """
+        akr propose uses a specific body-file flag (not --file), causing AKR-C002 when --file is guessed.
+        """
+    observed_at git:9cb999b02eeb7c82194757c2e5fdcdef46a32b50
+    author "antigravity"
+    created_at 2026-11-24
+}
+
+record exprim.papercut.akr-revise-rejected-a-48-word-trace-entry-with/1 : papercut {
+    title "akr revise rejected a 48-word trace entry with AKR-T024 (40-word limit…"
+    state verified
+    statement """
+        akr revise rejected a 48-word trace entry with AKR-T024 (40-word limit per trace entry); split multi-metric trace summaries into <=40-word entries.
+        """
+    observed_at git:9cb999b02eeb7c82194757c2e5fdcdef46a32b50
+    author "antigravity"
+    created_at 2026-11-24
+}
+
+record exprim.papercut.akr-start-takes-the-task-string-positionally/1 : papercut {
+    title "akr start takes the task string positionally and uses --paths <glob>…"
+    state verified
+    statement """
+        akr start takes the task string positionally and uses --paths <glob> (plural), whereas passing --task or --path fails with AKR-C002.
+        """
+    observed_at git:9cb999b02eeb7c82194757c2e5fdcdef46a32b50
+    author "antigravity"
+    created_at 2026-11-24
+}
+
+record exprim.papercut.assumed-exprim-image-decodedformat-grayalpha8/1 : papercut {
+    title "Assumed exprim::image::DecodedFormat::GrayAlpha8 in…"
+    state verified
+    statement """
+        Assumed exprim::image::DecodedFormat::GrayAlpha8 in tests/image_jpx_codec.rs instead of checking src/image/jpx.rs, where the variant is named DecodedFormat::GrayA8.
+        """
+    observed_at git:9cb999b02eeb7c82194757c2e5fdcdef46a32b50
+    author "antigravity"
+    created_at 2026-11-24
+}
+
+record exprim.papercut.cargo-clippy-d-warnings-under-rustc-1-99-flags/1 : papercut {
+    title "cargo clippy -- -D warnings under rustc 1.99 flags…"
+    state verified
+    statement """
+        cargo clippy -- -D warnings under rustc 1.99 flags clippy::chunks_exact_to_as_chunks on untouched build.rs (lines 268 and 315).
+        """
+    observed_at git:9cb999b02eeb7c82194757c2e5fdcdef46a32b50
+    author "antigravity"
+    created_at 2026-11-24
+}
+
+record exprim.papercut.jp2lam-inspect-jp2-with-limits-returns-jp2lam/1 : papercut {
+    title "jp2lam::inspect_jp2_with_limits returns jp2lam::DecodeMetadata rather…"
+    state verified
+    statement """
+        jp2lam::inspect_jp2_with_limits returns jp2lam::DecodeMetadata rather than Jp2Metadata; checked codecs/jp2lam/src/lib.rs exports to align the import.
+        """
+    observed_at git:9cb999b02eeb7c82194757c2e5fdcdef46a32b50
+    author "antigravity"
+    created_at 2026-11-24
+}
+
+record exprim.papercut.powershell-5-1-array-splatting-featargs-before/1 : papercut {
+    title "PowerShell 5.1 array splatting (@featArgs) before --example caused…"
+    state verified
+    statement """
+        PowerShell 5.1 array splatting (@featArgs) before --example caused cargo run to miss --example decode_benchmark; pass explicit flags instead of splatting flag arrays into native commands.
+        """
+    observed_at git:9cb999b02eeb7c82194757c2e5fdcdef46a32b50
+    author "antigravity"
+    created_at 2026-11-24
+}
+
+record exprim.papercut.ran-akr-explain-plan-after-reading-agents-md/1 : papercut {
+    title "Ran 'akr explain plan' after reading AGENTS.md ('Replacing a plan...…"
+    state verified
+    statement """
+        Ran 'akr explain plan' after reading AGENTS.md ('Replacing a plan... Unsure what a kind requires? akr explain <kind>'), which failed with AKR-C004 because 'plan' is prose shorthand rather than a record kind; listing valid kinds in AKR-C004 help or AGENTS.md would avoid a retry.
+        """
+    observed_at git:9cb999b02eeb7c82194757c2e5fdcdef46a32b50
+    author "antigravity"
+    created_at 2026-11-24
+}

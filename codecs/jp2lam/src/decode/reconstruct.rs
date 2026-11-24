@@ -12,7 +12,11 @@ use rayon::prelude::*;
 
 use super::stats::StatsSink;
 use super::t1::{CoefficientPlane, DecodedTileCoefficients};
-use crate::dwt::SynthesisPrefix;
+use crate::dwt::{
+    LevelSynth53Scratch, LevelSynthScratch, SynthesisPrefix, SynthesisPrefix53, i32_lifting_is_safe,
+};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Parallelize fused pack when the plane has at least this many samples.
 const FUSED_PACK_PARALLEL_SAMPLES: usize = 256 * 1024;
@@ -26,21 +30,77 @@ const FUSED_PACK_PARALLEL_SAMPLES: usize = 256 * 1024;
 /// `rayon::current_num_threads()` reports that pool's size, not the budget.
 /// Every caller's job is a pure per-chunk map, so the bytes do not depend on
 /// the budget.
-fn for_each_chunk_mut<T: Send>(
+struct DisjointSlice<'a, T>(UnsafeCell<&'a mut [T]>);
+
+// SAFETY: `for_each_chunk_budgeted` hands each slice index to at most one
+// worker via an atomic cursor, so no two threads ever access the same cell.
+unsafe impl<T: Send> Send for DisjointSlice<'_, T> {}
+unsafe impl<T: Send> Sync for DisjointSlice<'_, T> {}
+
+/// Run `job` over `data` in `chunk_len`-element chunks using at most `workers`
+/// concurrent Rayon tasks, with one reusable `S` scratch per worker and
+/// cooperative cancellation before each chunk.
+///
+/// Unlike raw `par_chunks_mut`, spawning `0..task_count` workers with an atomic
+/// cursor strictly honors `DecodeConcurrency::Budgeted(workers)` even on a
+/// larger shared Rayon pool, and avoids allocating per-band scratch buffers for
+/// every chunk up front. When `workers <= 1` or there is at most one chunk,
+/// runs directly on the calling thread with zero Rayon overhead.
+fn for_each_chunk_budgeted<T: Send, S>(
     data: &mut [T],
     chunk_len: usize,
     workers: usize,
-    job: impl Fn(usize, &mut [T]) + Send + Sync,
-) {
-    if workers > 1 {
-        data.par_chunks_mut(chunk_len)
-            .enumerate()
-            .for_each(|(index, chunk)| job(index, chunk));
-    } else {
-        data.chunks_mut(chunk_len)
-            .enumerate()
-            .for_each(|(index, chunk)| job(index, chunk));
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    init_scratch: impl Fn() -> S + Send + Sync,
+    job: impl Fn(usize, &mut [T], &mut S) + Send + Sync,
+) -> Result<()> {
+    if data.is_empty() {
+        return Ok(());
     }
+    let chunk_len = chunk_len.max(1);
+    if workers <= 1 || data.len() <= chunk_len {
+        let mut scratch = init_scratch();
+        for (index, chunk) in data.chunks_mut(chunk_len).enumerate() {
+            if cancel.is_some_and(|f| f()) {
+                return Err(Jp2LamError::Cancelled);
+            }
+            job(index, chunk, &mut scratch);
+        }
+        return Ok(());
+    }
+
+    let chunks: Vec<DisjointSlice<'_, T>> = data
+        .chunks_mut(chunk_len)
+        .map(|slice| DisjointSlice(UnsafeCell::new(slice)))
+        .collect();
+    let task_count = workers.min(chunks.len()).max(1);
+    let cursor = AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
+
+    (0..task_count).into_par_iter().for_each(|_| {
+        let mut scratch = init_scratch();
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            let index = cursor.fetch_add(1, Ordering::Relaxed);
+            if index >= chunks.len() {
+                return;
+            }
+            if cancel.is_some_and(|f| f()) {
+                cancelled.store(true, Ordering::Relaxed);
+                return;
+            }
+            // SAFETY: `cursor.fetch_add` yields each `index < chunks.len()` at most once.
+            let slice: &mut [T] = unsafe { *chunks[index].0.get() };
+            job(index, slice, &mut scratch);
+        }
+    });
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(Jp2LamError::Cancelled);
+    }
+    Ok(())
 }
 
 pub(crate) fn reconstruct_image_profiled(
@@ -231,15 +291,8 @@ fn reconstruct_color_planes_finalized(
         WaveletTransform::Reversible53 => {
             let mut planes = Vec::with_capacity(tiles.len());
             for tile in tiles {
-                let component = tile.component;
-                let (w, h) = (tile.width, tile.height);
-                planes.push(reconstruct_reversible_53_centered(
-                    header,
-                    tile.into_integer()?,
-                    component,
-                    w,
-                    h,
-                    stats,
+                planes.push(reconstruct_reversible_53_tile_centered(
+                    header, tile, stats,
                 )?);
             }
             if apply_mct {
@@ -261,13 +314,8 @@ fn reconstruct_color_planes_finalized(
         WaveletTransform::Irreversible97 => {
             let mut planes = Vec::with_capacity(tiles.len());
             for tile in tiles {
-                let (w, h) = (tile.width, tile.height);
-                planes.push(reconstruct_irreversible_97_centered(
-                    header,
-                    tile.into_real()?,
-                    w,
-                    h,
-                    stats,
+                planes.push(reconstruct_irreversible_97_tile_centered(
+                    header, tile, stats,
                 )?);
             }
             if apply_mct {
@@ -298,23 +346,14 @@ fn reconstruct_aux_component_finalized(
     stats: &mut StatsSink<'_>,
 ) -> Result<Vec<i32>> {
     let component = tile.component;
-    let (w, h) = (tile.width, tile.height);
     let precision = header.siz.components[component].precision;
     Ok(match header.transform_for(component) {
         WaveletTransform::Irreversible97 => {
-            let centered =
-                reconstruct_irreversible_97_centered(header, tile.into_real()?, w, h, stats)?;
+            let centered = reconstruct_irreversible_97_tile_centered(header, tile, stats)?;
             finalize_f32_samples(centered, precision)
         }
         WaveletTransform::Reversible53 => {
-            let centered = reconstruct_reversible_53_centered(
-                header,
-                tile.into_integer()?,
-                component,
-                w,
-                h,
-                stats,
-            )?;
+            let centered = reconstruct_reversible_53_tile_centered(header, tile, stats)?;
             finalize_i32_samples(centered, precision)
         }
     })
@@ -595,6 +634,7 @@ pub(crate) fn reconstruct_packed_u8_into(
     tiles: Vec<DecodedTileCoefficients>,
     target: PackedWriteTarget<'_>,
     workers: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
     target.validate()?;
@@ -618,7 +658,7 @@ pub(crate) fn reconstruct_packed_u8_into(
     }
     match colorspace {
         ColorSpace::Gray if channels == 1 => {
-            reconstruct_grayscale_u8_into(header, tiles, target, workers, stats)
+            reconstruct_grayscale_u8_into(header, tiles, target, workers, cancel, stats)
         }
         ColorSpace::Gray | ColorSpace::Srgb | ColorSpace::Cmyk => reconstruct_interleaved_u8_into(
             header,
@@ -629,6 +669,7 @@ pub(crate) fn reconstruct_packed_u8_into(
             tiles,
             target,
             workers,
+            cancel,
             stats,
         ),
         ColorSpace::YCbCr => {
@@ -640,15 +681,216 @@ pub(crate) fn reconstruct_packed_u8_into(
     }
 }
 
+/// Reconstruct a single 8-bit non-MCT component directly into `dst_channel` of
+/// `target` (`0 <= dst_channel < target.channels`), streaming row bands out of
+/// the synthesis ring so only one component's subbands reside in memory at once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconstruct_component_channel_u8_into(
+    header: &CodestreamHeader,
+    tile: DecodedTileCoefficients,
+    dst_channel: usize,
+    target: &mut PackedWriteTarget<'_>,
+    workers: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    stats: &mut StatsSink<'_>,
+) -> Result<()> {
+    target.validate()?;
+    let comp_idx = tile.component;
+    let component = header
+        .siz
+        .components
+        .get(comp_idx)
+        .ok_or_else(|| invalid("missing decoded component header"))?;
+    let width = header.siz.width as usize;
+    let height = header.siz.height as usize;
+    if tile.width != width || tile.height != height || dst_channel >= target.channels {
+        return Err(invalid("component channel write geometry mismatch"));
+    }
+    let levels = header.cod.decomposition_levels;
+    let common_even = levels >= 1 && use_common_even_dwt(header);
+    let channels = target.channels;
+    let (w, sx, sy) = (target.width, target.source_x, target.source_y);
+    let (x0, stride) = (target.origin_x, target.stride);
+
+    let start = stats.start();
+    match header.transform_for(comp_idx) {
+        WaveletTransform::Reversible53
+            if common_even && i32_lifting_is_safe(tile.max_abs, levels, false) =>
+        {
+            let kernel = PRIMITIVES.kernel;
+            let dwt_start = stats.start();
+            let prefix = build_prefix_53(tile, levels, kernel, stats)?;
+            record_dwt_time(stats, dwt_start);
+            stats.update(|s| {
+                s.reconstructed_pixels = s
+                    .reconstructed_pixels
+                    .saturating_add((width * height) as u64);
+            });
+            let shift = 1i32 << (component.precision - 1);
+            let max_sample = ((1i32 << component.precision) - 1) as u32;
+            for_each_row_band_cancellable(
+                target,
+                workers,
+                cancel,
+                LevelSynth53Scratch::new,
+                |first_row, band, scratch| {
+                    let mut synth =
+                        prefix.final_level_with_scratch(kernel, sy + first_row, scratch);
+                    for out in band.chunks_mut(stride) {
+                        let row = synth.next_row();
+                        scatter_gray_row_i32(
+                            &mut out[x0 * channels..(x0 + w) * channels],
+                            channels,
+                            dst_channel,
+                            &row[sx..sx + w],
+                            shift,
+                            max_sample,
+                        );
+                    }
+                },
+            )?;
+        }
+        WaveletTransform::Reversible53 => {
+            let centered = reconstruct_reversible_53_tile_centered(header, tile, stats)?;
+            let shift = 1i32 << (component.precision - 1);
+            let max_sample = ((1i32 << component.precision) - 1) as u32;
+            for_each_row_band_cancellable(
+                target,
+                workers,
+                cancel,
+                || (),
+                |first_row, band, ()| {
+                    for (row, out) in band.chunks_mut(stride).enumerate() {
+                        let source = (sy + first_row + row) * width + sx;
+                        scatter_gray_row_i32(
+                            &mut out[x0 * channels..(x0 + w) * channels],
+                            channels,
+                            dst_channel,
+                            &centered[source..source + w],
+                            shift,
+                            max_sample,
+                        );
+                    }
+                },
+            )?;
+        }
+        WaveletTransform::Irreversible97 if common_even => {
+            let kernel = PRIMITIVES.kernel;
+            let dwt_start = stats.start();
+            let prefix = build_prefix_97(tile, levels, kernel, stats)?;
+            record_dwt_time(stats, dwt_start);
+            stats.update(|s| {
+                s.reconstructed_pixels = s
+                    .reconstructed_pixels
+                    .saturating_add((width * height) as u64);
+            });
+            let shift = (1u32 << (component.precision - 1)) as f32;
+            let max_sample = (1u32 << component.precision) - 1;
+            for_each_row_band_cancellable(
+                target,
+                workers,
+                cancel,
+                LevelSynthScratch::new,
+                |first_row, band, scratch| {
+                    let mut synth =
+                        prefix.final_level_with_scratch(kernel, sy + first_row, scratch);
+                    for out in band.chunks_mut(stride) {
+                        let row = synth.next_row();
+                        scatter_gray_row_f32(
+                            &mut out[x0 * channels..(x0 + w) * channels],
+                            channels,
+                            dst_channel,
+                            &row[sx..sx + w],
+                            shift,
+                            max_sample,
+                        );
+                    }
+                },
+            )?;
+        }
+        WaveletTransform::Irreversible97 => {
+            let centered = reconstruct_irreversible_97_tile_centered(header, tile, stats)?;
+            let shift = (1u32 << (component.precision - 1)) as f32;
+            let max_sample = (1u32 << component.precision) - 1;
+            for_each_row_band_cancellable(
+                target,
+                workers,
+                cancel,
+                || (),
+                |first_row, band, ()| {
+                    for (row, out) in band.chunks_mut(stride).enumerate() {
+                        let source = (sy + first_row + row) * width + sx;
+                        scatter_gray_row_f32(
+                            &mut out[x0 * channels..(x0 + w) * channels],
+                            channels,
+                            dst_channel,
+                            &centered[source..source + w],
+                            shift,
+                            max_sample,
+                        );
+                    }
+                },
+            )?;
+        }
+    }
+    record_finalize_time(stats, start);
+    Ok(())
+}
+
+#[inline]
+fn scatter_gray_row_i32(
+    out: &mut [u8],
+    channels: usize,
+    dst_channel: usize,
+    row: &[i32],
+    shift: i32,
+    max_sample: u32,
+) {
+    if max_sample == 255 {
+        for (px, &sample) in out.chunks_exact_mut(channels).zip(row) {
+            px[dst_channel] = sample.saturating_add(shift).clamp(0, 255) as u8;
+        }
+    } else {
+        for (px, &sample) in out.chunks_exact_mut(channels).zip(row) {
+            let v = sample.saturating_add(shift).clamp(0, max_sample as i32) as u32;
+            px[dst_channel] = scale_unsigned_to_u8(v, max_sample);
+        }
+    }
+}
+
+#[inline]
+fn scatter_gray_row_f32(
+    out: &mut [u8],
+    channels: usize,
+    dst_channel: usize,
+    row: &[f32],
+    shift: f32,
+    max_sample: u32,
+) {
+    if max_sample == 255 {
+        for (px, &sample) in out.chunks_exact_mut(channels).zip(row) {
+            px[dst_channel] = (sample + shift + 0.5).clamp(0.0, 255.0) as u8;
+        }
+    } else {
+        for (px, &sample) in out.chunks_exact_mut(channels).zip(row) {
+            let v = (sample + shift + 0.5).clamp(0.0, max_sample as f32) as u32;
+            px[dst_channel] = scale_unsigned_to_u8(v, max_sample);
+        }
+    }
+}
+
 fn reconstruct_grayscale_u8_into(
     header: &CodestreamHeader,
     mut tiles: Vec<DecodedTileCoefficients>,
     mut target: PackedWriteTarget<'_>,
     workers: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
+    tiles.sort_by_key(|tile| tile.component);
+    tiles.truncate(1);
     if tiles.len() != 1 {
-        return Err(invalid("Gray8 output requires exactly one component"));
+        return Err(invalid("Gray8 output requires at least one component"));
     }
     let tile = tiles.remove(0);
     let component = header
@@ -668,16 +910,27 @@ fn reconstruct_grayscale_u8_into(
     }
 
     let start = stats.start();
+    let levels = header.cod.decomposition_levels;
     match header.transform_for(0) {
-        WaveletTransform::Reversible53 => {
-            let centered = reconstruct_reversible_53_centered(
+        WaveletTransform::Reversible53
+            if levels >= 1
+                && use_common_even_dwt(header)
+                && i32_lifting_is_safe(tile.max_abs, levels, false) =>
+        {
+            reconstruct_gray_53_fused_plane_into(
                 header,
-                tile.into_integer()?,
-                0,
+                tile,
                 width,
                 height,
+                component.precision,
+                &mut target,
+                workers,
+                cancel,
                 stats,
             )?;
+        }
+        WaveletTransform::Reversible53 => {
+            let centered = reconstruct_reversible_53_tile_centered(header, tile, stats)?;
             let shift = 1i32 << (component.precision - 1);
             let max_sample = (1i32 << component.precision) - 1;
             write_gray_plane_i32(
@@ -689,28 +942,21 @@ fn reconstruct_grayscale_u8_into(
                 workers,
             );
         }
-        WaveletTransform::Irreversible97
-            if header.cod.decomposition_levels >= 1 && use_common_even_dwt(header) =>
-        {
-            reconstruct_gray_97_fused_into(
+        WaveletTransform::Irreversible97 if levels >= 1 && use_common_even_dwt(header) => {
+            reconstruct_gray_97_fused_plane_into(
                 header,
-                tile.into_real()?,
+                tile,
                 width,
                 height,
                 component.precision,
                 &mut target,
                 workers,
+                cancel,
                 stats,
             )?;
         }
         WaveletTransform::Irreversible97 => {
-            let centered = reconstruct_irreversible_97_centered(
-                header,
-                tile.into_real()?,
-                width,
-                height,
-                stats,
-            )?;
+            let centered = reconstruct_irreversible_97_tile_centered(header, tile, stats)?;
             let shift = (1u32 << (component.precision - 1)) as f32;
             let max_sample = (1u32 << component.precision) - 1;
             write_gray_plane_f32(&centered, width, shift, max_sample, &mut target, workers);
@@ -731,11 +977,13 @@ fn reconstruct_grayscale_u8_into(
 /// and an image large enough to pay for it the bands run across the decode
 /// executor; otherwise there is one band, on the calling thread. Each row is
 /// a pure function of its position, so the bytes do not depend on the split.
-fn for_each_row_band(
+fn for_each_row_band_cancellable<S>(
     target: &mut PackedWriteTarget<'_>,
     workers: usize,
-    job: impl Fn(usize, &mut [u8]) + Send + Sync,
-) {
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    init_scratch: impl Fn() -> S + Send + Sync,
+    job: impl Fn(usize, &mut [u8], &mut S) + Send + Sync,
+) -> Result<()> {
     let stride = target.stride;
     let rows = target.height;
     let start = target.origin_y * stride;
@@ -746,53 +994,142 @@ fn for_each_row_band(
     } else {
         (rows, 1)
     };
-    for_each_chunk_mut(
+    for_each_chunk_budgeted(
         &mut target.data[start..end],
         rows_per_band * stride,
         workers,
-        |band, chunk| job(band * rows_per_band, chunk),
+        cancel,
+        init_scratch,
+        |band, chunk, scratch| job(band * rows_per_band, chunk, scratch),
+    )
+}
+
+fn for_each_row_band(
+    target: &mut PackedWriteTarget<'_>,
+    workers: usize,
+    job: impl Fn(usize, &mut [u8]) + Send + Sync,
+) {
+    let _ = for_each_row_band_cancellable(
+        target,
+        workers,
+        None,
+        || (),
+        |first_row, chunk, ()| job(first_row, chunk),
     );
 }
 
-/// Irreversible 9/7 gray straight to bytes: every level but the finest runs
-/// into quarter-size buffers, then the finest level is synthesised row by row
-/// and each row is level-shifted, rounded and clamped into the target as it
-/// leaves the synthesis ring. The same kernel and per-sample conversion as the
-/// planar path (`reconstruct_irreversible_97_centered` +
-/// `write_gray_plane_f32`), so the bytes are identical; the full-resolution
-/// `f32` plane is never written or read back (two plane-sized passes fewer).
-/// The finest level runs in row bands across the worker budget, each band
-/// with its own synthesis ring.
-/// Callers check `use_common_even_dwt` and at least one level first.
+fn build_prefix_97(
+    tile: DecodedTileCoefficients,
+    levels: u8,
+    kernel: Kernel,
+    stats: &mut StatsSink<'_>,
+) -> Result<SynthesisPrefix> {
+    let (w, h) = (tile.width, tile.height);
+    Ok(match tile.plane {
+        CoefficientPlane::SplitReal(split) => {
+            if stats.is_enabled() {
+                let mut timing = crate::dwt::InverseDwtTiming::default();
+                let p = crate::dwt::inverse_97_2d_even_but_last_split(
+                    split,
+                    levels,
+                    kernel,
+                    Some(&mut timing),
+                );
+                record_dwt_breakdown(stats, timing);
+                p
+            } else {
+                crate::dwt::inverse_97_2d_even_but_last_split(split, levels, kernel, None)
+            }
+        }
+        CoefficientPlane::Real(data) => {
+            if stats.is_enabled() {
+                let mut timing = crate::dwt::InverseDwtTiming::default();
+                let p = crate::dwt::inverse_97_2d_even_but_last(
+                    data,
+                    w,
+                    h,
+                    levels,
+                    kernel,
+                    Some(&mut timing),
+                );
+                record_dwt_breakdown(stats, timing);
+                p
+            } else {
+                crate::dwt::inverse_97_2d_even_but_last(data, w, h, levels, kernel, None)
+            }
+        }
+        CoefficientPlane::Integer(_) | CoefficientPlane::SplitInteger(_) => {
+            return Err(invalid(
+                "irreversible reconstruction requested for a reversible coefficient plane",
+            ));
+        }
+    })
+}
+
+fn build_prefix_53(
+    tile: DecodedTileCoefficients,
+    levels: u8,
+    kernel: Kernel,
+    stats: &mut StatsSink<'_>,
+) -> Result<SynthesisPrefix53> {
+    let (w, h) = (tile.width, tile.height);
+    Ok(match tile.plane {
+        CoefficientPlane::SplitInteger(split) => {
+            if stats.is_enabled() {
+                let mut timing = crate::dwt::InverseDwtTiming::default();
+                let p = crate::dwt::inverse_53_2d_even_but_last_split(
+                    split,
+                    levels,
+                    kernel,
+                    Some(&mut timing),
+                );
+                record_dwt_breakdown(stats, timing);
+                p
+            } else {
+                crate::dwt::inverse_53_2d_even_but_last_split(split, levels, kernel, None)
+            }
+        }
+        CoefficientPlane::Integer(data) => {
+            if stats.is_enabled() {
+                let mut timing = crate::dwt::InverseDwtTiming::default();
+                let p = crate::dwt::inverse_53_2d_even_but_last(
+                    data,
+                    w,
+                    h,
+                    levels,
+                    kernel,
+                    Some(&mut timing),
+                );
+                record_dwt_breakdown(stats, timing);
+                p
+            } else {
+                crate::dwt::inverse_53_2d_even_but_last(data, w, h, levels, kernel, None)
+            }
+        }
+        CoefficientPlane::Real(_) | CoefficientPlane::SplitReal(_) => {
+            return Err(invalid(
+                "reversible reconstruction requested for an irreversible coefficient plane",
+            ));
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
-fn reconstruct_gray_97_fused_into(
+fn reconstruct_gray_97_fused_plane_into(
     header: &CodestreamHeader,
-    data: Vec<f32>,
+    tile: DecodedTileCoefficients,
     width: usize,
     height: usize,
     precision: u8,
     target: &mut PackedWriteTarget<'_>,
     workers: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
     let levels = header.cod.decomposition_levels;
     let kernel = PRIMITIVES.kernel;
     let dwt_start = stats.start();
-    let prefix = if stats.is_enabled() {
-        let mut timing = crate::dwt::InverseDwtTiming::default();
-        let prefix = crate::dwt::inverse_97_2d_even_but_last(
-            data,
-            width,
-            height,
-            levels,
-            kernel,
-            Some(&mut timing),
-        );
-        record_dwt_breakdown(stats, timing);
-        prefix
-    } else {
-        crate::dwt::inverse_97_2d_even_but_last(data, width, height, levels, kernel, None)
-    };
+    let prefix = build_prefix_97(tile, levels, kernel, stats)?;
     record_dwt_time(stats, dwt_start);
     stats.update(|stats| {
         stats.reconstructed_pixels = stats
@@ -804,14 +1141,97 @@ fn reconstruct_gray_97_fused_into(
     let max_sample = (1u32 << precision) - 1;
     let (w, sx, sy) = (target.width, target.source_x, target.source_y);
     let (x0, stride) = (target.origin_x, target.stride);
-    for_each_row_band(target, workers, |first_row, band| {
-        let mut synth = prefix.final_level(kernel, sy + first_row);
-        for out in band.chunks_mut(stride) {
-            let row = synth.next_row();
-            finalize_gray_row_f32(&mut out[x0..x0 + w], &row[sx..sx + w], shift, max_sample);
-        }
+    for_each_row_band_cancellable(
+        target,
+        workers,
+        cancel,
+        LevelSynthScratch::new,
+        |first_row, band, scratch| {
+            let mut synth = prefix.final_level_with_scratch(kernel, sy + first_row, scratch);
+            for out in band.chunks_mut(stride) {
+                let row = synth.next_row();
+                finalize_gray_row_f32(&mut out[x0..x0 + w], &row[sx..sx + w], shift, max_sample);
+            }
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_gray_53_fused_plane_into(
+    header: &CodestreamHeader,
+    tile: DecodedTileCoefficients,
+    width: usize,
+    height: usize,
+    precision: u8,
+    target: &mut PackedWriteTarget<'_>,
+    workers: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    stats: &mut StatsSink<'_>,
+) -> Result<()> {
+    if header.quant_for(tile.component).style != QuantizationStyle::NoQuantization {
+        return Err(invalid(
+            "reversible 5/3 reconstruction expects no quantization",
+        ));
+    }
+    let levels = header.cod.decomposition_levels;
+    let kernel = PRIMITIVES.kernel;
+    let dwt_start = stats.start();
+    let prefix = build_prefix_53(tile, levels, kernel, stats)?;
+    record_dwt_time(stats, dwt_start);
+    stats.update(|stats| {
+        stats.reconstructed_pixels = stats
+            .reconstructed_pixels
+            .saturating_add((width * height) as u64);
     });
-    Ok(())
+
+    let shift = 1i32 << (precision - 1);
+    let max_sample = ((1i32 << precision) - 1) as u32;
+    let (w, sx, sy) = (target.width, target.source_x, target.source_y);
+    let (x0, stride) = (target.origin_x, target.stride);
+    for_each_row_band_cancellable(
+        target,
+        workers,
+        cancel,
+        LevelSynth53Scratch::new,
+        |first_row, band, scratch| {
+            let mut synth = prefix.final_level_with_scratch(kernel, sy + first_row, scratch);
+            for out in band.chunks_mut(stride) {
+                let row = synth.next_row();
+                finalize_gray_row_i32(&mut out[x0..x0 + w], &row[sx..sx + w], shift, max_sample);
+            }
+        },
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_gray_97_fused_into(
+    header: &CodestreamHeader,
+    data: Vec<f32>,
+    width: usize,
+    height: usize,
+    precision: u8,
+    target: &mut PackedWriteTarget<'_>,
+    workers: usize,
+    stats: &mut StatsSink<'_>,
+) -> Result<()> {
+    reconstruct_gray_97_fused_plane_into(
+        header,
+        DecodedTileCoefficients {
+            component: 0,
+            width,
+            height,
+            max_abs: 0,
+            plane: CoefficientPlane::Real(data),
+        },
+        width,
+        height,
+        precision,
+        target,
+        workers,
+        None,
+        stats,
+    )
 }
 
 /// Level-shift, round and clamp one row of centred 9/7 samples to bytes.
@@ -902,15 +1322,22 @@ fn reconstruct_interleaved_u8_into(
     mut tiles: Vec<DecodedTileCoefficients>,
     mut target: PackedWriteTarget<'_>,
     workers: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
     let decoded = header.siz.components.len();
-    if !matches!(channels, 2 | 3 | 4) || tiles.len() != decoded || decoded < colour_channels {
+    let keep = match layout {
+        PackedLayout::Rgbx => colour_channels,
+        PackedLayout::Bgra => decoded.min(colour_channels + 1),
+        PackedLayout::Sequential => channels.min(decoded),
+    };
+    if !matches!(channels, 2 | 3 | 4) || tiles.len() < keep || decoded < colour_channels {
         return Err(invalid(format!(
             "{colorspace:?} packed output needs ≥{colour_channels} colour components of {decoded} decoded (channels={channels})"
         )));
     }
     tiles.sort_by_key(|tile| tile.component);
+    tiles.truncate(keep);
     if tiles
         .iter()
         .enumerate()
@@ -920,12 +1347,6 @@ fn reconstruct_interleaved_u8_into(
             "decoded packed-output components are not contiguous",
         ));
     }
-    let keep = match layout {
-        PackedLayout::Rgbx => colour_channels,
-        PackedLayout::Bgra => decoded.min(colour_channels + 1),
-        PackedLayout::Sequential => channels.min(decoded),
-    };
-    tiles.truncate(keep);
     let source_width = header.siz.width as usize;
     let pixel_count = source_width * header.siz.height as usize;
     let colour_count = colour_channels.min(tiles.len());
@@ -940,6 +1361,7 @@ fn reconstruct_interleaved_u8_into(
             pixel_count,
             &mut target,
             workers,
+            cancel,
             stats,
         );
     }
@@ -1039,6 +1461,7 @@ fn reconstruct_fused_packed_into(
     pixel_count: usize,
     target: &mut PackedWriteTarget<'_>,
     workers: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
     debug_assert_eq!(colour_count, 3);
@@ -1050,6 +1473,9 @@ fn reconstruct_fused_packed_into(
 
     match header.cod.transform {
         WaveletTransform::Irreversible97 => {
+            if cancel.is_some_and(|f| f()) {
+                return Err(Jp2LamError::Cancelled);
+            }
             let aux_u8 = match aux_tile {
                 Some(tile) => Some(reconstruct_aux_component_u8(header, tile, stats)?),
                 None => None,
@@ -1064,22 +1490,21 @@ fn reconstruct_fused_packed_into(
                     channels,
                     target,
                     workers,
+                    cancel,
                     stats,
                 );
             }
             let mut planes = Vec::with_capacity(3);
             for tile in colour_tiles {
-                let (w, h) = (tile.width, tile.height);
-                planes.push(reconstruct_irreversible_97_centered(
-                    header,
-                    tile.into_real()?,
-                    w,
-                    h,
-                    stats,
+                if cancel.is_some_and(|f| f()) {
+                    return Err(Jp2LamError::Cancelled);
+                }
+                planes.push(reconstruct_irreversible_97_tile_centered(
+                    header, tile, stats,
                 )?);
             }
             let start = stats.start();
-            fuse_pack_f32_into(
+            fuse_pack_f32_into_cancellable(
                 &planes[0],
                 &planes[1],
                 &planes[2],
@@ -1091,29 +1516,45 @@ fn reconstruct_fused_packed_into(
                 header.siz.width as usize,
                 target,
                 workers,
+                cancel,
             )?;
             record_finalize_time(stats, start);
         }
         WaveletTransform::Reversible53 => {
-            let mut planes = Vec::with_capacity(3);
-            for tile in colour_tiles {
-                let component = tile.component;
-                let (w, h) = (tile.width, tile.height);
-                planes.push(reconstruct_reversible_53_centered(
-                    header,
-                    tile.into_integer()?,
-                    component,
-                    w,
-                    h,
-                    stats,
-                )?);
+            if cancel.is_some_and(|f| f()) {
+                return Err(Jp2LamError::Cancelled);
             }
+            // Convert any auxiliary (alpha / CMYK K) plane to 1 B/px first so
+            // its 4 B/px coefficient buffer drops before colour synthesis.
             let aux_u8 = match aux_tile {
                 Some(tile) => Some(reconstruct_aux_component_u8(header, tile, stats)?),
                 None => None,
             };
+            if fused_final_level_53_applies(header, &colour_tiles, pixel_count, target, apply_mct) {
+                return reconstruct_reversible_53_fused_pack(
+                    header,
+                    colour_tiles,
+                    aux_u8.as_deref(),
+                    apply_mct,
+                    layout,
+                    channels,
+                    target,
+                    workers,
+                    cancel,
+                    stats,
+                );
+            }
+            let mut planes = Vec::with_capacity(3);
+            for tile in colour_tiles {
+                if cancel.is_some_and(|f| f()) {
+                    return Err(Jp2LamError::Cancelled);
+                }
+                planes.push(reconstruct_reversible_53_tile_centered(
+                    header, tile, stats,
+                )?);
+            }
             let start = stats.start();
-            fuse_pack_i32_into(
+            fuse_pack_i32_into_cancellable(
                 &planes[0],
                 &planes[1],
                 &planes[2],
@@ -1125,6 +1566,7 @@ fn reconstruct_fused_packed_into(
                 header.siz.width as usize,
                 target,
                 workers,
+                cancel,
             )?;
             record_finalize_time(stats, start);
         }
@@ -1385,6 +1827,7 @@ fn rct_rgb_i32(y: i32, db: i32, dr: i32) -> (u8, u8, u8) {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn fuse_pack_f32_into(
     y: &[f32],
     cb: &[f32],
@@ -1397,6 +1840,37 @@ fn fuse_pack_f32_into(
     plane_width: usize,
     target: &mut PackedWriteTarget<'_>,
     workers: usize,
+) -> Result<()> {
+    fuse_pack_f32_into_cancellable(
+        y,
+        cb,
+        cr,
+        aux,
+        apply_ict,
+        layout,
+        channels,
+        pixel_count,
+        plane_width,
+        target,
+        workers,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fuse_pack_f32_into_cancellable(
+    y: &[f32],
+    cb: &[f32],
+    cr: &[f32],
+    aux: Option<&[u8]>,
+    apply_ict: bool,
+    layout: PackedLayout,
+    channels: usize,
+    pixel_count: usize,
+    plane_width: usize,
+    target: &mut PackedWriteTarget<'_>,
+    workers: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> Result<()> {
     if y.len() != pixel_count || cb.len() != pixel_count || cr.len() != pixel_count {
         return Err(invalid("fused pack plane length mismatch"));
@@ -1424,14 +1898,14 @@ fn fuse_pack_f32_into(
     };
 
     if tight {
-        // Contiguous destination: coarse row jobs, spread over the pool only
-        // when the request's budget allows (see `for_each_chunk_mut`).
-        let rows_per_job = h.div_ceil(rayon::current_num_threads().max(1) * 2).max(1);
-        for_each_chunk_mut(
+        let rows_per_job = h.div_ceil(workers.max(1) * 2).max(16);
+        for_each_chunk_budgeted(
             &mut target.data[..h * stride],
             rows_per_job * stride,
             workers,
-            |job, chunk| {
+            cancel,
+            || (),
+            |job, chunk, ()| {
                 let first_row = job * rows_per_job;
                 for (k, out_row) in chunk.chunks_exact_mut(stride).enumerate() {
                     let i0 = (first_row + k) * w;
@@ -1445,9 +1919,12 @@ fn fuse_pack_f32_into(
                     );
                 }
             },
-        );
+        )?;
     } else {
         for py in 0..h {
+            if (py & 63) == 0 && cancel.is_some_and(|f| f()) {
+                return Err(Jp2LamError::Cancelled);
+            }
             let i0 = target.source_index(0, py, plane_width);
             let off = target.pixel_offset(0, py);
             pack_row_f32(
@@ -1605,7 +2082,194 @@ fn pack_row_f32(
     }
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod pack_i32_avx2 {
+    use super::{PackRowI32Params, PackedLayout};
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    /// Pack leading pixels in groups of eight using AVX2 integer RCT + clamp +
+    /// byte shuffle, matching [`super::rct_rgb_i32`] and
+    /// [`super::finalize_centered_i32_u8`] bit-for-bit.
+    ///
+    /// # Safety
+    /// The CPU must support AVX2.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn pack_row_prefix(
+        y: &[i32],
+        db: &[i32],
+        dr: &[i32],
+        aux: Option<&[u8]>,
+        params: PackRowI32Params,
+        out: &mut [u8],
+    ) -> usize {
+        let width = y.len();
+        let channels = params.channels;
+        debug_assert!(db.len() == width && dr.len() == width && out.len() == width * channels);
+        if let Some(aux) = aux {
+            debug_assert_eq!(aux.len(), width);
+        }
+        enum Mode {
+            Rgb,
+            Rgba,
+            Rgbx,
+            Bgra,
+        }
+        let (mode, count) = match (params.layout, channels) {
+            (PackedLayout::Sequential, 3) => (
+                Mode::Rgb,
+                if width >= 10 {
+                    ((width - 10) / 8 + 1) * 8
+                } else {
+                    0
+                },
+            ),
+            (PackedLayout::Sequential, 4) => (Mode::Rgba, width & !7),
+            (PackedLayout::Rgbx, 4) => (Mode::Rgbx, width & !7),
+            (PackedLayout::Bgra, 4) => (Mode::Bgra, width & !7),
+            _ => return 0,
+        };
+        if count == 0 {
+            return 0;
+        }
+        let min_c = _mm256_set1_epi32(-128);
+        let max_c = _mm256_set1_epi32(127);
+        let shift = _mm256_set1_epi32(128);
+        let opaque = _mm256_set1_epi32(0xff << 24);
+        #[rustfmt::skip]
+        let rgb_shuffle = _mm256_setr_epi8(
+            0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1,
+            0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1,
+        );
+        // `v.clamp(-128, 127) + 128 == v.saturating_add(128).clamp(0, 255)` for all `i32`.
+        let finalize = |v: __m256i| -> __m256i {
+            _mm256_add_epi32(_mm256_min_epi32(_mm256_max_epi32(v, min_c), max_c), shift)
+        };
+        let mut x = 0usize;
+        while x < count {
+            // SAFETY: `x + 8 <= count <= width`.
+            let (yy, dbv, drv) = unsafe {
+                (
+                    _mm256_loadu_si256(y.as_ptr().add(x).cast()),
+                    _mm256_loadu_si256(db.as_ptr().add(x).cast()),
+                    _mm256_loadu_si256(dr.as_ptr().add(x).cast()),
+                )
+            };
+            let (r, g, b) = if params.apply_rct {
+                let g = _mm256_sub_epi32(yy, _mm256_srai_epi32(_mm256_add_epi32(dbv, drv), 2));
+                (_mm256_add_epi32(drv, g), g, _mm256_add_epi32(dbv, g))
+            } else {
+                (yy, dbv, drv)
+            };
+            let r = finalize(r);
+            let g = finalize(g);
+            let b = finalize(b);
+            let alpha = || -> __m256i {
+                match aux {
+                    Some(aux) => {
+                        // SAFETY: `x + 8 <= width == aux.len()`.
+                        let bytes = unsafe { _mm_loadl_epi64(aux.as_ptr().add(x).cast()) };
+                        _mm256_slli_epi32(_mm256_cvtepu8_epi32(bytes), 24)
+                    }
+                    None => opaque,
+                }
+            };
+            let g8 = _mm256_slli_epi32(g, 8);
+            match mode {
+                Mode::Rgb => {
+                    let px = _mm256_or_si256(_mm256_or_si256(r, g8), _mm256_slli_epi32(b, 16));
+                    let packed = _mm256_shuffle_epi8(px, rgb_shuffle);
+                    // SAFETY: `3 * x + 28 <= 3 * width` by `count`.
+                    unsafe {
+                        let dst = out.as_mut_ptr().add(3 * x);
+                        _mm_storeu_si128(dst.cast(), _mm256_castsi256_si128(packed));
+                        _mm_storeu_si128(dst.add(12).cast(), _mm256_extracti128_si256(packed, 1));
+                    }
+                }
+                Mode::Rgba => {
+                    let px = _mm256_or_si256(
+                        _mm256_or_si256(r, g8),
+                        _mm256_or_si256(_mm256_slli_epi32(b, 16), alpha()),
+                    );
+                    // SAFETY: `4 * x + 32 <= 4 * width`.
+                    unsafe { _mm256_storeu_si256(out.as_mut_ptr().add(4 * x).cast(), px) };
+                }
+                Mode::Rgbx => {
+                    let px = _mm256_or_si256(
+                        _mm256_or_si256(r, g8),
+                        _mm256_or_si256(_mm256_slli_epi32(b, 16), opaque),
+                    );
+                    // SAFETY: `4 * x + 32 <= 4 * width`.
+                    unsafe { _mm256_storeu_si256(out.as_mut_ptr().add(4 * x).cast(), px) };
+                }
+                Mode::Bgra => {
+                    let px = _mm256_or_si256(
+                        _mm256_or_si256(b, g8),
+                        _mm256_or_si256(_mm256_slli_epi32(r, 16), alpha()),
+                    );
+                    // SAFETY: `4 * x + 32 <= 4 * width`.
+                    unsafe { _mm256_storeu_si256(out.as_mut_ptr().add(4 * x).cast(), px) };
+                }
+            }
+            x += 8;
+        }
+        count
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PackRowI32Params {
+    apply_rct: bool,
+    layout: PackedLayout,
+    channels: usize,
+    kernel: Kernel,
+}
+
+fn pack_row_i32(
+    y: &[i32],
+    db: &[i32],
+    dr: &[i32],
+    aux: Option<&[u8]>,
+    params: PackRowI32Params,
+    out: &mut [u8],
+) {
+    let channels = params.channels;
+    let width = y.len();
+    debug_assert_eq!(out.len(), width * channels);
+    let mut x = 0usize;
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if params.kernel == Kernel::Avx2 {
+        // SAFETY: `Kernel::Avx2` is only selected after runtime AVX2 detection.
+        x = unsafe { pack_i32_avx2::pack_row_prefix(y, db, dr, aux, params, out) };
+    }
+    while x < width {
+        let (r, g, b) = if params.apply_rct {
+            rct_rgb_i32(y[x], db[x], dr[x])
+        } else {
+            (
+                finalize_centered_i32_u8(y[x]),
+                finalize_centered_i32_u8(db[x]),
+                finalize_centered_i32_u8(dr[x]),
+            )
+        };
+        let a = aux.map_or(255, |p| p[x]);
+        store_rgb_layout(
+            &mut out[x * channels..(x + 1) * channels],
+            params.layout,
+            channels,
+            r,
+            g,
+            b,
+            a,
+        );
+        x += 1;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn fuse_pack_i32_into(
     y: &[i32],
     db: &[i32],
@@ -1619,6 +2283,37 @@ fn fuse_pack_i32_into(
     target: &mut PackedWriteTarget<'_>,
     workers: usize,
 ) -> Result<()> {
+    fuse_pack_i32_into_cancellable(
+        y,
+        db,
+        dr,
+        aux,
+        apply_rct,
+        layout,
+        channels,
+        pixel_count,
+        plane_width,
+        target,
+        workers,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fuse_pack_i32_into_cancellable(
+    y: &[i32],
+    db: &[i32],
+    dr: &[i32],
+    aux: Option<&[u8]>,
+    apply_rct: bool,
+    layout: PackedLayout,
+    channels: usize,
+    pixel_count: usize,
+    plane_width: usize,
+    target: &mut PackedWriteTarget<'_>,
+    workers: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+) -> Result<()> {
     if y.len() != pixel_count || db.len() != pixel_count || dr.len() != pixel_count {
         return Err(invalid("fused pack plane length mismatch"));
     }
@@ -1629,75 +2324,59 @@ fn fuse_pack_i32_into(
     }
     let w = target.width;
     let h = target.height;
+    let stride = target.stride;
     let tight = target.source_x == 0
         && target.source_y == 0
         && w * h == pixel_count
         && target.origin_x == 0
         && target.origin_y == 0
-        && target.stride == w * channels
+        && stride == w * channels
         && pixel_count >= FUSED_PACK_PARALLEL_SAMPLES;
+    let row = PackRowI32Params {
+        apply_rct,
+        layout,
+        channels,
+        kernel: PRIMITIVES.kernel,
+    };
 
     if tight {
-        // Coarse pixel jobs, spread over the pool only when the request's
-        // budget allows (see `for_each_chunk_mut`).
-        let pixels_per_job = (pixel_count / rayon::current_num_threads().max(1) / 2).max(1024);
-        let active = pixel_count * channels;
-        for_each_chunk_mut(
-            &mut target.data[..active],
-            pixels_per_job * channels,
+        let rows_per_job = h.div_ceil(workers.max(1) * 2).max(16);
+        for_each_chunk_budgeted(
+            &mut target.data[..h * stride],
+            rows_per_job * stride,
             workers,
-            |job, chunk| {
-                let base = job * pixels_per_job;
-                let n = chunk.len() / channels;
-                for x in 0..n {
-                    let i = base + x;
-                    let (r, g, b) = if apply_rct {
-                        rct_rgb_i32(y[i], db[i], dr[i])
-                    } else {
-                        (
-                            finalize_centered_i32_u8(y[i]),
-                            finalize_centered_i32_u8(db[i]),
-                            finalize_centered_i32_u8(dr[i]),
-                        )
-                    };
-                    let a = aux.map(|p| p[i]).unwrap_or(255);
-                    store_rgb_layout(
-                        &mut chunk[x * channels..(x + 1) * channels],
-                        layout,
-                        channels,
-                        r,
-                        g,
-                        b,
-                        a,
+            cancel,
+            || (),
+            |job, chunk, ()| {
+                let first_row = job * rows_per_job;
+                for (k, out_row) in chunk.chunks_exact_mut(stride).enumerate() {
+                    let i0 = (first_row + k) * w;
+                    pack_row_i32(
+                        &y[i0..i0 + w],
+                        &db[i0..i0 + w],
+                        &dr[i0..i0 + w],
+                        aux.map(|p| &p[i0..i0 + w]),
+                        row,
+                        out_row,
                     );
                 }
             },
-        );
+        )?;
     } else {
         for py in 0..h {
-            for px in 0..w {
-                let i = target.source_index(px, py, plane_width);
-                let (r, g, b) = if apply_rct {
-                    rct_rgb_i32(y[i], db[i], dr[i])
-                } else {
-                    (
-                        finalize_centered_i32_u8(y[i]),
-                        finalize_centered_i32_u8(db[i]),
-                        finalize_centered_i32_u8(dr[i]),
-                    )
-                };
-                let a = aux.map(|p| p[i]).unwrap_or(255);
-                let off = target.pixel_offset(px, py);
-                store_rgb_layout(
-                    &mut target.data[off..off + channels],
-                    layout,
-                    channels,
-                    r,
-                    g,
-                    b,
-                    a,
-                );
+            if (py & 63) == 0 && cancel.is_some_and(|f| f()) {
+                return Err(Jp2LamError::Cancelled);
             }
+            let i0 = target.source_index(0, py, plane_width);
+            let off = target.pixel_offset(0, py);
+            pack_row_i32(
+                &y[i0..i0 + w],
+                &db[i0..i0 + w],
+                &dr[i0..i0 + w],
+                aux.map(|p| &p[i0..i0 + w]),
+                row,
+                &mut target.data[off..off + w * channels],
+            );
         }
     }
     Ok(())
@@ -1919,23 +2598,14 @@ fn reconstruct_aux_component_u8(
     stats: &mut StatsSink<'_>,
 ) -> Result<Vec<u8>> {
     let component = tile.component;
-    let (w, h) = (tile.width, tile.height);
     let precision = header.siz.components[component].precision;
     Ok(match header.transform_for(component) {
         WaveletTransform::Irreversible97 => {
-            let centered =
-                reconstruct_irreversible_97_centered(header, tile.into_real()?, w, h, stats)?;
+            let centered = reconstruct_irreversible_97_tile_centered(header, tile, stats)?;
             centered_f32_to_u8(centered, precision)
         }
         WaveletTransform::Reversible53 => {
-            let centered = reconstruct_reversible_53_centered(
-                header,
-                tile.into_integer()?,
-                component,
-                w,
-                h,
-                stats,
-            )?;
+            let centered = reconstruct_reversible_53_tile_centered(header, tile, stats)?;
             centered_i32_to_u8(centered, precision)
         }
     })
@@ -2008,18 +2678,148 @@ fn reconstruct_srgb_image(
     })
 }
 
+fn reconstruct_reversible_53_tile_centered(
+    header: &CodestreamHeader,
+    tile: DecodedTileCoefficients,
+    stats: &mut StatsSink<'_>,
+) -> Result<Vec<i32>> {
+    let component = tile.component;
+    let (width, height, max_abs) = (tile.width, tile.height, tile.max_abs);
+    if header.quant_for(component).style != QuantizationStyle::NoQuantization {
+        return Err(invalid(
+            "reversible 5/3 reconstruction expects no quantization",
+        ));
+    }
+    let levels = header.cod.decomposition_levels;
+    if use_common_even_dwt(header) && i32_lifting_is_safe(max_abs, levels, false) {
+        let dwt_start = stats.start();
+        let kernel = PRIMITIVES.kernel;
+        let out = match tile.plane {
+            CoefficientPlane::SplitInteger(split) => {
+                if stats.is_enabled() {
+                    let mut timing = crate::dwt::InverseDwtTiming::default();
+                    let out = crate::dwt::inverse_53_2d_even_split(
+                        split,
+                        levels,
+                        kernel,
+                        Some(&mut timing),
+                    );
+                    record_dwt_breakdown(stats, timing);
+                    out
+                } else {
+                    crate::dwt::inverse_53_2d_even_split(split, levels, kernel, None)
+                }
+            }
+            CoefficientPlane::Integer(data) => {
+                if stats.is_enabled() {
+                    let mut timing = crate::dwt::InverseDwtTiming::default();
+                    let out = crate::dwt::inverse_53_2d_even(
+                        data,
+                        width,
+                        height,
+                        levels,
+                        kernel,
+                        Some(&mut timing),
+                    );
+                    record_dwt_breakdown(stats, timing);
+                    out
+                } else {
+                    crate::dwt::inverse_53_2d_even(data, width, height, levels, kernel, None)
+                }
+            }
+            CoefficientPlane::Real(_) | CoefficientPlane::SplitReal(_) => {
+                return Err(invalid(
+                    "reversible reconstruction requested for an irreversible coefficient plane",
+                ));
+            }
+        };
+        record_dwt_time(stats, dwt_start);
+        stats.update(|stats| {
+            stats.reconstructed_pixels =
+                stats.reconstructed_pixels.saturating_add(out.len() as u64);
+        });
+        return Ok(out);
+    }
+    reconstruct_reversible_53_centered(
+        header,
+        tile.into_integer()?,
+        component,
+        width,
+        height,
+        stats,
+    )
+}
+
+fn reconstruct_irreversible_97_tile_centered(
+    header: &CodestreamHeader,
+    tile: DecodedTileCoefficients,
+    stats: &mut StatsSink<'_>,
+) -> Result<Vec<f32>> {
+    let (width, height) = (tile.width, tile.height);
+    let levels = header.cod.decomposition_levels;
+    if use_common_even_dwt(header) {
+        let dwt_start = stats.start();
+        let kernel = PRIMITIVES.kernel;
+        let out = match tile.plane {
+            CoefficientPlane::SplitReal(split) => {
+                if stats.is_enabled() {
+                    let mut timing = crate::dwt::InverseDwtTiming::default();
+                    let out = crate::dwt::inverse_97_2d_even_split(
+                        split,
+                        levels,
+                        kernel,
+                        Some(&mut timing),
+                    );
+                    record_dwt_breakdown(stats, timing);
+                    out
+                } else {
+                    crate::dwt::inverse_97_2d_even_split(split, levels, kernel, None)
+                }
+            }
+            CoefficientPlane::Real(data) => {
+                if stats.is_enabled() {
+                    let mut timing = crate::dwt::InverseDwtTiming::default();
+                    let out = crate::dwt::inverse_97_2d_even(
+                        data,
+                        width,
+                        height,
+                        levels,
+                        kernel,
+                        Some(&mut timing),
+                    );
+                    record_dwt_breakdown(stats, timing);
+                    out
+                } else {
+                    crate::dwt::inverse_97_2d_even(data, width, height, levels, kernel, None)
+                }
+            }
+            CoefficientPlane::Integer(_) | CoefficientPlane::SplitInteger(_) => {
+                return Err(invalid(
+                    "irreversible reconstruction requested for a reversible coefficient plane",
+                ));
+            }
+        };
+        record_dwt_time(stats, dwt_start);
+        stats.update(|stats| {
+            stats.reconstructed_pixels =
+                stats.reconstructed_pixels.saturating_add(out.len() as u64);
+        });
+        return Ok(out);
+    }
+    reconstruct_irreversible_97_centered(header, tile.into_real()?, width, height, stats)
+}
 /// True when the tile-component origin is aligned to the full decomposition
 /// lattice (`2^levels`). Every synthesis step then has even phase, so the
 /// origin-zero optimized inverse DWT is bit-identical to the phase-aware path
 /// and is preferred for multi-tile streams with regular tile grids.
-fn lattice_aligned_origin(x0: usize, y0: usize, levels: u8) -> bool {
+pub(crate) fn lattice_aligned_origin(x0: usize, y0: usize, levels: u8) -> bool {
     let Some(alignment) = 1usize.checked_shl(u32::from(levels)) else {
         return false;
     };
     x0.is_multiple_of(alignment) && y0.is_multiple_of(alignment)
 }
 
-fn use_common_even_dwt(header: &CodestreamHeader) -> bool {
+pub(crate) fn use_common_even_dwt(header: &CodestreamHeader) -> bool {
     lattice_aligned_origin(
         header.siz.x_origin as usize,
         header.siz.y_origin as usize,
@@ -2121,21 +2921,41 @@ fn fused_final_level_applies(
                 && tile.width * tile.height == pixel_count
                 && target.source_x + target.width <= tile.width
                 && target.source_y + target.height <= tile.height
-                && matches!(tile.plane, CoefficientPlane::Real(_))
+                && matches!(
+                    tile.plane,
+                    CoefficientPlane::Real(_) | CoefficientPlane::SplitReal(_)
+                )
         })
 }
 
-/// Irreversible 9/7 to packed bytes without materialising the colour planes:
-/// every level but the finest runs per component into quarter-size buffers,
-/// then the finest level of all three components is synthesised row by row in
-/// lockstep and each row triple goes through the inverse ICT and byte packing
-/// straight out of the synthesis rings. The full-resolution planes are never
-/// written or read back, which removes six plane-sized memory passes.
-///
-/// With a worker budget above one, the three coarse-level syntheses run
-/// concurrently and rows are banded across the Rayon pool when the target is
-/// contiguous (each band primes its own pipelines, see `dwt::stream97`). With
-/// a budget of one, everything runs in order on the calling thread.
+fn fused_final_level_53_applies(
+    header: &CodestreamHeader,
+    colour_tiles: &[DecodedTileCoefficients],
+    pixel_count: usize,
+    target: &PackedWriteTarget<'_>,
+    apply_rct: bool,
+) -> bool {
+    let levels = header.cod.decomposition_levels;
+    let plane_width = header.siz.width as usize;
+    levels >= 1
+        && use_common_even_dwt(header)
+        && colour_tiles.len() == 3
+        && colour_tiles.iter().all(|tile| {
+            tile.width == plane_width
+                && tile.width > 0
+                && tile.height > 0
+                && tile.width * tile.height == pixel_count
+                && target.source_x + target.width <= tile.width
+                && target.source_y + target.height <= tile.height
+                && header.quant_for(tile.component).style == QuantizationStyle::NoQuantization
+                && matches!(
+                    tile.plane,
+                    CoefficientPlane::Integer(_) | CoefficientPlane::SplitInteger(_)
+                )
+                && i32_lifting_is_safe(tile.max_abs, levels, apply_rct)
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_irreversible_97_fused_pack(
     header: &CodestreamHeader,
@@ -2146,6 +2966,7 @@ fn reconstruct_irreversible_97_fused_pack(
     channels: usize,
     target: &mut PackedWriteTarget<'_>,
     workers: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
     let levels = header.cod.decomposition_levels;
@@ -2155,30 +2976,19 @@ fn reconstruct_irreversible_97_fused_pack(
     let prefixes: Vec<SynthesisPrefix> = if stats.is_enabled() {
         let mut prefixes = Vec::with_capacity(3);
         for tile in colour_tiles {
-            let (w, h) = (tile.width, tile.height);
-            let mut timing = crate::dwt::InverseDwtTiming::default();
-            prefixes.push(crate::dwt::inverse_97_2d_even_but_last(
-                tile.into_real()?,
-                w,
-                h,
-                levels,
-                kernel,
-                Some(&mut timing),
-            ));
-            record_dwt_breakdown(stats, timing);
+            if cancel.is_some_and(|f| f()) {
+                return Err(Jp2LamError::Cancelled);
+            }
+            prefixes.push(build_prefix_97(tile, levels, kernel, stats)?);
         }
         prefixes
     } else {
-        let synthesize = |tile: DecodedTileCoefficients| {
-            let (w, h) = (tile.width, tile.height);
-            Ok(crate::dwt::inverse_97_2d_even_but_last(
-                tile.into_real()?,
-                w,
-                h,
-                levels,
-                kernel,
-                None,
-            ))
+        let synthesize = |tile: DecodedTileCoefficients| -> Result<SynthesisPrefix> {
+            if cancel.is_some_and(|f| f()) {
+                return Err(Jp2LamError::Cancelled);
+            }
+            let mut disabled = StatsSink::disabled();
+            build_prefix_97(tile, levels, kernel, &mut disabled)
         };
         if workers > 1 {
             colour_tiles
@@ -2223,15 +3033,24 @@ fn reconstruct_irreversible_97_fused_pack(
         && pixel_count >= FUSED_PACK_PARALLEL_SAMPLES
         && workers > 1;
     if tight {
-        let rows_per_band = h.div_ceil(rayon::current_num_threads() * 2).max(16);
-        target.data[..h * stride]
-            .par_chunks_mut(rows_per_band * stride)
-            .enumerate()
-            .for_each(|(band, chunk)| {
+        let rows_per_band = h.div_ceil(workers.max(1) * 2).max(16);
+        for_each_chunk_budgeted(
+            &mut target.data[..h * stride],
+            rows_per_band * stride,
+            workers,
+            cancel,
+            || {
+                (
+                    LevelSynthScratch::new(),
+                    LevelSynthScratch::new(),
+                    LevelSynthScratch::new(),
+                )
+            },
+            |band, chunk, (sy_s, scb_s, scr_s)| {
                 let first = sy + band * rows_per_band;
-                let mut sy_ = py.final_level(kernel, first);
-                let mut scb = pcb.final_level(kernel, first);
-                let mut scr = pcr.final_level(kernel, first);
+                let mut sy_ = py.final_level_with_scratch(kernel, first, sy_s);
+                let mut scb = pcb.final_level_with_scratch(kernel, first, scb_s);
+                let mut scr = pcr.final_level_with_scratch(kernel, first, scr_s);
                 for (k, out_row) in chunk.chunks_exact_mut(stride).enumerate() {
                     let y_row = sy_.next_row();
                     let cb_row = scb.next_row();
@@ -2245,12 +3064,19 @@ fn reconstruct_irreversible_97_fused_pack(
                         out_row,
                     );
                 }
-            });
+            },
+        )?;
     } else {
-        let mut sy_ = py.final_level(kernel, sy);
-        let mut scb = pcb.final_level(kernel, sy);
-        let mut scr = pcr.final_level(kernel, sy);
+        let mut sy_s = LevelSynthScratch::new();
+        let mut scb_s = LevelSynthScratch::new();
+        let mut scr_s = LevelSynthScratch::new();
+        let mut sy_ = py.final_level_with_scratch(kernel, sy, &mut sy_s);
+        let mut scb = pcb.final_level_with_scratch(kernel, sy, &mut scb_s);
+        let mut scr = pcr.final_level_with_scratch(kernel, sy, &mut scr_s);
         for py_ in 0..h {
+            if (py_ & 63) == 0 && cancel.is_some_and(|f| f()) {
+                return Err(Jp2LamError::Cancelled);
+            }
             let off = target.pixel_offset(0, py_);
             let y_row = sy_.next_row();
             let cb_row = scb.next_row();
@@ -2259,6 +3085,153 @@ fn reconstruct_irreversible_97_fused_pack(
                 &y_row[sx..sx + w],
                 &cb_row[sx..sx + w],
                 &cr_row[sx..sx + w],
+                aux_row(py_),
+                params,
+                &mut target.data[off..off + w * channels],
+            );
+        }
+    }
+    record_finalize_time(stats, start);
+    stats.update(|stats| {
+        stats.output_pixels = stats.output_pixels.saturating_add((w * h) as u64);
+    });
+    Ok(())
+}
+
+/// Reversible 5/3 to packed bytes without materialising full-resolution colour
+/// `Vec<i32>` planes: coarse levels synthesize into `1/4`-size `LL1` planes (in
+/// parallel across the three colour components when `workers > 1`), then the
+/// finest level of all three components streams row-by-row through inverse RCT
+/// and AVX2 byte packing directly into `target`.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_reversible_53_fused_pack(
+    header: &CodestreamHeader,
+    colour_tiles: Vec<DecodedTileCoefficients>,
+    aux: Option<&[u8]>,
+    apply_rct: bool,
+    layout: PackedLayout,
+    channels: usize,
+    target: &mut PackedWriteTarget<'_>,
+    workers: usize,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    stats: &mut StatsSink<'_>,
+) -> Result<()> {
+    let levels = header.cod.decomposition_levels;
+    let kernel = PRIMITIVES.kernel;
+    let dwt_start = stats.start();
+    let plane_width = header.siz.width as usize;
+    let prefixes: Vec<SynthesisPrefix53> = if stats.is_enabled() {
+        let mut prefixes = Vec::with_capacity(3);
+        for tile in colour_tiles {
+            if cancel.is_some_and(|f| f()) {
+                return Err(Jp2LamError::Cancelled);
+            }
+            prefixes.push(build_prefix_53(tile, levels, kernel, stats)?);
+        }
+        prefixes
+    } else {
+        let synthesize = |tile: DecodedTileCoefficients| -> Result<SynthesisPrefix53> {
+            if cancel.is_some_and(|f| f()) {
+                return Err(Jp2LamError::Cancelled);
+            }
+            let mut disabled = StatsSink::disabled();
+            build_prefix_53(tile, levels, kernel, &mut disabled)
+        };
+        if workers > 1 {
+            colour_tiles
+                .into_par_iter()
+                .map(synthesize)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            colour_tiles
+                .into_iter()
+                .map(synthesize)
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    record_dwt_time(stats, dwt_start);
+    let [py, pdb, pdr] = <[SynthesisPrefix53; 3]>::try_from(prefixes)
+        .map_err(|_| invalid("fused reconstruction expects three colour planes"))?;
+    let pixel_count = py.width() * py.height();
+    stats.update(|stats| {
+        stats.reconstructed_pixels = stats
+            .reconstructed_pixels
+            .saturating_add(3 * pixel_count as u64);
+    });
+
+    let start = stats.start();
+    let w = target.width;
+    let h = target.height;
+    let stride = target.stride;
+    let sx = target.source_x;
+    let sy = target.source_y;
+    let params = PackRowI32Params {
+        apply_rct,
+        layout,
+        channels,
+        kernel: PRIMITIVES.kernel,
+    };
+    let aux_row = |py_: usize| {
+        aux.map(|p| &p[(sy + py_) * plane_width + sx..(sy + py_) * plane_width + sx + w])
+    };
+    let tight = target.origin_x == 0
+        && target.origin_y == 0
+        && stride == w * channels
+        && pixel_count >= FUSED_PACK_PARALLEL_SAMPLES
+        && workers > 1;
+    if tight {
+        let rows_per_band = h.div_ceil(workers.max(1) * 2).max(16);
+        for_each_chunk_budgeted(
+            &mut target.data[..h * stride],
+            rows_per_band * stride,
+            workers,
+            cancel,
+            || {
+                (
+                    LevelSynth53Scratch::new(),
+                    LevelSynth53Scratch::new(),
+                    LevelSynth53Scratch::new(),
+                )
+            },
+            |band, chunk, (sy_s, sdb_s, sdr_s)| {
+                let first = sy + band * rows_per_band;
+                let mut sy_ = py.final_level_with_scratch(kernel, first, sy_s);
+                let mut sdb = pdb.final_level_with_scratch(kernel, first, sdb_s);
+                let mut sdr = pdr.final_level_with_scratch(kernel, first, sdr_s);
+                for (k, out_row) in chunk.chunks_exact_mut(stride).enumerate() {
+                    let y_row = sy_.next_row();
+                    let db_row = sdb.next_row();
+                    let dr_row = sdr.next_row();
+                    pack_row_i32(
+                        &y_row[sx..sx + w],
+                        &db_row[sx..sx + w],
+                        &dr_row[sx..sx + w],
+                        aux_row(band * rows_per_band + k),
+                        params,
+                        out_row,
+                    );
+                }
+            },
+        )?;
+    } else {
+        let mut sy_s = LevelSynth53Scratch::new();
+        let mut sdb_s = LevelSynth53Scratch::new();
+        let mut sdr_s = LevelSynth53Scratch::new();
+        let mut sy_ = py.final_level_with_scratch(kernel, sy, &mut sy_s);
+        let mut sdb = pdb.final_level_with_scratch(kernel, sy, &mut sdb_s);
+        let mut sdr = pdr.final_level_with_scratch(kernel, sy, &mut sdr_s);
+        for py_ in 0..h {
+            if (py_ & 63) == 0 && cancel.is_some_and(|f| f()) {
+                return Err(Jp2LamError::Cancelled);
+            }
+            let off = target.pixel_offset(0, py_);
+            let y_row = sy_.next_row();
+            let db_row = sdb.next_row();
+            let dr_row = sdr.next_row();
+            pack_row_i32(
+                &y_row[sx..sx + w],
+                &db_row[sx..sx + w],
+                &dr_row[sx..sx + w],
                 aux_row(py_),
                 params,
                 &mut target.data[off..off + w * channels],
@@ -2452,6 +3425,75 @@ mod pack_kernel_tests {
                             assert_eq!(
                                 out, reference,
                                 "{kernel:?} {layout:?} channels {channels} width {width} ict {apply_ict} aux {with_aux}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_i32_kernel_packs_identical_bytes() {
+        use super::{PackRowI32Params, pack_row_i32};
+        let kernels = Kernel::available();
+        let samples_i32 = |len: usize, seed: u32| -> Vec<i32> {
+            let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(77);
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    (state % 1001) as i32 - 500
+                })
+                .collect()
+        };
+        for &(layout, channels) in &[
+            (PackedLayout::Sequential, 3usize),
+            (PackedLayout::Sequential, 4),
+            (PackedLayout::Rgbx, 4),
+            (PackedLayout::Bgra, 4),
+        ] {
+            for width in (1..=40).chain([300, 1001]) {
+                for apply_rct in [false, true] {
+                    for with_aux in [false, true] {
+                        let y = samples_i32(width, width as u32 * 3 + 1);
+                        let db = samples_i32(width, width as u32 * 3 + 2);
+                        let dr = samples_i32(width, width as u32 * 3 + 3);
+                        let aux: Vec<u8> = (0..width).map(|i| (i * 41 % 256) as u8).collect();
+                        let aux = with_aux.then_some(aux.as_slice());
+                        let mut reference = vec![0u8; width * channels];
+                        pack_row_i32(
+                            &y,
+                            &db,
+                            &dr,
+                            aux,
+                            PackRowI32Params {
+                                apply_rct,
+                                layout,
+                                channels,
+                                kernel: Kernel::Scalar,
+                            },
+                            &mut reference,
+                        );
+                        for &kernel in &kernels {
+                            let mut out = vec![0xaau8; width * channels];
+                            pack_row_i32(
+                                &y,
+                                &db,
+                                &dr,
+                                aux,
+                                PackRowI32Params {
+                                    apply_rct,
+                                    layout,
+                                    channels,
+                                    kernel,
+                                },
+                                &mut out,
+                            );
+                            assert_eq!(
+                                out, reference,
+                                "{kernel:?} {layout:?} channels {channels} width {width} rct {apply_rct} aux {with_aux}"
                             );
                         }
                     }

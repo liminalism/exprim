@@ -466,7 +466,8 @@ fn bilevel_images_are_charged_by_the_bit_not_by_the_rgba_pixel() {
     assert_eq!(page.images.len(), 1);
     assert_eq!(page.complexity.estimated_image_decode_peak_bytes, 0);
 
-    // An 8-bit gray image is promoted to an RGB8 copy for the fast paths.
+    // An 8-bit gray image with default decode is sampled in place by the
+    // native Gray8 fast paths: nothing more to allocate.
     let page = page_with_images(
         b"q 10 0 0 10 0 0 cm /Im0 Do Q",
         &[(
@@ -474,7 +475,7 @@ fn bilevel_images_are_charged_by_the_bit_not_by_the_rgba_pixel() {
             &[0x80; 8],
         )],
     );
-    assert_eq!(page.complexity.estimated_image_decode_peak_bytes, 8 * 3);
+    assert_eq!(page.complexity.estimated_image_decode_peak_bytes, 0);
 }
 
 /// A page drawing `content` with form XObjects `/Fm` (a 20x20 transparency
