@@ -356,3 +356,20 @@ record exprim.renderer.next-levers/1 : work {
     supported_by [ @exprim.renderer.attribution-20261110 ]
     author "dk"
 }
+
+record exprim.work.compile-without-reading-image-bytes/1 : work {
+    title "Compile pages without reading or copying their image payloads"
+    state completed
+    intent """
+        A viewer's text-index sweep compiles every page of a scanned book; each compile read and copied the page's JPEG, pulling the whole 781 MB file into the process working set for text it never draws.
+        """
+    trace [
+        "Compiling all 808 pages of a scan touched 755 MB of the mmap with 8 MB private: the bytes were read and the copies freed.",
+        "Unfiltered codec payloads now borrow from a contiguous source (SharedBytes::from_source); a CodecUnfiltered decode result marks them.",
+        "Still 428 MB touched: the windowed object loader let the stream parser scan a 64 KB then 512 KB window for endstream before growing.",
+        "A truncated window now returns UnexpectedEof when the declared body runs past it, so the loader grows without scanning; at EOF the old repair applies.",
+        "Result: compiling all pages leaves 38 MB WS in 0.78 s (was 755 MB, ~1.8 s); full exprim suite 1087 passed."
+    ]
+    derived_from [ @exprim.observation.xref-rebuild-touches-whole-mmap ]
+    author "dk"
+}

@@ -3601,6 +3601,11 @@ impl<'a> Interpreter<'a> {
             Ok(SharedDecoded::Codec(bytes, name)) => {
                 (None, codec_kind(name.as_bytes()), Some(bytes.into()))
             }
+            Ok(SharedDecoded::CodecShared(bytes, name)) => {
+                (None, codec_kind(name.as_bytes()), Some(bytes))
+            }
+            // `decode_image_data` resolves it to `CodecShared`.
+            Ok(SharedDecoded::CodecUnfiltered(_)) => (None, None, None),
             Err(_) => (None, None, None),
         };
         let smask = self.build_image_smask(dict);
@@ -4359,7 +4364,12 @@ impl<'a> Interpreter<'a> {
                 codec_kind(name.as_bytes()),
                 Some(bytes.into()),
             ),
-            Err(_) => return None,
+            Ok(SharedDecoded::CodecShared(bytes, name)) => (
+                Arc::from(Vec::new()),
+                codec_kind(name.as_bytes()),
+                Some(bytes),
+            ),
+            Ok(SharedDecoded::CodecUnfiltered(_)) | Err(_) => return None,
         };
         Some(Arc::new(ImageSMask {
             width,
@@ -4452,7 +4462,12 @@ impl<'a> Interpreter<'a> {
                         codec_kind(name.as_bytes()),
                         Some(bytes.into()),
                     ),
-                    Err(_) => return None,
+                    Ok(SharedDecoded::CodecShared(bytes, name)) => (
+                        Arc::from(Vec::new()),
+                        codec_kind(name.as_bytes()),
+                        Some(bytes),
+                    ),
+                    Ok(SharedDecoded::CodecUnfiltered(_)) | Err(_) => return None,
                 };
                 Some(crate::page_ir::ImageMask::Stencil(Arc::new(ImageSMask {
                     width,
@@ -5075,6 +5090,11 @@ impl<'a> Interpreter<'a> {
             Ok(SharedDecoded::Codec(bytes, name)) => {
                 (None, codec_kind(name.as_bytes()), Some(bytes.into()))
             }
+            Ok(SharedDecoded::CodecShared(bytes, name)) => {
+                (None, codec_kind(name.as_bytes()), Some(bytes))
+            }
+            // `decode_image_data` resolves it to `CodecShared`.
+            Ok(SharedDecoded::CodecUnfiltered(_)) => (None, None, None),
             Err(_) => (None, None, None),
         }
     }

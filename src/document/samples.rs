@@ -64,6 +64,41 @@ impl DocumentSnapshot {
         expected_len: Option<usize>,
         ctx: &mut ParseContext,
     ) -> Result<SharedDecoded, DocumentError> {
+        let decoded = self.decode_image_data_inner(stream, object, expected_len, ctx)?;
+        let SharedDecoded::CodecUnfiltered(name) = decoded else {
+            return Ok(decoded);
+        };
+        // The codec payload is the stream body unchanged. Borrow it from a
+        // mapped source rather than copy it: compiling a page then reads none
+        // of its image bytes, and only a render touches them.
+        let borrowed = match &stream.data {
+            StreamData::InSource { offset, len } => usize::try_from(*offset)
+                .ok()
+                .zip(usize::try_from(*len).ok())
+                .and_then(|(start, len)| {
+                    crate::page_ir::SharedBytes::from_source(
+                        Arc::clone(self.source()),
+                        start..start.checked_add(len)?,
+                    )
+                }),
+            StreamData::Owned(_) => None,
+        };
+        let bytes = match borrowed {
+            Some(bytes) => bytes,
+            None => crate::page_ir::SharedBytes::from(
+                self.resolver().stream_body(&stream.data)?.as_ref(),
+            ),
+        };
+        Ok(SharedDecoded::CodecShared(bytes, name))
+    }
+
+    fn decode_image_data_inner(
+        &self,
+        stream: &PdfStream,
+        object: Option<ObjectId>,
+        expected_len: Option<usize>,
+        ctx: &mut ParseContext,
+    ) -> Result<SharedDecoded, DocumentError> {
         let resolver = self.resolver();
         let raw_shared = match &stream.data {
             StreamData::Owned(bytes) => Some(bytes),

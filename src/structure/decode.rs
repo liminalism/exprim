@@ -103,6 +103,17 @@ pub enum SharedDecoded {
     /// codec filter's canonical name, exactly as [`decode_stream_to_codec`]
     /// returns them.
     Codec(Vec<u8>, String),
+    /// The chain is the image codec alone: its still-encoded bytes are the
+    /// stream body `raw` itself, unchanged. Returned instead of [`Self::Codec`]
+    /// so a caller holding the body in a mapped source can keep a reference
+    /// to it rather than a copy (a scanned book's pages are each a megabyte
+    /// of JPEG, and every page compile copied its image).
+    CodecUnfiltered(String),
+    /// [`Self::CodecUnfiltered`] resolved by
+    /// [`crate::document::DocumentSnapshot::decode_image_data`]: the payload as
+    /// shared bytes, borrowed from the document's source when it is mapped.
+    /// [`decode_stream_to_codec_shared`] itself never returns it.
+    CodecShared(crate::page_ir::SharedBytes, String),
 }
 
 /// [`decode_stream_to_codec`] for a caller that keeps the result as shared
@@ -139,6 +150,11 @@ pub fn decode_stream_to_codec_shared(
             Ok(SharedDecoded::Bytes(shared))
         }
         (Decoded::Cow(Cow::Owned(bytes)), None) => Ok(SharedDecoded::Bytes(Arc::from(bytes))),
+        (Decoded::Cow(Cow::Borrowed(body)), Some(codec))
+            if std::ptr::eq(body.as_ptr(), raw.as_ptr()) && body.len() == raw.len() =>
+        {
+            Ok(SharedDecoded::CodecUnfiltered(codec))
+        }
         (data, Some(codec)) => Ok(SharedDecoded::Codec(data.into_vec(), codec)),
     }
 }
@@ -1447,6 +1463,8 @@ mod tests {
             .map(|d| match d {
                 SharedDecoded::Bytes(bytes) => (bytes.to_vec(), None),
                 SharedDecoded::Codec(bytes, name) => (bytes, Some(name)),
+                SharedDecoded::CodecUnfiltered(name) => (raw.to_vec(), Some(name)),
+                SharedDecoded::CodecShared(bytes, name) => (bytes.as_slice().to_vec(), Some(name)),
             })
             .map_err(|e| format!("{e:?}"));
         (r, b.used())

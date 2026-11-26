@@ -430,22 +430,75 @@ impl ImageColorSpace {
     }
 }
 
-/// Immutable owned bytes whose original `Vec` allocation is shared without a
-/// `Vec -> Arc<[u8]>` full-buffer copy. The private field intentionally exposes
-/// only slices: codec payloads are immutable after page compilation.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SharedBytes(Arc<Vec<u8>>);
+/// Immutable bytes shared without a full-buffer copy: either an owned `Vec`
+/// allocation (no `Vec -> Arc<[u8]>` copy), or a range of a document source
+/// that is contiguous in memory (a memory-mapped file), which is then never
+/// copied and never read until a renderer reads the slice. The private field
+/// intentionally exposes only slices: codec payloads are immutable after page
+/// compilation.
+#[derive(Clone)]
+pub struct SharedBytes(SharedBytesRepr);
+
+#[derive(Clone)]
+enum SharedBytesRepr {
+    Owned(Arc<Vec<u8>>),
+    Source {
+        source: Arc<dyn crate::source::PdfSource>,
+        range: std::ops::Range<usize>,
+    },
+}
 
 impl SharedBytes {
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        self.0.as_slice()
+        match &self.0 {
+            SharedBytesRepr::Owned(bytes) => bytes.as_slice(),
+            SharedBytesRepr::Source { source, range } => source
+                .as_contiguous()
+                .and_then(|whole| whole.get(range.clone()))
+                // `from_source` checked both; a source's contiguous view
+                // never changes.
+                .unwrap_or(&[]),
+        }
+    }
+
+    /// `range` of `source` without copying it, when the source is
+    /// contiguous in memory and holds the whole range; `None` otherwise.
+    pub fn from_source(
+        source: Arc<dyn crate::source::PdfSource>,
+        range: std::ops::Range<usize>,
+    ) -> Option<Self> {
+        let whole = source.as_contiguous()?;
+        whole.get(range.clone())?;
+        Some(Self(SharedBytesRepr::Source { source, range }))
+    }
+}
+
+impl Default for SharedBytes {
+    fn default() -> Self {
+        Self(SharedBytesRepr::Owned(Arc::default()))
+    }
+}
+
+impl PartialEq for SharedBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for SharedBytes {}
+
+impl std::fmt::Debug for SharedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SharedBytes")
+            .field(&self.as_slice())
+            .finish()
     }
 }
 
 impl From<Vec<u8>> for SharedBytes {
     fn from(bytes: Vec<u8>) -> Self {
-        Self(Arc::new(bytes))
+        Self(SharedBytesRepr::Owned(Arc::new(bytes)))
     }
 }
 

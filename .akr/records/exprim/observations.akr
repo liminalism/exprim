@@ -254,6 +254,33 @@ record exprim.memory.real-documents-20261120/1 : observation {
     author "dk"
 }
 
+record exprim.observation.xref-rebuild-touches-whole-mmap/1 : observation {
+    title "Xref rebuild over an MmapSource pulls the whole file into the process working set"
+    state superseded
+    statement """
+        Opening a 781 MB PDF whose startxref is wrong (rebuilt by full object scan) via MmapSource + DocumentSnapshot takes 1.87 s and leaves 750 MB working set but 2 MB private: every mapped page the scan touched stays in the process WS. The pages are clean and reclaimable, but tools showing working set report ~0.8 GB that MuPDF's buffered-read repair leaves in the OS file cache instead. Rendering afterwards is modest: 42 MB private after one 1400 px page, 89 MB after 22 tiled pages, 138 MB after all 808 pages at 160 px (bounded caches incl. 96 MB SharedImageCache). Measured at rev 1671fdd, the revision liminaldoc locks.
+        """
+    observed_at git:1671fddda00066c70719493ec8fcbf28202e6c78
+    method command
+    watches [ "src/source/**", "src/document/**", "src/syntax/**" ]
+    confidence high
+    author "dk"
+}
+
+record exprim.observation.xref-rebuild-touches-whole-mmap/2 : observation {
+    title "Xref rebuild over an MmapSource pulled the whole file into the working set (fixed upstream by 72357682)"
+    state verified
+    statement """
+        At rev 1671fdd, opening a 781 MB PDF with a wrong startxref (rebuilt by full object scan) via MmapSource + DocumentSnapshot took 1.87 s and left 750 MB working set but 2 MB private. At 72357682 the same open takes 16 ms and 11 MB WS: no longer reproduces. Rendering after open is modest: ~89 MB private after 22 tiled 1400 px pages, ~136 MB after all 808 pages at 160 px (bounded caches incl. the 96 MiB SharedImageCache). The remaining full-file read at that rev came from page compile, tracked in exprim.work.compile-without-reading-image-bytes.
+        """
+    observed_at git:72357682adbfbb850a914457f2d9de383a9dd921
+    method command
+    watches [ "src/source/**", "src/document/**", "src/syntax/**" ]
+    confidence high
+    supersedes [ @exprim.observation.xref-rebuild-touches-whole-mmap/1 ]
+    author "dk"
+}
+
 record exprim.renderer.attribution-20261110/1 : observation {
     title "Where CPU render time goes on dense vectors, tables and text (G0)"
     state superseded

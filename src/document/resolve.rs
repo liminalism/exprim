@@ -267,7 +267,7 @@ impl Resolver<'_> {
                 .source
                 .read_range(abs..end)
                 .map_err(crate::structure::StructureError::from)?;
-            match self.attempt_parse(&window, abs, id, ctx) {
+            match self.attempt_parse(&window, abs, id, !at_eof, ctx) {
                 // The parser cannot tell a window from the whole file: a
                 // stream whose declared end lies past the window fails its
                 // `/Length` check there and is "repaired" at the first
@@ -333,9 +333,10 @@ impl Resolver<'_> {
         window: &[u8],
         abs: u64,
         id: ObjectId,
+        truncated: bool,
         ctx: &mut ParseContext,
     ) -> Attempt {
-        match self.parse_indirect_at(window, 0, abs, id, ctx) {
+        match self.parse_indirect_at(window, 0, abs, id, truncated, ctx) {
             Ok(parsed) if parsed.id.number == id.number => {
                 // Generation tolerance: PDFium validates the object number
                 // only; sloppy writers get generations wrong.
@@ -350,7 +351,7 @@ impl Resolver<'_> {
                 // scan forward for the real `N G obj` header (repair).
                 match scan_for_object_header(window, id.number) {
                     Some((rel, _generation)) => {
-                        match self.parse_indirect_at(window, rel, abs, id, ctx) {
+                        match self.parse_indirect_at(window, rel, abs, id, truncated, ctx) {
                             Ok(parsed) if parsed.id.number == id.number => Attempt::Parsed(
                                 Box::new(parsed),
                                 abs + rel as u64 - self.structure.header_offset,
@@ -378,6 +379,7 @@ impl Resolver<'_> {
         rel: usize,
         abs: u64,
         _id: ObjectId,
+        truncated: bool,
         ctx: &mut ParseContext,
     ) -> Result<crate::object::parser::ParsedIndirect, SyntaxError> {
         let mut parser = ObjectParser::new(
@@ -385,7 +387,8 @@ impl Resolver<'_> {
             abs + rel as u64,
             &self.limits.syntax,
             self.names,
-        );
+        )
+        .with_truncated_input(truncated);
         let mut resolve_length = |len_id: ObjectId| -> Option<i64> {
             self.resolve(len_id, ctx).ok().and_then(|o| o.as_int())
         };

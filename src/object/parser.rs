@@ -53,6 +53,9 @@ pub struct ObjectParser<'a> {
     lexer: Lexer<'a>,
     names: &'a NameTable,
     repairs: Vec<IndirectRepair>,
+    /// The input is a window that stops before the end of the file (see
+    /// [`Self::with_truncated_input`]).
+    truncated_input: bool,
 }
 
 impl<'a> ObjectParser<'a> {
@@ -66,7 +69,20 @@ impl<'a> ObjectParser<'a> {
             lexer: Lexer::new(input, base_offset, limits),
             names,
             repairs: Vec::new(),
+            truncated_input: false,
         }
+    }
+
+    /// The input is a window that ends before the file does. A stream whose
+    /// declared `/Length` runs past the window's end then fails with
+    /// [`SyntaxError::UnexpectedEof`], so the caller reads a larger window,
+    /// instead of being "repaired" by scanning the window for `endstream`:
+    /// that scan read every byte of every large image the window cut short
+    /// (512 KB per megabyte-sized page scan), only for the caller to discard
+    /// the result and parse again.
+    pub fn with_truncated_input(mut self, truncated: bool) -> Self {
+        self.truncated_input = truncated;
+        self
     }
 
     /// Build directly on an existing lexer (used by the structure layer,
@@ -76,6 +92,7 @@ impl<'a> ObjectParser<'a> {
             lexer,
             names,
             repairs: Vec::new(),
+            truncated_input: false,
         }
     }
 
@@ -392,6 +409,23 @@ impl<'a> ObjectParser<'a> {
             _ => None,
         };
         let _ = id; // Currently only used by callers mapping repairs.
+
+        // The declared body, and the `endstream` after it, lie past the end of
+        // a window: let the caller widen it rather than scan what is here.
+        // Slack covers the EOL and keyword after the body.
+        const ENDSTREAM_SLACK: usize = 64;
+        if self.truncated_input
+            && let Some(len) = declared
+            && let Ok(len_usize) = usize::try_from(len)
+            && data_start
+                .saturating_add(len_usize)
+                .saturating_add(ENDSTREAM_SLACK)
+                > input.len()
+        {
+            return Err(SyntaxError::UnexpectedEof {
+                offset: self.lexer.base_offset() + input.len() as u64,
+            });
+        }
 
         // Happy path: /Length is sane and `endstream` follows the body.
         if let Some(len) = declared

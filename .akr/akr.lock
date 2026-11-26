@@ -5,8 +5,7 @@ build {
     tool "akr 0.8.0"
     grammar "0.1"
     vocabulary "0.3"
-    commit git:b1e5b8becdacdc16239ce5d6d6855260b416b006
-    source_graph "sha256:e56021dd7695a57ffd353abb60e693b1209891266b082615e5c3c6a332aadf4d"
+    source_graph "sha256:9d9d4d3d1b8fee991469b0d7249434ef45caf4231391eb0ebd8f95591255ee96"
 }
 
 source ".akr/project.akr" {
@@ -25,8 +24,8 @@ source ".akr/records/exprim/evidence.akr" {
 }
 
 source ".akr/records/exprim/observations.akr" {
-    hash "sha256:3f5ca96e91dada9713ddc7bc0d7e2a29b3f7372c5660e9a5a9d73fddc221c39c"
-    records 10
+    hash "sha256:66c24d8397959a686b860560d055967d98021c36fd151b1827654428b2a5334d"
+    records 12
 }
 
 source ".akr/records/exprim/papercuts.akr" {
@@ -45,8 +44,8 @@ source ".akr/records/exprim/questions.akr" {
 }
 
 source ".akr/records/exprim/work.akr" {
-    hash "sha256:d762f4673550197b2028054d8ef20edd1ab483eab6cc768dbe1618132533ae26"
-    records 7
+    hash "sha256:7ca2c3433f8a14c27e5592c5b6e1a411adb3234bb84fd91c05ffae77b5604c7a"
+    records 8
 }
 
 resolution @exprim.memory.chunked-lowering/1 {
@@ -199,6 +198,12 @@ resolution @exprim.structure.rebuild-skips-stream-bodies/1 {
     hash "sha256:b4d542de1e00a215f67d053ffcdac369285602aa22790e94e6fc24b0ef612641"
 }
 
+resolution @exprim.work.compile-without-reading-image-bytes/1 {
+    slot derived_from
+    to @exprim.observation.xref-rebuild-touches-whole-mmap/2
+    hash "sha256:6689b0d41fcc3ea644d681272353845c082c1324892cf1fd300f56ab91a32ad7"
+}
+
 seal @exprim.corpus.attribution-20261110/1 {
     state superseded
     hash "sha256:22e80dcf70b5aac7e42c9c589b4e7e80323bb09ddc5198abf22373d71e4b1203"
@@ -242,6 +247,16 @@ seal @exprim.memory.peak-audit-20261120/1 {
 seal @exprim.memory.real-documents-20261120/1 {
     state verified
     hash "sha256:b4d542de1e00a215f67d053ffcdac369285602aa22790e94e6fc24b0ef612641"
+}
+
+seal @exprim.observation.xref-rebuild-touches-whole-mmap/1 {
+    state superseded
+    hash "sha256:4ab13b0fdd940823c475cb8cdfb6a9aad2397fd11f153d7ed8cad4a7b09800e8"
+}
+
+seal @exprim.observation.xref-rebuild-touches-whole-mmap/2 {
+    state verified
+    hash "sha256:6689b0d41fcc3ea644d681272353845c082c1324892cf1fd300f56ab91a32ad7"
 }
 
 seal @exprim.papercut.akr-propose-uses-a-specific-body-file-flag-not/1 {
@@ -312,4 +327,9 @@ seal @exprim.renderer.g1-exact-speedups/1 {
 seal @exprim.renderer.g1-exact-speedups-ab/1 {
     state verified
     hash "sha256:3ef284fbf3676dc2abf1906572136a4c8ba0b460c2519782ae2c9ad1150c7c99"
+}
+
+seal @exprim.work.compile-without-reading-image-bytes/1 {
+    state completed
+    hash "sha256:85c5aebeb14d74a472ca28af21f2a86d7a25aaeab911de362d7337b39d7d3fb0"
 }
