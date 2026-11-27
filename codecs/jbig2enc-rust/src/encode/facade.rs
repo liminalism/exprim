@@ -82,7 +82,7 @@ impl<'a> BilevelImage<'a> {
         let max = BitImage::MAX_DIMENSION as u64;
         for (name, value) in [("width", width), ("height", height)] {
             if value == 0 || u64::from(value) > max {
-                return Err(invalid_input(format!(
+                return Err(Jbig2Error::invalid_input(format!(
                     "{name} must be between 1 and {max}, got {value}"
                 )));
             }
@@ -90,14 +90,16 @@ impl<'a> BilevelImage<'a> {
         let row_bytes = layout.row_bytes(width);
         let stride = layout.stride();
         if stride < row_bytes {
-            return Err(invalid_input(format!(
+            return Err(Jbig2Error::invalid_input(format!(
                 "stride {stride} is shorter than a {width}-pixel row ({row_bytes} bytes)"
             )));
         }
         let required = stride
             .checked_mul(height as usize - 1)
             .and_then(|bytes| bytes.checked_add(row_bytes))
-            .ok_or_else(|| invalid_input("image size overflows the address space".to_string()))?;
+            .ok_or_else(|| {
+                Jbig2Error::invalid_input("image size overflows the address space".to_string())
+            })?;
         if data.len() < required {
             // Packed data passed where bytes were declared is *the* mistake a
             // byte-per-pixel API invites; name it rather than a bare length.
@@ -107,7 +109,7 @@ impl<'a> BilevelImage<'a> {
             {
                 return Err(Jbig2Error::PackedDataDetected);
             }
-            return Err(invalid_input(format!(
+            return Err(Jbig2Error::invalid_input(format!(
                 "buffer has {} bytes but a {width}x{height} image needs {required}",
                 data.len()
             )));
@@ -211,7 +213,7 @@ impl<'a> BilevelImage<'a> {
                 })
             }
         };
-        result.map_err(invalid_input)
+        result.map_err(Jbig2Error::invalid_input)
     }
 }
 
@@ -324,12 +326,10 @@ impl EncodeOptions {
         let mut config = self.preset.config();
         if let Some(refine) = self.refine {
             if refine && !config.symbol_mode {
-                return Err(Jbig2Error::InvalidConfig {
-                    message: format!(
-                        "refinement requires a symbol-coding preset; '{}' codes generic regions",
-                        self.preset.name()
-                    ),
-                });
+                return Err(Jbig2Error::invalid_config(format!(
+                    "refinement requires a symbol-coding preset; '{}' codes generic regions",
+                    self.preset.name()
+                )));
             }
             config.refine = refine;
         }
@@ -347,9 +347,7 @@ fn validate_config(config: &mut Jbig2Config) -> Result<(), Jbig2Error> {
     if !config.symbol_mode {
         config.text_refine = false;
     }
-    let invalid = |message: &str| Jbig2Error::InvalidConfig {
-        message: message.to_string(),
-    };
+    let invalid = |message: &str| Jbig2Error::invalid_config(message);
     if config.refine && !config.symbol_mode {
         return Err(invalid("refinement requires symbol mode to be enabled"));
     }
@@ -422,30 +420,24 @@ impl DocumentEncoder {
 
     fn require_pages(&self) -> Result<(), Jbig2Error> {
         if self.inner.get_page_count() == 0 {
-            return Err(invalid_input("no pages were added".to_string()));
+            return Err(Jbig2Error::invalid_input("no pages were added".to_string()));
         }
         Ok(())
     }
 }
 
 /// Classify an encoder-internal error: a configured resource budget the
-/// output would exceed is [`Jbig2Error::ResourceLimit`]; anything else is an
-/// encoding failure.
+/// output would exceed is classified [`ErrorKind::ResourceLimit`](crate::ErrorKind::ResourceLimit);
+/// anything else is an encoding failure.
 impl From<anyhow::Error> for Jbig2Error {
     fn from(error: anyhow::Error) -> Self {
         if let Some(limit) = error.downcast_ref::<ResourceLimitExceeded>() {
-            return Jbig2Error::ResourceLimit {
-                message: limit.0.clone(),
-            };
+            return Jbig2Error::resource_limit(&limit.0);
         }
         Jbig2Error::EncodingFailed {
             message: error.to_string(),
         }
     }
-}
-
-fn invalid_input(message: String) -> Jbig2Error {
-    Jbig2Error::InvalidInput { message }
 }
 
 #[cfg(test)]

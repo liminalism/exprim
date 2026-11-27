@@ -30,7 +30,7 @@ does not import decoder-only helpers into the encode-only hash test.
 
 ## Retained external legacy gate
 
-The two old inputs predate the 0.7 work. Their encoded byte-hash baselines have not
+The two old inputs predate the 0.6.3 work. Their encoded byte-hash baselines have not
 been regenerated during the component-extractor replacement.
 Both PBMs are excluded from the Cargo package. Their unchanged hash manifest
 and explicit test remain, so removing the scan from distribution does not

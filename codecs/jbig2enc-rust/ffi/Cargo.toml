@@ -31,7 +31,7 @@ name = "jbig2rs"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-jbig2enc-rust = { version = "0.7.0", path = "..", default-features = false, features = ["encode", "decode", "symboldict"] }
+jbig2enc-rust = { version = "0.6.3", path = "..", default-features = false, features = ["encode", "decode", "symboldict"] }
 anyhow = "1.0"
 
 [features]

@@ -8,7 +8,7 @@
 [package]
 name = "jbig2enc-py"
 # Kept equal to the codec's version: the wheel reports it as __version__.
-version = "0.7.0"
+version = "0.6.3"
 edition = "2024"
 description = "Python bindings (PyO3) for the jbig2enc-rust JBIG2 encoder and decoder"
 license = "MIT AND Apache-2.0"
@@ -20,7 +20,7 @@ name = "jbig2enc"
 crate-type = ["cdylib"]
 
 [dependencies]
-jbig2enc-rust = { version = "0.7.0", path = "..", default-features = false, features = ["encode", "decode", "symboldict"] }
+jbig2enc-rust = { version = "0.6.3", path = "..", default-features = false, features = ["encode", "decode", "symboldict"] }
 # `abi3-py311` yields one wheel per platform for every CPython from 3.11 up;
 # 3.11 is the floor because pyo3 gates the buffer protocol behind `Py_3_11`
 # under the limited API, and accepting NumPy/PIL buffers directly is most of

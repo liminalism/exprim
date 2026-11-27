@@ -1,4 +1,4 @@
-# API and packaging audit for the 0.7 work
+# API and packaging audit for the 0.6.3 work
 
 Existing constructors and entry points remain, including
 `encode_single_image_lossless()`, `encode_document()`, `Jbig2Encoder::new()` and

@@ -1,10 +1,11 @@
 # Changelog
 
-## 0.7.0 — unreleased
+## 0.6.3 — unreleased
 
 A binding-neutral API, a C ABI, and the Python binding moved into its own
 crate. Encoded output is byte-identical to 0.6.2 for every existing entry
-point.
+point, and the release is semver-compatible with 0.6.2: `Jbig2Error` keeps
+its variant set and the `python` feature still resolves.
 
 ### Added
 
@@ -20,8 +21,11 @@ point.
 - `DocumentEncoder`: a multi-page encoder that owns its configuration
   (`'static`, `Send`), finishing as a file or as PDF fragments.
 - `Jbig2Encoder::owned` and `PdfGroupEncoder::owned`; `PdfGroupEncoder::push_image`.
-- `ErrorKind` and `Jbig2Error::kind()`; new variants `InvalidInput`,
-  `InvalidConfig` and `ResourceLimit`. `DecodeErrorKind` and `DecodeError::kind()`.
+- `ErrorKind` and `Jbig2Error::kind()`, which classifies invalid input, an
+  invalid configuration and a resource-limit refusal. Those three are
+  `Jbig2Error::EncodingFailed` with a fixed message prefix (`invalid input: `,
+  `invalid configuration: `, `resource limit exceeded: `), since a new variant
+  would break exhaustive matches. `DecodeErrorKind` and `DecodeError::kind()`.
   `ResourceLimitExceeded` is the typed error inside a refused encode.
 - `MonoBitmap::copy_packed_rows` (into a caller buffer, any stride and
   polarity), `MonoBitmap::to_bytes_per_pixel`, `MonoBitmap::packed_row_bytes`.
@@ -31,9 +35,8 @@ point.
 
 ### Changed
 
-- `Jbig2Error` is `#[non_exhaustive]`. A refusal by `decoder_resource_limits`
-  is now `Jbig2Error::ResourceLimit` rather than `EncodingFailed`, and a
-  configuration the encoder rejects is `InvalidConfig`.
+- A refusal by `decoder_resource_limits` is still `EncodingFailed`; its
+  message now starts `resource limit exceeded: `.
 - `encode_single_image*` and `encode_document_pdf_split` run through
   `DocumentEncoder`; their output is unchanged.
 - The crate is a workspace with the bindings (`ffi/`, `python/`) as members.
@@ -41,7 +44,8 @@ point.
 
 ### Removed
 
-- The `python` feature and the `pyo3` dependency. The wheel is now built from
+- The `pyo3` dependency. The `python` feature remains as a no-op so
+  dependents that enable it still build; the wheel is now built from
   the `jbig2enc-py` crate in `python/` (`maturin develop` there, as before);
   its Python API is unchanged apart from additions (`preset=`,
   `pixel_format=`, `stride=`, `polarity=`, `threshold=`, `presets()`).
@@ -49,7 +53,7 @@ point.
 ### Deprecated
 
 - `encode::api` (re-exported as `jbig2`): a duplicate of the crate-root API
-  with its own `Jbig2Error`. To be removed in 0.8.
+  with its own `Jbig2Error`. To be removed in 0.7.
 
 ## 0.6.2 — 2026-11-24
 

@@ -17,7 +17,9 @@ record exprim.jbig2.ffi-facade/1 : work {
         "Python reads C-contiguous buffers in place while holding the GIL, packing straight to BitImage; the GIL is released only for encoding the packed bitmap.",
         "Existing Python kwargs keep their exact semantics; preset= is a new path and refuses mixing with symbol_mode/lossless rather than letting one silently win.",
         "decode_alloc's steady-state test failed once in a workspace run and passed 8/8 alone: it counts allocations process-wide while sibling tests run in parallel.",
-        "Verified: 297 workspace tests pass; the C example builds clean at /W4 as C and C++ and round-trips; 26 Python tests pass; Lege's API surface compiles unchanged."
+        "Verified: 297 workspace tests pass; the C example builds clean at /W4 as C and C++ and round-trips; 26 Python tests pass; Lege's API surface compiles unchanged.",
+        "Versioned 0.6.3 at the user's request, not 0.7.0: the two Cargo-semver breaks (non_exhaustive Jbig2Error with new variants, removed python feature) were undone so the patch release is compatible.",
+        "New error classes ride in EncodingFailed behind fixed message prefixes that kind() reads; python stays as a no-op feature. Variant set checked against 0.6.2 by hand (cargo-semver-checks not installed)."
     ]
     acceptance {
         check c-roundtrip {

@@ -268,7 +268,7 @@ unsafe fn arg_mut<'a, T>(pointer: *mut T, what: &str) -> Result<&'a mut T, Failu
 
 // ── Library metadata ────────────────────────────────────────────────────────
 
-/// The codec version, e.g. `"0.7.0"`. Static; do not free.
+/// The codec version, e.g. `"0.6.3"`. Static; do not free.
 #[unsafe(no_mangle)]
 pub extern "C" fn jbig2rs_version() -> *const c_char {
     static VERSION: OnceLock<CString> = OnceLock::new();

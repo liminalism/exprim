@@ -296,7 +296,7 @@ extern "C" {
 const char *jbig2rs_last_error_message(void);
 
 /**
- * The codec version, e.g. `"0.7.0"`. Static; do not free.
+ * The codec version, e.g. `"0.6.3"`. Static; do not free.
  */
 const char *jbig2rs_version(void);
 

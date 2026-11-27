@@ -1,6 +1,6 @@
 [package]
 name = "jbig2enc-rust"
-version = "0.7.0"
+version = "0.6.3"
 edition = "2024"
 description = "JBIG2 encoder implementation in Rust with PDF fragment support"
 license = "MIT AND Apache-2.0"
@@ -83,6 +83,9 @@ profiling = ["dep:pprof"]
 # Empty because the bridge is provided via build-script/linker flags at bench
 # time; the feature just gates compilation of that test target.
 c-encoder-bench = []
+# No-op, kept so 0.6.x dependents that enable it still resolve. The PyO3
+# binding moved to the jbig2enc-py crate in python/ (build the wheel there).
+python = []
 
 [[bin]]
 name = "tester"

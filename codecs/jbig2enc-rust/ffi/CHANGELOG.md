@@ -2,7 +2,7 @@
 
 ## 0.1.0 — unreleased
 
-First release: ABI 1.0 over `jbig2enc-rust` 0.7.0.
+First release: ABI 1.0 over `jbig2enc-rust` 0.6.3.
 
 - Encoding of packed 1bpp, byte-per-pixel and grayscale input, with any
   stride and either polarity, to standalone files or PDF fragments.

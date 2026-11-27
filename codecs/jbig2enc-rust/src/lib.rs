@@ -32,19 +32,14 @@ pub enum ErrorKind {
 }
 
 /// Errors that can occur during JBIG2 encoding
+///
+/// The variant set is the one 0.6.2 published, so a downstream exhaustive
+/// `match` keeps compiling. Invalid input, an invalid configuration and a
+/// resource-limit refusal are [`Jbig2Error::EncodingFailed`] with a fixed
+/// message prefix; [`Jbig2Error::kind`] classifies them.
 #[derive(Debug)]
-#[non_exhaustive]
 #[cfg(feature = "encode")]
 pub enum Jbig2Error {
-    /// The image or its buffer was invalid (dimensions, stride, length).
-    InvalidInput { message: String },
-
-    /// The configuration is not one the encoder accepts.
-    InvalidConfig { message: String },
-
-    /// The output would exceed a configured decoder resource budget.
-    ResourceLimit { message: String },
-
     /// Input buffer size mismatch
     BufferSizeMismatch {
         expected: usize,
@@ -83,13 +78,6 @@ pub enum Jbig2Error {
 impl std::fmt::Display for Jbig2Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Jbig2Error::InvalidInput { message } => write!(f, "Invalid input: {}", message),
-            Jbig2Error::InvalidConfig { message } => {
-                write!(f, "Invalid configuration: {}", message)
-            }
-            Jbig2Error::ResourceLimit { message } => {
-                write!(f, "Resource limit exceeded: {}", message)
-            }
             Jbig2Error::BufferSizeMismatch {
                 expected,
                 actual,
@@ -143,19 +131,61 @@ impl Jbig2Error {
     /// The broad class of this error.
     pub fn kind(&self) -> ErrorKind {
         match self {
-            Jbig2Error::InvalidInput { .. }
-            | Jbig2Error::BufferSizeMismatch { .. }
+            Jbig2Error::BufferSizeMismatch { .. }
             | Jbig2Error::BufferTooSmall { .. }
             | Jbig2Error::ArrayShapeError { .. }
             | Jbig2Error::PackedDataDetected => ErrorKind::InvalidInput,
-            Jbig2Error::InvalidConfig { .. } => ErrorKind::InvalidConfig,
-            Jbig2Error::ResourceLimit { .. } => ErrorKind::ResourceLimit,
-            Jbig2Error::EncodingFailed { .. }
-            | Jbig2Error::DictionaryFailed { .. }
+            Jbig2Error::EncodingFailed { message } => classify_failure(message),
+            Jbig2Error::DictionaryFailed { .. }
             | Jbig2Error::StreamCountMismatch { .. }
             | Jbig2Error::SegmentWriteFailed { .. } => ErrorKind::Encode,
         }
     }
+
+    /// The image or its buffer was invalid (dimensions, stride, length).
+    pub(crate) fn invalid_input(message: impl std::fmt::Display) -> Self {
+        Jbig2Error::EncodingFailed {
+            message: format!("{INVALID_INPUT_PREFIX}{message}"),
+        }
+    }
+
+    /// The configuration is not one the encoder accepts.
+    pub(crate) fn invalid_config(message: impl std::fmt::Display) -> Self {
+        Jbig2Error::EncodingFailed {
+            message: format!("{INVALID_CONFIG_PREFIX}{message}"),
+        }
+    }
+
+    /// The output would exceed a configured decoder resource budget.
+    pub(crate) fn resource_limit(message: impl std::fmt::Display) -> Self {
+        Jbig2Error::EncodingFailed {
+            message: format!("{RESOURCE_LIMIT_PREFIX}{message}"),
+        }
+    }
+}
+
+// These classes have no variant of their own: adding one to the exhaustive
+// 0.6.2 enum would break downstream matches, so 0.6.x tags the message instead.
+// Only the constructors above write these prefixes.
+#[cfg(feature = "encode")]
+const INVALID_INPUT_PREFIX: &str = "invalid input: ";
+#[cfg(feature = "encode")]
+const INVALID_CONFIG_PREFIX: &str = "invalid configuration: ";
+#[cfg(feature = "encode")]
+const RESOURCE_LIMIT_PREFIX: &str = "resource limit exceeded: ";
+
+#[cfg(feature = "encode")]
+fn classify_failure(message: &str) -> ErrorKind {
+    if message.starts_with(INVALID_INPUT_PREFIX) {
+        return ErrorKind::InvalidInput;
+    }
+    if message.starts_with(INVALID_CONFIG_PREFIX) {
+        return ErrorKind::InvalidConfig;
+    }
+    if message.starts_with(RESOURCE_LIMIT_PREFIX) {
+        return ErrorKind::ResourceLimit;
+    }
+    ErrorKind::Encode
 }
 
 #[cfg(feature = "encode")]
@@ -190,8 +220,8 @@ pub mod shared;
 // Phase 0 module rename (Gap A). Remove once dependents migrate to the
 // `encode::` paths.
 #[cfg(feature = "encode")]
-// Deprecated since 0.7.0 (its items carry the attribute; one on a `use` is
-// inert): a duplicate of the crate-root API. Removed in 0.8.
+// Deprecated since 0.6.3 (its items carry the attribute; one on a `use` is
+// inert): a duplicate of the crate-root API. Removed in 0.7.
 pub use encode::api as jbig2;
 #[cfg(feature = "encode")]
 pub use encode::arith as jbig2arith;
@@ -424,14 +454,13 @@ pub fn encode_document_pdf_split(
 ) -> Result<PdfSplitOutput, Jbig2Error> {
     let mut encoder = DocumentEncoder::new(legacy_config(config))?;
     for image in images {
-        let bitimage = jbig2sym::array_to_bitimage(image)
-            .map_err(|message| Jbig2Error::InvalidInput { message })?;
+        let bitimage = jbig2sym::array_to_bitimage(image).map_err(Jbig2Error::invalid_input)?;
         encoder.add_bit_image(bitimage)?;
     }
     encoder.finish_pdf()
 }
 
-/// The pre-0.7 entry points silently dropped refinement without symbol
+/// The pre-0.6.3 entry points silently dropped refinement without symbol
 /// coding, where [`DocumentEncoder`] refuses it; keep their behaviour.
 #[cfg(feature = "encode")]
 fn legacy_config(config: &Jbig2Config) -> Jbig2Config {
