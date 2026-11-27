@@ -77,32 +77,24 @@ impl File {
 
     /// Checks and modifies the save name if invalid for native encoding
     pub fn check_save_name(&mut self, is_bundled: bool) -> String {
-        if !is_bundled && !self.valid_name {
-            let retval = if self.name.is_empty() {
-                &self.id
-            } else {
-                &self.name
-            }
-            .to_string();
-            // Simplified check for native encoding compatibility
-            // In real implementation, check against filesystem encoding
-            if retval.chars().any(|c| c.is_control() || c > '\x7F') {
-                let mut buf = String::new();
-                for c in retval.chars() {
-                    if c.is_control() || c > '\x7F' {
-                        buf.push_str(&format!("{:02X}", c as u8));
-                    } else {
-                        buf.push(c);
-                    }
-                }
-                self.oldname = std::mem::replace(&mut self.name, buf);
-                self.valid_name = true;
-            }
-            self.valid_name = true;
-            self.name.clone()
-        } else {
-            self.get_save_name()
+        if is_bundled || self.valid_name {
+            return self.get_save_name();
         }
+        let retval = if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+        .to_string();
+        // Simplified check for native encoding compatibility
+        // In real implementation, check against filesystem encoding
+        if retval.chars().any(|c| c.is_control() || c > '\x7F') {
+            let buf = escape_non_native_chars(&retval);
+            self.oldname = std::mem::replace(&mut self.name, buf);
+            self.valid_name = true;
+        }
+        self.valid_name = true;
+        self.name.clone()
     }
 
     /// Returns the save name (name if set, else id)
@@ -180,6 +172,19 @@ impl File {
     pub fn get_page_num(&self) -> i32 {
         self.page_num
     }
+}
+
+/// Replaces each control or non-ASCII character with its low byte in two hex digits.
+fn escape_non_native_chars(name: &str) -> String {
+    let mut buf = String::new();
+    for c in name.chars() {
+        if c.is_control() || c > '\x7F' {
+            buf.push_str(&format!("{:02X}", c as u8));
+        } else {
+            buf.push(c);
+        }
+    }
+    buf
 }
 
 /// Directory for a multipage DjVu document (DIRM chunk)
@@ -273,20 +278,17 @@ impl DjVmDir {
 
     pub fn remove_file(&self, id: &str) -> Option<Arc<File>> {
         let mut data = self.data.lock().unwrap();
-        if let Some(file) = data.id2file.remove(id) {
-            data.name2file.remove(&file.name);
-            data.files_list.retain(|f| f.id != id);
-            if file.is_page() {
-                data.page2file.retain(|f| f.id != id);
-                // Re-number pages
-                for (i, page_file) in data.page2file.iter_mut().enumerate() {
-                    Arc::get_mut(page_file).unwrap().page_num = i as i32;
-                }
+        let file = data.id2file.remove(id)?;
+        data.name2file.remove(&file.name);
+        data.files_list.retain(|f| f.id != id);
+        if file.is_page() {
+            data.page2file.retain(|f| f.id != id);
+            // Re-number pages
+            for (i, page_file) in data.page2file.iter_mut().enumerate() {
+                Arc::get_mut(page_file).unwrap().page_num = i as i32;
             }
-            Some(file)
-        } else {
-            None
         }
+        Some(file)
     }
 
     pub fn move_file_to_page_pos(&self, id: &str, new_pos: usize) -> Result<()> {
@@ -464,22 +466,23 @@ impl DjVmDir {
     /// Deletes a file by ID
     pub fn delete_file(&self, id: &str) -> Result<()> {
         let mut data = self.data.lock().unwrap();
-        if let Some(pos) = data.files_list.iter().position(|f| f.id == id) {
-            let file = data.files_list.remove(pos);
-            data.name2file.remove(&file.name);
-            data.id2file.remove(&file.id);
-            if file.is_page() {
-                if let Some(page_pos) = data.page2file.iter().position(|f| Arc::ptr_eq(f, &file)) {
-                    data.page2file.remove(page_pos);
-                    for i in page_pos..data.page2file.len() {
-                        Arc::get_mut(&mut data.page2file[i]).unwrap().page_num = i as i32;
-                    }
-                }
-            }
-            Ok(())
-        } else {
-            Err(DjvuError::Stream(format!("File not found: {}", id)))
+        let Some(pos) = data.files_list.iter().position(|f| f.id == id) else {
+            return Err(DjvuError::Stream(format!("File not found: {}", id)));
+        };
+        let file = data.files_list.remove(pos);
+        data.name2file.remove(&file.name);
+        data.id2file.remove(&file.id);
+        if !file.is_page() {
+            return Ok(());
         }
+        let Some(page_pos) = data.page2file.iter().position(|f| Arc::ptr_eq(f, &file)) else {
+            return Ok(());
+        };
+        data.page2file.remove(page_pos);
+        for i in page_pos..data.page2file.len() {
+            Arc::get_mut(&mut data.page2file[i]).unwrap().page_num = i as i32;
+        }
+        Ok(())
     }
 
     // Second implementation of move_file_to_page_pos removed to fix duplicate function error

@@ -35,32 +35,31 @@ impl DjvuStrExt for str {
 
         while let Some((start, _)) = it.next() {
             unescaped.push_str(&self[last_end..start]);
-            if let Some(end) = self[start..].find(';') {
-                let entity = &self[start + 1..start + end];
-                last_end = start + end + 1;
-                let ch = match entity {
-                    "lt" => Some('<' as u32),
-                    "gt" => Some('>' as u32),
-                    "amp" => Some('&' as u32),
-                    "apos" => Some('\'' as u32),
-                    "quot" => Some('"' as u32),
-                    _ => None,
-                };
-                let char_code = if entity.starts_with("#x") || entity.starts_with("#X") {
-                    u32::from_str_radix(&entity[2..], 16).ok()
-                } else if entity.starts_with('#') {
-                    u32::from_str_radix(&entity[1..], 10).ok()
-                } else {
-                    ch
-                };
-                if let Some(code) = char_code.and_then(char::from_u32) {
-                    unescaped.push(code);
-                } else {
-                    unescaped.push_str(&self[start..last_end]);
-                }
-            } else {
+            let Some(end) = self[start..].find(';') else {
                 last_end = start;
                 break;
+            };
+            let entity = &self[start + 1..start + end];
+            last_end = start + end + 1;
+            let ch = match entity {
+                "lt" => Some('<' as u32),
+                "gt" => Some('>' as u32),
+                "amp" => Some('&' as u32),
+                "apos" => Some('\'' as u32),
+                "quot" => Some('"' as u32),
+                _ => None,
+            };
+            let char_code = if entity.starts_with("#x") || entity.starts_with("#X") {
+                u32::from_str_radix(&entity[2..], 16).ok()
+            } else if entity.starts_with('#') {
+                u32::from_str_radix(&entity[1..], 10).ok()
+            } else {
+                ch
+            };
+            if let Some(code) = char_code.and_then(char::from_u32) {
+                unescaped.push(code);
+            } else {
+                unescaped.push_str(&self[start..last_end]);
             }
         }
         unescaped.push_str(&self[last_end..]);

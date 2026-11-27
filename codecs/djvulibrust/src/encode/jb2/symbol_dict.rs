@@ -136,18 +136,25 @@ impl BitImage {
             let mut out = Vec::with_capacity(words_per_row * self.height);
             for y in 0..self.height {
                 for word_x in 0..words_per_row {
-                    let mut w = 0u32;
-                    for bit in 0..32 {
-                        let x = word_x * 32 + bit;
-                        if x < self.width && self.get_pixel_unchecked(x, y) {
-                            w |= 1u32 << (31 - bit);
-                        }
-                    }
-                    out.push(w);
+                    out.push(self.packed_word(word_x, y));
                 }
             }
             out
         })
+    }
+
+    /// Packs the 32 pixels of word `word_x` in row `y`, MSB first; pixels
+    /// past the right edge read as white.
+    #[inline]
+    fn packed_word(&self, word_x: usize, y: usize) -> u32 {
+        let mut w = 0u32;
+        for bit in 0..32 {
+            let x = word_x * 32 + bit;
+            if x < self.width && self.get_pixel_unchecked(x, y) {
+                w |= 1u32 << (31 - bit);
+            }
+        }
+        w
     }
 }
 
@@ -195,6 +202,66 @@ impl Comparator {
         }
     }
 
+    /// Counts the pixels that differ between `b` and `a` shifted by
+    /// (`dx`, `dy`), stopping early once the count reaches `best_err`.
+    /// `None` when the shifted rows do not overlap.
+    fn shifted_error(a: &BitImage, b: &BitImage, dx: i32, dy: i32, best_err: u32) -> Option<u32> {
+        let awpr = ((a.width + 31) >> 5) as usize;
+        let bwpr = ((b.width + 31) >> 5) as usize;
+        let a_words = a.to_packed_words();
+        let b_words = b.to_packed_words();
+
+        let mut err = 0u32;
+        let bit_dx = (dx & 31) as u32;
+        let word_dx = (dx >> 5) as isize;
+
+        let y0 = dy.max(0) as u32;
+        let y1 = (a.height as i32 + dy).min(b.height as i32).max(0) as u32;
+        if y1 <= y0 {
+            return None;
+        }
+
+        for row in 0..(y1 - y0) {
+            let a_row_idx = (row as i32 + y0 as i32 - dy) as usize * awpr;
+            let b_row_idx = (row as i32 + y0 as i32) as usize * bwpr;
+
+            if a_row_idx >= a_words.len() || b_row_idx >= b_words.len() {
+                continue;
+            }
+
+            let a_row_end = std::cmp::min(a_row_idx + awpr, a_words.len());
+            let b_row_end = std::cmp::min(b_row_idx + bwpr, b_words.len());
+
+            let a_row = &a_words[a_row_idx..a_row_end];
+            let b_row = &b_words[b_row_idx..b_row_end];
+
+            for w in 0..((a.width.max(b.width) + 31) >> 5) {
+                let idx = w as isize + word_dx;
+                let aw = Self::get_word(a_row, idx);
+                let aw_next = if bit_dx == 0 {
+                    0
+                } else {
+                    Self::get_word(a_row, idx + 1)
+                };
+                let aligned_a = if bit_dx == 0 {
+                    aw
+                } else {
+                    (aw << bit_dx) | (aw_next >> (32 - bit_dx))
+                };
+                let bw = Self::get_word(b_row, w as isize);
+                let xor_result = aligned_a ^ bw;
+                err += xor_result.count_ones();
+                if err >= best_err {
+                    break;
+                }
+            }
+            if err >= best_err {
+                break;
+            }
+        }
+        Some(err)
+    }
+
     pub fn distance(
         &mut self,
         a: &BitImage,
@@ -207,8 +274,6 @@ impl Comparator {
             return None;
         }
 
-        let awpr = ((a.width + 31) >> 5) as usize;
-        let bwpr = ((b.width + 31) >> 5) as usize;
         let wpr_overlap = ((a.width.max(b.width) + 31) >> 5) as usize;
         if self.tmp.len() < wpr_overlap {
             self.tmp.resize(wpr_overlap, 0);
@@ -218,60 +283,11 @@ impl Comparator {
         let mut best_dx = 0;
         let mut best_dy = 0;
 
-        let a_words = a.to_packed_words();
-        let b_words = b.to_packed_words();
-
         for dy in -SEARCH_RADIUS..=SEARCH_RADIUS {
             for dx in -SEARCH_RADIUS..=SEARCH_RADIUS {
-                let mut err = 0u32;
-                let bit_dx = (dx & 31) as u32;
-                let word_dx = (dx >> 5) as isize;
-
-                let y0 = dy.max(0) as u32;
-                let y1 = (a.height as i32 + dy).min(b.height as i32).max(0) as u32;
-                if y1 <= y0 {
+                let Some(err) = Self::shifted_error(a, b, dx, dy, best_err) else {
                     continue;
-                }
-
-                for row in 0..(y1 - y0) {
-                    let a_row_idx = (row as i32 + y0 as i32 - dy) as usize * awpr;
-                    let b_row_idx = (row as i32 + y0 as i32) as usize * bwpr;
-
-                    if a_row_idx >= a_words.len() || b_row_idx >= b_words.len() {
-                        continue;
-                    }
-
-                    let a_row_end = std::cmp::min(a_row_idx + awpr, a_words.len());
-                    let b_row_end = std::cmp::min(b_row_idx + bwpr, b_words.len());
-
-                    let a_row = &a_words[a_row_idx..a_row_end];
-                    let b_row = &b_words[b_row_idx..b_row_end];
-
-                    for w in 0..((a.width.max(b.width) + 31) >> 5) {
-                        let idx = w as isize + word_dx;
-                        let aw = Self::get_word(a_row, idx);
-                        let aw_next = if bit_dx == 0 {
-                            0
-                        } else {
-                            Self::get_word(a_row, idx + 1)
-                        };
-                        let aligned_a = if bit_dx == 0 {
-                            aw
-                        } else {
-                            (aw << bit_dx) | (aw_next >> (32 - bit_dx))
-                        };
-                        let bw = Self::get_word(b_row, w as isize);
-                        let xor_result = aligned_a ^ bw;
-                        err += xor_result.count_ones();
-                        if err >= best_err {
-                            break;
-                        }
-                    }
-                    if err >= best_err {
-                        break;
-                    }
-                }
-
+                };
                 if err < best_err {
                     best_err = err;
                     best_dx = dx;

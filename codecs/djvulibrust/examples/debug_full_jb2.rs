@@ -52,17 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let x2 = 800 - 1 - x1;
         let y = i as usize;
 
-        // Make lines thick (5 pixels)
-        for dx in 0..5 {
-            for dy in 0..5 {
-                if x1 + dx < 800 && y + dy < 600 {
-                    mask.set_usize(x1 + dx, y + dy, true);
-                }
-                if x2 >= dx && y + dy < 600 {
-                    mask.set_usize(x2 - dx, y + dy, true);
-                }
-            }
-        }
+        draw_thick_points(&mut mask, x1, x2, y);
     }
 
     // Add a border too
@@ -140,4 +130,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  DjVu:   djview /tmp/test_compound.djvu");
 
     Ok(())
+}
+
+/// Marks the 5x5 squares that make row `y` of the two diagonals at `x1` and `x2` thick.
+fn draw_thick_points(mask: &mut BitImage, x1: usize, x2: usize, y: usize) {
+    // Make lines thick (5 pixels)
+    for dx in 0..5 {
+        for dy in 0..5 {
+            if x1 + dx < 800 && y + dy < 600 {
+                mask.set_usize(x1 + dx, y + dy, true);
+            }
+            if x2 >= dx && y + dy < 600 {
+                mask.set_usize(x2 - dx, y + dy, true);
+            }
+        }
+    }
 }

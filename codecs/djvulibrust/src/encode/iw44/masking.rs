@@ -57,6 +57,14 @@ pub fn interpolate_mask(
         }
     }
     // 3) iterate over scales
+    let mut state = MaskInterpolation {
+        data,
+        count,
+        scratch,
+        w,
+        h,
+        rowsize,
+    };
     let mut split = 1;
     let mut scale = 2;
     let mut again = true;
@@ -64,64 +72,97 @@ pub fn interpolate_mask(
         again = false;
         for i in (0..h).step_by(scale) {
             for j in (0..w).step_by(scale) {
-                // compute weighted average over the square [i..i+scale)×[j..j+scale)
-                let istart = if i + split > h {
-                    i.saturating_sub(scale)
-                } else {
-                    i
-                };
-                let jstart = if j + split > w {
-                    j.saturating_sub(scale)
-                } else {
-                    j
-                };
-                let mut gray_sum = 0i32;
-                let mut total_w = 0i32;
-                let mut saw_zero = false;
-                let iend = (i + scale).min(h);
-                let jend = (j + scale).min(w);
-                let mut ii = istart;
-                while ii < iend {
-                    let mut jj = jstart;
-                    while jj < jend {
-                        let wght = count[ii * w + jj];
-                        if wght > 0 {
-                            total_w += wght;
-                            gray_sum += wght * scratch[ii * w + jj];
-                        } else if ii >= i && jj >= j {
-                            saw_zero = true;
-                        }
-                        jj += split;
-                    }
-                    ii += split;
-                }
-                let idx = i * w + j;
-                if total_w == 0 {
-                    // still no information here; we'll try again at a coarser scale
-                    again = true;
-                    count[idx] = 0;
-                } else {
-                    // fill masked pixels if we saw them
-                    let gray = (gray_sum / total_w) as i32;
-                    if saw_zero {
-                        for yy in i..iend {
-                            for xx in j..jend {
-                                let cidx = yy * w + xx;
-                                if count[cidx] == 0 {
-                                    data[yy * rowsize + xx] = gray as i16;
-                                    count[cidx] = 1;
-                                }
-                            }
-                        }
-                    }
-                    // store for next iteration
-                    count[idx] = (total_w >> 2) as i32;
-                    scratch[idx] = gray;
-                }
+                again |= state.average_cell(i, j, split, scale);
             }
         }
         split = scale;
         scale <<= 1;
+    }
+}
+
+/// Working state of `interpolate_mask`: the image, per-pixel weights (zero
+/// where nothing is known yet) and the averaged values of the previous scale.
+struct MaskInterpolation<'a> {
+    data: &'a mut [i16],
+    count: Vec<i32>,
+    scratch: Vec<i32>,
+    w: usize,
+    h: usize,
+    rowsize: usize,
+}
+
+impl MaskInterpolation<'_> {
+    /// Averages the known samples of the `scale`-sized cell at (`i`, `j`),
+    /// fills its masked pixels with that average and stores it for the next
+    /// scale. Returns `true` when the cell holds no information yet, so a
+    /// coarser scale must try again.
+    fn average_cell(&mut self, i: usize, j: usize, split: usize, scale: usize) -> bool {
+        let (w, h) = (self.w, self.h);
+        // compute weighted average over the square [i..i+scale)×[j..j+scale)
+        let istart = if i + split > h {
+            i.saturating_sub(scale)
+        } else {
+            i
+        };
+        let jstart = if j + split > w {
+            j.saturating_sub(scale)
+        } else {
+            j
+        };
+        let mut gray_sum = 0i32;
+        let mut total_w = 0i32;
+        let mut saw_zero = false;
+        let iend = (i + scale).min(h);
+        let jend = (j + scale).min(w);
+        let mut ii = istart;
+        while ii < iend {
+            let mut jj = jstart;
+            while jj < jend {
+                let wght = self.count[ii * w + jj];
+                if wght > 0 {
+                    total_w += wght;
+                    gray_sum += wght * self.scratch[ii * w + jj];
+                } else if ii >= i && jj >= j {
+                    saw_zero = true;
+                }
+                jj += split;
+            }
+            ii += split;
+        }
+        let idx = i * w + j;
+        if total_w == 0 {
+            // still no information here; we'll try again at a coarser scale
+            self.count[idx] = 0;
+            return true;
+        }
+        // fill masked pixels if we saw them
+        let gray = (gray_sum / total_w) as i32;
+        if saw_zero {
+            self.fill_unknown(i..iend, j..jend, gray);
+        }
+        // store for next iteration
+        self.count[idx] = (total_w >> 2) as i32;
+        self.scratch[idx] = gray;
+        false
+    }
+
+    /// Writes `gray` into every pixel of the given rows and columns that has
+    /// no information yet, and marks it known.
+    fn fill_unknown(
+        &mut self,
+        rows: std::ops::Range<usize>,
+        cols: std::ops::Range<usize>,
+        gray: i32,
+    ) {
+        for yy in rows {
+            for xx in cols.clone() {
+                let cidx = yy * self.w + xx;
+                if self.count[cidx] == 0 {
+                    self.data[yy * self.rowsize + xx] = gray as i16;
+                    self.count[cidx] = 1;
+                }
+            }
+        }
     }
 }
 
@@ -173,30 +214,13 @@ pub fn forward_mask(
 
         // zero out masked detail coefficients
         for y in (0..h).step_by(scale * 2) {
-            // horizontal band
-            for x in (scale..w).step_by(scale * 2) {
-                if smask[y * w + x] != 0 {
-                    scratch[y * w + x] = 0;
-                }
-            }
-            // vertical band
-            if y + scale < h {
-                for x in (0..w).step_by(scale) {
-                    if smask[(y + scale) * w + x] != 0 {
-                        scratch[(y + scale) * w + x] = 0;
-                    }
-                }
-            }
+            zero_masked_details(&mut scratch, &smask, y, w, h, scale);
         }
 
         // reconstruct back to pixel domain (inverse IW44 transform would be called here in reference impl, but is not implemented in encoder)
         // restore visible pixels so they remain exact (convert i16 to i32)
         for y in (0..h).step_by(scale) {
-            for x in (0..w).step_by(scale) {
-                if smask[y * w + x] == 0 {
-                    scratch[y * w + x] = data[y * rowsize + x] as i32;
-                }
-            }
+            restore_visible_row(&mut scratch, &smask, data, y * w, y * rowsize, w, scale);
         }
 
         // re-decompose to freeze the mask out
@@ -217,19 +241,68 @@ pub fn forward_mask(
 
         // update the mask for the next coarser scale
         for y in (0..h).step_by(scale * 2) {
-            for x in (0..w).step_by(scale * 2) {
-                let m00 = smask[y * w + x] != 0;
-                let m10 = if y + scale < h {
-                    smask[(y + scale) * w + x] != 0
-                } else {
-                    false
-                };
-                let left = x >= scale && smask[y * w + x - scale] != 0;
-                let right = x + scale < w && smask[y * w + x + scale] != 0;
-                smask[y * w + x] = if m00 && m10 && left && right { 1 } else { 0 };
-            }
+            coarsen_mask_row(&mut smask, y, w, h, scale);
         }
 
         scale <<= 1;
+    }
+}
+
+/// Zeroes the masked detail coefficients of the decomposition row pair
+/// starting at row `y`: the horizontal band on row `y` and the vertical band
+/// on row `y + scale`.
+fn zero_masked_details(
+    scratch: &mut [i32],
+    smask: &[i8],
+    y: usize,
+    w: usize,
+    h: usize,
+    scale: usize,
+) {
+    // horizontal band
+    for x in (scale..w).step_by(scale * 2) {
+        if smask[y * w + x] != 0 {
+            scratch[y * w + x] = 0;
+        }
+    }
+    // vertical band
+    if y + scale >= h {
+        return;
+    }
+    for x in (0..w).step_by(scale) {
+        if smask[(y + scale) * w + x] != 0 {
+            scratch[(y + scale) * w + x] = 0;
+        }
+    }
+}
+
+/// Restores the exact pixel values of the visible (unmasked) samples of one
+/// row; `mask_row` and `data_row` are the row's offsets in `smask`/`scratch`
+/// and in `data`.
+fn restore_visible_row(
+    scratch: &mut [i32],
+    smask: &[i8],
+    data: &[i16],
+    mask_row: usize,
+    data_row: usize,
+    w: usize,
+    scale: usize,
+) {
+    for x in (0..w).step_by(scale) {
+        if smask[mask_row + x] == 0 {
+            scratch[mask_row + x] = data[data_row + x] as i32;
+        }
+    }
+}
+
+/// Recomputes the mask of one row for the next coarser scale: a sample stays
+/// masked only when it, the sample below and both horizontal neighbours are.
+fn coarsen_mask_row(smask: &mut [i8], y: usize, w: usize, h: usize, scale: usize) {
+    for x in (0..w).step_by(scale * 2) {
+        let m00 = smask[y * w + x] != 0;
+        let m10 = y + scale < h && smask[(y + scale) * w + x] != 0;
+        let left = x >= scale && smask[y * w + x - scale] != 0;
+        let right = x + scale < w && smask[y * w + x + scale] != 0;
+        smask[y * w + x] = if m00 && m10 && left && right { 1 } else { 0 };
     }
 }

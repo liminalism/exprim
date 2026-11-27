@@ -257,16 +257,16 @@ impl<W: Write> ZEncoder<W> {
             if self.delay < 0xff {
                 self.delay -= 1;
             }
-        } else {
-            self.byte = (self.byte << 1) | (bit & 1);
-            self.scount += 1;
-            if self.scount == 8 {
-                if let Some(ref mut writer) = self.writer {
-                    writer.write_all(&[self.byte])?;
-                }
-                self.scount = 0;
-                self.byte = 0;
+            return Ok(());
+        }
+        self.byte = (self.byte << 1) | (bit & 1);
+        self.scount += 1;
+        if self.scount == 8 {
+            if let Some(ref mut writer) = self.writer {
+                writer.write_all(&[self.byte])?;
             }
+            self.scount = 0;
+            self.byte = 0;
         }
         Ok(())
     }

@@ -221,13 +221,14 @@ impl PageBuilder {
     /// Detects if masking is needed (JB2 foreground overlaps IW44 background)
     pub fn needs_masking(&self) -> bool {
         for fg_layer in &self.layers {
-            if matches!(fg_layer.data, LayerData::Foreground(_)) {
-                for bg_layer in &self.layers {
-                    if matches!(bg_layer.data, LayerData::Background(_)) {
-                        if fg_layer.overlaps_with(bg_layer) {
-                            return true;
-                        }
-                    }
+            if !matches!(fg_layer.data, LayerData::Foreground(_)) {
+                continue;
+            }
+            for bg_layer in &self.layers {
+                if matches!(bg_layer.data, LayerData::Background(_))
+                    && fg_layer.overlaps_with(bg_layer)
+                {
+                    return true;
                 }
             }
         }

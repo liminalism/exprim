@@ -139,6 +139,11 @@ fn update_row_generic_wide(buf: &mut [i16], q: usize, w: usize, s: usize, s3: us
 /// for every column in that row. Both are proven, not assumed — see the
 /// `filter_fv_split_scalar` equality tests, which exercise scale==1 across
 /// the same matrix and would catch a violation.
+#[allow(
+    clippy::excessive_nesting,
+    clippy::cognitive_complexity,
+    reason = "IW44 vertical lifting kernel for scale 1: its boundary branches are literal copies of filter_fv_split_scalar's (DjVuLibre IW44EncodeCodec.cpp filter_fv) with scale fixed at 1, and the exhaustive equality tests rely on that branch-for-branch correspondence"
+)]
 fn filter_fv_scale1_wide(buf: &mut [i16], w: usize, h: usize, rowsize: usize) {
     let s = rowsize;
     let s3 = s + s + s;
@@ -272,6 +277,11 @@ fn filter_fv_dispatch(buf: &mut [i16], w: usize, h: usize, rowsize: usize, scale
 /// Exists to (a) prove the split is safe before any SIMD touches it, and
 /// (b) serve as the literal scalar template the `scale1_wide` kernel below
 /// vectorizes the generic-row inner loop of.
+#[allow(
+    clippy::excessive_nesting,
+    clippy::cognitive_complexity,
+    reason = "test-only scalar template of the IW44 vertical lifting filter: every branch condition and formula is copied verbatim from transform::filter_fv (DjVuLibre filter_fv) so the predict/update split can be checked bit for bit against it"
+)]
 #[cfg(test)]
 pub(super) fn filter_fv_split_scalar(
     buf: &mut [i16],
@@ -417,6 +427,10 @@ pub(super) fn filter_fv_split_scalar(
 ///    scratch array (`highs_per_row`), and pass 2 read from that instead of
 ///    the buffer. Pass 1 still writes the truncated i16 to `buf[q]` too —
 ///    that's the real output later levels/callers need.
+#[allow(
+    clippy::excessive_nesting,
+    reason = "test-only scalar template of the IW44 horizontal lifting filter: every branch condition and formula is copied verbatim from transform::filter_fh (DjVuLibre filter_fh) so the predict/update split can be checked bit for bit against it"
+)]
 #[cfg(test)]
 pub(super) fn filter_fh_split_scalar(
     buf: &mut [i16],
@@ -635,40 +649,67 @@ mod tests {
         "extremes",
     ];
 
-    #[test]
-    fn split_scalar_matches_original_exhaustive() {
-        let mut cases = 0usize;
-        for &w in SIZES {
-            for &h in &[0usize, 1, 2, 3, 4, 5, 7, 8, 16, 17, 31, 32, 65] {
+    /// Every (w, h, rowsize, scale) combination of the given widths,
+    /// heights and scales with a non-empty image, at row padding 0, 1 and 7.
+    fn geometries(
+        widths: &[usize],
+        heights: &[usize],
+        scales: &[usize],
+    ) -> Vec<(usize, usize, usize, usize)> {
+        let mut out = Vec::new();
+        for &w in widths {
+            for &h in heights {
                 if w == 0 || h == 0 {
                     continue;
                 }
                 for &rowsize_extra in &[0usize, 1, 7] {
                     let rowsize = w + rowsize_extra;
-                    for &scale in &[1usize, 2, 4] {
-                        // Original filter_fv's `y` loop only exercises rows
-                        // when h/scale allows at least the smallest window;
-                        // trivial combinations are still valid inputs, so
-                        // just run them all rather than filtering.
-                        for &pattern in PATTERNS {
-                            let seed =
-                                (w * 7919 + h * 104729 + rowsize * 13 + scale * 5 + pattern.len())
-                                    as u32;
-                            let mut buf_a = make_buf(rowsize, h, pattern, seed);
-                            let mut buf_b = buf_a.clone();
-
-                            filter_fv_original(&mut buf_a, w, h, rowsize, scale);
-                            filter_fv_split_scalar(&mut buf_b, w, h, rowsize, scale);
-
-                            assert_eq!(
-                                buf_a, buf_b,
-                                "mismatch: w={w} h={h} rowsize={rowsize} scale={scale} pattern={pattern}"
-                            );
-                            cases += 1;
-                        }
-                    }
+                    out.extend(scales.iter().map(|&scale| (w, h, rowsize, scale)));
                 }
             }
+        }
+        out
+    }
+
+    /// Runs `reference` and `candidate` on copies of the same buffer for
+    /// every pattern and asserts identical output; returns the number of
+    /// cases run. Each pattern's seed is `seed_base + pattern.len()`.
+    fn assert_matches_for_all_patterns(
+        reference: impl Fn(&mut [i16]),
+        candidate: impl Fn(&mut [i16]),
+        (rowsize, h): (usize, usize),
+        seed_base: usize,
+        case: &str,
+    ) -> usize {
+        for &pattern in PATTERNS {
+            let seed = (seed_base + pattern.len()) as u32;
+            let mut buf_a = make_buf(rowsize, h, pattern, seed);
+            let mut buf_b = buf_a.clone();
+
+            reference(&mut buf_a);
+            candidate(&mut buf_b);
+
+            assert_eq!(buf_a, buf_b, "mismatch: {case} pattern={pattern}");
+        }
+        PATTERNS.len()
+    }
+
+    #[test]
+    fn split_scalar_matches_original_exhaustive() {
+        let mut cases = 0usize;
+        let heights = [0usize, 1, 2, 3, 4, 5, 7, 8, 16, 17, 31, 32, 65];
+        for (w, h, rowsize, scale) in geometries(SIZES, &heights, &[1, 2, 4]) {
+            // Original filter_fv's `y` loop only exercises rows
+            // when h/scale allows at least the smallest window;
+            // trivial combinations are still valid inputs, so
+            // just run them all rather than filtering.
+            cases += assert_matches_for_all_patterns(
+                |buf| filter_fv_original(buf, w, h, rowsize, scale),
+                |buf| filter_fv_split_scalar(buf, w, h, rowsize, scale),
+                (rowsize, h),
+                w * 7919 + h * 104729 + rowsize * 13 + scale * 5,
+                &format!("w={w} h={h} rowsize={rowsize} scale={scale}"),
+            );
         }
         assert!(
             cases > 100,
@@ -684,26 +725,15 @@ mod tests {
             1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 39, 40, 63, 64, 65, 100, 127, 128, 129,
         ];
         let mut cases = 0usize;
-        for &w in WIDE_SIZES {
-            for &h in &[1usize, 2, 3, 4, 5, 7, 8, 16, 17, 31, 32, 33, 65] {
-                for &rowsize_extra in &[0usize, 1, 7] {
-                    let rowsize = w + rowsize_extra;
-                    for &pattern in PATTERNS {
-                        let seed = (w * 7919 + h * 104729 + rowsize * 13 + pattern.len()) as u32;
-                        let mut buf_a = make_buf(rowsize, h, pattern, seed);
-                        let mut buf_b = buf_a.clone();
-
-                        filter_fv_original(&mut buf_a, w, h, rowsize, 1);
-                        filter_fv_scale1_wide(&mut buf_b, w, h, rowsize);
-
-                        assert_eq!(
-                            buf_a, buf_b,
-                            "mismatch: w={w} h={h} rowsize={rowsize} pattern={pattern}"
-                        );
-                        cases += 1;
-                    }
-                }
-            }
+        let heights = [1usize, 2, 3, 4, 5, 7, 8, 16, 17, 31, 32, 33, 65];
+        for (w, h, rowsize, _) in geometries(WIDE_SIZES, &heights, &[1]) {
+            cases += assert_matches_for_all_patterns(
+                |buf| filter_fv_original(buf, w, h, rowsize, 1),
+                |buf| filter_fv_scale1_wide(buf, w, h, rowsize),
+                (rowsize, h),
+                w * 7919 + h * 104729 + rowsize * 13,
+                &format!("w={w} h={h} rowsize={rowsize}"),
+            );
         }
         assert!(
             cases > 100,
@@ -748,33 +778,15 @@ mod tests {
         // `if q < e` is false and the sibling while-loops must still run
         // unnested for the row to be processed at all.
         let mut cases = 0usize;
-        for &w in SIZES {
-            for &h in &[0usize, 1, 2, 3, 4, 5, 7, 8, 16, 17, 31, 32, 65] {
-                if w == 0 || h == 0 {
-                    continue;
-                }
-                for &rowsize_extra in &[0usize, 1, 7] {
-                    let rowsize = w + rowsize_extra;
-                    for &scale in &[1usize, 2, 4, 8] {
-                        for &pattern in PATTERNS {
-                            let seed =
-                                (w * 7919 + h * 104729 + rowsize * 13 + scale * 5 + pattern.len())
-                                    as u32;
-                            let mut buf_a = make_buf(rowsize, h, pattern, seed);
-                            let mut buf_b = buf_a.clone();
-
-                            filter_fh_original(&mut buf_a, w, h, rowsize, scale);
-                            filter_fh_split_scalar(&mut buf_b, w, h, rowsize, scale);
-
-                            assert_eq!(
-                                buf_a, buf_b,
-                                "mismatch: w={w} h={h} rowsize={rowsize} scale={scale} pattern={pattern}"
-                            );
-                            cases += 1;
-                        }
-                    }
-                }
-            }
+        let heights = [0usize, 1, 2, 3, 4, 5, 7, 8, 16, 17, 31, 32, 65];
+        for (w, h, rowsize, scale) in geometries(SIZES, &heights, &[1, 2, 4, 8]) {
+            cases += assert_matches_for_all_patterns(
+                |buf| filter_fh_original(buf, w, h, rowsize, scale),
+                |buf| filter_fh_split_scalar(buf, w, h, rowsize, scale),
+                (rowsize, h),
+                w * 7919 + h * 104729 + rowsize * 13 + scale * 5,
+                &format!("w={w} h={h} rowsize={rowsize} scale={scale}"),
+            );
         }
         assert!(
             cases > 100,

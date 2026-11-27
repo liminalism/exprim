@@ -312,6 +312,11 @@ pub(crate) fn filter_fh(buf: &mut [i16], w: usize, h: usize, mut rowsize: usize,
 ///
 /// `pub(crate)` so `crate::simd` can register it as the default scalar
 /// primitive and use it as the correctness reference for SIMD kernels.
+#[allow(
+    clippy::excessive_nesting,
+    clippy::cognitive_complexity,
+    reason = "IW44 vertical lifting filter, a line-for-line port of DjVuLibre IW44EncodeCodec.cpp filter_fv: the prediction and update steps and their y<3 / y in 3..6 / y>=hlimit boundary cases mirror the C++ branch for branch, and this is the scalar reference the SIMD kernels are tested against"
+)]
 pub(crate) fn filter_fv(buf: &mut [i16], w: usize, h: usize, rowsize: usize, scale: usize) {
     let s = scale * rowsize;
     let s3 = s + s + s;

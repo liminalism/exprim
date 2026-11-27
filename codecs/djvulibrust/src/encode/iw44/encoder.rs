@@ -110,74 +110,23 @@ pub fn make_ycbcr_codecs(
 ) -> (Codec, Option<Codec>, Option<Codec>) {
     #[cfg(feature = "rayon")]
     {
-        match params.crcb_mode {
+        let half = match params.crcb_mode {
             CrcbMode::None => {
                 let ymap = CoeffMap::create_from_signed_channel(y_buf, width, height, mask, "Y");
                 return (Codec::new(ymap, params), None, None);
             }
-            CrcbMode::Half => {
-                let (y_codec, (cb_codec, cr_codec)) = rayon::join(
-                    || {
-                        let ymap =
-                            CoeffMap::create_from_signed_channel(y_buf, width, height, mask, "Y");
-                        Codec::new(ymap, params)
-                    },
-                    || {
-                        let (mut cbmap, mut crmap) = rayon::join(
-                            || {
-                                CoeffMap::create_from_signed_channel(
-                                    cb_buf, width, height, mask, "Cb",
-                                )
-                            },
-                            || {
-                                CoeffMap::create_from_signed_channel(
-                                    cr_buf, width, height, mask, "Cr",
-                                )
-                            },
-                        );
-                        cbmap.slashres(2);
-                        crmap.slashres(2);
+            CrcbMode::Half => true,
+            CrcbMode::Normal | CrcbMode::Full => false,
+        };
+        let (y_codec, (cb_codec, cr_codec)) = rayon::join(
+            || {
+                let ymap = CoeffMap::create_from_signed_channel(y_buf, width, height, mask, "Y");
+                Codec::new(ymap, params)
+            },
+            || make_chroma_codecs_parallel(cb_buf, cr_buf, (width, height), mask, params, half),
+        );
 
-                        (
-                            Some(Codec::new(cbmap, params)),
-                            Some(Codec::new(crmap, params)),
-                        )
-                    },
-                );
-
-                return (y_codec, cb_codec, cr_codec);
-            }
-            CrcbMode::Normal | CrcbMode::Full => {
-                let (y_codec, (cb_codec, cr_codec)) = rayon::join(
-                    || {
-                        let ymap =
-                            CoeffMap::create_from_signed_channel(y_buf, width, height, mask, "Y");
-                        Codec::new(ymap, params)
-                    },
-                    || {
-                        let (cbmap, crmap) = rayon::join(
-                            || {
-                                CoeffMap::create_from_signed_channel(
-                                    cb_buf, width, height, mask, "Cb",
-                                )
-                            },
-                            || {
-                                CoeffMap::create_from_signed_channel(
-                                    cr_buf, width, height, mask, "Cr",
-                                )
-                            },
-                        );
-
-                        (
-                            Some(Codec::new(cbmap, params)),
-                            Some(Codec::new(crmap, params)),
-                        )
-                    },
-                );
-
-                return (y_codec, cb_codec, cr_codec);
-            }
-        }
+        return (y_codec, cb_codec, cr_codec);
     }
 
     #[cfg(not(feature = "rayon"))]
@@ -211,6 +160,32 @@ pub fn make_ycbcr_codecs(
 
         (y_codec, cb_codec, cr_codec)
     }
+}
+
+/// Builds the Cb and Cr codecs, their coefficient maps in parallel; `half`
+/// reduces both chroma maps to half resolution first.
+#[cfg(feature = "rayon")]
+fn make_chroma_codecs_parallel(
+    cb_buf: &[i8],
+    cr_buf: &[i8],
+    (width, height): (u32, u32),
+    mask: Option<&Bitmap>,
+    params: &EncoderParams,
+    half: bool,
+) -> (Option<Codec>, Option<Codec>) {
+    let (mut cbmap, mut crmap) = rayon::join(
+        || CoeffMap::create_from_signed_channel(cb_buf, width, height, mask, "Cb"),
+        || CoeffMap::create_from_signed_channel(cr_buf, width, height, mask, "Cr"),
+    );
+    if half {
+        cbmap.slashres(2);
+        crmap.slashres(2);
+    }
+
+    (
+        Some(Codec::new(cbmap, params)),
+        Some(Codec::new(crmap, params)),
+    )
 }
 
 pub fn encoder_from_rgb_with_helpers(
@@ -340,19 +315,7 @@ impl IWEncoder {
             // Encode one slice using codec-controlled scheduling (mirrors DjVuLibre)
             // Each codec manages its own curbit/curband state independently
             let should_continue = self.y_codec.code_slice(&mut zp_impl)?;
-
-            if let Some(ref mut cb) = self.cb_codec {
-                if self.total_slices as i32 >= self.crcb_delay {
-                    debug!("Encoding Cb slice {}", self.total_slices);
-                    cb.code_slice(&mut zp_impl)?;
-                }
-            }
-            if let Some(ref mut cr) = self.cr_codec {
-                if self.total_slices as i32 >= self.crcb_delay {
-                    debug!("Encoding Cr slice {}", self.total_slices);
-                    cr.code_slice(&mut zp_impl)?;
-                }
-            }
+            self.code_chroma_slices(&mut zp_impl)?;
 
             // A slice is always processed, so we always increment
             slices_encoded += 1;
@@ -360,16 +323,8 @@ impl IWEncoder {
 
             // Check slice limit only if not overridden by max_slices parameter
             // When max_slices is usize::MAX, we encode all remaining slices
-            if max_slices < usize::MAX {
-                if let Some(slice_limit) = self.params.slices {
-                    if slices_encoded >= slice_limit {
-                        info!(
-                            "encode_chunk: Reached slice limit {}, stopping",
-                            slice_limit
-                        );
-                        break;
-                    }
-                }
+            if max_slices < usize::MAX && self.reached_slice_limit(slices_encoded) {
+                break;
             }
 
             // Check byte limit
@@ -387,20 +342,8 @@ impl IWEncoder {
             }
 
             // Quality control - estimate decibels (skip if lossless mode)
-            if !self.params.lossless {
-                if let Some(db_target) = self.params.decibels {
-                    // Always check quality after first slice or when appropriate
-                    if slices_encoded > 0
-                        || self.y_codec.curband == 0
-                        || estdb >= db_target - super::constants::DECIBEL_PRUNE
-                    {
-                        estdb = self.y_codec.estimate_decibel(self.params.db_frac);
-                        if estdb >= db_target {
-                            self.y_codec.curbit = -1;
-                            break;
-                        }
-                    }
-                }
+            if !self.params.lossless && self.reached_decibel_target(slices_encoded, &mut estdb) {
+                break;
             }
         }
 
@@ -428,31 +371,7 @@ impl IWEncoder {
 
         // Full secondary header only for the first chunk (serial == 0)
         if self.serial == 0 {
-            let is_color = self.cb_codec.is_some() && self.cr_codec.is_some();
-            // Major version: bit 7 set (0x80) indicates grayscale/BM44, clear indicates color/PM44
-            // C++ uses: major = 1 | 0x80 for grayscale, major = 1 for color
-            let major = if is_color { 1 } else { 1 | 0x80 };
-            chunk_data.push(major);
-            chunk_data.push(2); // Minor version 2 per C++
-            chunk_data.extend_from_slice(&(w as u16).to_be_bytes());
-            chunk_data.extend_from_slice(&(h as u16).to_be_bytes());
-
-            // Tertiary header CrCbDelay byte: For grayscale (no chroma), use 0x00.
-            // For color images, set 0x80 flag and OR in the delay value.
-            // From C++ IW44EncodeCodec.cpp:
-            // - CRCBfull: crcb_half=0, crcb_delay=0 -> crcbdelay = 0x80 | 0 = 0x80
-            // - CRCBnormal: crcb_half=0, crcb_delay=10 -> crcbdelay = 0x80 | 10 = 0x8a
-            // - CRCBhalf: crcb_half=1, crcb_delay=10 -> crcbdelay = 0x00 | 10 = 0x0a
-            let crcb_delay_byte: u8 = if is_color {
-                let mut byte = if self.crcb_half { 0x00 } else { 0x80 };
-                if self.crcb_delay >= 0 {
-                    byte |= self.crcb_delay as u8;
-                }
-                byte
-            } else {
-                0x00
-            };
-            chunk_data.push(crcb_delay_byte);
+            self.write_secondary_header(&mut chunk_data, w, h);
         }
 
         // Append ZP payload
@@ -465,5 +384,87 @@ impl IWEncoder {
         self.serial = self.serial.wrapping_add(1);
 
         Ok((chunk_data, more))
+    }
+
+    /// Codes the current slice of the Cb and Cr codecs, once the chroma
+    /// delay has passed.
+    fn code_chroma_slices<Z: ZpEncoderCursor>(&mut self, zp: &mut Z) -> Result<(), EncoderError> {
+        let chroma_due = self.total_slices as i32 >= self.crcb_delay;
+        if let (Some(cb), true) = (self.cb_codec.as_mut(), chroma_due) {
+            debug!("Encoding Cb slice {}", self.total_slices);
+            cb.code_slice(zp)?;
+        }
+        if let (Some(cr), true) = (self.cr_codec.as_mut(), chroma_due) {
+            debug!("Encoding Cr slice {}", self.total_slices);
+            cr.code_slice(zp)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `slices_encoded` has reached the configured slice limit.
+    fn reached_slice_limit(&self, slices_encoded: usize) -> bool {
+        let Some(slice_limit) = self.params.slices else {
+            return false;
+        };
+        if slices_encoded < slice_limit {
+            return false;
+        }
+        info!(
+            "encode_chunk: Reached slice limit {}, stopping",
+            slice_limit
+        );
+        true
+    }
+
+    /// Re-estimates the quality when a decibel target is set and it is time
+    /// to check, storing the estimate in `estdb`. Returns `true`, and ends
+    /// the Y codec, once the target is met.
+    fn reached_decibel_target(&mut self, slices_encoded: usize, estdb: &mut f32) -> bool {
+        let Some(db_target) = self.params.decibels else {
+            return false;
+        };
+        // Always check quality after first slice or when appropriate
+        if !(slices_encoded > 0
+            || self.y_codec.curband == 0
+            || *estdb >= db_target - super::constants::DECIBEL_PRUNE)
+        {
+            return false;
+        }
+        *estdb = self.y_codec.estimate_decibel(self.params.db_frac);
+        if *estdb < db_target {
+            return false;
+        }
+        self.y_codec.curbit = -1;
+        true
+    }
+
+    /// Appends the version, size and chroma-delay fields that only the
+    /// first chunk (serial 0) carries.
+    fn write_secondary_header(&self, chunk_data: &mut Vec<u8>, w: usize, h: usize) {
+        let is_color = self.cb_codec.is_some() && self.cr_codec.is_some();
+        // Major version: bit 7 set (0x80) indicates grayscale/BM44, clear indicates color/PM44
+        // C++ uses: major = 1 | 0x80 for grayscale, major = 1 for color
+        let major = if is_color { 1 } else { 1 | 0x80 };
+        chunk_data.push(major);
+        chunk_data.push(2); // Minor version 2 per C++
+        chunk_data.extend_from_slice(&(w as u16).to_be_bytes());
+        chunk_data.extend_from_slice(&(h as u16).to_be_bytes());
+
+        // Tertiary header CrCbDelay byte: For grayscale (no chroma), use 0x00.
+        // For color images, set 0x80 flag and OR in the delay value.
+        // From C++ IW44EncodeCodec.cpp:
+        // - CRCBfull: crcb_half=0, crcb_delay=0 -> crcbdelay = 0x80 | 0 = 0x80
+        // - CRCBnormal: crcb_half=0, crcb_delay=10 -> crcbdelay = 0x80 | 10 = 0x8a
+        // - CRCBhalf: crcb_half=1, crcb_delay=10 -> crcbdelay = 0x00 | 10 = 0x0a
+        let crcb_delay_byte: u8 = if is_color {
+            let mut byte = if self.crcb_half { 0x00 } else { 0x80 };
+            if self.crcb_delay >= 0 {
+                byte |= self.crcb_delay as u8;
+            }
+            byte
+        } else {
+            0x00
+        };
+        chunk_data.push(crcb_delay_byte);
     }
 }

@@ -25,21 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Create "words" (simple rectangular blocks)
         for word in 0..6 {
             let word_x = x_offset + (word * 110);
-            let word_width = 80;
-
-            // Draw a solid rectangle for each word
-            for row in 0..30 {
-                for col in 0..word_width {
-                    let x = word_x + col;
-                    let y = y_offset + row;
-
-                    if x < width as usize && y < height as usize {
-                        if !(row > 10 && row < 20 && col > 10 && col < 70) {
-                            mask.set_usize(x, y, true);
-                        }
-                    }
-                }
-            }
+            draw_word(&mut mask, word_x, y_offset, width, height);
         }
     }
 
@@ -89,4 +75,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Draws one 80x30 "word": a solid rectangle with a hole in the middle, clipped to the page.
+fn draw_word(mask: &mut BitImage, word_x: usize, y_offset: usize, width: u32, height: u32) {
+    let word_width = 80;
+
+    // Draw a solid rectangle for each word
+    for row in 0..30 {
+        for col in 0..word_width {
+            let x = word_x + col;
+            let y = y_offset + row;
+
+            if x >= width as usize || y >= height as usize {
+                continue;
+            }
+            if !(row > 10 && row < 20 && col > 10 && col < 70) {
+                mask.set_usize(x, y, true);
+            }
+        }
+    }
 }

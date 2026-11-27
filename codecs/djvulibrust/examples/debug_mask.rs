@@ -50,20 +50,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mask.set_usize(col, row, true);
             }
             // Some text-like blocks inside
-            if row > 150 && row < 200 && col > 150 && col < 650 {
-                if (col / 20) % 2 == 0 {
-                    mask.set_usize(col, row, true);
-                }
+            if row > 150 && row < 200 && col > 150 && col < 650 && (col / 20) % 2 == 0 {
+                mask.set_usize(col, row, true);
             }
-            if row > 250 && row < 300 && col > 150 && col < 650 {
-                if (col / 20) % 2 == 0 {
-                    mask.set_usize(col, row, true);
-                }
+            if row > 250 && row < 300 && col > 150 && col < 650 && (col / 20) % 2 == 0 {
+                mask.set_usize(col, row, true);
             }
-            if row > 350 && row < 400 && col > 150 && col < 650 {
-                if (col / 20) % 2 == 0 {
-                    mask.set_usize(col, row, true);
-                }
+            if row > 350 && row < 400 && col > 150 && col < 650 && (col / 20) % 2 == 0 {
+                mask.set_usize(col, row, true);
             }
         }
     }
@@ -115,28 +109,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut reconstructed = BitImage::new(width, height)?;
 
     for (left, bottom, shape_idx) in &blits {
-        if *shape_idx < bitmaps.len() {
-            let shape = &bitmaps[*shape_idx];
-            let shape_w = shape.width;
-            let shape_h = shape.height;
-
-            // Blit coordinates are left, bottom in DjVu coordinate system
-            // Convert to top-left for our image (y=0 at top)
-            let top = height as i32 - *bottom - shape_h as i32;
-
-            for sy in 0..shape_h {
-                for sx in 0..shape_w {
-                    let dx = *left + sx as i32;
-                    let dy = top + sy as i32;
-
-                    if dx >= 0 && dx < width as i32 && dy >= 0 && dy < height as i32 {
-                        if shape.get_pixel_unchecked(sx, sy) {
-                            reconstructed.set_usize(dx as usize, dy as usize, true);
-                        }
-                    }
-                }
-            }
-        }
+        let Some(shape) = bitmaps.get(*shape_idx) else {
+            continue;
+        };
+        blit_shape(&mut reconstructed, shape, *left, *bottom, width, height);
     }
 
     // Count reconstructed black pixels
@@ -161,4 +137,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("View with: display /tmp/1_raw_mask.pbm /tmp/2_reconstructed_mask.pbm");
 
     Ok(())
+}
+
+/// Draws `shape` into `target` at the DjVu blit position (`left`, `bottom`), clipped to the page.
+fn blit_shape(
+    target: &mut BitImage,
+    shape: &BitImage,
+    left: i32,
+    bottom: i32,
+    width: u32,
+    height: u32,
+) {
+    let shape_w = shape.width;
+    let shape_h = shape.height;
+
+    // Blit coordinates are left, bottom in DjVu coordinate system
+    // Convert to top-left for our image (y=0 at top)
+    let top = height as i32 - bottom - shape_h as i32;
+
+    for sy in 0..shape_h {
+        for sx in 0..shape_w {
+            let dx = left + sx as i32;
+            let dy = top + sy as i32;
+
+            if dx >= 0
+                && dx < width as i32
+                && dy >= 0
+                && dy < height as i32
+                && shape.get_pixel_unchecked(sx, sy)
+            {
+                target.set_usize(dx as usize, dy as usize, true);
+            }
+        }
+    }
 }

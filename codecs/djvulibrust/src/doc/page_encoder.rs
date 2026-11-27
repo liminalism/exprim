@@ -210,6 +210,132 @@ impl Default for PageEncodeParams {
     }
 }
 
+/// Writes the FGbz chunk that colours the JB2 layer black: with per-blit
+/// correspondence data when there are blits, as a bare palette otherwise.
+fn write_fgbz(writer: &mut IffWriter, num_blits: usize) -> Result<()> {
+    // Determine if we have blits to color
+    if num_blits == 0 {
+        // Fallback for 0 blits: Write simple black FGbz palette
+        // Format: BYTE version | INT16 nPaletteSize | BYTE3 bgrColor
+        let fgbz_data: [u8; 6] = [
+            0x00, // Version (no correspondence data)
+            0x00, 0x01, // nPaletteSize = 1 (big-endian)
+            0x00, 0x00, 0x00, // BGR color = black
+        ];
+        writer.put_chunk("FGbz")?;
+        writer.write_all(&fgbz_data)?;
+        writer.close_chunk()?;
+        return Ok(());
+    }
+
+    // Write FGbz with correspondence (Version 0x80 | 0)
+    writer.put_chunk("FGbz")?;
+
+    // Version 0 with correspondence bit (0x80)
+    writer.write_all(&[0x80])?;
+
+    // Palette size: 1 (black)
+    writer.write_all(&1u16.to_be_bytes())?;
+    writer.write_all(&[0x00, 0x00, 0x00])?; // Black BGR
+
+    // Correspondence Data (per DjVuPalette.cpp)
+    // nDataSize: INT24 = number of blits (NOT compressed size)
+    let n = num_blits as u32;
+    writer.write_all(&[((n >> 16) & 0xFF) as u8])?;
+    writer.write_all(&[((n >> 8) & 0xFF) as u8])?;
+    writer.write_all(&[(n & 0xFF) as u8])?;
+
+    // Indices: BZZ encoded stream of INT16 indices (big-endian)
+    // Since we have only 1 color (index 0), all blits get index 0.
+    // Each index is written as a 16-bit big-endian integer.
+    let mut index_bytes = Vec::with_capacity(num_blits * 2);
+    for _ in 0..num_blits {
+        index_bytes.push(0u8); // High byte of index 0
+        index_bytes.push(0u8); // Low byte of index 0
+    }
+    let compressed_indices = bzz_compress(&index_bytes, 50)
+        .map_err(|e| DjvuError::EncodingError(format!("FGbz compression failed: {e}")))?;
+    writer.write_all(&compressed_indices)?;
+
+    writer.close_chunk()?;
+    Ok(())
+}
+
+/// Writes the hidden text layer as a BZZ-compressed TXTz chunk.
+///
+/// Text layer encoding is NON-FATAL. If it fails, we skip the TXTz chunk
+/// rather than failing the entire page. This prevents OCR coordinate issues
+/// from breaking the visual output. Only a failed chunk write is an error.
+fn write_hidden_text(writer: &mut IffWriter, text_layer: &HiddenText) -> Result<()> {
+    let mut txt_buf = Vec::new();
+    if let Err(e) = text_layer.encode(&mut txt_buf) {
+        // Log but don't fail - page will still be viewable without searchable text
+        crate::warn_log!(
+            "[page_encoder] Warning: Failed to encode hidden text: {e}. Skipping text layer."
+        );
+        return Ok(());
+    }
+    // Use BZZ compression for DJVU spec compliance (100KB blocks)
+    let data = match bzz_compress(&txt_buf, 100) {
+        Ok(data) => data,
+        Err(e) => {
+            crate::warn_log!(
+                "[page_encoder] Warning: BZZ compression for TXTz failed: {e}. Skipping text layer."
+            );
+            return Ok(());
+        }
+    };
+    writer.put_chunk("TXTz")?;
+    writer.write_all(&data)?;
+    writer.close_chunk()?;
+    Ok(())
+}
+
+/// Converts the page mask to a gray IW44 mask at the background's resolution:
+/// `reduced_dims` when `factor > 1`, the mask's own size otherwise.
+fn reduce_mask(mask_bitimg: &BitImage, factor: u32, reduced_dims: (u32, u32)) -> Bitmap {
+    let (fw, fh) = (mask_bitimg.width as u32, mask_bitimg.height as u32);
+    let (mw, mh) = if factor > 1 {
+        reduced_dims // match the reduced background dimensions
+    } else {
+        (fw, fh)
+    };
+    let mut mask_pixels = Vec::with_capacity((mw * mh) as usize);
+    for ry in 0..mh {
+        for rx in 0..mw {
+            let masked = if factor > 1 {
+                block_all_masked(mask_bitimg, rx, ry, factor)
+            } else {
+                mask_bitimg.get_pixel_unchecked(rx as usize, ry as usize)
+            };
+            mask_pixels.push(GrayPixel::new(if masked { 1 } else { 0 }));
+        }
+    }
+    Bitmap::from_vec(mw, mh, mask_pixels)
+}
+
+/// AND-reduction over the full-res mask block covered by reduced pixel
+/// (`rx`, `ry`), clipped at the mask edges.
+fn block_all_masked(mask_bitimg: &BitImage, rx: u32, ry: u32, factor: u32) -> bool {
+    let (fw, fh) = (mask_bitimg.width as u32, mask_bitimg.height as u32);
+    for dy in 0..factor {
+        let sy = ry * factor + dy;
+        if sy >= fh {
+            break;
+        }
+        for dx in 0..factor {
+            let sx = rx * factor + dx;
+            if sx >= fw {
+                break;
+            }
+            if !mask_bitimg.get_pixel_unchecked(sx as usize, sy as usize) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Box-average downsample of an RGB pixmap by an integer factor. Output dims are
 /// `ceil(w/factor) x ceil(h/factor)`; edge blocks average only their covered
 /// source pixels. Used for `bg_subsample` (c44-style BG44 reduction).
@@ -220,33 +346,37 @@ fn downsample_pixmap(img: &Pixmap, factor: u32) -> Pixmap {
     let mut out = Pixmap::new(rw, rh);
     for ry in 0..rh {
         for rx in 0..rw {
-            let (mut sr, mut sg, mut sb, mut n) = (0u32, 0u32, 0u32, 0u32);
-            for dy in 0..factor {
-                let sy = ry * factor + dy;
-                if sy >= h {
-                    break;
-                }
-                for dx in 0..factor {
-                    let sx = rx * factor + dx;
-                    if sx >= w {
-                        break;
-                    }
-                    let p = img.get_pixel(sx, sy);
-                    sr += p.r as u32;
-                    sg += p.g as u32;
-                    sb += p.b as u32;
-                    n += 1;
-                }
-            }
-            let n = n.max(1);
-            out.put_pixel(
-                rx,
-                ry,
-                Pixel::new((sr / n) as u8, (sg / n) as u8, (sb / n) as u8),
-            );
+            out.put_pixel(rx, ry, block_average(img, rx, ry, factor));
         }
     }
     out
+}
+
+/// Averages the source pixels covered by output pixel (`rx`, `ry`) of a
+/// `factor`-times reduction, clipping the block at the image edges.
+#[inline]
+fn block_average(img: &Pixmap, rx: u32, ry: u32, factor: u32) -> Pixel {
+    let (w, h) = img.dimensions();
+    let (mut sr, mut sg, mut sb, mut n) = (0u32, 0u32, 0u32, 0u32);
+    for dy in 0..factor {
+        let sy = ry * factor + dy;
+        if sy >= h {
+            break;
+        }
+        for dx in 0..factor {
+            let sx = rx * factor + dx;
+            if sx >= w {
+                break;
+            }
+            let p = img.get_pixel(sx, sy);
+            sr += p.r as u32;
+            sg += p.g as u32;
+            sb += p.b as u32;
+            n += 1;
+        }
+    }
+    let n = n.max(1);
+    Pixel::new((sr / n) as u8, (sg / n) as u8, (sb / n) as u8)
 }
 
 /// Represents a single page's components for encoding.
@@ -582,215 +712,22 @@ impl PageComponents {
             let shared_shapes = self.shared_dict.as_deref().map(|dict| dict.shapes());
             let inherited_shape_count = shared_shapes.map_or(0, <[BitImage]>::len);
 
-            if let Some(dict_id) = shared_dict_id {
-                writer.put_chunk("INCL")?;
-                writer.write_all(dict_id.as_bytes())?;
-                writer.close_chunk()?;
-            } else if let Some(shapes) = shared_shapes {
-                // A standalone FORM:DJVU cannot resolve an INCL component, so
-                // carry the dictionary locally before its Sjbz consumer.
-                let mut dict_encoder = JB2Encoder::new(Vec::new());
-                let parents = vec![-1; shapes.len()];
-                let djbz = dict_encoder
-                    .encode_dictionary(shapes, &parents, 0)
-                    .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
-                writer.put_chunk("Djbz")?;
-                writer.write_all(&djbz)?;
-                writer.close_chunk()?;
-            }
-
-            // --- BG44: Always emit a blank background for bitonal/JB2 pages ---
-            let mut wrote_bg44 = false;
-            if let Some(bg_img) = &self.background {
-                if params.use_iw44 {
-                    self.encode_iw44_background(bg_img, &mut writer, params)?;
-                    wrote_bg44 = true;
-                } else {
-                    return Err(DjvuError::InvalidOperation(
-                        "JB2 background encoding requires a bitonal image. Use foreground instead."
-                            .to_string(),
-                    ));
-                }
-            }
-            // If no background but JB2 content exists, emit an all-white BG44
-            if !wrote_bg44
-                && (self.foreground.is_some() || self.mask.is_some() || self.jb2_shapes.is_some())
-            {
-                let (w, h) = (self.width, self.height);
-                let white_bg = Pixmap::from_pixel(w, h, Pixel::white());
-                self.encode_iw44_background(&white_bg, &mut writer, params)?;
-            }
+            Self::write_shared_dict(&mut writer, shared_dict_id, shared_shapes)?;
+            let wrote_bg44 = self.write_background(&mut writer, params)?;
 
             // --- Djbz + Sjbz: JB2 encoding ---
-            let mut num_blits = 0;
-            let mut encoded_sjbz: Option<Vec<u8>> = None;
-
-            // JB2 can come from three sources (in priority order):
-            // 1. Manual jb2_shapes/jb2_blits (always available, no feature required)
-            // 2. Auto-extracted from foreground (requires symboldict feature)
-            // 3. Auto-extracted from mask (requires symboldict feature)
-
-            let _jb2_encoded =
-                if let (Some(shapes), Some(blits)) = (&self.jb2_shapes, &self.jb2_blits) {
-                    let blits =
-                        local_blits_after_inherited(blits, shapes.len(), inherited_shape_count)?;
-                    num_blits = blits.len();
-                    // Manual JB2 encoding (no feature required)
-                    use crate::encode::jb2::encoder::JB2Encoder;
-                    let parents: Vec<i32> = vec![-1; shapes.len()];
-
-                    // --- Sjbz ---
-                    let mut page_encoder = JB2Encoder::new(Vec::new());
-                    let sjbz_raw = page_encoder
-                        .encode_page_with_shapes(
-                            self.width,
-                            self.height,
-                            shapes,
-                            &parents,
-                            &blits,
-                            inherited_shape_count,
-                            shared_shapes,
-                        )
-                        .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
-
-                    encoded_sjbz = Some(sjbz_raw);
-                    true
-                } else {
-                    false
-                };
-
-            // Auto-extraction fallback (only if manual JB2 wasn't used)
-            if !_jb2_encoded {
-                if let Some(fg_img) = &self.foreground {
-                    // Auto-extract from foreground (requires symboldict feature)
-                    use crate::encode::jb2::{
-                        analyze_page, encoder::JB2Encoder, shapes_to_encoder_format,
-                    };
-
-                    let mut page_encoder = JB2Encoder::new(Vec::new());
-
-                    // Run connected component analysis
-                    let dpi = 300;
-                    let losslevel = 1;
-                    let cc_image = analyze_page(fg_img, dpi, losslevel);
-                    let shapes = cc_image.extract_shapes();
-                    let (dictionary, parents, blits) =
-                        shapes_to_encoder_format(shapes, self.height as i32);
-                    let blits = local_blits_after_inherited(
-                        &blits,
-                        dictionary.len(),
-                        inherited_shape_count,
-                    )?;
-                    num_blits = blits.len();
-
-                    // --- Sjbz ---
-                    let sjbz_raw = page_encoder
-                        .encode_page_with_shapes(
-                            self.width,
-                            self.height,
-                            &dictionary,
-                            &parents,
-                            &blits,
-                            inherited_shape_count,
-                            shared_shapes,
-                        )
-                        .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
-
-                    encoded_sjbz = Some(sjbz_raw);
-                } else if let Some(mask_img) = &self.mask {
-                    // Auto-extract from mask (requires symboldict feature)
-                    use crate::encode::jb2::{
-                        analyze_page, encoder::JB2Encoder, shapes_to_encoder_format,
-                    };
-
-                    let mut page_encoder = JB2Encoder::new(Vec::new());
-
-                    // Run connected component analysis
-                    let dpi = 300;
-                    let losslevel = 1;
-                    let cc_image = analyze_page(mask_img, dpi, losslevel);
-                    let shapes = cc_image.extract_shapes();
-                    let (dictionary, parents, blits) =
-                        shapes_to_encoder_format(shapes, self.height as i32);
-                    let blits = local_blits_after_inherited(
-                        &blits,
-                        dictionary.len(),
-                        inherited_shape_count,
-                    )?;
-                    num_blits = blits.len();
-
-                    // --- Sjbz ---
-                    let sjbz_raw = page_encoder
-                        .encode_page_with_shapes(
-                            self.width,
-                            self.height,
-                            &dictionary,
-                            &parents,
-                            &blits,
-                            inherited_shape_count,
-                            shared_shapes,
-                        )
-                        .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
-
-                    encoded_sjbz = Some(sjbz_raw);
-                }
-            }
+            let jb2 = self.encode_sjbz(inherited_shape_count, shared_shapes)?;
 
             // --- FGbz: Foreground colors for compound images ---
             // Must be written BEFORE Sjbz to inform viewer of colors?
             // Spec says no strict order, but standard is BG44 -> FGbz -> Sjbz.
 
-            let has_jb2 = encoded_sjbz.is_some();
-            if wrote_bg44 && has_jb2 {
-                // Determine if we have blits to color
-                if num_blits > 0 {
-                    // Write FGbz with correspondence (Version 0x80 | 0)
-                    writer.put_chunk("FGbz")?;
-
-                    // Version 0 with correspondence bit (0x80)
-                    writer.write_all(&[0x80])?;
-
-                    // Palette size: 1 (black)
-                    writer.write_all(&1u16.to_be_bytes())?;
-                    writer.write_all(&[0x00, 0x00, 0x00])?; // Black BGR
-
-                    // Correspondence Data (per DjVuPalette.cpp)
-                    // nDataSize: INT24 = number of blits (NOT compressed size)
-                    let n = num_blits as u32;
-                    writer.write_all(&[((n >> 16) & 0xFF) as u8])?;
-                    writer.write_all(&[((n >> 8) & 0xFF) as u8])?;
-                    writer.write_all(&[(n & 0xFF) as u8])?;
-
-                    // Indices: BZZ encoded stream of INT16 indices (big-endian)
-                    // Since we have only 1 color (index 0), all blits get index 0.
-                    // Each index is written as a 16-bit big-endian integer.
-                    let mut index_bytes = Vec::with_capacity(num_blits * 2);
-                    for _ in 0..num_blits {
-                        index_bytes.push(0u8); // High byte of index 0
-                        index_bytes.push(0u8); // Low byte of index 0
-                    }
-                    let compressed_indices = bzz_compress(&index_bytes, 50).map_err(|e| {
-                        DjvuError::EncodingError(format!("FGbz compression failed: {e}"))
-                    })?;
-                    writer.write_all(&compressed_indices)?;
-
-                    writer.close_chunk()?;
-                } else {
-                    // Fallback for 0 blits: Write simple black FGbz palette
-                    // Format: BYTE version | INT16 nPaletteSize | BYTE3 bgrColor
-                    let fgbz_data: [u8; 6] = [
-                        0x00, // Version (no correspondence data)
-                        0x00, 0x01, // nPaletteSize = 1 (big-endian)
-                        0x00, 0x00, 0x00, // BGR color = black
-                    ];
-                    writer.put_chunk("FGbz")?;
-                    writer.write_all(&fgbz_data)?;
-                    writer.close_chunk()?;
-                }
+            if let (true, Some((_, num_blits))) = (wrote_bg44, &jb2) {
+                write_fgbz(&mut writer, *num_blits)?;
             }
 
             // --- Write Delayed Sjbz ---
-            if let Some(sjbz_data) = encoded_sjbz {
+            if let Some((sjbz_data, _)) = jb2 {
                 // Write raw JB2 stream (already ZP-compressed, no BZZ needed)
                 writer.put_chunk("Sjbz")?;
                 writer.write_all(&sjbz_data)?;
@@ -798,35 +735,8 @@ impl PageComponents {
             }
 
             // --- TXTa/TXTz: Hidden text layer ---
-            // NOTE: Text layer encoding is NON-FATAL. If it fails, we skip the TXTz chunk
-            // rather than failing the entire page. This prevents OCR coordinate issues
-            // from breaking the visual output.
             if let Some(text_layer) = &self.text_layer {
-                let mut txt_buf = Vec::new();
-                let tl = text_layer;
-                match tl.encode(&mut txt_buf) {
-                    Ok(()) => {
-                        // Use BZZ compression for DJVU spec compliance (100KB blocks)
-                        match bzz_compress(&txt_buf, 100) {
-                            Ok(data) => {
-                                writer.put_chunk("TXTz")?;
-                                writer.write_all(&data)?;
-                                writer.close_chunk()?;
-                            }
-                            Err(e) => {
-                                crate::warn_log!(
-                                    "[page_encoder] Warning: BZZ compression for TXTz failed: {e}. Skipping text layer."
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Log but don't fail - page will still be viewable without searchable text
-                        crate::warn_log!(
-                            "[page_encoder] Warning: Failed to encode hidden text: {e}. Skipping text layer."
-                        );
-                    }
-                }
+                write_hidden_text(&mut writer, text_layer)?;
             }
 
             // --- ANTa/ANTz: Hyperlink/annotation layer ---
@@ -853,6 +763,138 @@ impl PageComponents {
             writer.close_chunk()?;
         }
         Ok(output)
+    }
+
+    /// Writes the page's reference to a shared JB2 dictionary: an INCL chunk
+    /// naming the promoted FORM:DJVI component, or, for a standalone page, the
+    /// dictionary itself as a local Djbz chunk.
+    fn write_shared_dict(
+        writer: &mut IffWriter,
+        shared_dict_id: Option<&str>,
+        shared_shapes: Option<&[BitImage]>,
+    ) -> Result<()> {
+        if let Some(dict_id) = shared_dict_id {
+            writer.put_chunk("INCL")?;
+            writer.write_all(dict_id.as_bytes())?;
+            writer.close_chunk()?;
+            return Ok(());
+        }
+        let Some(shapes) = shared_shapes else {
+            return Ok(());
+        };
+        // A standalone FORM:DJVU cannot resolve an INCL component, so
+        // carry the dictionary locally before its Sjbz consumer.
+        let mut dict_encoder = JB2Encoder::new(Vec::new());
+        let parents = vec![-1; shapes.len()];
+        let djbz = dict_encoder
+            .encode_dictionary(shapes, &parents, 0)
+            .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
+        writer.put_chunk("Djbz")?;
+        writer.write_all(&djbz)?;
+        writer.close_chunk()?;
+        Ok(())
+    }
+
+    /// Writes the BG44 layer: the page background if there is one, or an
+    /// all-white background when the page carries JB2 content. Returns whether
+    /// the page's own background was written.
+    fn write_background(&self, writer: &mut IffWriter, params: &PageEncodeParams) -> Result<bool> {
+        // --- BG44: Always emit a blank background for bitonal/JB2 pages ---
+        if let Some(bg_img) = &self.background {
+            if !params.use_iw44 {
+                return Err(DjvuError::InvalidOperation(
+                    "JB2 background encoding requires a bitonal image. Use foreground instead."
+                        .to_string(),
+                ));
+            }
+            self.encode_iw44_background(bg_img, writer, params)?;
+            return Ok(true);
+        }
+        // If no background but JB2 content exists, emit an all-white BG44
+        if self.foreground.is_some() || self.mask.is_some() || self.jb2_shapes.is_some() {
+            let (w, h) = (self.width, self.height);
+            let white_bg = Pixmap::from_pixel(w, h, Pixel::white());
+            self.encode_iw44_background(&white_bg, writer, params)?;
+        }
+        Ok(false)
+    }
+
+    /// Encodes the page's JB2 stream and returns it with its blit count, or
+    /// `None` when the page has no bitonal content.
+    ///
+    /// JB2 can come from three sources (in priority order):
+    /// 1. Manual jb2_shapes/jb2_blits (always available, no feature required)
+    /// 2. Auto-extracted from foreground (requires symboldict feature)
+    /// 3. Auto-extracted from mask (requires symboldict feature)
+    fn encode_sjbz(
+        &self,
+        inherited_shape_count: usize,
+        shared_shapes: Option<&[BitImage]>,
+    ) -> Result<Option<(Vec<u8>, usize)>> {
+        if let (Some(shapes), Some(blits)) = (&self.jb2_shapes, &self.jb2_blits) {
+            let blits = local_blits_after_inherited(blits, shapes.len(), inherited_shape_count)?;
+            let num_blits = blits.len();
+            // Manual JB2 encoding (no feature required)
+            let parents: Vec<i32> = vec![-1; shapes.len()];
+
+            // --- Sjbz ---
+            let mut page_encoder = JB2Encoder::new(Vec::new());
+            let sjbz_raw = page_encoder
+                .encode_page_with_shapes(
+                    self.width,
+                    self.height,
+                    shapes,
+                    &parents,
+                    &blits,
+                    inherited_shape_count,
+                    shared_shapes,
+                )
+                .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
+            return Ok(Some((sjbz_raw, num_blits)));
+        }
+
+        // Auto-extraction fallback (only if manual JB2 wasn't used)
+        let Some(image) = self.foreground.as_ref().or(self.mask.as_ref()) else {
+            return Ok(None);
+        };
+        self.encode_extracted_sjbz(image, inherited_shape_count, shared_shapes)
+            .map(Some)
+    }
+
+    /// Extracts JB2 shapes from a bitonal layer by connected-component
+    /// analysis and encodes them; returns the Sjbz stream and its blit count.
+    fn encode_extracted_sjbz(
+        &self,
+        image: &BitImage,
+        inherited_shape_count: usize,
+        shared_shapes: Option<&[BitImage]>,
+    ) -> Result<(Vec<u8>, usize)> {
+        use crate::encode::jb2::{analyze_page, shapes_to_encoder_format};
+
+        let mut page_encoder = JB2Encoder::new(Vec::new());
+
+        // Run connected component analysis
+        let dpi = 300;
+        let losslevel = 1;
+        let cc_image = analyze_page(image, dpi, losslevel);
+        let shapes = cc_image.extract_shapes();
+        let (dictionary, parents, blits) = shapes_to_encoder_format(shapes, self.height as i32);
+        let blits = local_blits_after_inherited(&blits, dictionary.len(), inherited_shape_count)?;
+        let num_blits = blits.len();
+
+        // --- Sjbz ---
+        let sjbz_raw = page_encoder
+            .encode_page_with_shapes(
+                self.width,
+                self.height,
+                &dictionary,
+                &parents,
+                &blits,
+                inherited_shape_count,
+                shared_shapes,
+            )
+            .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
+        Ok((sjbz_raw, num_blits))
     }
 
     /// Writes the INFO chunk as per DjVu spec (10 bytes)
@@ -900,14 +942,10 @@ impl PageComponents {
         writer: &mut IffWriter,
         params: &PageEncodeParams,
     ) -> Result<()> {
-        let crcb_mode = if params.color {
-            if params.bg_quality >= 95 {
-                crate::encode::iw44::encoder::CrcbMode::Full
-            } else {
-                crate::encode::iw44::encoder::CrcbMode::Half
-            }
-        } else {
-            crate::encode::iw44::encoder::CrcbMode::None
+        let crcb_mode = match (params.color, params.bg_quality >= 95) {
+            (true, true) => crate::encode::iw44::encoder::CrcbMode::Full,
+            (true, false) => crate::encode::iw44::encoder::CrcbMode::Half,
+            (false, _) => crate::encode::iw44::encoder::CrcbMode::None,
         };
 
         // Background subsampling (c44 -bgsubsample): encode the BG44 layer at 1/N
@@ -966,42 +1004,7 @@ impl PageComponents {
         // A reduced pixel is treated as fully masked (1) only if *every* covered full-res mask
         // pixel is masked — so any reduced pixel with visible background is still encoded.
         let mask_gray = if let (true, Some(mask_bitimg)) = (ENABLE_MASKED_IW44, &self.mask) {
-            let (fw, fh) = (mask_bitimg.width as u32, mask_bitimg.height as u32);
-            let (mw, mh) = if factor > 1 {
-                (w, h) // match the reduced background dimensions
-            } else {
-                (fw, fh)
-            };
-            let mut mask_pixels = Vec::with_capacity((mw * mh) as usize);
-            for ry in 0..mh {
-                for rx in 0..mw {
-                    let masked = if factor > 1 {
-                        // AND-reduction over the covered full-res block.
-                        let mut all_masked = true;
-                        'blk: for dy in 0..factor {
-                            let sy = ry * factor + dy;
-                            if sy >= fh {
-                                break;
-                            }
-                            for dx in 0..factor {
-                                let sx = rx * factor + dx;
-                                if sx >= fw {
-                                    break;
-                                }
-                                if !mask_bitimg.get_pixel_unchecked(sx as usize, sy as usize) {
-                                    all_masked = false;
-                                    break 'blk;
-                                }
-                            }
-                        }
-                        all_masked
-                    } else {
-                        mask_bitimg.get_pixel_unchecked(rx as usize, ry as usize)
-                    };
-                    mask_pixels.push(GrayPixel::new(if masked { 1 } else { 0 }));
-                }
-            }
-            Some(Bitmap::from_vec(mw, mh, mask_pixels))
+            Some(reduce_mask(mask_bitimg, factor, (w, h)))
         } else {
             None
         };

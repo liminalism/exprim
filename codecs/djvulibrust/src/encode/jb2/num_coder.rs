@@ -179,34 +179,31 @@ impl NumCoder {
                     phase = 2;
                     cutoff = 1;
                 }
+                // Phase 2: Exponential range search
+                2 if decision => {
+                    // Keep doubling
+                    cutoff += cutoff + 1;
+                }
                 2 => {
-                    // Phase 2: Exponential range search
-                    if !decision {
-                        // Found our range
-                        phase = 3;
-                        range = ((cutoff + 1) / 2) as u32;
-                        if range == 1 {
-                            cutoff = 0;
-                        } else {
-                            cutoff -= (range / 2) as i32;
-                        }
+                    // Found our range
+                    phase = 3;
+                    range = ((cutoff + 1) / 2) as u32;
+                    cutoff = if range == 1 {
+                        0
                     } else {
-                        // Keep doubling
-                        cutoff += cutoff + 1;
-                    }
+                        cutoff - (range / 2) as i32
+                    };
                 }
                 3 => {
                     // Phase 3: Binary search within range
                     range /= 2;
-                    if range != 1 {
-                        if !decision {
-                            cutoff -= (range / 2) as i32;
-                        } else {
-                            cutoff += (range / 2) as i32;
-                        }
-                    } else if !decision {
-                        cutoff -= 1;
-                    }
+                    let half = (range / 2) as i32;
+                    cutoff = match (range != 1, decision) {
+                        (true, false) => cutoff - half,
+                        (true, true) => cutoff + half,
+                        (false, false) => cutoff - 1,
+                        (false, true) => cutoff,
+                    };
                 }
                 _ => unreachable!(),
             }

@@ -48,22 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Create "words" (simple rectangular blocks)
         for word in 0..6 {
             let word_x = x_offset + (word * 110);
-            let word_width = 80;
-
-            // Draw a solid rectangle for each word
-            for row in 0..30 {
-                for col in 0..word_width {
-                    let x = word_x + col;
-                    let y = y_offset + row;
-
-                    if x < width as usize && y < height as usize {
-                        // Solid rectangle (except for a small hole in the middle to prove it's a mask)
-                        if !(row > 10 && row < 20 && col > 10 && col < 70) {
-                            mask.set_usize(x, y, true);
-                        }
-                    }
-                }
-            }
+            draw_word(&mut mask, word_x, y_offset, width, height);
         }
     }
 
@@ -81,20 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // We'll reconstruct bytes manually to be safe and independent of internal storage.
 
         for y in 0..height {
-            let mut byte = 0u8;
-            for x in 0..width {
-                if mask.get_pixel_unchecked(x as usize, y as usize) {
-                    byte |= 1 << (7 - (x % 8));
-                }
-                if x % 8 == 7 {
-                    pbm_data.push(byte);
-                    byte = 0;
-                }
-            }
-            // If width not multiple of 8, pad last byte (not needed for 800, but good practice)
-            if width % 8 != 0 {
-                pbm_data.push(byte);
-            }
+            push_pbm_row(&mut pbm_data, &mask, y, width);
         }
         fs::write("/tmp/compound_debug_mask.pbm", &pbm_data)?;
     }
@@ -158,4 +130,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  djview {}", output_path);
 
     Ok(())
+}
+
+/// Draws one 80x30 "word": a solid rectangle with a hole in the middle, clipped to the page.
+fn draw_word(mask: &mut BitImage, word_x: usize, y_offset: usize, width: u32, height: u32) {
+    let word_width = 80;
+
+    // Draw a solid rectangle for each word
+    for row in 0..30 {
+        for col in 0..word_width {
+            let x = word_x + col;
+            let y = y_offset + row;
+
+            if x >= width as usize || y >= height as usize {
+                continue;
+            }
+            // Solid rectangle (except for a small hole in the middle to prove it's a mask)
+            if !(row > 10 && row < 20 && col > 10 && col < 70) {
+                mask.set_usize(x, y, true);
+            }
+        }
+    }
+}
+
+/// Appends row `y` of `mask` to `pbm_data` as packed P4 bytes, MSB first.
+fn push_pbm_row(pbm_data: &mut Vec<u8>, mask: &BitImage, y: u32, width: u32) {
+    let mut byte = 0u8;
+    for x in 0..width {
+        if mask.get_pixel_unchecked(x as usize, y as usize) {
+            byte |= 1 << (7 - (x % 8));
+        }
+        if x % 8 == 7 {
+            pbm_data.push(byte);
+            byte = 0;
+        }
+    }
+    // If width not multiple of 8, pad last byte (not needed for 800, but good practice)
+    if width % 8 != 0 {
+        pbm_data.push(byte);
+    }
 }

@@ -131,20 +131,25 @@ fn synthetic_bilevel(width: u32, height: u32) -> BitImage {
                 x += cw;
                 continue;
             }
-            for dy in 0..21u32 {
-                let bits = ((g + 1).wrapping_mul(dy / 3 + 3).wrapping_mul(2654435761) >> 11) & 0x1f;
-                for dx in 0..15u32 {
-                    if (bits >> (dx / 3)) & 1 != 0 {
-                        bm.set_usize((x + dx) as usize, (y + dy) as usize, true);
-                    }
-                }
-            }
+            draw_glyph(&mut bm, g, x, y);
             x += cw;
         }
         y += ch;
         row += 1;
     }
     bm
+}
+
+/// Draws glyph pattern `g` as a 15x21 cell with its top-left corner at (`x`, `y`).
+fn draw_glyph(bm: &mut BitImage, g: u32, x: u32, y: u32) {
+    for dy in 0..21u32 {
+        let bits = ((g + 1).wrapping_mul(dy / 3 + 3).wrapping_mul(2654435761) >> 11) & 0x1f;
+        for dx in 0..15u32 {
+            if (bits >> (dx / 3)) & 1 != 0 {
+                bm.set_usize((x + dx) as usize, (y + dy) as usize, true);
+            }
+        }
+    }
 }
 
 fn main() {

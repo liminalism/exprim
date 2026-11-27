@@ -352,6 +352,38 @@ mod your_neuquant {
         netsize: usize,
     }
 
+    /// The closest neuron seen so far in a [`NeuQuant::contest`] search:
+    /// its distance and index, or `f32::MAX` and -1 before the first.
+    struct Nearest {
+        dist: f32,
+        pos: i32,
+    }
+
+    impl Nearest {
+        fn new() -> Self {
+            Self {
+                dist: f32::MAX,
+                pos: -1,
+            }
+        }
+
+        /// Takes neuron `pos` if `dist` is strictly closer than the best so far.
+        fn offer(&mut self, dist: f32, pos: i32) {
+            if dist < self.dist {
+                self.dist = dist;
+                self.pos = pos;
+            }
+        }
+    }
+
+    /// The learning radius after one decay step; it drops to 0 once it
+    /// reaches 1.
+    fn decayed_radius(rad: i32) -> i32 {
+        let bias_radius = rad * (1 << 6);
+        let rad = (bias_radius - (bias_radius / RADIUS_DEC)) >> 6;
+        if rad <= 1 { 0 } else { rad }
+    }
+
     impl NeuQuant {
         pub fn new(samplefac: i32, colors: usize, pixels: &[u8]) -> Self {
             let netsize = colors.max(1);
@@ -397,8 +429,10 @@ mod your_neuquant {
                 let tmp = i as f32 * 256.0 / self.netsize as f32;
                 let a_init = if self.netsize <= 16 {
                     i as f32 * (255.0 / (self.netsize as f32 - 1.0).max(1.0))
+                } else if i < 16 {
+                    (i as f32) * 16.0
                 } else {
-                    if i < 16 { (i as f32) * 16.0 } else { 255.0 }
+                    255.0
                 };
 
                 self.network.push(Neuron {
@@ -472,10 +506,8 @@ mod your_neuquant {
         }
 
         fn contest(&mut self, b_pix: f32, g_pix: f32, r_pix: f32, a_pix: f32) -> i32 {
-            let mut bestd = f32::MAX;
-            let mut bestbiasd = bestd;
-            let mut bestpos = -1;
-            let mut bestbiaspos = -1;
+            let mut best = Nearest::new();
+            let mut best_biased = Nearest::new();
 
             for i in 0..self.netsize {
                 let n = &self.network[i];
@@ -483,28 +515,21 @@ mod your_neuquant {
                 dist += (n.r - r_pix).abs();
 
                 let current_bias = self.bias[i];
-                if dist < bestd || dist < bestbiasd + current_bias {
+                if dist < best.dist || dist < best_biased.dist + current_bias {
                     dist += (n.g - g_pix).abs();
                     dist += (n.a - a_pix).abs();
 
-                    if dist < bestd {
-                        bestd = dist;
-                        bestpos = i as i32;
-                    }
-                    let biasdist = dist - current_bias;
-                    if biasdist < bestbiasd {
-                        bestbiasd = biasdist;
-                        bestbiaspos = i as i32;
-                    }
+                    best.offer(dist, i as i32);
+                    best_biased.offer(dist - current_bias, i as i32);
                 }
                 let current_freq = self.freq[i];
                 self.freq[i] -= BETA * current_freq;
                 self.bias[i] += BETAGAMMA * current_freq;
             }
 
-            self.freq[bestpos as usize] += BETA;
-            self.bias[bestpos as usize] -= BETAGAMMA;
-            bestbiaspos
+            self.freq[best.pos as usize] += BETA;
+            self.bias[best.pos as usize] -= BETAGAMMA;
+            best_biased.pos
         }
 
         fn learn(&mut self, pixels: &[u8]) {
@@ -548,11 +573,7 @@ mod your_neuquant {
 
                 if (i + 1) % delta == 0 {
                     alpha -= alpha / alphadec;
-                    let bias_radius = rad * (1 << 6);
-                    rad = (bias_radius - (bias_radius / RADIUS_DEC)) >> 6;
-                    if rad <= 1 {
-                        rad = 0;
-                    }
+                    rad = decayed_radius(rad);
                 }
             }
         }
@@ -573,14 +594,15 @@ mod your_neuquant {
             for i in 0..self.netsize {
                 let p = &self.colormap[i];
                 let p_g = p.g.clamp(0, 255) as usize;
-                if p_g != previouscol {
-                    self.netindex[previouscol] = (startpos + i) >> 1;
-                    for j in (previouscol + 1)..p_g {
-                        self.netindex[j] = i;
-                    }
-                    previouscol = p_g;
-                    startpos = i;
+                if p_g == previouscol {
+                    continue;
                 }
+                self.netindex[previouscol] = (startpos + i) >> 1;
+                for j in (previouscol + 1)..p_g {
+                    self.netindex[j] = i;
+                }
+                previouscol = p_g;
+                startpos = i;
             }
             let max_netpos = (self.netsize - 1).max(0);
             self.netindex[previouscol] = (startpos + max_netpos) >> 1;

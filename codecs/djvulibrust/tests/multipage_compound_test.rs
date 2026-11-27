@@ -60,18 +60,7 @@ fn create_test_foreground(width: u32, height: u32, page_num: u32) -> BitImage {
             let word_start = x_offset + word * 120;
             let word_width = 80 + (word * 10);
 
-            for row in 0..40 {
-                for col in 0..word_width {
-                    let x = word_start + col;
-                    let y = y_offset + row;
-                    if x < width as usize && y < height as usize {
-                        // Make it look like text with vertical stripes
-                        if (col % 12 < 9) && (row > 8 && row < 32) {
-                            mask.set_usize(x, y, true);
-                        }
-                    }
-                }
-            }
+            draw_striped_word(&mut mask, word_start, y_offset, word_width, width, height);
         }
     }
 
@@ -331,4 +320,28 @@ fn test_ten_page_compound_document() {
 
     println!("\nSUCCESS: 10-page document created and verified");
     println!("Test file: {}", test_file);
+}
+
+/// Draws one 40-row "word" of vertical stripes at (`word_start`, `y_offset`), clipped to the page.
+fn draw_striped_word(
+    mask: &mut BitImage,
+    word_start: usize,
+    y_offset: usize,
+    word_width: usize,
+    width: u32,
+    height: u32,
+) {
+    for row in 0..40 {
+        for col in 0..word_width {
+            let x = word_start + col;
+            let y = y_offset + row;
+            if x >= width as usize || y >= height as usize {
+                continue;
+            }
+            // Make it look like text with vertical stripes
+            if (col % 12 < 9) && (row > 8 && row < 32) {
+                mask.set_usize(x, y, true);
+            }
+        }
+    }
 }

@@ -63,6 +63,7 @@
 //! of the public API and data flow described in the DjVu specification.
 
 use crate::encode::jb2::symbol_dict::BitImage;
+use std::collections::HashMap;
 
 // ─── Run ────────────────────────────────────────────────────────────────────
 
@@ -191,14 +192,15 @@ impl CCImage {
                 while x < bm.width && !bm.get_pixel_unchecked(x, y) {
                     x += 1;
                 }
-                if x < bm.width {
-                    let x1 = x;
-                    // Consume black pixels
-                    while x < bm.width && bm.get_pixel_unchecked(x, y) {
-                        x += 1;
-                    }
-                    self.add_single_run(y as i32, x1 as i32, (x - 1) as i32);
+                if x >= bm.width {
+                    break;
                 }
+                let x1 = x;
+                // Consume black pixels
+                while x < bm.width && bm.get_pixel_unchecked(x, y) {
+                    x += 1;
+                }
+                self.add_single_run(y as i32, x1 as i32, (x - 1) as i32);
             }
         }
     }
@@ -248,37 +250,24 @@ impl CCImage {
             // Scan previous-line runs that could overlap
             let mut pp = p;
             while pp < n_runs && self.runs[pp].y < y && self.runs[pp].x1 <= x2 {
-                if self.runs[pp].x2 >= x1 {
-                    // This previous run overlaps — union.
-                    let mut oid = self.runs[pp].ccid;
-                    // Path compression: find root
-                    while (oid as usize) < umap.len() && umap[oid as usize] < oid {
-                        oid = umap[oid as usize];
-                    }
+                if self.runs[pp].x2 < x1 {
+                    pp += 1;
+                    continue;
+                }
+                // This previous run overlaps — union.
+                let mut oid = self.runs[pp].ccid;
+                // Path compression: find root
+                while (oid as usize) < umap.len() && umap[oid as usize] < oid {
+                    oid = umap[oid as usize];
+                }
+                id = union_ccids(&mut umap, id, oid);
 
-                    if id >= umap.len() as i32 {
-                        // First overlap: adopt the previous run's root
-                        id = oid;
-                    } else if id < oid {
-                        // Merge: point oid → id
-                        if (oid as usize) < umap.len() {
-                            umap[oid as usize] = id;
-                        }
-                    } else if oid < id {
-                        // Merge: point id → oid
-                        if (id as usize) < umap.len() {
-                            umap[id as usize] = oid;
-                        }
-                        id = oid;
-                    }
+                // Freshen previous run's ccid
+                self.runs[pp].ccid = id;
 
-                    // Freshen previous run's ccid
-                    self.runs[pp].ccid = id;
-
-                    // Stop if this previous run extends past our current run
-                    if self.runs[pp].x2 >= x2 {
-                        break;
-                    }
+                // Stop if this previous run extends past our current run
+                if self.runs[pp].x2 >= x2 {
+                    break;
                 }
                 pp += 1;
             }
@@ -460,15 +449,16 @@ impl CCImage {
     /// regions should be exempted, but neither cjb2 nor we do that.)
     pub fn erase_tiny_ccs(&mut self) {
         for i in 0..self.ccs.len() {
-            if self.ccs[i].npix <= self.tinysize {
-                let frun = self.ccs[i].frun as usize;
-                let nrun = self.ccs[i].nrun as usize;
-                self.ccs[i].nrun = 0;
-                self.ccs[i].npix = 0;
-                for r in frun..frun + nrun {
-                    if r < self.runs.len() {
-                        self.runs[r].ccid = -1;
-                    }
+            if self.ccs[i].npix > self.tinysize {
+                continue;
+            }
+            let frun = self.ccs[i].frun as usize;
+            let nrun = self.ccs[i].nrun as usize;
+            self.ccs[i].nrun = 0;
+            self.ccs[i].npix = 0;
+            for r in frun..frun + nrun {
+                if r < self.runs.len() {
+                    self.runs[r].ccid = -1;
                 }
             }
         }
@@ -502,27 +492,16 @@ impl CCImage {
         }
 
         let splitsize = self.largesize;
-        let mut ncc = self.ccs.len() as i32;
         let mut extra_runs: Vec<Run> = Vec::new();
 
         // We need a way to map (gridi, gridj, ccid) → new ccid.
         // Using a HashMap like DjVuLibre's GMap.
-        use std::collections::HashMap;
-        let mut grid_map: HashMap<(i16, i16, i32), i32> = HashMap::new();
+        let mut grid = GridCcids {
+            map: HashMap::new(),
+            ncc: self.ccs.len() as i32,
+        };
 
         self.nregularccs = self.ccs.len();
-
-        let makeccid =
-            |key: (i16, i16, i32), map: &mut HashMap<(i16, i16, i32), i32>, ncc: &mut i32| -> i32 {
-                if let Some(&id) = map.get(&key) {
-                    id
-                } else {
-                    let id = *ncc;
-                    map.insert(key, id);
-                    *ncc += 1;
-                    id
-                }
-            };
 
         for ccid in 0..self.ccs.len() {
             let cc = &self.ccs[ccid];
@@ -534,6 +513,8 @@ impl CCImage {
             let cc_width = cc.bb.width();
             let frun = cc.frun as usize;
             let nrun = cc.nrun as usize;
+            // The CC's runs, clipped to the run list.
+            let runs_end = (frun + nrun).min(self.runs.len());
 
             if cc_height <= self.smallsize && cc_width <= self.smallsize {
                 // ── Merge small CC ───────────────────────────────────
@@ -542,64 +523,20 @@ impl CCImage {
                 let gridi = ((cc.bb.ymin + cc.bb.ymax) / splitsize / 2) as i16;
                 let gridj = ((cc.bb.xmin + cc.bb.xmax) / splitsize / 2) as i16;
                 let key = (gridi, gridj, -1);
-                let new_ccid = makeccid(key, &mut grid_map, &mut ncc);
-                for r in frun..frun + nrun {
-                    if r < self.runs.len() {
-                        self.runs[r].ccid = new_ccid;
-                    }
+                let new_ccid = grid.ccid(key);
+                for r in frun..runs_end {
+                    self.runs[r].ccid = new_ccid;
                 }
             } else if cc_height >= self.largesize || cc_width >= self.largesize {
                 // ── Split large CC ───────────────────────────────────
-                for r in frun..frun + nrun {
-                    if r >= self.runs.len() {
-                        continue;
-                    }
-
-                    let run_y = self.runs[r].y;
-                    let run_x1 = self.runs[r].x1;
-                    let run_x2 = self.runs[r].x2;
-
-                    let gridi = (run_y / splitsize) as i16;
-                    let gridj_start = (run_x1 / splitsize) as i16;
-                    let gridj_end = (run_x2 / splitsize) as i16;
-
-                    let key = (gridi, gridj_start, ccid as i32);
-                    let new_ccid = makeccid(key, &mut grid_map, &mut ncc);
-                    self.runs[r].ccid = new_ccid;
-
-                    if gridj_end > gridj_start {
-                        // Run spans multiple grid columns — split it.
-                        // Truncate the original run to its first grid cell.
-                        let orig_x2 = self.runs[r].x2;
-                        self.runs[r].x2 = (gridj_start as i32 + 1) * splitsize - 1;
-
-                        // Create new runs for intermediate grid cells
-                        let mut current_gridj = gridj_start + 1;
-                        while current_gridj < gridj_end {
-                            let cell_x1 = current_gridj as i32 * splitsize;
-                            let cell_x2 = cell_x1 + splitsize - 1;
-                            let key = (gridi, current_gridj, ccid as i32);
-                            let cell_ccid = makeccid(key, &mut grid_map, &mut ncc);
-                            extra_runs.push(Run {
-                                y: run_y,
-                                x1: cell_x1,
-                                x2: cell_x2,
-                                ccid: cell_ccid,
-                            });
-                            current_gridj += 1;
-                        }
-
-                        // Create run for the last grid cell
-                        let last_x1 = gridj_end as i32 * splitsize;
-                        let key = (gridi, gridj_end, ccid as i32);
-                        let last_ccid = makeccid(key, &mut grid_map, &mut ncc);
-                        extra_runs.push(Run {
-                            y: run_y,
-                            x1: last_x1,
-                            x2: orig_x2,
-                            ccid: last_ccid,
-                        });
-                    }
+                for r in frun..runs_end {
+                    split_run_into_grid(
+                        &mut self.runs[r],
+                        ccid as i32,
+                        splitsize,
+                        &mut grid,
+                        &mut extra_runs,
+                    );
                 }
             }
             // Normal-sized CCs keep their existing ccid — no changes needed.
@@ -773,6 +710,110 @@ impl CCImage {
         }
         shapes
     }
+}
+
+/// Allocates CC ids for (grid row, grid column, source ccid) cells, handing
+/// out the next unused id the first time a cell is seen.
+struct GridCcids {
+    map: HashMap<(i16, i16, i32), i32>,
+    ncc: i32,
+}
+
+impl GridCcids {
+    /// Returns the id of `key`'s cell, allocating it on first use.
+    fn ccid(&mut self, key: (i16, i16, i32)) -> i32 {
+        if let Some(&id) = self.map.get(&key) {
+            return id;
+        }
+        let id = self.ncc;
+        self.map.insert(key, id);
+        self.ncc += 1;
+        id
+    }
+}
+
+/// Reassigns one run of the large CC `ccid` to its grid cell. A run that
+/// spans several grid columns is truncated to its first cell and the rest is
+/// pushed to `extra_runs`, one run per further cell.
+fn split_run_into_grid(
+    run: &mut Run,
+    ccid: i32,
+    splitsize: i32,
+    grid: &mut GridCcids,
+    extra_runs: &mut Vec<Run>,
+) {
+    let run_y = run.y;
+    let run_x1 = run.x1;
+    let run_x2 = run.x2;
+
+    let gridi = (run_y / splitsize) as i16;
+    let gridj_start = (run_x1 / splitsize) as i16;
+    let gridj_end = (run_x2 / splitsize) as i16;
+
+    let key = (gridi, gridj_start, ccid);
+    let new_ccid = grid.ccid(key);
+    run.ccid = new_ccid;
+
+    if gridj_end <= gridj_start {
+        return;
+    }
+    // Run spans multiple grid columns — split it.
+    // Truncate the original run to its first grid cell.
+    let orig_x2 = run.x2;
+    run.x2 = (gridj_start as i32 + 1) * splitsize - 1;
+
+    // Create new runs for intermediate grid cells
+    let mut current_gridj = gridj_start + 1;
+    while current_gridj < gridj_end {
+        let cell_x1 = current_gridj as i32 * splitsize;
+        let cell_x2 = cell_x1 + splitsize - 1;
+        let key = (gridi, current_gridj, ccid);
+        let cell_ccid = grid.ccid(key);
+        extra_runs.push(Run {
+            y: run_y,
+            x1: cell_x1,
+            x2: cell_x2,
+            ccid: cell_ccid,
+        });
+        current_gridj += 1;
+    }
+
+    // Create run for the last grid cell
+    let last_x1 = gridj_end as i32 * splitsize;
+    let key = (gridi, gridj_end, ccid);
+    let last_ccid = grid.ccid(key);
+    extra_runs.push(Run {
+        y: run_y,
+        x1: last_x1,
+        x2: orig_x2,
+        ccid: last_ccid,
+    });
+}
+
+/// Merges the union-find classes of the current run and a previous-line
+/// root `oid`, and returns the current run's id afterwards. `id >= umap.len()`
+/// means the current run has no id yet.
+#[inline]
+fn union_ccids(umap: &mut [i32], id: i32, oid: i32) -> i32 {
+    if id >= umap.len() as i32 {
+        // First overlap: adopt the previous run's root
+        return oid;
+    }
+    if id < oid {
+        // Merge: point oid → id
+        if (oid as usize) < umap.len() {
+            umap[oid as usize] = id;
+        }
+        return id;
+    }
+    if oid < id {
+        // Merge: point id → oid
+        if (id as usize) < umap.len() {
+            umap[id as usize] = oid;
+        }
+        return oid;
+    }
+    id
 }
 
 // ─── Convenience entry point ────────────────────────────────────────────────

@@ -341,6 +341,50 @@ mod fusion_tests {
         *state
     }
 
+    /// `len` test coefficients of the named pattern, drawn from an xorshift
+    /// stream seeded with `seed`.
+    fn pattern_data(pattern: &str, len: usize, seed: u32) -> Vec<i16> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| match pattern {
+                "zero" => 0i16,
+                "random_small" => ((xorshift(&mut state) % 200) as i32 - 100) as i16,
+                "random_full" => xorshift(&mut state) as i16,
+                "extremes" => {
+                    if xorshift(&mut state) % 2 == 0 {
+                        i16::MIN + (xorshift(&mut state) % 4) as i16
+                    } else {
+                        i16::MAX - (xorshift(&mut state) % 4) as i16
+                    }
+                }
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    /// Reads one block both ways and asserts the results are identical.
+    fn assert_fused_matches_two_step(
+        data16: &[i16],
+        bw: usize,
+        block_x: usize,
+        block_y: usize,
+        case: &str,
+    ) {
+        let mut liftblock = [0i16; 1024];
+        CoeffMap::copy_block_data(&mut liftblock, data16, bw, block_x, block_y);
+        let mut two_step = Block::default();
+        two_step.read_liftblock(&liftblock);
+
+        let mut fused = Block::default();
+        fused.read_from_transform_block(data16, bw, block_x, block_y);
+
+        assert_eq!(
+            two_step.present, fused.present,
+            "present mask mismatch: {case}"
+        );
+        assert_eq!(two_step.buckets, fused.buckets, "bucket mismatch: {case}");
+    }
+
     /// `read_from_transform_block` (fused) must produce byte-identical
     /// `Block`s to the old two-step `copy_block_data` + `read_liftblock`,
     /// across varied plane sizes (multiple blocks in both directions,
@@ -354,43 +398,16 @@ mod fusion_tests {
             let bh = blocks_h * 32;
             for &pattern in &["zero", "random_small", "random_full", "extremes"] {
                 let seed = (blocks_w * 7919 + blocks_h * 104729 + pattern.len()) as u32;
-                let mut state = seed | 1;
-                let data16: Vec<i16> = (0..bw * bh)
-                    .map(|_| match pattern {
-                        "zero" => 0i16,
-                        "random_small" => ((xorshift(&mut state) % 200) as i32 - 100) as i16,
-                        "random_full" => xorshift(&mut state) as i16,
-                        "extremes" => {
-                            if xorshift(&mut state) % 2 == 0 {
-                                i16::MIN + (xorshift(&mut state) % 4) as i16
-                            } else {
-                                i16::MAX - (xorshift(&mut state) % 4) as i16
-                            }
-                        }
-                        _ => unreachable!(),
-                    })
-                    .collect();
+                let data16 = pattern_data(pattern, bw * bh, seed);
 
-                for block_y in 0..blocks_h {
-                    for block_x in 0..blocks_w {
-                        let mut liftblock = [0i16; 1024];
-                        CoeffMap::copy_block_data(&mut liftblock, &data16, bw, block_x, block_y);
-                        let mut two_step = Block::default();
-                        two_step.read_liftblock(&liftblock);
-
-                        let mut fused = Block::default();
-                        fused.read_from_transform_block(&data16, bw, block_x, block_y);
-
-                        assert_eq!(
-                            two_step.present, fused.present,
-                            "present mask mismatch: blocks_w={blocks_w} blocks_h={blocks_h} block_x={block_x} block_y={block_y} pattern={pattern}"
-                        );
-                        assert_eq!(
-                            two_step.buckets, fused.buckets,
-                            "bucket mismatch: blocks_w={blocks_w} blocks_h={blocks_h} block_x={block_x} block_y={block_y} pattern={pattern}"
-                        );
-                        cases += 1;
-                    }
+                // Row-major over the blocks: block_y outer, block_x inner.
+                for block in 0..blocks_w * blocks_h {
+                    let (block_y, block_x) = (block / blocks_w, block % blocks_w);
+                    let case = format!(
+                        "blocks_w={blocks_w} blocks_h={blocks_h} block_x={block_x} block_y={block_y} pattern={pattern}"
+                    );
+                    assert_fused_matches_two_step(&data16, bw, block_x, block_y, &case);
+                    cases += 1;
                 }
             }
         }

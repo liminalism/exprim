@@ -725,14 +725,13 @@ impl<W: Write> JB2Encoder<W> {
             if parent >= 0 {
                 // Refined shape - use MATCHED_REFINE_LIBRARY_ONLY
                 let parent_idx = parent as usize;
-                let parent_shape = if parent_idx < inherited_shape_count {
+                if parent_idx < inherited_shape_count {
                     // Parent is in inherited dictionary - we'd need access to it
                     // For now, fall back to direct encoding
                     self.encode_new_mark_library_only(&mut zc, shape)?;
                     continue;
-                } else {
-                    &shapes[parent_idx - inherited_shape_count]
-                };
+                }
+                let parent_shape = &shapes[parent_idx - inherited_shape_count];
 
                 let lib_size = (inherited_shape_count + i) as i32;
                 self.encode_matched_refine_library_only(
@@ -1046,15 +1045,12 @@ impl<W: Write> JB2Encoder<W> {
 
                 if parent >= 0 && shape_in_lib[parent as usize] {
                     // Use MATCHED_REFINE
-                    let parent_bitmap = if (parent as usize) < inherited_shape_count {
-                        inherited_shapes
-                            .and_then(|s| s.get(parent as usize))
-                            .ok_or_else(|| {
-                                Jb2Error::InvalidData("Parent shape not available".to_string())
-                            })?
-                    } else {
-                        &shapes[parent as usize - inherited_shape_count]
-                    };
+                    let parent_bitmap = refinement_parent(
+                        shapes,
+                        inherited_shapes,
+                        inherited_shape_count,
+                        parent as usize,
+                    )?;
 
                     self.encode_matched_refine(
                         &mut zc,
@@ -1087,6 +1083,23 @@ impl<W: Write> JB2Encoder<W> {
         let result = zc.finish()?;
         Ok(result)
     }
+}
+
+/// Looks up the library shape `index` that a MATCHED_REFINE record refines:
+/// the inherited dictionary's shapes come first, then the page's local
+/// shapes. Fails when an inherited shape is not available.
+fn refinement_parent<'a>(
+    shapes: &'a [BitImage],
+    inherited_shapes: Option<&'a [BitImage]>,
+    inherited_shape_count: usize,
+    index: usize,
+) -> Result<&'a BitImage, Jb2Error> {
+    if index >= inherited_shape_count {
+        return Ok(&shapes[index - inherited_shape_count]);
+    }
+    inherited_shapes
+        .and_then(|s| s.get(index))
+        .ok_or_else(|| Jb2Error::InvalidData("Parent shape not available".to_string()))
 }
 
 #[cfg(test)]

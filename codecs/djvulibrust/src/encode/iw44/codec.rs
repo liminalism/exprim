@@ -243,9 +243,7 @@ impl Codec {
             else {
                 continue;
             };
-            let mut bstate = 0;
-
-            if band != 0 {
+            let bstate = if band != 0 {
                 // Band other than zero: derive state from pcoeff/epcoeff like DjVuLibre
                 let thres = quant_hi[band as usize];
                 if thres > 0 && (empty_mask >> bucket_idx) & 1 != 0 {
@@ -257,37 +255,9 @@ impl Codec {
                     continue;
                 }
                 if thres > 0 && thres < 0x8000 {
-                    // Branchless form of the same three-way select, so the
-                    // sixteen coefficients vectorize instead of compiling to
-                    // sixteen unpredictable branch pairs. `is_null_slice`
-                    // guarantees `0 < thres < 0x8000` for bands 1..9, which
-                    // lets the magnitude test run in u16 (`unsigned_abs` maps
-                    // i16::MIN to 32768 without overflowing) rather than
-                    // widening every coefficient to i32.
-                    let thres_u = thres as u16;
-                    for i in 0..16 {
-                        let sig = (src16[i].unsigned_abs() >= thres_u) as u8;
-                        // sig -> NEW|UNK (0x03), !sig -> UNK (0x01)
-                        let state = if ep16[i] != 0 {
-                            ACTIVE
-                        } else {
-                            UNK | (sig << 1)
-                        };
-                        cstate[i] = state;
-                        bstate |= state;
-                    }
+                    prepare_bucket_u16(cstate, src16, ep16, thres)
                 } else {
-                    for i in 0..16 {
-                        let state = if ep16[i] != 0 {
-                            ACTIVE
-                        } else if (src16[i] as i32).abs() >= thres {
-                            NEW | UNK
-                        } else {
-                            UNK
-                        };
-                        cstate[i] = state;
-                        bstate |= state;
-                    }
+                    prepare_bucket_i32(cstate, src16, ep16, thres)
                 }
             } else {
                 // Band zero: preserve prior coeff_state ZERO/UNK behavior like DjVuLibre
@@ -303,33 +273,15 @@ impl Codec {
                 // explicitly.
                 let prev =
                     &coeff_state[coeff_base + bucket_idx * 16..coeff_base + bucket_idx * 16 + 16];
-                for i in 0..16 {
-                    let thres = quant_lo[i];
-                    let mut cstatetmp = prev[i];
-
-                    debug_assert!(
-                        cstatetmp == ZERO
-                            || cstatetmp == UNK
-                            || cstatetmp == ACTIVE
-                            || cstatetmp == (NEW | UNK),
-                        "Invalid coeff state: {} at gidx={}",
-                        cstatetmp,
-                        coeff_base + bucket_idx * 16 + i
-                    );
-
-                    if cstatetmp != ZERO {
-                        cstatetmp = if ep16[i] != 0 {
-                            ACTIVE
-                        } else if (src16[i] as i32).abs() >= thres {
-                            NEW | UNK
-                        } else {
-                            UNK
-                        };
-                    }
-                    cstate[i] = cstatetmp;
-                    bstate |= cstatetmp;
-                }
-            }
+                prepare_bucket_band0(
+                    cstate,
+                    prev,
+                    src16,
+                    ep16,
+                    quant_lo,
+                    coeff_base + bucket_idx * 16,
+                )
+            };
 
             scratch_bucket[buck] = bstate;
             bbstate |= bstate;
@@ -341,29 +293,28 @@ impl Codec {
     /// Check if a slice is null (has no data to encode) based on quantization thresholds
     /// CRITICAL: For band 0, this also updates coeffstate[] array (matches djvulibre behavior)
     pub fn is_null_slice(&mut self, _bit: i32, band: i32) -> bool {
-        if band == 0 {
-            // For band 0, update coefficient state for ALL blocks' bucket 0 coefficients
-            // This matches djvulibre IW44Image.cpp:is_null_slice exactly
-            let mut is_null = true;
-            for blockno in 0..self.map.num_blocks {
-                let base_idx = blockno * 64 * 16; // Start of this block's coefficients
-                for i in 0..16 {
-                    let threshold = self.quant_lo[i];
-                    // Reset state to ZERO
-                    self.coeff_state[base_idx + i] = ZERO;
-                    if threshold > 0 && threshold < 0x8000 {
-                        // Mark as UNK (unknown) if threshold is active
-                        self.coeff_state[base_idx + i] = UNK;
-                        is_null = false;
-                    }
-                }
-            }
-            is_null
-        } else {
+        if band != 0 {
             // For other bands, just check the threshold (no state update needed)
             let threshold = self.quant_hi[band as usize];
-            !(threshold > 0 && threshold < 0x8000)
+            return !(threshold > 0 && threshold < 0x8000);
         }
+        // For band 0, update coefficient state for ALL blocks' bucket 0 coefficients
+        // This matches djvulibre IW44Image.cpp:is_null_slice exactly
+        let mut is_null = true;
+        for blockno in 0..self.map.num_blocks {
+            let base_idx = blockno * 64 * 16; // Start of this block's coefficients
+            for i in 0..16 {
+                let threshold = self.quant_lo[i];
+                // Reset state to ZERO
+                self.coeff_state[base_idx + i] = ZERO;
+                if threshold > 0 && threshold < 0x8000 {
+                    // Mark as UNK (unknown) if threshold is active
+                    self.coeff_state[base_idx + i] = UNK;
+                    is_null = false;
+                }
+            }
+        }
+        is_null
     }
 
     /// Finish processing a slice by reducing quantization thresholds (matches C44's finish_code_slice)
@@ -445,44 +396,7 @@ impl Codec {
         // For each bucket with potential new coefficients, encode whether it actually has any.
         // Only run this pass if we have NEW coefficients (gated by root bit or forced for small bands)
         if encode_new_passes {
-            // Destructured so the emap block and the bucket states can be read
-            // while a context is borrowed mutably for the encoder.
-            let Self {
-                emap,
-                scratch_bucket,
-                ctx_bucket,
-                ..
-            } = self;
-            let emap_block = &emap.blocks[blockno];
-            let ctx_band = &mut ctx_bucket[band as usize];
-            let states = &scratch_bucket[..nbucket];
-            for (buckno, &state) in states.iter().enumerate() {
-                if (state & UNK) != 0 {
-                    let mut ctx = 0;
-                    if band > 0 {
-                        let k = (fbucket + buckno) << 2;
-                        let b = emap_block.get_bucket_raw((k >> 4) as u8);
-                        let k = k & 0xf;
-                        if b[k] != 0 {
-                            ctx += 1;
-                        }
-                        if b[k + 1] != 0 {
-                            ctx += 1;
-                        }
-                        if b[k + 2] != 0 {
-                            ctx += 1;
-                        }
-                        if ctx < 3 && b[k + 3] != 0 {
-                            ctx += 1;
-                        }
-                    }
-                    if (bbstate & ACTIVE) != 0 {
-                        ctx |= 4;
-                    }
-                    let bucket_bit = (state & NEW) != 0;
-                    zp.encode(bucket_bit, &mut ctx_band[ctx])?;
-                }
-            }
+            self.encode_bucket_bits(zp, band, blockno, fbucket, nbucket, bbstate)?;
         }
 
         // --- Pass 2: Code new coefficients and their signs ---
@@ -490,148 +404,14 @@ impl Codec {
         // THIS IS WHERE THE MAGNITUDE IS FIRST RECORDED.
         // Only run this pass if we have NEW coefficients (gated by root bit or forced for small bands)
         if encode_new_passes {
-            let Self {
-                map,
-                emap,
-                scratch_coeff,
-                scratch_bucket,
-                ctx_start,
-                quant_hi,
-                quant_lo,
-                ..
-            } = self;
-            let map_block = &map.blocks[blockno];
-            let emap_block = &mut emap.blocks[blockno];
-            // Loop-invariant for every band but 0, where the threshold is
-            // per-coefficient; hoisting it out of the coefficient loop drops a
-            // branch and a load from the innermost body.
-            let band_thres = if band == 0 {
-                0
-            } else {
-                quant_hi[band as usize]
-            };
-            for buckno in 0..nbucket {
-                let bucket_state_value = scratch_bucket[buckno];
-                if (bucket_state_value & NEW) != 0 {
-                    let pcoeff_bucket = map_block.get_bucket_raw((fbucket + buckno) as u8);
-                    let epcoeff_bucket = emap_block.get_bucket_mut((fbucket + buckno) as u8);
-
-                    let mut gotcha = 0;
-                    let maxgotcha = 7;
-                    // One bounds check for the bucket's sixteen states.
-                    let cstate = &scratch_coeff[buckno * 16..buckno * 16 + 16];
-                    let active_bit = if (bucket_state_value & ACTIVE) != 0 {
-                        8
-                    } else {
-                        0
-                    };
-
-                    for &state in cstate {
-                        if (state & UNK) != 0 {
-                            gotcha += 1;
-                        }
-                    }
-
-                    for i in 0..16 {
-                        if (cstate[i] & UNK) != 0 {
-                            let ctx = if gotcha >= maxgotcha {
-                                maxgotcha
-                            } else {
-                                gotcha
-                            } | active_bit;
-
-                            let is_new = (cstate[i] & NEW) != 0;
-                            zp.encode(is_new, &mut ctx_start[ctx])?;
-
-                            if is_new {
-                                // 1. Encode the sign bit (this is a raw, non-adaptive bit)
-                                let sign = pcoeff_bucket[i] < 0;
-                                // Use encode_raw_bit for raw contexts (128, 129) instead of IWencoder
-                                zp.iwencoder(sign).map_err(super::EncoderError::ZCodec)?;
-
-                                // 2. Set the initial reconstructed value in emap (magnitude with sign).
-                                // Use the BASE threshold for initial reconstruction (not bit-plane shifted)
-                                // C++ logic: `epcoeff[i] = thres + (thres>>1);` where thres is the BASE threshold
-                                let thres = if band == 0 { quant_lo[i] } else { band_thres };
-                                let mag = (thres + (thres >> 1)) as i16;
-                                // Store only magnitude in epcoeff (sign is tracked separately in bitstream)
-                                epcoeff_bucket[i] = mag;
-
-                                gotcha = 0;
-                            } else if gotcha > 0 {
-                                gotcha -= 1;
-                            }
-                        }
-                    }
-                }
-            }
+            self.encode_new_coefficients(zp, band, blockno, fbucket, nbucket)?;
         }
 
         // --- Pass 3: Code mantissa bits for ACTIVE coefficient refinement ---
         // For coefficients that are already significant, refine their magnitude by one bit.
         // This pass runs independently of Pass 1/2 (can have ACTIVE without NEW)
         if has_active {
-            let Self {
-                map,
-                emap,
-                scratch_coeff,
-                scratch_bucket,
-                ctx_mant,
-                quant_hi,
-                quant_lo,
-                ..
-            } = self;
-            let map_block = &map.blocks[blockno];
-            let emap_block = &mut emap.blocks[blockno];
-            // Same hoist as pass 2: for bands 1..9 both the threshold and the
-            // `3 * thresh` adaptive/raw cutoff are constant across the whole
-            // pass, and this is the encoder's single hottest loop.
-            let band_thres = if band == 0 {
-                0
-            } else {
-                quant_hi[band as usize]
-            };
-            let band_thres3 = band_thres.saturating_mul(3);
-            for buckno in 0..nbucket {
-                if (scratch_bucket[buckno] & ACTIVE) != 0 {
-                    let pcoeff_bucket = map_block.get_bucket_raw((fbucket + buckno) as u8);
-                    let epcoeff_bucket = emap_block.get_bucket_mut((fbucket + buckno) as u8);
-                    let cstate = &scratch_coeff[buckno * 16..buckno * 16 + 16];
-                    for i in 0..16 {
-                        if (cstate[i] & ACTIVE) != 0 {
-                            // All operations here are on magnitudes. epcoeff stores magnitudes only.
-                            let abs_pcoeff = (pcoeff_bucket[i] as i32).abs();
-                            let ecoeff = epcoeff_bucket[i] as i32;
-
-                            // Use the base threshold (no bitplane shift) like DjVuLibre
-                            // C++ uses `thres = quant_lo[i]` for band 0 or `quant_hi[band]` otherwise
-                            let (thresh, thresh3) = if band == 0 {
-                                let t = quant_lo[i];
-                                (t, t.saturating_mul(3))
-                            } else {
-                                (band_thres, band_thres3)
-                            };
-
-                            // The refinement bit (`pix`) is 1 if the true magnitude is in the upper half
-                            // of the current uncertainty interval [ecoeff - thresh, ecoeff + thresh).
-                            let pix = abs_pcoeff >= ecoeff;
-
-                            // Encode the refinement bit adaptively or raw based on magnitude
-                            if ecoeff <= thresh3 {
-                                zp.encode(pix, ctx_mant)?;
-                            } else {
-                                // Use encode_raw_bit for raw contexts (128, 129) instead of IWencoder
-                                zp.iwencoder(pix).map_err(super::EncoderError::ZCodec)?;
-                            }
-
-                            // Update the reconstructed magnitude. epcoeff stores magnitude only.
-                            // C++ logic: `epcoeff[i] = ecoeff - (pix ? 0 : thres) + (thres>>1);`
-                            let adjustment = if pix { 0 } else { thresh };
-                            epcoeff_bucket[i] = (ecoeff - adjustment + (thresh >> 1)) as i16;
-                        }
-                    }
-                }
-            }
+            self.encode_refinement_bits(zp, band, blockno, fbucket, nbucket)?;
         }
 
         // The NEW -> ACTIVE promotion loop that used to stand here was dead.
@@ -653,6 +433,229 @@ impl Codec {
         // `encode_prepare` maps `epcoeff != 0` back to ACTIVE), not by this
         // loop.
 
+        Ok(())
+    }
+
+    /// Pass 1 of `encode_buckets`: for each bucket that may hold new
+    /// coefficients, codes whether it actually has any.
+    #[inline]
+    fn encode_bucket_bits<Z: ZpEncoderCursor>(
+        &mut self,
+        zp: &mut Z,
+        band: i32,
+        blockno: usize,
+        fbucket: usize,
+        nbucket: usize,
+        bbstate: u8,
+    ) -> Result<(), super::EncoderError> {
+        // Destructured so the emap block and the bucket states can be read
+        // while a context is borrowed mutably for the encoder.
+        let Self {
+            emap,
+            scratch_bucket,
+            ctx_bucket,
+            ..
+        } = self;
+        let emap_block = &emap.blocks[blockno];
+        let ctx_band = &mut ctx_bucket[band as usize];
+        let states = &scratch_bucket[..nbucket];
+        for (buckno, &state) in states.iter().enumerate() {
+            if (state & UNK) == 0 {
+                continue;
+            }
+            let mut ctx = 0;
+            if band > 0 {
+                let k = (fbucket + buckno) << 2;
+                let b = emap_block.get_bucket_raw((k >> 4) as u8);
+                let k = k & 0xf;
+                if b[k] != 0 {
+                    ctx += 1;
+                }
+                if b[k + 1] != 0 {
+                    ctx += 1;
+                }
+                if b[k + 2] != 0 {
+                    ctx += 1;
+                }
+                if ctx < 3 && b[k + 3] != 0 {
+                    ctx += 1;
+                }
+            }
+            if (bbstate & ACTIVE) != 0 {
+                ctx |= 4;
+            }
+            let bucket_bit = (state & NEW) != 0;
+            zp.encode(bucket_bit, &mut ctx_band[ctx])?;
+        }
+        Ok(())
+    }
+
+    /// Pass 2 of `encode_buckets`: codes, for every UNK coefficient of a
+    /// bucket with NEW ones, whether it becomes significant, and the sign and
+    /// initial reconstruction of each one that does.
+    #[inline]
+    fn encode_new_coefficients<Z: ZpEncoderCursor>(
+        &mut self,
+        zp: &mut Z,
+        band: i32,
+        blockno: usize,
+        fbucket: usize,
+        nbucket: usize,
+    ) -> Result<(), super::EncoderError> {
+        let Self {
+            map,
+            emap,
+            scratch_coeff,
+            scratch_bucket,
+            ctx_start,
+            quant_hi,
+            quant_lo,
+            ..
+        } = self;
+        let map_block = &map.blocks[blockno];
+        let emap_block = &mut emap.blocks[blockno];
+        // Loop-invariant for every band but 0, where the threshold is
+        // per-coefficient; hoisting it out of the coefficient loop drops a
+        // branch and a load from the innermost body.
+        let band_thres = if band == 0 {
+            0
+        } else {
+            quant_hi[band as usize]
+        };
+        for buckno in 0..nbucket {
+            let bucket_state_value = scratch_bucket[buckno];
+            if (bucket_state_value & NEW) == 0 {
+                continue;
+            }
+            let pcoeff_bucket = map_block.get_bucket_raw((fbucket + buckno) as u8);
+            let epcoeff_bucket = emap_block.get_bucket_mut((fbucket + buckno) as u8);
+
+            let mut gotcha = 0;
+            let maxgotcha = 7;
+            // One bounds check for the bucket's sixteen states.
+            let cstate = &scratch_coeff[buckno * 16..buckno * 16 + 16];
+            let active_bit = if (bucket_state_value & ACTIVE) != 0 {
+                8
+            } else {
+                0
+            };
+
+            for &state in cstate {
+                if (state & UNK) != 0 {
+                    gotcha += 1;
+                }
+            }
+
+            for i in 0..16 {
+                if (cstate[i] & UNK) == 0 {
+                    continue;
+                }
+                let ctx = if gotcha >= maxgotcha {
+                    maxgotcha
+                } else {
+                    gotcha
+                } | active_bit;
+
+                let is_new = (cstate[i] & NEW) != 0;
+                zp.encode(is_new, &mut ctx_start[ctx])?;
+
+                if !is_new {
+                    gotcha = gotcha.saturating_sub(1);
+                    continue;
+                }
+                // 1. Encode the sign bit (this is a raw, non-adaptive bit)
+                let sign = pcoeff_bucket[i] < 0;
+                // Use encode_raw_bit for raw contexts (128, 129) instead of IWencoder
+                zp.iwencoder(sign).map_err(super::EncoderError::ZCodec)?;
+
+                // 2. Set the initial reconstructed value in emap (magnitude with sign).
+                // Use the BASE threshold for initial reconstruction (not bit-plane shifted)
+                // C++ logic: `epcoeff[i] = thres + (thres>>1);` where thres is the BASE threshold
+                let thres = if band == 0 { quant_lo[i] } else { band_thres };
+                let mag = (thres + (thres >> 1)) as i16;
+                // Store only magnitude in epcoeff (sign is tracked separately in bitstream)
+                epcoeff_bucket[i] = mag;
+
+                gotcha = 0;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pass 3 of `encode_buckets`: codes one refinement (mantissa) bit for
+    /// every ACTIVE coefficient and updates its reconstructed magnitude.
+    #[inline]
+    fn encode_refinement_bits<Z: ZpEncoderCursor>(
+        &mut self,
+        zp: &mut Z,
+        band: i32,
+        blockno: usize,
+        fbucket: usize,
+        nbucket: usize,
+    ) -> Result<(), super::EncoderError> {
+        let Self {
+            map,
+            emap,
+            scratch_coeff,
+            scratch_bucket,
+            ctx_mant,
+            quant_hi,
+            quant_lo,
+            ..
+        } = self;
+        let map_block = &map.blocks[blockno];
+        let emap_block = &mut emap.blocks[blockno];
+        // Same hoist as pass 2: for bands 1..9 both the threshold and the
+        // `3 * thresh` adaptive/raw cutoff are constant across the whole
+        // pass, and this is the encoder's single hottest loop.
+        let band_thres = if band == 0 {
+            0
+        } else {
+            quant_hi[band as usize]
+        };
+        let band_thres3 = band_thres.saturating_mul(3);
+        for buckno in 0..nbucket {
+            if (scratch_bucket[buckno] & ACTIVE) == 0 {
+                continue;
+            }
+            let pcoeff_bucket = map_block.get_bucket_raw((fbucket + buckno) as u8);
+            let epcoeff_bucket = emap_block.get_bucket_mut((fbucket + buckno) as u8);
+            let cstate = &scratch_coeff[buckno * 16..buckno * 16 + 16];
+            for i in 0..16 {
+                if (cstate[i] & ACTIVE) == 0 {
+                    continue;
+                }
+                // All operations here are on magnitudes. epcoeff stores magnitudes only.
+                let abs_pcoeff = (pcoeff_bucket[i] as i32).abs();
+                let ecoeff = epcoeff_bucket[i] as i32;
+
+                // Use the base threshold (no bitplane shift) like DjVuLibre
+                // C++ uses `thres = quant_lo[i]` for band 0 or `quant_hi[band]` otherwise
+                let (thresh, thresh3) = if band == 0 {
+                    let t = quant_lo[i];
+                    (t, t.saturating_mul(3))
+                } else {
+                    (band_thres, band_thres3)
+                };
+
+                // The refinement bit (`pix`) is 1 if the true magnitude is in the upper half
+                // of the current uncertainty interval [ecoeff - thresh, ecoeff + thresh).
+                let pix = abs_pcoeff >= ecoeff;
+
+                // Encode the refinement bit adaptively or raw based on magnitude
+                if ecoeff <= thresh3 {
+                    zp.encode(pix, ctx_mant)?;
+                } else {
+                    // Use encode_raw_bit for raw contexts (128, 129) instead of IWencoder
+                    zp.iwencoder(pix).map_err(super::EncoderError::ZCodec)?;
+                }
+
+                // Update the reconstructed magnitude. epcoeff stores magnitude only.
+                // C++ logic: `epcoeff[i] = ecoeff - (pix ? 0 : thres) + (thres>>1);`
+                let adjustment = if pix { 0 } else { thresh };
+                epcoeff_bucket[i] = (ecoeff - adjustment + (thresh >> 1)) as i16;
+            }
+        }
         Ok(())
     }
 
@@ -727,4 +730,103 @@ impl Codec {
         let factor = 255.0 * (1 << super::constants::IW_SHIFT) as f32;
         10.0 * (factor * factor / mse_avg).log10()
     }
+}
+
+/// Coefficient states of one bucket of bands 1..9 when `0 < thres < 0x8000`;
+/// returns the bucket's OR of states.
+///
+/// Branchless form of the same three-way select as [`prepare_bucket_i32`], so
+/// the sixteen coefficients vectorize instead of compiling to sixteen
+/// unpredictable branch pairs. `is_null_slice` guarantees `0 < thres < 0x8000`
+/// for bands 1..9, which lets the magnitude test run in u16 (`unsigned_abs`
+/// maps i16::MIN to 32768 without overflowing) rather than widening every
+/// coefficient to i32.
+#[inline(always)]
+fn prepare_bucket_u16(
+    cstate: &mut [u8; 16],
+    src16: &[i16; 16],
+    ep16: &[i16; 16],
+    thres: i32,
+) -> u8 {
+    let mut bstate = 0;
+    let thres_u = thres as u16;
+    for i in 0..16 {
+        let sig = (src16[i].unsigned_abs() >= thres_u) as u8;
+        // sig -> NEW|UNK (0x03), !sig -> UNK (0x01)
+        let state = if ep16[i] != 0 {
+            ACTIVE
+        } else {
+            UNK | (sig << 1)
+        };
+        cstate[i] = state;
+        bstate |= state;
+    }
+    bstate
+}
+
+/// Coefficient states of one bucket of bands 1..9 for any threshold; returns
+/// the bucket's OR of states.
+#[inline(always)]
+fn prepare_bucket_i32(
+    cstate: &mut [u8; 16],
+    src16: &[i16; 16],
+    ep16: &[i16; 16],
+    thres: i32,
+) -> u8 {
+    let mut bstate = 0;
+    for i in 0..16 {
+        let state = if ep16[i] != 0 {
+            ACTIVE
+        } else if (src16[i] as i32).abs() >= thres {
+            NEW | UNK
+        } else {
+            UNK
+        };
+        cstate[i] = state;
+        bstate |= state;
+    }
+    bstate
+}
+
+/// Coefficient states of one band-0 bucket: a coefficient seeded ZERO by
+/// `is_null_slice` (`prev`) stays ZERO, the others take the three-way select
+/// against their own `quant_lo` threshold. Returns the bucket's OR of states;
+/// `gidx_base` only labels the debug assertion.
+#[inline(always)]
+fn prepare_bucket_band0(
+    cstate: &mut [u8; 16],
+    prev: &[u8],
+    src16: &[i16; 16],
+    ep16: &[i16; 16],
+    quant_lo: &[i32; 16],
+    gidx_base: usize,
+) -> u8 {
+    let mut bstate = 0;
+    for i in 0..16 {
+        let thres = quant_lo[i];
+        let mut cstatetmp = prev[i];
+
+        debug_assert!(
+            cstatetmp == ZERO
+                || cstatetmp == UNK
+                || cstatetmp == ACTIVE
+                || cstatetmp == (NEW | UNK),
+            "Invalid coeff state: {} at gidx={}",
+            cstatetmp,
+            gidx_base + i
+        );
+
+        if cstatetmp != ZERO {
+            cstatetmp = if ep16[i] != 0 {
+                ACTIVE
+            } else if (src16[i] as i32).abs() >= thres {
+                NEW | UNK
+            } else {
+                UNK
+            };
+        }
+        cstate[i] = cstatetmp;
+        bstate |= cstatetmp;
+    }
+    bstate
 }

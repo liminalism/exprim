@@ -429,25 +429,21 @@ impl DjvuImageExt for Pixmap {
 
                 if alpha_val == 255 {
                     *bg_pixel = fg_pixel;
-                } else {
-                    let level = multipliers[alpha_val as usize];
-                    bg_pixel.r = {
-                        let bg = bg_pixel.r as i32;
-                        let fg = fg_pixel.r as i32;
-                        (bg - (((bg - fg) * level as i32) >> 16)) as u8
-                    };
-                    bg_pixel.g = {
-                        let bg = bg_pixel.g as i32;
-                        let fg = fg_pixel.g as i32;
-                        (bg - (((bg - fg) * level as i32) >> 16)) as u8
-                    };
-                    bg_pixel.b = {
-                        let bg = bg_pixel.b as i32;
-                        let fg = fg_pixel.b as i32;
-                        (bg - (((bg - fg) * level as i32) >> 16)) as u8
-                    };
+                    continue;
                 }
+                let level = multipliers[alpha_val as usize];
+                bg_pixel.r = blend_channel(bg_pixel.r, fg_pixel.r, level);
+                bg_pixel.g = blend_channel(bg_pixel.g, fg_pixel.g, level);
+                bg_pixel.b = blend_channel(bg_pixel.b, fg_pixel.b, level);
             }
         }
     }
+}
+
+/// Moves one background channel towards the foreground by `level / 0x10000`.
+#[inline]
+fn blend_channel(bg: u8, fg: u8, level: u32) -> u8 {
+    let bg = bg as i32;
+    let fg = fg as i32;
+    (bg - (((bg - fg) * level as i32) >> 16)) as u8
 }
