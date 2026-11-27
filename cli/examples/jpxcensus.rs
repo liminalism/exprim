@@ -85,9 +85,8 @@ fn codestream(data: &[u8]) -> Option<&[u8]> {
 fn header_markers(cs: &[u8]) -> (Vec<u16>, Vec<u16>) {
     let mut main = Vec::new();
     let mut tile = Vec::new();
-    let read16 = |p: usize| -> Option<u16> {
-        cs.get(p..p + 2).map(|b| u16::from_be_bytes([b[0], b[1]]))
-    };
+    let read16 =
+        |p: usize| -> Option<u16> { cs.get(p..p + 2).map(|b| u16::from_be_bytes([b[0], b[1]])) };
     let mut pos = 2usize; // past SOC
     // Main header: every segment up to the first SOT.
     loop {
@@ -114,8 +113,7 @@ fn header_markers(cs: &[u8]) -> (Vec<u16>, Vec<u16>) {
             break;
         };
         let mut hpos = pos + 2 + lsot as usize;
-        loop {
-            let Some(marker) = read16(hpos) else { break };
+        while let Some(marker) = read16(hpos) {
             if marker == 0xff93 {
                 break;
             }
