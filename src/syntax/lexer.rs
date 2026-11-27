@@ -85,15 +85,22 @@ impl<'a> Lexer<'a> {
                 }
                 Some(b'%') => {
                     self.pos += 1;
-                    while let Some(b) = self.peek() {
-                        if is_eol(b) {
-                            break;
-                        }
-                        self.pos += 1;
-                    }
+                    self.skip_to_eol();
                 }
                 _ => return,
             }
+        }
+    }
+
+    /// Advance to the next EOL byte (left unconsumed) or the end of input:
+    /// the body of a `%` comment.
+    #[inline]
+    fn skip_to_eol(&mut self) {
+        while let Some(b) = self.peek() {
+            if is_eol(b) {
+                break;
+            }
+            self.pos += 1;
         }
     }
 
@@ -327,48 +334,52 @@ impl<'a> Lexer<'a> {
                     }
                     out.push(b'\n');
                 }
-                b'\\' => {
-                    let Some(e) = self.bump() else {
-                        return Err(SyntaxError::UnterminatedString { offset: start });
-                    };
-                    match e {
-                        b'n' => out.push(b'\n'),
-                        b'r' => out.push(b'\r'),
-                        b't' => out.push(b'\t'),
-                        b'b' => out.push(0x08),
-                        b'f' => out.push(0x0C),
-                        b'\\' => out.push(b'\\'),
-                        b'(' => out.push(b'('),
-                        b')' => out.push(b')'),
-                        // Line continuation: backslash-EOL vanishes.
-                        b'\n' => {}
-                        b'\r' => {
-                            if self.peek() == Some(b'\n') {
-                                self.pos += 1;
-                            }
-                        }
-                        b'0'..=b'7' => {
-                            // 1–3 octal digits; overflow wraps to a byte
-                            // (PDFium accumulates then truncates).
-                            let mut code = u16::from(e - b'0');
-                            for _ in 0..2 {
-                                match self.peek().and_then(octal_value) {
-                                    Some(d) => {
-                                        self.pos += 1;
-                                        code = code * 8 + u16::from(d);
-                                    }
-                                    None => break,
-                                }
-                            }
-                            out.push((code & 0xFF) as u8);
-                        }
-                        // Unknown escape: backslash is dropped, char kept.
-                        other => out.push(other),
-                    }
-                }
+                b'\\' => self.read_string_escape(start, &mut out)?,
                 other => out.push(other),
             }
         }
+    }
+
+    /// One literal-string escape; the backslash is already consumed. Appends
+    /// the escaped byte, if any, to `out`.
+    #[inline]
+    fn read_string_escape(&mut self, start: Offset, out: &mut Vec<u8>) -> Result<(), SyntaxError> {
+        let Some(e) = self.bump() else {
+            return Err(SyntaxError::UnterminatedString { offset: start });
+        };
+        match e {
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0C),
+            b'\\' => out.push(b'\\'),
+            b'(' => out.push(b'('),
+            b')' => out.push(b')'),
+            // Line continuation: backslash-EOL vanishes.
+            b'\n' => {}
+            b'\r' => {
+                if self.peek() == Some(b'\n') {
+                    self.pos += 1;
+                }
+            }
+            b'0'..=b'7' => {
+                // 1–3 octal digits; overflow wraps to a byte
+                // (PDFium accumulates then truncates).
+                let mut code = u16::from(e - b'0');
+                for _ in 0..2 {
+                    let Some(d) = self.peek().and_then(octal_value) else {
+                        break;
+                    };
+                    self.pos += 1;
+                    code = code * 8 + u16::from(d);
+                }
+                out.push((code & 0xFF) as u8);
+            }
+            // Unknown escape: backslash is dropped, char kept.
+            other => out.push(other),
+        }
+        Ok(())
     }
 
     /// Hex string body; the opening `<` is already consumed.

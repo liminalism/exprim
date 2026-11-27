@@ -455,11 +455,11 @@ impl PageRange {
                 let mut out = Vec::new();
                 for &(start, end) in spans {
                     let start = start.max(1);
-                    for page in start..=end {
-                        if page <= page_count {
-                            out.push(page - 1);
-                        }
-                    }
+                    out.extend(
+                        (start..=end)
+                            .filter(|&page| page <= page_count)
+                            .map(|page| page - 1),
+                    );
                 }
                 out
             }

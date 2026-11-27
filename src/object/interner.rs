@@ -119,6 +119,14 @@ mod tests {
         assert_eq!(i.len(), 1);
     }
 
+    /// Intern each name and check it resolves back to its own bytes.
+    fn intern_and_check(i: &NameInterner, names: &[Vec<u8>]) {
+        for n in names {
+            let id = i.intern(n);
+            assert_eq!(i.resolve(id).as_ref(), &n[..]);
+        }
+    }
+
     #[test]
     fn concurrent_interning_converges() {
         let i = Arc::new(NameInterner::new());
@@ -129,12 +137,7 @@ mod tests {
             for _ in 0..8 {
                 let i = Arc::clone(&i);
                 let names = names.clone();
-                s.spawn(move || {
-                    for n in &names {
-                        let id = i.intern(n);
-                        assert_eq!(i.resolve(id).as_ref(), &n[..]);
-                    }
-                });
+                s.spawn(move || intern_and_check(&i, &names));
             }
         });
         assert_eq!(i.len(), 16);

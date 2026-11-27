@@ -1058,46 +1058,79 @@ fn placed_glyphs(
     // glyph hangs centered below the pen point. Neither the advance nor `TJ`
     // adjustments are scaled by Th, which is horizontal-only; the `v` x
     // displacement is horizontal, so it is.
-    let vertical = metrics.is_vertical();
-    let mut cursor = 0.0;
-    let mut out = Vec::new();
+    let mut pen = GlyphPen {
+        run,
+        metrics,
+        glyph_map,
+        th,
+        fs,
+        vertical: metrics.is_vertical(),
+        cursor: 0.0,
+        out: Vec::new(),
+    };
     for el in run.elements.iter() {
         match el {
-            TextElement::Show(bytes) => {
-                // The font decodes the byte string into codes/CIDs with PDF
-                // advances (1 byte for simple fonts, 2 for Identity CID); the
-                // CID→GID map turns a composite CID into its glyph id.
-                for dc in metrics.decode(bytes) {
-                    let word = if dc.word_space { run.word_spacing } else { 0.0 };
-                    if let Some(vp) = vertical.then(|| metrics.vertical(dc.cid)).flatten() {
-                        let (vx, vy) = vp.origin;
-                        out.push(PlacedGlyph {
-                            glyph: glyph_map.gid(dc.cid),
-                            x: -(vx as f64) / 1000.0 * fs * th,
-                            y: cursor + run.rise - (vy as f64) / 1000.0 * fs,
-                        });
-                        cursor += vp.advance as f64 / 1000.0 * fs + run.char_spacing + word;
-                    } else {
-                        out.push(PlacedGlyph {
-                            glyph: glyph_map.gid(dc.cid),
-                            x: cursor,
-                            y: run.rise,
-                        });
-                        let w = dc.advance as f64 / 1000.0 * fs;
-                        cursor += (w + run.char_spacing + word) * th;
-                    }
-                }
-            }
-            TextElement::Adjust(n) => {
-                cursor += if vertical {
-                    -n / 1000.0 * fs
-                } else {
-                    -n / 1000.0 * fs * th
-                };
+            TextElement::Show(bytes) => pen.show(bytes),
+            TextElement::Adjust(n) => pen.adjust(*n),
+        }
+    }
+    pen.out
+}
+
+/// The pen of [`placed_glyphs`]: places each decoded glyph at the running
+/// cursor and advances it, along x or (vertical writing) along y.
+struct GlyphPen<'a> {
+    run: &'a TextRun,
+    metrics: &'a crate::font::FontMetrics,
+    glyph_map: &'a crate::font::GlyphMap,
+    th: f64,
+    fs: f64,
+    vertical: bool,
+    cursor: f64,
+    out: Vec<PlacedGlyph>,
+}
+
+impl GlyphPen<'_> {
+    /// Place the glyphs of one shown string.
+    fn show(&mut self, bytes: &[u8]) {
+        let (run, fs, th) = (self.run, self.fs, self.th);
+        // The font decodes the byte string into codes/CIDs with PDF
+        // advances (1 byte for simple fonts, 2 for Identity CID); the
+        // CID→GID map turns a composite CID into its glyph id.
+        for dc in self.metrics.decode(bytes) {
+            let word = if dc.word_space { run.word_spacing } else { 0.0 };
+            if let Some(vp) = self
+                .vertical
+                .then(|| self.metrics.vertical(dc.cid))
+                .flatten()
+            {
+                let (vx, vy) = vp.origin;
+                self.out.push(PlacedGlyph {
+                    glyph: self.glyph_map.gid(dc.cid),
+                    x: -(vx as f64) / 1000.0 * fs * th,
+                    y: self.cursor + run.rise - (vy as f64) / 1000.0 * fs,
+                });
+                self.cursor += vp.advance as f64 / 1000.0 * fs + run.char_spacing + word;
+            } else {
+                self.out.push(PlacedGlyph {
+                    glyph: self.glyph_map.gid(dc.cid),
+                    x: self.cursor,
+                    y: run.rise,
+                });
+                let w = dc.advance as f64 / 1000.0 * fs;
+                self.cursor += (w + run.char_spacing + word) * th;
             }
         }
     }
-    out
+
+    /// Apply one `TJ` adjustment (thousandths of a text-space unit).
+    fn adjust(&mut self, n: f64) {
+        self.cursor += if self.vertical {
+            -n / 1000.0 * self.fs
+        } else {
+            -n / 1000.0 * self.fs * self.th
+        };
+    }
 }
 
 // Resolve a semantic color to a device-space IR paint. Device families convert

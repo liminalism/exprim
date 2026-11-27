@@ -681,23 +681,14 @@ impl DocumentSnapshot {
             mut ctx,
             (mut security, mut pages, mut ocg, mut stats),
             rebuilt_already,
-        ) = match crate::structure::load_structure(source.as_ref(), &names, &structure_limits) {
-            Ok(s) => match try_build(s) {
-                Ok((s, c, p)) => (s, c, p, false),
-                Err(build_err) => match rebuild() {
-                    Ok(r) => match try_build(r) {
-                        Ok((s, c, p)) => (s, c, p, true),
-                        Err(_) => return Err(build_err),
-                    },
-                    Err(_) => return Err(build_err),
-                },
-            },
-            Err(load_err) => match rebuild() {
-                Ok(r) => match try_build(r) {
-                    Ok((s, c, p)) => (s, c, p, true),
-                    Err(_) => return Err(load_err.into()),
-                },
-                Err(_) => return Err(load_err.into()),
+        ) = match crate::structure::load_structure(source.as_ref(), &names, &structure_limits)
+            .map_err(DocumentError::from)
+            .and_then(&try_build)
+        {
+            Ok((s, c, p)) => (s, c, p, false),
+            Err(first_err) => match rebuild().ok().and_then(|r| try_build(r).ok()) {
+                Some((s, c, p)) => (s, c, p, true),
+                None => return Err(first_err),
             },
         };
 
@@ -712,30 +703,15 @@ impl DocumentSnapshot {
         {
             let mut ctx2 = ParseContext::new();
             if let Ok((sec2, pages2, ocg2, stats2)) = build_parts(&rebuilt, &mut ctx2) {
-                let (pages2, candidate_stats) = if stats2.real_pages == 0 {
-                    let resolver = Resolver {
-                        source: source.as_ref(),
-                        structure: &rebuilt,
-                        names: &names,
-                        limits: &limits,
-                        security: sec2.as_ref(),
-                    };
-                    let orphans = pages::recover_orphan_pages(&resolver, &mut ctx2);
-                    if orphans.page_count() > 0 {
-                        let orphan_count = orphans.page_count() as usize;
-                        (
-                            orphans,
-                            pages::WalkStats {
-                                real_pages: orphan_count,
-                                lost_subtrees: 0,
-                            },
-                        )
-                    } else {
-                        (pages2, stats2)
-                    }
-                } else {
-                    (pages2, stats2)
+                let resolver = Resolver {
+                    source: source.as_ref(),
+                    structure: &rebuilt,
+                    names: &names,
+                    limits: &limits,
+                    security: sec2.as_ref(),
                 };
+                let (pages2, candidate_stats) =
+                    orphan_pages_if_treeless(&resolver, &mut ctx2, pages2, stats2);
                 let improves = candidate_stats.real_pages > stats.real_pages
                     || (candidate_stats.real_pages == stats.real_pages
                         && candidate_stats.lost_subtrees < stats.lost_subtrees);
@@ -944,6 +920,32 @@ impl DocumentSnapshot {
     pub fn recovery_events(&self) -> &[RecoveryEvent] {
         &self.inner.structure.recovery
     }
+}
+
+/// A rebuilt structure's page tree, or, when that tree has no real pages,
+/// its explicit orphan page leaves (if there are any) with stats that count
+/// them as real pages.
+fn orphan_pages_if_treeless(
+    resolver: &Resolver<'_>,
+    ctx: &mut ParseContext,
+    pages: PageTreeIndex,
+    stats: pages::WalkStats,
+) -> (PageTreeIndex, pages::WalkStats) {
+    if stats.real_pages != 0 {
+        return (pages, stats);
+    }
+    let orphans = pages::recover_orphan_pages(resolver, ctx);
+    if orphans.page_count() == 0 {
+        return (pages, stats);
+    }
+    let orphan_count = orphans.page_count() as usize;
+    (
+        orphans,
+        pages::WalkStats {
+            real_pages: orphan_count,
+            lost_subtrees: 0,
+        },
+    )
 }
 
 /// Build the document's [`SecurityContext`] from its `/Encrypt` dictionary.

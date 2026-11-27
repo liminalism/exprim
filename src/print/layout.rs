@@ -422,14 +422,16 @@ fn build_sheets(
                 });
             }
             let cells = cell_rects(imageable, columns, rows, order);
-            let mut placements = Vec::new();
-            for (slot, cell) in slots.iter().zip(cells) {
-                if let Some(page) = *slot {
-                    let mut placement = fit_page(page, cell, options.scaling, page_rotation);
+            // Empty slots leave their cell blank.
+            let placements = slots
+                .iter()
+                .zip(cells)
+                .filter_map(|(slot, cell)| {
+                    let mut placement = fit_page((*slot)?, cell, options.scaling, page_rotation);
                     placement.clip = placement.clip.intersect(imageable);
-                    placements.push(placement);
-                }
-            }
+                    Some(placement)
+                })
+                .collect();
             out.push(Sheet {
                 index,
                 bounds,

@@ -296,26 +296,7 @@ impl Resolver<'_> {
                             actual: found_at,
                         });
                     }
-                    for repair in parsed.repairs {
-                        match repair {
-                            IndirectRepair::StreamLengthRepaired { declared, actual } => {
-                                ctx.recovery.push(RecoveryEvent::StreamLengthRepaired {
-                                    id,
-                                    declared,
-                                    actual,
-                                });
-                            }
-                            IndirectRepair::MissingReferenceGeneration { number, offset } => {
-                                ctx.recovery
-                                    .push(RecoveryEvent::ReferenceGenerationRepaired {
-                                        id,
-                                        referenced: number,
-                                        offset,
-                                    });
-                            }
-                            IndirectRepair::MissingEndObj => {}
-                        }
-                    }
+                    note_indirect_repairs(ctx, id, parsed.repairs);
                     return Ok(parsed.object);
                 }
                 Attempt::Grow if !at_eof => {
@@ -642,6 +623,35 @@ impl Resolver<'_> {
         ctx: &mut ParseContext,
     ) -> Option<Dictionary> {
         self.resolve_filter_params(dict, ctx)
+    }
+}
+
+/// Log the parser's repairs of indirect object `id` as recovery events, in
+/// the order the parser made them.
+fn note_indirect_repairs(
+    ctx: &mut ParseContext,
+    id: ObjectId,
+    repairs: impl IntoIterator<Item = IndirectRepair>,
+) {
+    for repair in repairs {
+        match repair {
+            IndirectRepair::StreamLengthRepaired { declared, actual } => {
+                ctx.recovery.push(RecoveryEvent::StreamLengthRepaired {
+                    id,
+                    declared,
+                    actual,
+                });
+            }
+            IndirectRepair::MissingReferenceGeneration { number, offset } => {
+                ctx.recovery
+                    .push(RecoveryEvent::ReferenceGenerationRepaired {
+                        id,
+                        referenced: number,
+                        offset,
+                    });
+            }
+            IndirectRepair::MissingEndObj => {}
+        }
     }
 }
 

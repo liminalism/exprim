@@ -192,14 +192,8 @@ pub fn search_pages(
                 let (mut reached, mut resume_here) = (false, false);
                 if spec.max_matches > 0 {
                     let left = spec.max_matches - summary.match_count;
-                    if data.matches.len() > left {
-                        data.matches.truncate(left);
-                        data.match_count = left;
-                        (reached, resume_here) = (true, true);
-                    } else if data.matches.len() == left {
-                        resume_here = cut;
-                        reached = cut || index + 1 < pages.len();
-                    }
+                    (reached, resume_here) =
+                        apply_match_allowance(&mut data, cut, left, index + 1 < pages.len());
                 }
                 let mut warnings = warnings;
                 if cut && !reached {
@@ -212,11 +206,7 @@ pub fn search_pages(
                 summary.pages_with_matches += 1;
                 let flow = on(SearchEvent::Page(pz, data, warnings))?;
                 if reached {
-                    let next = if resume_here || index + 1 >= pages.len() {
-                        pz.one_based()
-                    } else {
-                        pages[index + 1].one_based()
-                    };
+                    let next = resume_page(pages, index, pz, resume_here);
                     summary.stop(
                         next,
                         format!("match limit max-matches={} reached", spec.max_matches),
@@ -238,6 +228,42 @@ pub fn search_pages(
     match failure {
         Some(error) => Err(error),
         None => Ok(summary),
+    }
+}
+
+/// Cut a page's matches to the `left` the run's allowance still has room
+/// for. Returns whether the allowance is now reached, and whether a resumed
+/// search should start again on this page.
+fn apply_match_allowance(
+    data: &mut SearchPageData,
+    cut: bool,
+    left: usize,
+    more_pages: bool,
+) -> (bool, bool) {
+    if data.matches.len() > left {
+        data.matches.truncate(left);
+        data.match_count = left;
+        return (true, true);
+    }
+    if data.matches.len() == left {
+        return (cut || more_pages, cut);
+    }
+    (false, false)
+}
+
+/// The one-based page a search stopped at page `pz`, selection `index`,
+/// resumes from: `pz` when its matches were cut or it is the last, else the
+/// next selected page.
+fn resume_page(
+    pages: &[crate::pages::PageZero],
+    index: usize,
+    pz: crate::pages::PageZero,
+    resume_here: bool,
+) -> u32 {
+    if resume_here || index + 1 >= pages.len() {
+        pz.one_based()
+    } else {
+        pages[index + 1].one_based()
     }
 }
 

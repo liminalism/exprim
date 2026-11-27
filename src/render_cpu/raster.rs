@@ -546,47 +546,11 @@ impl RasterKernel {
         let prof_timed = u64::from(self.prof.time_fills);
 
         // Build monotonic-in-y edges and the path's device-space bounds.
-        self.edges.clear();
-        let mut y_min = f32::INFINITY;
-        let mut y_max = f32::NEG_INFINITY;
-        let mut x_min = f32::INFINITY;
-        let mut x_max = f32::NEG_INFINITY;
-        for (subpath_index, &(start, end)) in subpaths.iter().enumerate() {
-            if subpath_index & 0x3f == 0 && should_cancel.is_some_and(|cancel| cancel()) {
-                self.reset_cancelled_fill();
-                return false;
-            }
-            let n = end - start;
-            if n < 2 {
-                continue;
-            }
-            for i in 0..n {
-                let a = points[start + i];
-                let b = points[start + (i + 1) % n];
-                if a[1] == b[1] {
-                    continue;
-                }
-                let (y_top, y_bot, x_at_top, dir) = if a[1] < b[1] {
-                    (a[1], b[1], a[0], 1.0)
-                } else {
-                    (b[1], a[1], b[0], -1.0)
-                };
-                let dxdy = (b[0] - a[0]) / (b[1] - a[1]);
-                self.edges.push(Edge {
-                    y_top,
-                    y_bot,
-                    x_at_top,
-                    dxdy,
-                    dir,
-                });
-                y_min = y_min.min(y_top);
-                y_max = y_max.max(y_bot);
-                // x-extent of this edge's endpoints (device space).
-                let x_at_bot = x_at_top + dxdy * (y_bot - y_top);
-                x_min = x_min.min(x_at_top.min(x_at_bot));
-                x_max = x_max.max(x_at_top.max(x_at_bot));
-            }
-        }
+        let Some([x_min, y_min, x_max, y_max]) = self.build_edges(points, subpaths, should_cancel)
+        else {
+            self.reset_cancelled_fill();
+            return false;
+        };
         #[cfg(feature = "profiling")]
         {
             let edge_build = crate::profiling::lap_opt(&mut lap);
@@ -629,6 +593,12 @@ impl RasterKernel {
             return true;
         }
         self.last_rows = (emit_end - emit_start) as u64;
+        let rows = FillRows {
+            row_start,
+            row_end,
+            emit_start,
+            emit_end,
+        };
 
         // Device-clamped x-window for the local accumulation buffer.
         let fwidth = width as f32;
@@ -694,84 +664,17 @@ impl RasterKernel {
             self.row_min[lr] = u32::MAX;
             self.row_max[lr] = 0;
         }
+        let window = AccumWindow {
+            rows,
+            bx,
+            stride,
+            width,
+            fwidth,
+        };
 
-        // --- Pass 1: deposit each edge once, into only the rows it crosses. ---
-        for edge_index in 0..self.edges.len() {
-            if edge_index & 0x3f == 0 && should_cancel.is_some_and(|cancel| cancel()) {
-                self.reset_cancelled_fill();
-                return false;
-            }
-            let e = self.edges[edge_index];
-            let er_start =
-                ((e.y_top.floor() as isize).max(row_start as isize) as usize).max(emit_start);
-            let er_end =
-                ((e.y_bot.ceil() as isize).min(row_end as isize).max(0) as usize).min(emit_end);
-            #[cfg(feature = "profiling")]
-            {
-                self.prof.cur().edge_rows += er_end.saturating_sub(er_start) as u64;
-            }
-            if e.dxdy == 0.0 {
-                // A2: vertical fast path. x is constant; precompute column split.
-                let xc = e.x_at_top.clamp(0.0, fwidth);
-                let c = (xc.floor().clamp(0.0, fwidth - 1.0)) as usize;
-                let lc = c.saturating_sub(bx).min(stride - 2);
-                let frac = (c as f32 + 1.0) - xc; // == (c+1) - xmid, with xmid == xc
-                for y in er_start..er_end {
-                    if y & 0xff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
-                        self.reset_cancelled_fill();
-                        return false;
-                    }
-                    let yf = y as f32;
-                    let ya = e.y_top.max(yf);
-                    let yb = e.y_bot.min(yf + 1.0);
-                    if yb <= ya {
-                        continue;
-                    }
-                    let cover = (yb - ya) * e.dir;
-                    let this_px = cover * frac;
-                    let lr = y - row_start;
-                    let base = lr * stride;
-                    self.acc[base + lc] += this_px;
-                    self.acc[base + lc + 1] += cover - this_px;
-                    if (lc as u32) < self.row_min[lr] {
-                        self.row_min[lr] = lc as u32;
-                    }
-                    if (lc as u32) > self.row_max[lr] {
-                        self.row_max[lr] = lc as u32;
-                    }
-                }
-            } else {
-                for y in er_start..er_end {
-                    if y & 0xff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
-                        self.reset_cancelled_fill();
-                        return false;
-                    }
-                    let yf = y as f32;
-                    let ya = e.y_top.max(yf);
-                    let yb = e.y_bot.min(yf + 1.0);
-                    if yb <= ya {
-                        continue;
-                    }
-                    let xa = e.x_at_top + (ya - e.y_top) * e.dxdy;
-                    let xb = e.x_at_top + (yb - e.y_top) * e.dxdy;
-                    let lr = y - row_start;
-                    let base = lr * stride;
-                    deposit_edge_row(
-                        &mut self.acc,
-                        base,
-                        xa,
-                        ya,
-                        xb,
-                        yb,
-                        e.dir,
-                        fwidth,
-                        bx,
-                        stride,
-                        &mut self.row_min[lr],
-                        &mut self.row_max[lr],
-                    );
-                }
-            }
+        if !self.deposit_edges(window, should_cancel) {
+            self.reset_cancelled_fill();
+            return false;
         }
 
         #[cfg(feature = "profiling")]
@@ -782,17 +685,215 @@ impl RasterKernel {
             c.clock_reads += 1 * prof_timed;
         }
 
-        // --- Pass 2: per-row prefix-sum → coverage, emit spans, reset. ---
-        // The scalar branch is a single fused pass (prefix-sum, convert, emit,
-        // reset) — byte-identical to the reference inner loop and with no
-        // per-row overhead. Wide rows take the AVX2 conversion, which requires a
-        // separate prefix-sum write-back (the SIMD convert cannot fuse with the
-        // sequential sum); it is bit-for-bit identical to the scalar branch.
-        let use_avx2 = coverage_use_avx2();
         let mut row = row;
-        for lr in (emit_start - row_start)..(emit_end - row_start) {
+        if !self.sweep_rows(window, rule, runs_mode, should_cancel, &mut row) {
+            self.reset_cancelled_fill();
+            return false;
+        }
+        #[cfg(feature = "profiling")]
+        {
+            let sweep = crate::profiling::lap_opt(&mut lap);
+            let c = self.prof.cur();
+            c.ns_accum_sweep += sweep;
+            c.clock_reads += 1 * prof_timed;
+        }
+        true
+    }
+
+    /// Build the monotonic-in-y edges of `subpaths` into `self.edges` and
+    /// return their device-space bounds `[x_min, y_min, x_max, y_max]`.
+    /// `None` when cancelled.
+    #[inline(always)]
+    fn build_edges(
+        &mut self,
+        points: &[[f32; 2]],
+        subpaths: &[(usize, usize)],
+        should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> Option<[f32; 4]> {
+        self.edges.clear();
+        let mut y_min = f32::INFINITY;
+        let mut y_max = f32::NEG_INFINITY;
+        let mut x_min = f32::INFINITY;
+        let mut x_max = f32::NEG_INFINITY;
+        for (subpath_index, &(start, end)) in subpaths.iter().enumerate() {
+            if subpath_index & 0x3f == 0 && should_cancel.is_some_and(|cancel| cancel()) {
+                return None;
+            }
+            let n = end - start;
+            if n < 2 {
+                continue;
+            }
+            for i in 0..n {
+                let a = points[start + i];
+                let b = points[start + (i + 1) % n];
+                if a[1] == b[1] {
+                    continue;
+                }
+                let (y_top, y_bot, x_at_top, dir) = if a[1] < b[1] {
+                    (a[1], b[1], a[0], 1.0)
+                } else {
+                    (b[1], a[1], b[0], -1.0)
+                };
+                let dxdy = (b[0] - a[0]) / (b[1] - a[1]);
+                self.edges.push(Edge {
+                    y_top,
+                    y_bot,
+                    x_at_top,
+                    dxdy,
+                    dir,
+                });
+                y_min = y_min.min(y_top);
+                y_max = y_max.max(y_bot);
+                // x-extent of this edge's endpoints (device space).
+                let x_at_bot = x_at_top + dxdy * (y_bot - y_top);
+                x_min = x_min.min(x_at_top.min(x_at_bot));
+                x_max = x_max.max(x_at_top.max(x_at_bot));
+            }
+        }
+        Some([x_min, y_min, x_max, y_max])
+    }
+
+    /// Pass 1 of the accumulation path: deposit each edge once, into only the
+    /// emitted rows it crosses. `false` when cancelled.
+    #[inline(always)]
+    fn deposit_edges(
+        &mut self,
+        window: AccumWindow,
+        should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> bool {
+        let rows = window.rows;
+        for edge_index in 0..self.edges.len() {
+            if edge_index & 0x3f == 0 && should_cancel.is_some_and(|cancel| cancel()) {
+                return false;
+            }
+            let e = self.edges[edge_index];
+            let er_start = ((e.y_top.floor() as isize).max(rows.row_start as isize) as usize)
+                .max(rows.emit_start);
+            let er_end = ((e.y_bot.ceil() as isize).min(rows.row_end as isize).max(0) as usize)
+                .min(rows.emit_end);
+            #[cfg(feature = "profiling")]
+            {
+                self.prof.cur().edge_rows += er_end.saturating_sub(er_start) as u64;
+            }
+            let completed = if e.dxdy == 0.0 {
+                self.deposit_vertical_edge(e, er_start..er_end, window, should_cancel)
+            } else {
+                self.deposit_sloped_edge(e, er_start..er_end, window, should_cancel)
+            };
+            if !completed {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Deposit a vertical edge into device rows `ys` of the accumulation
+    /// window. `false` when cancelled.
+    #[inline(always)]
+    fn deposit_vertical_edge(
+        &mut self,
+        e: Edge,
+        ys: std::ops::Range<usize>,
+        window: AccumWindow,
+        should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> bool {
+        let fwidth = window.fwidth;
+        let stride = window.stride;
+        // A2: vertical fast path. x is constant; precompute column split.
+        let xc = e.x_at_top.clamp(0.0, fwidth);
+        let c = (xc.floor().clamp(0.0, fwidth - 1.0)) as usize;
+        let lc = c.saturating_sub(window.bx).min(stride - 2);
+        let frac = (c as f32 + 1.0) - xc; // == (c+1) - xmid, with xmid == xc
+        for y in ys {
+            if y & 0xff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
+                return false;
+            }
+            let yf = y as f32;
+            let ya = e.y_top.max(yf);
+            let yb = e.y_bot.min(yf + 1.0);
+            if yb <= ya {
+                continue;
+            }
+            let cover = (yb - ya) * e.dir;
+            let this_px = cover * frac;
+            let lr = y - window.rows.row_start;
+            let base = lr * stride;
+            self.acc[base + lc] += this_px;
+            self.acc[base + lc + 1] += cover - this_px;
+            if (lc as u32) < self.row_min[lr] {
+                self.row_min[lr] = lc as u32;
+            }
+            if (lc as u32) > self.row_max[lr] {
+                self.row_max[lr] = lc as u32;
+            }
+        }
+        true
+    }
+
+    /// Deposit a sloped edge into device rows `ys` of the accumulation window.
+    /// `false` when cancelled.
+    #[inline(always)]
+    fn deposit_sloped_edge(
+        &mut self,
+        e: Edge,
+        ys: std::ops::Range<usize>,
+        window: AccumWindow,
+        should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> bool {
+        for y in ys {
+            if y & 0xff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
+                return false;
+            }
+            let yf = y as f32;
+            let ya = e.y_top.max(yf);
+            let yb = e.y_bot.min(yf + 1.0);
+            if yb <= ya {
+                continue;
+            }
+            let xa = e.x_at_top + (ya - e.y_top) * e.dxdy;
+            let xb = e.x_at_top + (yb - e.y_top) * e.dxdy;
+            let lr = y - window.rows.row_start;
+            let base = lr * window.stride;
+            deposit_edge_row(
+                &mut self.acc,
+                base,
+                xa,
+                ya,
+                xb,
+                yb,
+                e.dir,
+                window.fwidth,
+                window.bx,
+                window.stride,
+                &mut self.row_min[lr],
+                &mut self.row_max[lr],
+            );
+        }
+        true
+    }
+
+    /// Pass 2 of the accumulation path: per emitted row, prefix-sum the
+    /// deposits into coverage, hand the covered span to `row` and reset the
+    /// row's cells. `false` when cancelled.
+    ///
+    /// The scalar branch is a single fused pass (prefix-sum, convert, emit,
+    /// reset) — byte-identical to the reference inner loop and with no
+    /// per-row overhead. Wide rows take the AVX2 conversion, which requires a
+    /// separate prefix-sum write-back (the SIMD convert cannot fuse with the
+    /// sequential sum); it is bit-for-bit identical to the scalar branch.
+    #[inline(always)]
+    fn sweep_rows(
+        &mut self,
+        window: AccumWindow,
+        rule: FillRule,
+        runs_mode: bool,
+        should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
+        row: &mut impl FnMut(usize, usize, usize, &mut [u8], &[CovRun]) -> bool,
+    ) -> bool {
+        let use_avx2 = coverage_use_avx2();
+        let row_start = window.rows.row_start;
+        for lr in (window.rows.emit_start - row_start)..(window.rows.emit_end - row_start) {
             if lr & 0x1f == 0 && should_cancel.is_some_and(|cancel| cancel()) {
-                self.reset_cancelled_fill();
                 return false;
             }
             let cmin = self.row_min[lr];
@@ -805,9 +906,7 @@ impl RasterKernel {
             {
                 self.prof.cur().accum_cells_swept += (cmax - cmin + 1) as u64;
             }
-            let base = lr * stride;
-            let mut first = width;
-            let mut last = 0usize;
+            let base = lr * window.stride;
             // Wide rows look for untouched gaps and, in run-aware mode, hand
             // the row over as runs; narrow rows (small curved fills, steep
             // hairlines) keep the plain per-cell sweep and a single run, with
@@ -819,155 +918,206 @@ impl RasterKernel {
             // sentinel (see its doc comment), making this deliberately
             // always-false until a workload lowers the constant.
             #[allow(clippy::absurd_extreme_comparisons)]
-            if use_avx2 && cmax - cmin + 1 >= AVX2_MIN_SPAN {
-                let acc = &mut self.acc[base..base + stride];
-                let mut running = 0.0f32;
-                for c in cmin..=cmax {
-                    running += acc[c];
-                    acc[c] = running;
-                }
-                convert_coverage(&acc[cmin..=cmax], &mut self.cov, bx + cmin, rule);
-                for c in cmin..=cmax {
-                    let x = bx + c;
-                    if self.cov[x] != 0 {
-                        first = first.min(x);
-                        last = x;
-                    }
-                    acc[c] = 0.0;
-                }
-                acc[cmax + 1] = 0.0;
+            let (first, last) = if use_avx2 && cmax - cmin + 1 >= AVX2_MIN_SPAN {
+                self.sweep_row_avx2(base, window, cmin, cmax, rule)
             } else if !find_gaps {
-                let acc = &mut self.acc[base..base + stride];
-                let mut running = 0.0f32;
-                for c in cmin..=cmax {
-                    running += acc[c];
-                    acc[c] = 0.0;
-                    let byte = coverage_byte(running, rule);
-                    let x = bx + c;
-                    self.cov[x] = byte;
-                    if byte != 0 {
-                        first = first.min(x);
-                        last = x;
-                    }
-                }
-                acc[cmax + 1] = 0.0;
+                self.sweep_row_cells(base, window, cmin, cmax, rule)
             } else {
-                // A cell no edge touched holds zero, and adding zero leaves the
-                // running sum (up to the sign of a zero, which `coverage_byte`
-                // does not see) and so the coverage byte unchanged. A stretch
-                // of such cells is therefore one constant: its byte is
-                // computed once and written with a `fill`, or, in run-aware
-                // mode when long enough and fully covered, handed over as a
-                // constant run without touching the buffer at all. The bytes, `first` and
-                // `last` are exactly those of converting every cell; a
-                // rectangle's row costs its two edge cells instead of its
-                // width.
-                let acc = &mut self.acc[base..base + stride];
-                let mut running = 0.0f32;
-                self.row_runs.clear();
-                // Local column where the pending run of written cells starts.
-                let mut cells_from = cmin;
-                let mut c = cmin;
                 emit_runs = runs_mode;
-                while c <= cmax {
-                    let v = acc[c];
-                    if v == 0.0
-                        && c + COMPACT_GAP_PROBE <= cmax + 1
-                        && acc[c + 1..c + COMPACT_GAP_PROBE]
-                            .iter()
-                            .all(|&cell| cell == 0.0)
-                    {
-                        let gap = acc[c..=cmax]
-                            .iter()
-                            .position(|&cell| cell != 0.0)
-                            .unwrap_or(cmax + 1 - c);
-                        let end = c + gap;
-                        let byte = coverage_byte(running, rule);
-                        // Only empty and fully covered gaps become runs: a
-                        // constant *partial* run would take the consumer's
-                        // scalar constant blend, slower than the vectorized
-                        // mask blend its bytes get.
-                        if runs_mode && gap >= COMPACT_RUN_MIN && (byte == 0 || byte == 255) {
-                            if cells_from < c {
-                                self.row_runs.push(CovRun {
-                                    x0: (bx + cells_from) as u32,
-                                    x1: (bx + c) as u32,
-                                    fill: None,
-                                });
-                            }
-                            if byte != 0 {
-                                self.row_runs.push(CovRun {
-                                    x0: (bx + c) as u32,
-                                    x1: (bx + end) as u32,
-                                    fill: Some(byte),
-                                });
-                                first = first.min(bx + c);
-                                last = bx + end - 1;
-                            }
-                            cells_from = end;
-                        } else if byte != 0 {
-                            self.cov[bx + c..bx + end].fill(byte);
-                            first = first.min(bx + c);
-                            last = bx + end - 1;
-                        }
-                        c = end;
-                        continue;
-                    }
-                    running += v;
-                    acc[c] = 0.0;
-                    let byte = coverage_byte(running, rule);
-                    let x = bx + c;
-                    self.cov[x] = byte;
-                    if byte != 0 {
-                        first = first.min(x);
-                        last = x;
-                    }
-                    c += 1;
-                }
-                acc[cmax + 1] = 0.0;
-                if cells_from <= cmax {
-                    self.row_runs.push(CovRun {
-                        x0: (bx + cells_from) as u32,
-                        x1: (bx + cmax + 1) as u32,
-                        fill: None,
-                    });
-                }
-            }
+                self.sweep_row_gaps(base, window, cmin, cmax, rule, runs_mode)
+            };
 
             if first <= last {
-                self.last_covered += (last - first + 1) as u64;
-                let y = row_start + lr;
-                if emit_runs {
-                    // Constant runs were not written into the buffer; a
-                    // consumer that wrote them itself reports the row dirty.
-                    if row(y, first, last, &mut self.cov, &self.row_runs) {
-                        self.cov[first..=last].fill(0);
-                    } else {
-                        for run in &self.row_runs {
-                            if run.fill.is_none() {
-                                self.cov[run.x0 as usize..run.x1 as usize].fill(0);
-                            }
-                        }
-                    }
-                } else {
-                    let whole = [CovRun {
-                        x0: first as u32,
-                        x1: last as u32 + 1,
-                        fill: None,
-                    }];
-                    row(y, first, last, &mut self.cov, &whole);
-                    self.cov[first..=last].fill(0);
-                }
+                self.emit_accum_row(row_start + lr, first, last, emit_runs, row);
             }
         }
-        #[cfg(feature = "profiling")]
-        {
-            let sweep = crate::profiling::lap_opt(&mut lap);
-            let c = self.prof.cur();
-            c.ns_accum_sweep += sweep;
-            c.clock_reads += 1 * prof_timed;
-        }
         true
+    }
+
+    /// Accumulation-path row with the AVX2 conversion: prefix-sum the cells
+    /// `cmin..=cmax` of the row at `base` in place, convert them, then reset
+    /// them. Returns the first and last covered column (`first > last` when
+    /// none).
+    #[inline(always)]
+    fn sweep_row_avx2(
+        &mut self,
+        base: usize,
+        window: AccumWindow,
+        cmin: usize,
+        cmax: usize,
+        rule: FillRule,
+    ) -> (usize, usize) {
+        let bx = window.bx;
+        let mut first = window.width;
+        let mut last = 0usize;
+        let acc = &mut self.acc[base..base + window.stride];
+        let mut running = 0.0f32;
+        for c in cmin..=cmax {
+            running += acc[c];
+            acc[c] = running;
+        }
+        convert_coverage(&acc[cmin..=cmax], &mut self.cov, bx + cmin, rule);
+        for c in cmin..=cmax {
+            let x = bx + c;
+            if self.cov[x] != 0 {
+                first = first.min(x);
+                last = x;
+            }
+            acc[c] = 0.0;
+        }
+        acc[cmax + 1] = 0.0;
+        (first, last)
+    }
+
+    /// Accumulation-path row, plain per-cell sweep: prefix-sum, convert and
+    /// reset the cells `cmin..=cmax` of the row at `base` in one pass.
+    /// Returns the first and last covered column (`first > last` when none).
+    #[inline(always)]
+    fn sweep_row_cells(
+        &mut self,
+        base: usize,
+        window: AccumWindow,
+        cmin: usize,
+        cmax: usize,
+        rule: FillRule,
+    ) -> (usize, usize) {
+        let bx = window.bx;
+        let mut first = window.width;
+        let mut last = 0usize;
+        let acc = &mut self.acc[base..base + window.stride];
+        let mut running = 0.0f32;
+        for c in cmin..=cmax {
+            running += acc[c];
+            acc[c] = 0.0;
+            let byte = coverage_byte(running, rule);
+            let x = bx + c;
+            self.cov[x] = byte;
+            if byte != 0 {
+                first = first.min(x);
+                last = x;
+            }
+        }
+        acc[cmax + 1] = 0.0;
+        (first, last)
+    }
+
+    /// Accumulation-path row that skips untouched gaps: like
+    /// [`Self::sweep_row_cells`], but a stretch of untouched cells is written
+    /// with one `fill` or, in run-aware mode, recorded in `row_runs` as a
+    /// constant run. Returns the first and last covered column.
+    ///
+    /// A cell no edge touched holds zero, and adding zero leaves the
+    /// running sum (up to the sign of a zero, which `coverage_byte`
+    /// does not see) and so the coverage byte unchanged. A stretch
+    /// of such cells is therefore one constant: its byte is
+    /// computed once and written with a `fill`, or, in run-aware
+    /// mode when long enough and fully covered, handed over as a
+    /// constant run without touching the buffer at all. The bytes, `first` and
+    /// `last` are exactly those of converting every cell; a
+    /// rectangle's row costs its two edge cells instead of its
+    /// width.
+    #[inline(always)]
+    fn sweep_row_gaps(
+        &mut self,
+        base: usize,
+        window: AccumWindow,
+        cmin: usize,
+        cmax: usize,
+        rule: FillRule,
+        runs_mode: bool,
+    ) -> (usize, usize) {
+        let bx = window.bx;
+        let mut first = window.width;
+        let mut last = 0usize;
+        let acc = &mut self.acc[base..base + window.stride];
+        let mut running = 0.0f32;
+        self.row_runs.clear();
+        // Local column where the pending run of written cells starts.
+        let mut cells_from = cmin;
+        let mut c = cmin;
+        while c <= cmax {
+            let v = acc[c];
+            if v == 0.0
+                && c + COMPACT_GAP_PROBE <= cmax + 1
+                && acc[c + 1..c + COMPACT_GAP_PROBE]
+                    .iter()
+                    .all(|&cell| cell == 0.0)
+            {
+                let gap = acc[c..=cmax]
+                    .iter()
+                    .position(|&cell| cell != 0.0)
+                    .unwrap_or(cmax + 1 - c);
+                let end = c + gap;
+                let byte = coverage_byte(running, rule);
+                // Only empty and fully covered gaps become runs: a
+                // constant *partial* run would take the consumer's
+                // scalar constant blend, slower than the vectorized
+                // mask blend its bytes get.
+                if runs_mode && gap >= COMPACT_RUN_MIN && (byte == 0 || byte == 255) {
+                    push_gap_runs(&mut self.row_runs, bx, cells_from, c, end, byte);
+                    cells_from = end;
+                } else if byte != 0 {
+                    self.cov[bx + c..bx + end].fill(byte);
+                }
+                if byte != 0 {
+                    first = first.min(bx + c);
+                    last = bx + end - 1;
+                }
+                c = end;
+                continue;
+            }
+            running += v;
+            acc[c] = 0.0;
+            let byte = coverage_byte(running, rule);
+            let x = bx + c;
+            self.cov[x] = byte;
+            if byte != 0 {
+                first = first.min(x);
+                last = x;
+            }
+            c += 1;
+        }
+        acc[cmax + 1] = 0.0;
+        if cells_from <= cmax {
+            self.row_runs.push(CovRun {
+                x0: (bx + cells_from) as u32,
+                x1: (bx + cmax + 1) as u32,
+                fill: None,
+            });
+        }
+        (first, last)
+    }
+
+    /// Hand an accumulation-path row's covered span `first..=last` to `row`
+    /// (as `row_runs` when `emit_runs`, else as one run) and reset the
+    /// coverage it left in the buffer.
+    #[inline(always)]
+    fn emit_accum_row(
+        &mut self,
+        y: usize,
+        first: usize,
+        last: usize,
+        emit_runs: bool,
+        row: &mut impl FnMut(usize, usize, usize, &mut [u8], &[CovRun]) -> bool,
+    ) {
+        self.last_covered += (last - first + 1) as u64;
+        if !emit_runs {
+            let whole = [CovRun {
+                x0: first as u32,
+                x1: last as u32 + 1,
+                fill: None,
+            }];
+            row(y, first, last, &mut self.cov, &whole);
+            self.cov[first..=last].fill(0);
+            return;
+        }
+        // Constant runs were not written into the buffer; a
+        // consumer that wrote them itself reports the row dirty.
+        if row(y, first, last, &mut self.cov, &self.row_runs) {
+            self.cov[first..=last].fill(0);
+        } else {
+            clear_cell_runs(&mut self.cov, &self.row_runs);
+        }
     }
 
     /// Cancellation (or an unwound fill) may leave signed-area deposits in
@@ -1082,82 +1232,26 @@ impl RasterKernel {
         if self.acc_row.len() < width + 1 {
             self.acc_row.resize(width + 1, 0.0);
         }
-        let fwidth = width as f32;
-        let bh = row_end - row_start;
         #[cfg(feature = "profiling")]
         let mut lap = self.prof.time_fills.then(crate::profiling::Lap::start);
         #[cfg(feature = "profiling")]
         let prof_timed = u64::from(self.prof.time_fills);
 
-        // --- CSR counting sort: bucket contributing edges by activation row. ---
-        // An edge's row span is exactly the fast path's (raster.rs deposit loop):
-        // the saturating `as` casts also fix NaN (→0) and out-of-range coords, so
-        // the AET must reproduce them verbatim rather than "improve" on them.
-        //
-        // With a row window (`emit_start..emit_end`), an edge that starts above
-        // it is bucketed at the window's first row instead, and one that lies
-        // wholly outside is dropped. Buckets are still filled in edge-index
-        // order, so every row inside the window sees the same contributing
-        // edges in the same order as the unrestricted sweep.
-        self.aet_bucket_start.clear();
-        self.aet_bucket_start.resize(bh + 1, 0);
-        if self.aet_erend.len() < self.edges.len() {
-            self.aet_erend.resize(self.edges.len(), 0);
-        }
-        let mut contributing = 0usize;
+        let rows = FillRows {
+            row_start,
+            row_end,
+            emit_start,
+            emit_end,
+        };
         #[cfg(feature = "profiling")]
         let mut prof_edge_rows = 0u64;
-        for (edge_index, e) in self.edges.iter().enumerate() {
-            if edge_index & 0xff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
-                return false;
-            }
-            let er_start = (e.y_top.floor() as isize)
-                .max(row_start as isize)
-                .max(emit_start as isize);
-            let er_end = (e.y_bot.ceil() as isize)
-                .min(row_end as isize)
-                .max(0)
-                .min(emit_end as isize);
-            if er_start >= er_end {
-                continue; // touches no row — a pure no-op in the reference too
-            }
-            let lr = er_start as usize - row_start;
-            self.aet_bucket_start[lr + 1] += 1; // count into [lr+1] for the scan
-            contributing += 1;
+        if !self.bucket_aet_edges(
+            rows,
+            should_cancel,
             #[cfg(feature = "profiling")]
-            {
-                prof_edge_rows += (er_end - er_start) as u64;
-            }
-        }
-        for lr in 0..bh {
-            self.aet_bucket_start[lr + 1] += self.aet_bucket_start[lr];
-        }
-        // Scatter edge indices in edge-index order → every bucket is index-sorted
-        // for free. `aet_active_next` doubles as the per-row write cursor here.
-        self.aet_order.clear();
-        self.aet_order.resize(contributing, 0);
-        self.aet_active_next.clear();
-        self.aet_active_next
-            .extend_from_slice(&self.aet_bucket_start[..bh]);
-        for (i, e) in self.edges.iter().enumerate() {
-            if i & 0xff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
-                return false;
-            }
-            let er_start = (e.y_top.floor() as isize)
-                .max(row_start as isize)
-                .max(emit_start as isize);
-            let er_end = (e.y_bot.ceil() as isize)
-                .min(row_end as isize)
-                .max(0)
-                .min(emit_end as isize);
-            if er_start >= er_end {
-                continue;
-            }
-            let lr = er_start as usize - row_start;
-            let pos = self.aet_active_next[lr] as usize;
-            self.aet_order[pos] = i as u32;
-            self.aet_active_next[lr] += 1;
-            self.aet_erend[i] = er_end as u32;
+            &mut prof_edge_rows,
+        ) {
+            return false;
         }
 
         // --- Sweep rows, maintaining the index-sorted active list. ---
@@ -1190,123 +1284,24 @@ impl RasterKernel {
                 return false;
             }
             let y = row_start + lr;
-            let yf = y as f32;
-            let yu = y as u32;
             let prev_active = self.aet_active.len();
 
-            // Merge row `lr`'s newly-activating edges into the active list,
-            // dropping retired ones (er_end <= y), all order-preserving. Bucket
-            // edges have er_start == y so they never retire this row; active and
-            // bucket index-sets are disjoint, so no equal-key case arises.
             let b0 = self.aet_bucket_start[lr] as usize;
             let b1 = self.aet_bucket_start[lr + 1] as usize;
-            self.aet_active_next.clear();
-            let mut i = 0usize;
-            let mut j = b0;
-            while i < self.aet_active.len() && j < b1 {
-                let a = self.aet_active[i];
-                if self.aet_erend[a as usize] <= yu {
-                    i += 1;
-                    continue;
-                }
-                let bk = self.aet_order[j];
-                if a < bk {
-                    self.aet_active_next.push(a);
-                    i += 1;
-                } else {
-                    self.aet_active_next.push(bk);
-                    j += 1;
-                }
-            }
-            while i < self.aet_active.len() {
-                let a = self.aet_active[i];
-                if self.aet_erend[a as usize] > yu {
-                    self.aet_active_next.push(a);
-                }
-                i += 1;
-            }
-            while j < b1 {
-                self.aet_active_next.push(self.aet_order[j]);
-                j += 1;
-            }
-            std::mem::swap(&mut self.aet_active, &mut self.aet_active_next);
+            self.merge_activating_edges(b0, b1, y as u32);
 
-            if let Some((first, last)) = held {
-                // No activation and no retirement leaves the (index-sorted)
-                // active set unchanged; each edge must still span this row.
-                let repeat = b0 == b1
-                    && self.aet_active.len() == prev_active
-                    && self
-                        .aet_active
-                        .iter()
-                        .all(|&ei| self.edges[ei as usize].y_bot >= yf + 1.0);
-                if repeat {
-                    #[cfg(feature = "profiling")]
-                    {
-                        self.prof.cur().aet_rows_repeated += 1;
-                    }
-                    self.last_covered += (last - first + 1) as u64;
-                    if row(y, first, last, &mut self.cov, &self.row_runs) {
-                        for c in &mut self.cov[first..=last] {
-                            *c = 0;
-                        }
-                        held = None;
-                    }
-                    continue;
-                }
-                for r in &self.row_runs {
-                    if r.fill.is_none() {
-                        self.cov[r.x0 as usize..r.x1 as usize].fill(0);
-                    }
-                }
-                held = None;
+            // No activation and no retirement leaves the (index-sorted)
+            // active set unchanged.
+            let unchanged = b0 == b1 && self.aet_active.len() == prev_active;
+            if self.repeat_held_row(&mut held, unchanged, y, &mut row) {
+                continue;
             }
 
-            // Accumulate active edges in edge-index order — identical operands
-            // and order to the reference's `for e in &self.edges` filtered loop.
-            let active = std::mem::take(&mut self.aet_active);
-            let mut col_min = width;
-            let mut col_max = 0usize;
-            // Whether this row may be held for repetition (see above).
-            let mut all_vertical_full = runs_mode && y < (1 << 24);
-            self.aet_touched.clear();
-            for (active_index, &ei) in active.iter().enumerate() {
-                if active_index & 0xfff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
-                    self.aet_active = active;
-                    return false;
-                }
-                let e = self.edges[ei as usize];
-                let ya = e.y_top.max(yf);
-                let yb = e.y_bot.min(yf + 1.0);
-                all_vertical_full &= e.dxdy == 0.0 && ya == yf && yb == yf + 1.0;
-                if yb <= ya {
-                    continue;
-                }
-                let xa = e.x_at_top + (ya - e.y_top) * e.dxdy;
-                let xb = e.x_at_top + (yb - e.y_top) * e.dxdy;
-                // Per-edge touched range: `deposit_partial` writes cells
-                // `c` and `c + 1` for every column `c` it reports.
-                let mut edge_min = width;
-                let mut edge_max = 0usize;
-                accumulate(
-                    &mut self.acc_row,
-                    xa,
-                    ya,
-                    xb,
-                    yb,
-                    e.dir,
-                    fwidth,
-                    &mut edge_min,
-                    &mut edge_max,
-                );
-                if edge_min <= edge_max {
-                    col_min = col_min.min(edge_min);
-                    col_max = col_max.max(edge_max);
-                    self.aet_touched
-                        .push((edge_min as u32, edge_max as u32 + 2));
-                }
-            }
-            self.aet_active = active;
+            let Some((col_min, col_max, all_vertical_full)) =
+                self.accumulate_active_edges(y, width, runs_mode, should_cancel)
+            else {
+                return false;
+            };
 
             #[cfg(feature = "profiling")]
             {
@@ -1341,30 +1336,11 @@ impl RasterKernel {
                 runs_mode.then_some(&mut self.row_runs),
             );
             if first <= last {
-                self.last_covered += (last - first + 1) as u64;
-                let dirty = row(y, first, last, &mut self.cov, &self.row_runs);
-                if !runs_mode || dirty {
-                    for c in &mut self.cov[first..=last] {
-                        *c = 0;
-                    }
-                } else if all_vertical_full {
-                    held = Some((first, last));
-                } else {
-                    // Only the cell runs were written (and may hold coverage).
-                    for r in &self.row_runs {
-                        if r.fill.is_none() {
-                            self.cov[r.x0 as usize..r.x1 as usize].fill(0);
-                        }
-                    }
-                }
+                held = self.emit_aet_row(y, first, last, runs_mode, all_vertical_full, &mut row);
             }
         }
         if held.is_some() {
-            for r in &self.row_runs {
-                if r.fill.is_none() {
-                    self.cov[r.x0 as usize..r.x1 as usize].fill(0);
-                }
-            }
+            clear_cell_runs(&mut self.cov, &self.row_runs);
         }
         #[cfg(feature = "profiling")]
         {
@@ -1374,6 +1350,323 @@ impl RasterKernel {
             c.clock_reads += 1 * prof_timed;
         }
         true
+    }
+
+    /// CSR counting sort for the AET sweep: bucket the contributing edges by
+    /// activation row into `aet_order` / `aet_bucket_start`, and record each
+    /// one's retirement row in `aet_erend`. `false` when cancelled.
+    ///
+    /// An edge's row span is exactly the fast path's (raster.rs deposit loop):
+    /// the saturating `as` casts also fix NaN (→0) and out-of-range coords, so
+    /// the AET must reproduce them verbatim rather than "improve" on them.
+    ///
+    /// With a row window (`emit_start..emit_end`), an edge that starts above
+    /// it is bucketed at the window's first row instead, and one that lies
+    /// wholly outside is dropped. Buckets are still filled in edge-index
+    /// order, so every row inside the window sees the same contributing
+    /// edges in the same order as the unrestricted sweep.
+    #[inline(always)]
+    fn bucket_aet_edges(
+        &mut self,
+        rows: FillRows,
+        should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
+        #[cfg(feature = "profiling")] prof_edge_rows: &mut u64,
+    ) -> bool {
+        let row_start = rows.row_start;
+        let bh = rows.row_end - row_start;
+        self.aet_bucket_start.clear();
+        self.aet_bucket_start.resize(bh + 1, 0);
+        if self.aet_erend.len() < self.edges.len() {
+            self.aet_erend.resize(self.edges.len(), 0);
+        }
+        let mut contributing = 0usize;
+        for (edge_index, e) in self.edges.iter().enumerate() {
+            if edge_index & 0xff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
+                return false;
+            }
+            let (er_start, er_end) = aet_edge_rows(e, rows);
+            if er_start >= er_end {
+                continue; // touches no row — a pure no-op in the reference too
+            }
+            let lr = er_start as usize - row_start;
+            self.aet_bucket_start[lr + 1] += 1; // count into [lr+1] for the scan
+            contributing += 1;
+            #[cfg(feature = "profiling")]
+            {
+                *prof_edge_rows += (er_end - er_start) as u64;
+            }
+        }
+        for lr in 0..bh {
+            self.aet_bucket_start[lr + 1] += self.aet_bucket_start[lr];
+        }
+        // Scatter edge indices in edge-index order → every bucket is index-sorted
+        // for free. `aet_active_next` doubles as the per-row write cursor here.
+        self.aet_order.clear();
+        self.aet_order.resize(contributing, 0);
+        self.aet_active_next.clear();
+        self.aet_active_next
+            .extend_from_slice(&self.aet_bucket_start[..bh]);
+        for (i, e) in self.edges.iter().enumerate() {
+            if i & 0xff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
+                return false;
+            }
+            let (er_start, er_end) = aet_edge_rows(e, rows);
+            if er_start >= er_end {
+                continue;
+            }
+            let lr = er_start as usize - row_start;
+            let pos = self.aet_active_next[lr] as usize;
+            self.aet_order[pos] = i as u32;
+            self.aet_active_next[lr] += 1;
+            self.aet_erend[i] = er_end as u32;
+        }
+        true
+    }
+
+    /// Merge the edges activating at this row (`aet_order[b0..b1]`) into the
+    /// active list, dropping retired ones (`er_end <= yu`), all
+    /// order-preserving. Bucket edges have er_start == y so they never retire
+    /// this row; active and bucket index-sets are disjoint, so no equal-key
+    /// case arises.
+    #[inline(always)]
+    fn merge_activating_edges(&mut self, b0: usize, b1: usize, yu: u32) {
+        self.aet_active_next.clear();
+        let mut i = 0usize;
+        let mut j = b0;
+        while i < self.aet_active.len() && j < b1 {
+            let a = self.aet_active[i];
+            if self.aet_erend[a as usize] <= yu {
+                i += 1;
+                continue;
+            }
+            let bk = self.aet_order[j];
+            if a < bk {
+                self.aet_active_next.push(a);
+                i += 1;
+            } else {
+                self.aet_active_next.push(bk);
+                j += 1;
+            }
+        }
+        while i < self.aet_active.len() {
+            let a = self.aet_active[i];
+            if self.aet_erend[a as usize] > yu {
+                self.aet_active_next.push(a);
+            }
+            i += 1;
+        }
+        while j < b1 {
+            self.aet_active_next.push(self.aet_order[j]);
+            j += 1;
+        }
+        std::mem::swap(&mut self.aet_active, &mut self.aet_active_next);
+    }
+
+    /// Re-emit the held row for row `y` when the active set is `unchanged`
+    /// and every edge still spans the row (see the row-repetition note in
+    /// [`Self::fill_scanline_aet`]); otherwise release the held cells.
+    /// Returns whether row `y` was emitted.
+    #[inline(always)]
+    fn repeat_held_row(
+        &mut self,
+        held: &mut Option<(usize, usize)>,
+        unchanged: bool,
+        y: usize,
+        row: &mut impl FnMut(usize, usize, usize, &mut [u8], &[CovRun]) -> bool,
+    ) -> bool {
+        let Some((first, last)) = *held else {
+            return false;
+        };
+        let yf = y as f32;
+        let repeat = unchanged
+            && self
+                .aet_active
+                .iter()
+                .all(|&ei| self.edges[ei as usize].y_bot >= yf + 1.0);
+        if !repeat {
+            clear_cell_runs(&mut self.cov, &self.row_runs);
+            *held = None;
+            return false;
+        }
+        #[cfg(feature = "profiling")]
+        {
+            self.prof.cur().aet_rows_repeated += 1;
+        }
+        self.last_covered += (last - first + 1) as u64;
+        if row(y, first, last, &mut self.cov, &self.row_runs) {
+            for c in &mut self.cov[first..=last] {
+                *c = 0;
+            }
+            *held = None;
+        }
+        true
+    }
+
+    /// Accumulate the active edges into `acc_row` for row `y`, in edge-index
+    /// order — identical operands and order to the reference's
+    /// `for e in &self.edges` filtered loop — recording each deposit's touched
+    /// cells in `aet_touched`. Returns the touched column range and whether
+    /// the row may be held for repetition; `None` when cancelled.
+    #[inline(always)]
+    fn accumulate_active_edges(
+        &mut self,
+        y: usize,
+        width: usize,
+        runs_mode: bool,
+        should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> Option<(usize, usize, bool)> {
+        let fwidth = width as f32;
+        let yf = y as f32;
+        let active = std::mem::take(&mut self.aet_active);
+        let mut col_min = width;
+        let mut col_max = 0usize;
+        // Whether this row may be held for repetition (see above).
+        let mut all_vertical_full = runs_mode && y < (1 << 24);
+        self.aet_touched.clear();
+        for (active_index, &ei) in active.iter().enumerate() {
+            if active_index & 0xfff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
+                self.aet_active = active;
+                return None;
+            }
+            let e = self.edges[ei as usize];
+            let ya = e.y_top.max(yf);
+            let yb = e.y_bot.min(yf + 1.0);
+            all_vertical_full &= e.dxdy == 0.0 && ya == yf && yb == yf + 1.0;
+            if yb <= ya {
+                continue;
+            }
+            let xa = e.x_at_top + (ya - e.y_top) * e.dxdy;
+            let xb = e.x_at_top + (yb - e.y_top) * e.dxdy;
+            // Per-edge touched range: `deposit_partial` writes cells
+            // `c` and `c + 1` for every column `c` it reports.
+            let mut edge_min = width;
+            let mut edge_max = 0usize;
+            accumulate(
+                &mut self.acc_row,
+                xa,
+                ya,
+                xb,
+                yb,
+                e.dir,
+                fwidth,
+                &mut edge_min,
+                &mut edge_max,
+            );
+            if edge_min <= edge_max {
+                col_min = col_min.min(edge_min);
+                col_max = col_max.max(edge_max);
+                self.aet_touched
+                    .push((edge_min as u32, edge_max as u32 + 2));
+            }
+        }
+        self.aet_active = active;
+        Some((col_min, col_max, all_vertical_full))
+    }
+
+    /// Hand an AET row's covered span `first..=last` to `row` and reset what
+    /// it left in the buffer, or keep it there for repetition. Returns the
+    /// span when the row is held.
+    #[inline(always)]
+    fn emit_aet_row(
+        &mut self,
+        y: usize,
+        first: usize,
+        last: usize,
+        runs_mode: bool,
+        all_vertical_full: bool,
+        row: &mut impl FnMut(usize, usize, usize, &mut [u8], &[CovRun]) -> bool,
+    ) -> Option<(usize, usize)> {
+        self.last_covered += (last - first + 1) as u64;
+        let dirty = row(y, first, last, &mut self.cov, &self.row_runs);
+        if !runs_mode || dirty {
+            for c in &mut self.cov[first..=last] {
+                *c = 0;
+            }
+            return None;
+        }
+        if all_vertical_full {
+            return Some((first, last));
+        }
+        // Only the cell runs were written (and may hold coverage).
+        clear_cell_runs(&mut self.cov, &self.row_runs);
+        None
+    }
+}
+
+/// A fill's rows: the path's own `[row_start, row_end)` and, within them,
+/// the emitted `[emit_start, emit_end)`.
+#[derive(Debug, Clone, Copy)]
+struct FillRows {
+    row_start: usize,
+    row_end: usize,
+    emit_start: usize,
+    emit_end: usize,
+}
+
+/// The bbox-local accumulation window of a fill, shared by its deposit and
+/// sweep passes.
+#[derive(Debug, Clone, Copy)]
+struct AccumWindow {
+    rows: FillRows,
+    /// Device column of the window's first cell.
+    bx: usize,
+    /// Cells per local row: window width + carry cell + rounding slack.
+    stride: usize,
+    /// Device width, and as `f32`.
+    width: usize,
+    fwidth: f32,
+}
+
+/// An edge's AET row span `[er_start, er_end)` within the emitted rows,
+/// computed exactly as the accumulation path's deposit loop does.
+#[inline(always)]
+fn aet_edge_rows(e: &Edge, rows: FillRows) -> (isize, isize) {
+    let er_start = (e.y_top.floor() as isize)
+        .max(rows.row_start as isize)
+        .max(rows.emit_start as isize);
+    let er_end = (e.y_bot.ceil() as isize)
+        .min(rows.row_end as isize)
+        .max(0)
+        .min(rows.emit_end as isize);
+    (er_start, er_end)
+}
+
+/// Zero the coverage bytes of the written-cell (`fill: None`) runs in `runs`;
+/// constant runs were never written into `cov`.
+#[inline(always)]
+fn clear_cell_runs(cov: &mut [u8], runs: &[CovRun]) {
+    for run in runs {
+        if run.fill.is_none() {
+            cov[run.x0 as usize..run.x1 as usize].fill(0);
+        }
+    }
+}
+
+/// Run-aware gap over local cells `[c, end)` with coverage `byte` (0 or
+/// 255): close the pending written-cells run that started at `cells_from`,
+/// then record a covered gap as a constant run (an empty one is omitted).
+#[inline(always)]
+fn push_gap_runs(
+    runs: &mut Vec<CovRun>,
+    bx: usize,
+    cells_from: usize,
+    c: usize,
+    end: usize,
+    byte: u8,
+) {
+    if cells_from < c {
+        runs.push(CovRun {
+            x0: (bx + cells_from) as u32,
+            x1: (bx + c) as u32,
+            fill: None,
+        });
+    }
+    if byte != 0 {
+        runs.push(CovRun {
+            x0: (bx + c) as u32,
+            x1: (bx + end) as u32,
+            fill: Some(byte),
+        });
     }
 }
 
@@ -1953,13 +2246,7 @@ mod tests {
             let want = grid(&mut RasterKernel::default(), &second, w, h);
             let mut kernel = RasterKernel::default();
             let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut rows = 0;
-                kernel.fill(&first.0, &first.1, w, h, FillRule::NonZero, |_, _, _, _| {
-                    rows += 1;
-                    if rows == 3 {
-                        panic!("synthetic panic inside a fill");
-                    }
-                });
+                fill_panicking_at_third_row(&mut kernel, &first, w, h);
             }));
             assert!(unwound.is_err());
             let got = grid(&mut kernel, &second, w, h);
@@ -1968,6 +2255,17 @@ mod tests {
                 "{w}x{h}: the fill after an unwound fill differs from a fresh kernel's"
             );
         }
+    }
+
+    /// Fill `g` on `kernel` with a row callback that panics on the third row.
+    fn fill_panicking_at_third_row(kernel: &mut RasterKernel, g: &Geometry, w: usize, h: usize) {
+        let mut rows = 0;
+        kernel.fill(&g.0, &g.1, w, h, FillRule::NonZero, |_, _, _, _| {
+            rows += 1;
+            if rows == 3 {
+                panic!("synthetic panic inside a fill");
+            }
+        });
     }
 
     #[test]
@@ -2057,21 +2355,31 @@ mod tests {
     #[test]
     fn fast_path_matches_reference_bit_exact() {
         let mut rng = Lcg(0xC0FFEE_1234_5678);
+        for (w, h, rule) in random_sweep_cases() {
+            for _ in 0..40 {
+                let (p, s) = random_path(&mut rng, w as f32, h as f32);
+                let fast = coverage_grid(&p, &s, w, h, rule);
+                let refr = coverage_grid_ref(&p, &s, w, h, rule);
+                assert_eq!(
+                    fast, refr,
+                    "fast vs reference mismatch at {w}x{h} rule {rule:?}"
+                );
+            }
+        }
+    }
+
+    /// The (width, height, rule) cases of the random-geometry sweeps, in the
+    /// order they draw from the generator.
+    fn random_sweep_cases() -> Vec<(usize, usize, FillRule)> {
+        let mut cases = Vec::new();
         for w in [1usize, 3, 8, 17, 40, 128] {
             for h in [1usize, 3, 8, 17, 40, 96] {
                 for rule in [FillRule::NonZero, FillRule::EvenOdd] {
-                    for _ in 0..40 {
-                        let (p, s) = random_path(&mut rng, w as f32, h as f32);
-                        let fast = coverage_grid(&p, &s, w, h, rule);
-                        let refr = coverage_grid_ref(&p, &s, w, h, rule);
-                        assert_eq!(
-                            fast, refr,
-                            "fast vs reference mismatch at {w}x{h} rule {rule:?}"
-                        );
-                    }
+                    cases.push((w, h, rule));
                 }
             }
         }
+        cases
     }
 
     /// The AET fallback must be byte-for-byte identical to the naive reference
@@ -2080,19 +2388,15 @@ mod tests {
     #[test]
     fn aet_matches_reference_bit_exact() {
         let mut rng = Lcg(0x5EED_A57_9911_2244);
-        for w in [1usize, 3, 8, 17, 40, 128] {
-            for h in [1usize, 3, 8, 17, 40, 96] {
-                for rule in [FillRule::NonZero, FillRule::EvenOdd] {
-                    for _ in 0..40 {
-                        let (p, s) = random_path(&mut rng, w as f32, h as f32);
-                        let aet = coverage_grid_aet(&p, &s, w, h, rule);
-                        let refr = coverage_grid_ref(&p, &s, w, h, rule);
-                        assert_eq!(
-                            aet, refr,
-                            "aet vs reference mismatch at {w}x{h} rule {rule:?}"
-                        );
-                    }
-                }
+        for (w, h, rule) in random_sweep_cases() {
+            for _ in 0..40 {
+                let (p, s) = random_path(&mut rng, w as f32, h as f32);
+                let aet = coverage_grid_aet(&p, &s, w, h, rule);
+                let refr = coverage_grid_ref(&p, &s, w, h, rule);
+                assert_eq!(
+                    aet, refr,
+                    "aet vs reference mismatch at {w}x{h} rule {rule:?}"
+                );
             }
         }
     }
@@ -2248,47 +2552,70 @@ mod tests {
             let mut k = RasterKernel::default();
             for (p, s) in &cases {
                 for rule in [FillRule::NonZero, FillRule::EvenOdd] {
-                    let expect = coverage_grid(p, s, w, h, rule);
-                    let mut grid = vec![0u8; w * h];
-                    let mut spans = Vec::new();
-                    k.fill_runs_cancellable(p, s, w, h, rule, None, |y, x0, x1, cov, runs| {
-                        spans.push((y, x0, x1));
-                        let mut prev_end = 0u32;
-                        for r in runs {
-                            assert!(r.x0 < r.x1 && r.x0 >= prev_end, "runs ordered: {runs:?}");
-                            prev_end = r.x1;
-                            let row = &mut grid[y * w..(y + 1) * w];
-                            match r.fill {
-                                None => row[r.x0 as usize..r.x1 as usize]
-                                    .copy_from_slice(&cov[r.x0 as usize..r.x1 as usize]),
-                                Some(c) => {
-                                    assert!(
-                                        cov[r.x0 as usize..r.x1 as usize].iter().all(|&b| b == 0),
-                                        "constant run written into the buffer"
-                                    );
-                                    row[r.x0 as usize..r.x1 as usize].fill(c);
-                                }
-                            }
-                        }
-                        if materialize {
-                            for r in runs {
-                                if let Some(c) = r.fill {
-                                    cov[r.x0 as usize..r.x1 as usize].fill(c);
-                                }
-                            }
-                        }
-                        materialize
-                    });
-                    assert_eq!(
-                        grid, expect,
-                        "runs vs fill, rule {rule:?} materialize {materialize}"
-                    );
-                    // The row bounds handed over match `fill`'s.
-                    let mut plain = Vec::new();
-                    RasterKernel::default()
-                        .fill(p, s, w, h, rule, |y, x0, x1, _| plain.push((y, x0, x1)));
-                    assert_eq!(spans, plain, "row spans, rule {rule:?}");
+                    check_runs_match_fill(&mut k, p, s, w, h, rule, materialize);
                 }
+            }
+        }
+    }
+
+    /// One case of [`fill_runs_match_fill`] on the shared kernel `k`.
+    fn check_runs_match_fill(
+        k: &mut RasterKernel,
+        p: &[[f32; 2]],
+        s: &[(usize, usize)],
+        w: usize,
+        h: usize,
+        rule: FillRule,
+        materialize: bool,
+    ) {
+        let expect = coverage_grid(p, s, w, h, rule);
+        let mut grid = vec![0u8; w * h];
+        let mut spans = Vec::new();
+        k.fill_runs_cancellable(p, s, w, h, rule, None, |y, x0, x1, cov, runs| {
+            spans.push((y, x0, x1));
+            copy_runs(&mut grid[y * w..(y + 1) * w], cov, runs);
+            if materialize {
+                materialize_constant_runs(cov, runs);
+            }
+            materialize
+        });
+        assert_eq!(
+            grid, expect,
+            "runs vs fill, rule {rule:?} materialize {materialize}"
+        );
+        // The row bounds handed over match `fill`'s.
+        let mut plain = Vec::new();
+        RasterKernel::default().fill(p, s, w, h, rule, |y, x0, x1, _| plain.push((y, x0, x1)));
+        assert_eq!(spans, plain, "row spans, rule {rule:?}");
+    }
+
+    /// Write a handed-over row's runs into `row`, checking they are ordered
+    /// and disjoint and that constant runs were not written into `cov`.
+    fn copy_runs(row: &mut [u8], cov: &[u8], runs: &[CovRun]) {
+        let mut prev_end = 0u32;
+        for r in runs {
+            assert!(r.x0 < r.x1 && r.x0 >= prev_end, "runs ordered: {runs:?}");
+            prev_end = r.x1;
+            match r.fill {
+                None => row[r.x0 as usize..r.x1 as usize]
+                    .copy_from_slice(&cov[r.x0 as usize..r.x1 as usize]),
+                Some(c) => {
+                    assert!(
+                        cov[r.x0 as usize..r.x1 as usize].iter().all(|&b| b == 0),
+                        "constant run written into the buffer"
+                    );
+                    row[r.x0 as usize..r.x1 as usize].fill(c);
+                }
+            }
+        }
+    }
+
+    /// Write the constant runs into `cov`, as a consumer that wants the plain
+    /// buffer does.
+    fn materialize_constant_runs(cov: &mut [u8], runs: &[CovRun]) {
+        for r in runs {
+            if let Some(c) = r.fill {
+                cov[r.x0 as usize..r.x1 as usize].fill(c);
             }
         }
     }

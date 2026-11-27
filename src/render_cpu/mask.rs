@@ -10,7 +10,7 @@ use crate::page_ir::DeviceRect;
 
 use crate::render_cpu::kernels::mul_div_255;
 use crate::render_cpu::prepared::{ClipKind, CpuPreparedPage, PreparedClip, PreparedOp};
-use crate::render_cpu::raster::RasterKernel;
+use crate::render_cpu::raster::{FillRule, RasterKernel};
 
 /// The immutable, `Sync` slice of a prepared page that mask building reads. The
 /// full [`CpuPreparedPage`] is `!Sync` (diagnostic cells), so masks are built
@@ -604,9 +604,6 @@ pub fn build_clip_mask_cancellable(
     let cb = geom.clips[cid as usize].mask_bounds;
     let w = cb.width as usize;
     let h = cb.height as usize;
-    let (bx, by) = (cb.x as usize, cb.y as usize);
-    let ow = geom.width;
-    let oh = geom.height;
 
     // `acc` starts empty (fully masked). The first path clip is filled directly
     // into it; later path clips intersect via `tmp` + multiply. Most chains hold
@@ -620,82 +617,40 @@ pub fn build_clip_mask_cancellable(
     let mut cur = Some(cid);
     while let Some(id) = cur {
         let clip = &geom.clips[id as usize];
-        if let ClipKind::Path {
+        cur = clip.parent;
+        let ClipKind::Path {
             subpath_range,
             rule,
         } = clip.kind
-        {
-            let subs = &geom.subpaths[subpath_range.0 as usize..subpath_range.1 as usize];
-            path_seen += 1;
-            if path_seen == 1 {
-                // First (usually only) path: write coverage straight into `acc`,
-                // which is 0 everywhere the fill does not touch (correctly masked).
-                // Only the envelope's rows are kept, so only they are
-                // rasterized: a clip path far taller than its envelope (a
-                // page-sized path under a small rect ancestor) costs the
-                // envelope, not the page.
-                if !raster.fill_cancellable_in(
-                    &geom.points,
-                    subs,
-                    ow,
-                    oh,
-                    rule,
-                    by..by + h,
-                    should_cancel,
-                    |y, x0, x1, cov| {
-                        if y < by || y >= by + h {
-                            return;
-                        }
-                        let ly = y - by;
-                        let lx0 = x0.max(bx);
-                        let lx1 = x1.min(bx + w - 1);
-                        if lx0 <= lx1 {
-                            acc[ly * w + (lx0 - bx)..=ly * w + (lx1 - bx)]
-                                .copy_from_slice(&cov[lx0..=lx1]);
-                        }
-                    },
-                ) {
-                    return None;
-                }
-            } else {
-                // Additional path clip: rasterize into `tmp` and multiply in.
-                if tmp.is_empty() {
-                    tmp = vec![0u8; w * h];
-                } else {
-                    tmp.iter_mut().for_each(|t| *t = 0);
-                }
-                if !raster.fill_cancellable_in(
-                    &geom.points,
-                    subs,
-                    ow,
-                    oh,
-                    rule,
-                    by..by + h,
-                    should_cancel,
-                    |y, x0, x1, cov| {
-                        if y < by || y >= by + h {
-                            return;
-                        }
-                        let ly = y - by;
-                        let lx0 = x0.max(bx);
-                        let lx1 = x1.min(bx + w - 1);
-                        if lx0 <= lx1 {
-                            tmp[ly * w + (lx0 - bx)..=ly * w + (lx1 - bx)]
-                                .copy_from_slice(&cov[lx0..=lx1]);
-                        }
-                    },
-                ) {
-                    return None;
-                }
-                for (index, (a, &t)) in acc.iter_mut().zip(&tmp).enumerate() {
-                    if index & 0xffff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
-                        return None;
-                    }
-                    *a = mul_div_255(*a as u16, t as u16) as u8;
-                }
+        else {
+            continue;
+        };
+        let subs = &geom.subpaths[subpath_range.0 as usize..subpath_range.1 as usize];
+        path_seen += 1;
+        if path_seen == 1 {
+            // First (usually only) path: write coverage straight into `acc`,
+            // which is 0 everywhere the fill does not touch (correctly masked).
+            // Only the envelope's rows are kept, so only they are
+            // rasterized: a clip path far taller than its envelope (a
+            // page-sized path under a small rect ancestor) costs the
+            // envelope, not the page.
+            if !fill_envelope(raster, geom, subs, rule, cb, should_cancel, &mut acc) {
+                return None;
             }
+            continue;
         }
-        cur = clip.parent;
+        // Additional path clip: rasterize into `tmp` and multiply in.
+        if tmp.is_empty() {
+            tmp = vec![0u8; w * h];
+        } else {
+            tmp.iter_mut().for_each(|t| *t = 0);
+        }
+        if !fill_envelope(raster, geom, subs, rule, cb, should_cancel, &mut tmp) {
+            return None;
+        }
+        if !multiply_coverage(&mut acc, &tmp, should_cancel) {
+            return None;
+        }
     }
 
     let all_opaque = acc.iter().all(|&v| v == 255);
@@ -705,4 +660,56 @@ pub fn build_clip_mask_cancellable(
         outside: 0,
         all_opaque,
     })
+}
+
+/// Rasterize one clip path's coverage over the rows of envelope `cb` into
+/// `dst`, a `cb.width × cb.height` plane. `false` when cancelled.
+fn fill_envelope(
+    raster: &mut RasterKernel,
+    geom: ClipGeom,
+    subs: &[(usize, usize)],
+    rule: FillRule,
+    cb: DeviceRect,
+    should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    dst: &mut [u8],
+) -> bool {
+    let w = cb.width as usize;
+    let h = cb.height as usize;
+    let (bx, by) = (cb.x as usize, cb.y as usize);
+    raster.fill_cancellable_in(
+        geom.points,
+        subs,
+        geom.width,
+        geom.height,
+        rule,
+        by..by + h,
+        should_cancel,
+        |y, x0, x1, cov| {
+            if y < by || y >= by + h {
+                return;
+            }
+            let ly = y - by;
+            let lx0 = x0.max(bx);
+            let lx1 = x1.min(bx + w - 1);
+            if lx0 <= lx1 {
+                dst[ly * w + (lx0 - bx)..=ly * w + (lx1 - bx)].copy_from_slice(&cov[lx0..=lx1]);
+            }
+        },
+    )
+}
+
+/// Intersect `tmp`'s coverage into `acc` (`acc · tmp / 255`), polling for
+/// cancellation every 64 Ki pixels. `false` when cancelled.
+fn multiply_coverage(
+    acc: &mut [u8],
+    tmp: &[u8],
+    should_cancel: Option<&(dyn Fn() -> bool + Send + Sync)>,
+) -> bool {
+    for (index, (a, &t)) in acc.iter_mut().zip(tmp).enumerate() {
+        if index & 0xffff == 0 && should_cancel.is_some_and(|cancel| cancel()) {
+            return false;
+        }
+        *a = mul_div_255(*a as u16, t as u16) as u8;
+    }
+    true
 }

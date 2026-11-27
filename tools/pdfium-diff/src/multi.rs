@@ -5,17 +5,17 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use font8x8::UnicodeFonts;
 use exprim::document::{DocumentLimits, DocumentSnapshot, PageIndex, ParseContext};
 use exprim::page_ir::{PaintLeaf, PaintOrigin};
-use exprim::render_cpu::attribution::AttributionMap;
 use exprim::render_cpu::CpuBackend;
+use exprim::render_cpu::attribution::AttributionMap;
 use exprim::source::{OwnedBytesSource, PdfSource};
+use font8x8::UnicodeFonts;
 
 use crate::compare::Diff;
 use crate::renderers::{
-    parse_override, parse_references, PdfRenderer, ProcessRenderer,
-    RenderRequest as ExternalRequest, RenderedPage, RendererId,
+    PdfRenderer, ProcessRenderer, RenderRequest as ExternalRequest, RenderedPage, RendererId,
+    parse_override, parse_references,
 };
 
 const SAMPLE: usize = 6;
@@ -204,33 +204,35 @@ fn targeted(options: Options, renderers: &[ProcessRenderer]) -> Result<(), Strin
     }
     for renderer in renderers {
         let id = renderer.id();
-        match renderer.render_pages(&ExternalRequest {
+        let rendered = match renderer.render_pages(&ExternalRequest {
             pdf,
             pages: &pages,
             scale: options.scale,
         }) {
-            Ok(rendered) => {
-                for page in rendered {
-                    eprintln!(
-                        "{id} page {}: {:.1} ms",
-                        page.page,
-                        page.elapsed.as_secs_f64() * 1000.0
-                    );
-                    write_named_png(&out, pdf, id.name(), page.page, &page.png)?;
-                    if let (Some(csv), Some(map), Some((_, ours))) = (
-                        attribution_csv.as_mut(),
-                        attributions.get(&page.page),
-                        groups.get(&page.page).and_then(|renders| renders.first()),
-                    ) {
-                        write_attribution_rows(csv, pdf, id, ours, &page, map)?;
-                    }
-                    groups
-                        .entry(page.page)
-                        .or_default()
-                        .push((id.name().into(), page));
-                }
+            Ok(rendered) => rendered,
+            Err(error) => {
+                eprintln!("{id}: {error}");
+                continue;
             }
-            Err(error) => eprintln!("{id}: {error}"),
+        };
+        for page in rendered {
+            eprintln!(
+                "{id} page {}: {:.1} ms",
+                page.page,
+                page.elapsed.as_secs_f64() * 1000.0
+            );
+            write_named_png(&out, pdf, id.name(), page.page, &page.png)?;
+            if let (Some(csv), Some(map), Some((_, ours))) = (
+                attribution_csv.as_mut(),
+                attributions.get(&page.page),
+                groups.get(&page.page).and_then(|renders| renders.first()),
+            ) {
+                write_attribution_rows(csv, pdf, id, ours, &page, map)?;
+            }
+            groups
+                .entry(page.page)
+                .or_default()
+                .push((id.name().into(), page));
         }
     }
     for (page, renders) in groups {
@@ -298,11 +300,11 @@ fn sweep(options: Options, renderers: &[ProcessRenderer]) -> Result<(), String> 
     let csv_path = out.join("results.csv");
     ensure_header(&csv_path)?;
     let done = load_done(&csv_path)?;
-    let mut csv = std::fs::OpenOptions::new()
+    let csv = std::fs::OpenOptions::new()
         .append(true)
         .open(&csv_path)
         .map_err(|e| format!("open {}: {e}", csv_path.display()))?;
-    let mut attribution_csv = if options.attribution {
+    let attribution_csv = if options.attribution {
         Some(open_attribution_csv(&out.join("attribution.csv"))?)
     } else {
         None
@@ -321,6 +323,15 @@ fn sweep(options: Options, renderers: &[ProcessRenderer]) -> Result<(), String> 
     if let Some(samples) = options.timing_sample {
         run_benchmark(&files, samples, options.scale, renderers, &out)?;
     }
+    let mut output = SweepOutput {
+        out: &out,
+        attribution: options.attribution,
+        dump: options.dump,
+        done: &done,
+        attribution_done: &attribution_done,
+        csv,
+        attribution_csv,
+    };
     for (index, pdf) in files.iter().enumerate() {
         eprintln!("[{index}/{}] {}", files.len(), pdf.display());
         let count = match our_page_count(pdf) {
@@ -372,91 +383,146 @@ fn sweep(options: Options, renderers: &[ProcessRenderer]) -> Result<(), String> 
             }
             let (references, failures) =
                 render_pages_resilient(renderer, pdf, &pending, options.scale);
-            for reference in references {
-                let Some(ours) = ours.get(&reference.page) else {
-                    continue;
-                };
-                let (ours_rgba, reference_rgba, width, height) = normalize_pair(ours, &reference)?;
-                let diff = compare_rgba(&ours_rgba, &reference_rgba, width, height);
-                // Engines disagree on how to turn a fractional page box into
-                // whole pixels — hayro floors, we round — so a ±1 edge is a
-                // rounding artefact, not a layout difference. Sweep 11 labelled
-                // 47,352 otherwise-clean pages `dimension-mismatch` on that
-                // alone, which buried the real ones. `normalize_pair` already
-                // reconciles the rasters before `compare_rgba` either way.
-                let dw = ours.width.abs_diff(reference.width);
-                let dh = ours.height.abs_diff(reference.height);
-                let status = if dw > 1 || dh > 1 {
-                    "dimension-mismatch"
-                } else if diff.is_suspect() {
-                    "suspect"
-                } else {
-                    "ok"
-                };
-                let key = format!("{}|{}|{id}", pdf.display(), reference.page);
-                if !done.contains(&key) {
-                    writeln!(
-                        csv,
-                        "3,{},{},{},{},{},{},{},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},0,{},,",
-                        csv_escape(&pdf.display().to_string()),
-                        reference.page,
-                        id,
-                        ours.width,
-                        ours.height,
-                        reference.width,
-                        reference.height,
-                        diff.ink_delta(),
-                        diff.gross_frac,
-                        diff.ours_ink,
-                        diff.ref_ink,
-                        diff.ours_continuous_ink,
-                        diff.ref_continuous_ink,
-                        status
-                    )
-                    .map_err(|e| format!("write CSV: {e}"))?;
-                    csv.flush().map_err(|e| format!("flush CSV: {e}"))?;
-                }
-                if options.attribution && !attribution_done.contains(&key) {
-                    if let (Some(attr_csv), Some(map)) =
-                        (attribution_csv.as_mut(), attributions.get(&reference.page))
-                    {
-                        write_attribution_rows(attr_csv, pdf, id, ours, &reference, map)?;
-                    }
-                }
-                if options.dump && (diff.is_suspect() || status == "dimension-mismatch") {
-                    let renders =
-                        vec![("ours".into(), ours.clone()), (id.name().into(), reference)];
-                    write_contact_sheet(
-                        &out.join(format!(
-                            "{}-p{}-{id}-comparison.png",
-                            safe_stem(pdf),
-                            renders[0].1.page
-                        )),
-                        &renders,
-                    )?;
-                }
-            }
-            for (page, error) in failures {
-                let note = error.replace([',', '\n', '\r'], ";");
-                if !done.contains(&format!("{}|{page}|{id}", pdf.display())) {
-                    // Metrics are left *empty*, not zero-or-one. An
-                    // engine that failed produced no raster, so there
-                    // is no measurement — writing `ink=1, gross=1`
-                    // made a crashed control indistinguishable from a
-                    // total disagreement, and those rows sorted
-                    // straight to the top of any "worst pages" list.
-                    // (Sweep 11: `hellstorm` and
-                    // `Jews-and-the-Military` read as "we render
-                    // nothing, everyone else renders everything" when
-                    // in fact nobody rendered anything.)
-                    writeln!(csv, "{}", failure_csv_row(pdf, page, id, &note))
-                        .map_err(|e| format!("write CSV: {e}"))?;
-                }
-            }
-            csv.flush().map_err(|e| format!("flush CSV: {e}"))?;
+            output.record_references(pdf, id, &ours, references, &attributions)?;
+            output.record_failures(pdf, id, failures)?;
+            output.csv.flush().map_err(|e| format!("flush CSV: {e}"))?;
         }
     }
     Ok(())
+}
+
+/// Where a sweep writes its rows, and which rows earlier runs recorded.
+struct SweepOutput<'a> {
+    out: &'a Path,
+    attribution: bool,
+    dump: bool,
+    done: &'a HashSet<String>,
+    attribution_done: &'a HashSet<String>,
+    csv: std::fs::File,
+    attribution_csv: Option<std::fs::File>,
+}
+
+impl SweepOutput<'_> {
+    /// Record each reference render that has a render of ours to compare.
+    fn record_references(
+        &mut self,
+        pdf: &Path,
+        id: RendererId,
+        ours: &BTreeMap<u32, RenderedPage>,
+        references: Vec<RenderedPage>,
+        attributions: &BTreeMap<u32, AttributionMap>,
+    ) -> Result<(), String> {
+        for reference in references {
+            let Some(ours) = ours.get(&reference.page) else {
+                continue;
+            };
+            self.record_reference(pdf, id, ours, reference, attributions)?;
+        }
+        Ok(())
+    }
+
+    /// Grade one reference render against ours and record it: its CSV row
+    /// unless already recorded, its attribution rows, and a comparison sheet
+    /// for a suspect page when dumping.
+    fn record_reference(
+        &mut self,
+        pdf: &Path,
+        id: RendererId,
+        ours: &RenderedPage,
+        reference: RenderedPage,
+        attributions: &BTreeMap<u32, AttributionMap>,
+    ) -> Result<(), String> {
+        let (ours_rgba, reference_rgba, width, height) = normalize_pair(ours, &reference)?;
+        let diff = compare_rgba(&ours_rgba, &reference_rgba, width, height);
+        // Engines disagree on how to turn a fractional page box into
+        // whole pixels — hayro floors, we round — so a ±1 edge is a
+        // rounding artefact, not a layout difference. Sweep 11 labelled
+        // 47,352 otherwise-clean pages `dimension-mismatch` on that
+        // alone, which buried the real ones. `normalize_pair` already
+        // reconciles the rasters before `compare_rgba` either way.
+        let dw = ours.width.abs_diff(reference.width);
+        let dh = ours.height.abs_diff(reference.height);
+        let status = if dw > 1 || dh > 1 {
+            "dimension-mismatch"
+        } else if diff.is_suspect() {
+            "suspect"
+        } else {
+            "ok"
+        };
+        let key = format!("{}|{}|{id}", pdf.display(), reference.page);
+        if !self.done.contains(&key) {
+            writeln!(
+                self.csv,
+                "3,{},{},{},{},{},{},{},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},0,{},,",
+                csv_escape(&pdf.display().to_string()),
+                reference.page,
+                id,
+                ours.width,
+                ours.height,
+                reference.width,
+                reference.height,
+                diff.ink_delta(),
+                diff.gross_frac,
+                diff.ours_ink,
+                diff.ref_ink,
+                diff.ours_continuous_ink,
+                diff.ref_continuous_ink,
+                status
+            )
+            .map_err(|e| format!("write CSV: {e}"))?;
+            self.csv.flush().map_err(|e| format!("flush CSV: {e}"))?;
+        }
+        if self.attribution && !self.attribution_done.contains(&key) {
+            if let (Some(attr_csv), Some(map)) = (
+                self.attribution_csv.as_mut(),
+                attributions.get(&reference.page),
+            ) {
+                write_attribution_rows(attr_csv, pdf, id, ours, &reference, map)?;
+            }
+        }
+        if self.dump && (diff.is_suspect() || status == "dimension-mismatch") {
+            let renders = vec![("ours".into(), ours.clone()), (id.name().into(), reference)];
+            write_contact_sheet(
+                &self.out.join(format!(
+                    "{}-p{}-{id}-comparison.png",
+                    safe_stem(pdf),
+                    renders[0].1.page
+                )),
+                &renders,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record the pages a renderer failed on, unless already recorded.
+    fn record_failures(
+        &mut self,
+        pdf: &Path,
+        id: RendererId,
+        failures: Vec<(u32, String)>,
+    ) -> Result<(), String> {
+        for (page, error) in failures {
+            let note = error.replace([',', '\n', '\r'], ";");
+            if !self
+                .done
+                .contains(&format!("{}|{page}|{id}", pdf.display()))
+            {
+                // Metrics are left *empty*, not zero-or-one. An
+                // engine that failed produced no raster, so there
+                // is no measurement — writing `ink=1, gross=1`
+                // made a crashed control indistinguishable from a
+                // total disagreement, and those rows sorted
+                // straight to the top of any "worst pages" list.
+                // (Sweep 11: `hellstorm` and
+                // `Jews-and-the-Military` read as "we render
+                // nothing, everyone else renders everything" when
+                // in fact nobody rendered anything.)
+                writeln!(self.csv, "{}", failure_csv_row(pdf, page, id, &note))
+                    .map_err(|e| format!("write CSV: {e}"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn benchmark(options: Options, renderers: &[ProcessRenderer]) -> Result<(), String> {
@@ -605,6 +671,25 @@ fn sampled_pages(count: u32) -> Vec<u32> {
     (0..count).step_by(step).take(SAMPLE).collect()
 }
 
+/// A thread that cancels `token` once `timeout` has passed, unless `done` is
+/// set first.
+fn spawn_watchdog(
+    done: Arc<std::sync::atomic::AtomicBool>,
+    token: exprim::render_api::CancellationToken,
+    timeout: std::time::Duration,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if done.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        token.cancel();
+    })
+}
+
 fn render_ours(pdf: &Path, pages: &[u32], scale: f64) -> Result<Vec<RenderedPage>, String> {
     let bytes = std::fs::read(pdf).map_err(|e| format!("read {}: {e}", pdf.display()))?;
     let source: Arc<dyn PdfSource> = Arc::new(OwnedBytesSource::new(bytes));
@@ -624,19 +709,7 @@ fn render_ours(pdf: &Path, pages: &[u32], scale: f64) -> Result<Vec<RenderedPage
         let token = exprim::render_api::CancellationToken::new();
         request.limits.cancellation = Some(token.clone());
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watchdog = {
-            let done = done.clone();
-            std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + timeout;
-                while std::time::Instant::now() < deadline {
-                    if done.load(std::sync::atomic::Ordering::Acquire) {
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-                token.cancel();
-            })
-        };
+        let watchdog = spawn_watchdog(done.clone(), token, timeout);
         let start = std::time::Instant::now();
         let render = backend.render_to_host(&request);
         done.store(true, std::sync::atomic::Ordering::Release);
@@ -1065,16 +1138,23 @@ fn draw_text(image: &mut [u8], width: u32, x: u32, y: u32, text: &str) {
         let Some(glyph) = font8x8::BASIC_FONTS.get(ch) else {
             continue;
         };
-        for (gy, row) in glyph.iter().enumerate() {
-            for gx in 0..8 {
-                if row & (1 << gx) != 0 {
-                    let px = x as usize + index * 8 + gx;
-                    let py = y as usize + gy;
-                    if px < width as usize {
-                        let i = (py * width as usize + px) * 4;
-                        image[i..i + 4].copy_from_slice(&[0, 0, 0, 255]);
-                    }
-                }
+        draw_glyph(image, width, x as usize + index * 8, y as usize, &glyph);
+    }
+}
+
+/// Draw one 8x8 glyph in black with its top-left corner at (`x`, `y`),
+/// clipped at the image's right edge.
+fn draw_glyph(image: &mut [u8], width: u32, x: usize, y: usize, glyph: &[u8; 8]) {
+    for (gy, row) in glyph.iter().enumerate() {
+        for gx in 0..8 {
+            if row & (1 << gx) == 0 {
+                continue;
+            }
+            let px = x + gx;
+            let py = y + gy;
+            if px < width as usize {
+                let i = (py * width as usize + px) * 4;
+                image[i..i + 4].copy_from_slice(&[0, 0, 0, 255]);
             }
         }
     }
@@ -1140,33 +1220,48 @@ fn split_csv_prefix(line: &str, count: usize) -> Option<Vec<String>> {
     let mut fields = Vec::new();
     let mut chars = line.chars().peekable();
     while fields.len() < count {
-        let mut field = String::new();
-        if chars.peek() == Some(&'\"') {
+        let field = if chars.peek() == Some(&'\"') {
             chars.next();
-            loop {
-                match chars.next()? {
-                    '\"' if chars.peek() == Some(&'\"') => {
-                        chars.next();
-                        field.push('\"');
-                    }
-                    '\"' => break,
-                    c => field.push(c),
-                }
-            }
-            if chars.peek() == Some(&',') {
-                chars.next();
-            }
+            read_quoted_field(&mut chars)?
         } else {
-            while let Some(c) = chars.next() {
-                if c == ',' {
-                    break;
-                }
-                field.push(c);
-            }
-        }
+            read_plain_field(&mut chars)
+        };
         fields.push(field);
     }
     Some(fields)
+}
+
+/// The rest of a quoted CSV field after its opening quote, with doubled
+/// quotes undone, consuming the comma after it. `None` when the line ends
+/// inside the quotes.
+fn read_quoted_field(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    let mut field = String::new();
+    loop {
+        match chars.next()? {
+            '\"' if chars.peek() == Some(&'\"') => {
+                chars.next();
+                field.push('\"');
+            }
+            '\"' => break,
+            c => field.push(c),
+        }
+    }
+    if chars.peek() == Some(&',') {
+        chars.next();
+    }
+    Some(field)
+}
+
+/// An unquoted CSV field, up to and consuming the next comma.
+fn read_plain_field(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut field = String::new();
+    for c in chars.by_ref() {
+        if c == ',' {
+            break;
+        }
+        field.push(c);
+    }
+    field
 }
 
 fn csv_escape(value: &str) -> String {

@@ -117,46 +117,52 @@ fn parse_bfrange(lexer: &mut Lexer<'_>, map: &mut UnicodeMap) {
         };
         match token {
             Token::Word(word) if word == b"endbfrange" => break,
-            Token::Hex(lo_bytes) => {
-                let Some(Token::Hex(hi_bytes)) = lexer.next() else {
-                    continue;
-                };
-                let (Some(lo), Some(hi)) = (source_code(&lo_bytes), source_code(&hi_bytes)) else {
-                    continue;
-                };
-                if hi < lo || hi.saturating_sub(lo) > 0x10_0000 {
-                    // Bound work from a malicious range.
-                    continue;
+            Token::Hex(lo_bytes) => parse_bfrange_record(lexer, map, &lo_bytes),
+            _ => {}
+        }
+    }
+}
+
+/// Read the rest of one `bfrange` record after its low code and map every
+/// code in it, from either an incrementing destination or a destination array.
+fn parse_bfrange_record(lexer: &mut Lexer<'_>, map: &mut UnicodeMap, lo_bytes: &[u8]) {
+    let Some(Token::Hex(hi_bytes)) = lexer.next() else {
+        return;
+    };
+    let (Some(lo), Some(hi)) = (source_code(lo_bytes), source_code(&hi_bytes)) else {
+        return;
+    };
+    if hi < lo || hi.saturating_sub(lo) > 0x10_0000 {
+        // Bound work from a malicious range.
+        return;
+    }
+    match lexer.next() {
+        Some(Token::Hex(mut dst)) => {
+            for code in lo..=hi {
+                if let Some(text) = destination_utf16(&dst) {
+                    map.insert(code, text, UnicodeSource::ToUnicode);
                 }
-                match lexer.next() {
-                    Some(Token::Hex(mut dst)) => {
-                        for code in lo..=hi {
-                            if let Some(text) = destination_utf16(&dst) {
-                                map.insert(code, text, UnicodeSource::ToUnicode);
-                            }
-                            increment_big_endian(&mut dst);
-                        }
-                    }
-                    Some(Token::ArrayStart) => {
-                        let mut code = lo;
-                        loop {
-                            match lexer.next() {
-                                Some(Token::Hex(dst)) => {
-                                    if code <= hi {
-                                        if let Some(text) = destination_utf16(&dst) {
-                                            map.insert(code, text, UnicodeSource::ToUnicode);
-                                        }
-                                        code = code.saturating_add(1);
-                                    }
-                                }
-                                Some(Token::ArrayEnd) | None => break,
-                                _ => {}
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                increment_big_endian(&mut dst);
             }
+        }
+        Some(Token::ArrayStart) => parse_bfrange_array(lexer, map, lo, hi),
+        _ => {}
+    }
+}
+
+/// Map `lo..=hi` from a `[<dst> ...]` destination array, up to its `]`.
+/// Destinations past `hi` are read and dropped.
+fn parse_bfrange_array(lexer: &mut Lexer<'_>, map: &mut UnicodeMap, lo: u32, hi: u32) {
+    let mut code = lo;
+    loop {
+        match lexer.next() {
+            Some(Token::Hex(dst)) if code <= hi => {
+                if let Some(text) = destination_utf16(&dst) {
+                    map.insert(code, text, UnicodeSource::ToUnicode);
+                }
+                code = code.saturating_add(1);
+            }
+            Some(Token::ArrayEnd) | None => break,
             _ => {}
         }
     }

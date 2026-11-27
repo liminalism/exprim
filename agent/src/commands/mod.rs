@@ -164,26 +164,17 @@ pub fn run_pages<S, D: Send>(
                 }
                 let mut warnings = selection_warnings.take().unwrap_or_default();
                 warnings.extend(page_warnings);
-                match result {
-                    Ok(data) => emit(*page, data, warnings)?,
-                    Err(err) => {
-                        exit = 1;
-                        if run.mode == OutputMode::Human {
-                            for warning in &warnings {
-                                eprintln!("warning: {warning}");
-                            }
-                        }
-                        let env = Envelope::page_failed(
-                            run.document,
-                            page.one_based(),
-                            format!("{err:#}"),
-                        )
-                        .with_warnings(warnings);
-                        emit_failed(&env, run.mode, run.multi)?;
-                        if run.fail_fast {
-                            return Ok(ControlFlow::Break(()));
-                        }
+                let err = match result {
+                    Ok(data) => {
+                        emit(*page, data, warnings)?;
+                        return Ok(ControlFlow::Continue(()));
                     }
+                    Err(err) => err,
+                };
+                exit = 1;
+                report_failed_page(run, *page, &err, warnings)?;
+                if run.fail_fast {
+                    return Ok(ControlFlow::Break(()));
                 }
                 Ok(ControlFlow::Continue(()))
             };
@@ -201,6 +192,24 @@ pub fn run_pages<S, D: Send>(
         Some(err) => Err(err),
         None => Ok(exit),
     }
+}
+
+/// Report a page that failed as a record of its own, its warnings echoed
+/// to stderr first in human mode.
+fn report_failed_page(
+    run: PageRun<'_>,
+    page: crate::pages::PageZero,
+    err: &anyhow::Error,
+    warnings: Vec<String>,
+) -> Result<()> {
+    if run.mode == OutputMode::Human {
+        for warning in &warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+    let env = Envelope::page_failed(run.document, page.one_based(), format!("{err:#}"))
+        .with_warnings(warnings);
+    emit_failed(&env, run.mode, run.multi)
 }
 
 /// How one page of a parallel run ended.

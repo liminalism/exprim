@@ -159,22 +159,24 @@ pub fn dash_polyline(
             let p_start = [a[0] + dir[0] * pos, a[1] + dir[1] * pos];
             pos += step;
             let p_end = [a[0] + dir[0] * pos, a[1] + dir[1] * pos];
+            if on && cur.is_empty() {
+                cur.push(p_start);
+            }
             if on {
-                if cur.is_empty() {
-                    cur.push(p_start);
-                }
                 cur.push(p_end);
             }
             remaining -= step;
-            if remaining <= 1e-6 {
-                if on && cur.len() >= 2 {
-                    result.push(std::mem::take(&mut cur));
-                }
-                cur.clear();
-                idx = (idx + 1) % pattern.len();
-                remaining = pattern[idx];
-                on = !on;
+            let dash_ended = remaining <= 1e-6;
+            if !dash_ended {
+                continue;
             }
+            if on && cur.len() >= 2 {
+                result.push(std::mem::take(&mut cur));
+            }
+            cur.clear();
+            idx = (idx + 1) % pattern.len();
+            remaining = pattern[idx];
+            on = !on;
         }
     }
     if on && cur.len() >= 2 {

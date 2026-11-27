@@ -1114,34 +1114,7 @@ impl RenderSession {
                         .unwrap_or_else(|poisoned| poisoned.into_inner()),
                 );
                 if rgb {
-                    // The backend drops the alpha byte itself: inside the
-                    // surface for an in-place render, into a buffer of the
-                    // exact length otherwise, and strip by strip for a large
-                    // page either way. Rewrapped as a host page for the
-                    // shared checks below; its stride says three bytes per
-                    // pixel.
-                    let rendered = if in_place {
-                        self.backend.render_packed_rgb_with_options(
-                            &request,
-                            &options,
-                            &mut worker.raster,
-                        )
-                    } else {
-                        self.backend
-                            .render_rgb_with_options(&request, &options, &mut worker.raster)
-                    };
-                    rendered.map(|(packed, stats)| {
-                        (
-                            HostPage {
-                                width: packed.width,
-                                height: packed.height,
-                                stride: packed.stride,
-                                format: output_format,
-                                pixels: packed.pixels,
-                            },
-                            stats,
-                        )
-                    })
+                    self.render_rgb_host_page(&request, &options, &mut worker.raster, in_place)
                 } else {
                     self.backend
                         .render_with_options(&request, &options, &mut worker.raster)
@@ -1190,6 +1163,39 @@ impl RenderSession {
                 stats,
             )),
         }
+    }
+
+    /// Render `request` to RGB with the alpha byte dropped by the backend
+    /// itself: inside the surface for an in-place render, into a buffer of
+    /// the exact length otherwise, and strip by strip for a large page
+    /// either way. Rewrapped as a host page for the caller's shared checks;
+    /// its stride says three bytes per pixel.
+    fn render_rgb_host_page(
+        &self,
+        request: &RenderRequest,
+        options: &CpuRenderOptions,
+        raster: &mut CpuWorkerContext,
+        in_place: bool,
+    ) -> Result<(HostPage, crate::render_cpu::RenderStats), crate::render_api::RenderError> {
+        let rendered = if in_place {
+            self.backend
+                .render_packed_rgb_with_options(request, options, raster)
+        } else {
+            self.backend
+                .render_rgb_with_options(request, options, raster)
+        };
+        rendered.map(|(packed, stats)| {
+            (
+                HostPage {
+                    width: packed.width,
+                    height: packed.height,
+                    stride: packed.stride,
+                    format: request.output_format,
+                    pixels: packed.pixels,
+                },
+                stats,
+            )
+        })
     }
 
     /// Render the base raster, every region and the text-recognition raster of
@@ -1458,33 +1464,13 @@ fn qualifying_jbig2_smask(page: &CompiledPage) -> Option<Jbig2SmaskCandidate> {
                 {
                     return None;
                 }
-                if let Some(smask) = image.smask.as_ref() {
-                    if candidate.is_some()
-                        || smask.width != image.width
-                        || smask.height != image.height
-                        || smask.bits_per_component != 1
-                        || smask.codec != Some(ImageCodecKind::Jbig2)
-                        || !smask.samples.is_empty()
-                    {
-                        return None;
-                    }
-                    let page_data = smask.codec_data.clone().filter(|data| !data.is_empty())?;
-                    let stencil_polarity = match smask.decode.as_deref() {
-                        None => Jbig2StencilPolarity::PaintOne,
-                        Some([[lo, hi]]) if *lo == 0.0 && *hi == 1.0 => {
-                            Jbig2StencilPolarity::PaintOne
-                        }
-                        Some([[lo, hi]]) if *lo == 1.0 && *hi == 0.0 => {
-                            Jbig2StencilPolarity::PaintZero
-                        }
-                        _ => return None,
-                    };
-                    candidate = Some(Jbig2SmaskCandidate {
-                        smask: Arc::clone(smask),
-                        page_data: Arc::from(page_data.as_slice()),
-                        stencil_polarity,
-                    });
+                let Some(smask) = image.smask.as_ref() else {
+                    continue;
+                };
+                if candidate.is_some() {
+                    return None;
                 }
+                candidate = Some(jbig2_smask_candidate(image, smask)?);
             }
             _ => return None,
         }
@@ -1493,6 +1479,36 @@ fn qualifying_jbig2_smask(page: &CompiledPage) -> Option<Jbig2SmaskCandidate> {
         return None;
     }
     candidate
+}
+
+/// The preservable JBIG2 soft mask of a qualifying page image: a 1-bit
+/// JBIG2 mask of the image's own size with a non-empty page stream, still
+/// undecoded, and a `/Decode` that is either polarity. `None` disqualifies
+/// the page.
+fn jbig2_smask_candidate(
+    image: &crate::page_ir::ImageIr,
+    smask: &Arc<ImageSMask>,
+) -> Option<Jbig2SmaskCandidate> {
+    if smask.width != image.width
+        || smask.height != image.height
+        || smask.bits_per_component != 1
+        || smask.codec != Some(ImageCodecKind::Jbig2)
+        || !smask.samples.is_empty()
+    {
+        return None;
+    }
+    let page_data = smask.codec_data.clone().filter(|data| !data.is_empty())?;
+    let stencil_polarity = match smask.decode.as_deref() {
+        None => Jbig2StencilPolarity::PaintOne,
+        Some([[lo, hi]]) if *lo == 0.0 && *hi == 1.0 => Jbig2StencilPolarity::PaintOne,
+        Some([[lo, hi]]) if *lo == 1.0 && *hi == 0.0 => Jbig2StencilPolarity::PaintZero,
+        _ => return None,
+    };
+    Some(Jbig2SmaskCandidate {
+        smask: Arc::clone(smask),
+        page_data: Arc::from(page_data.as_slice()),
+        stencil_polarity,
+    })
 }
 
 /// See [`CompiledDocumentPage::bilevel_raster_height`]. An image counts when

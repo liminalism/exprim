@@ -382,6 +382,17 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Reader `t`'s share of the concurrent-read test: 200 positional reads
+    /// at offsets of its own, each checked against the file's bytes.
+    fn check_positional_reads(src: &FileReadAtSource, bytes: &[u8], t: u64) {
+        for i in 0..200u64 {
+            let off = (t * 8011 + i * 259) % (64 * 1024 - 16);
+            let mut buf = [0u8; 16];
+            src.read_exact_at(off, &mut buf).unwrap();
+            assert_eq!(&buf, &bytes[off as usize..off as usize + 16]);
+        }
+    }
+
     #[test]
     fn file_read_at_source_concurrent_reads_do_not_interfere() {
         // The whole point of positional reads: concurrent readers at
@@ -393,14 +404,7 @@ mod tests {
             for t in 0..8u64 {
                 let src = Arc::clone(&src);
                 let bytes = &bytes;
-                s.spawn(move || {
-                    for i in 0..200u64 {
-                        let off = (t * 8011 + i * 259) % (64 * 1024 - 16);
-                        let mut buf = [0u8; 16];
-                        src.read_exact_at(off, &mut buf).unwrap();
-                        assert_eq!(&buf, &bytes[off as usize..off as usize + 16]);
-                    }
-                });
+                s.spawn(move || check_positional_reads(&src, bytes, t));
             }
         });
         drop(src);

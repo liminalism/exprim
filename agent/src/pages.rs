@@ -58,46 +58,7 @@ pub fn parse_page_range(
 
     let mut indices: Vec<u32> = match spec.map(str::trim).filter(|s| !s.is_empty()) {
         None | Some("all") => (0..page_count).collect(),
-        Some(raw) => {
-            let mut out = Vec::new();
-            for part in raw.split(',') {
-                let part = part.trim();
-                if part.is_empty() {
-                    continue;
-                }
-                if let Some((a, b)) = part.split_once('-') {
-                    let (a, b) = (a.trim(), b.trim());
-                    if a.is_empty() && b.is_empty() {
-                        bail!("invalid page range {part:?}");
-                    }
-                    let start = if a.is_empty() { 1 } else { parse_one_based(a)? };
-                    let mut end = if b.is_empty() {
-                        page_count
-                    } else {
-                        parse_one_based(b)?
-                    };
-                    if !b.is_empty() && start > end {
-                        bail!("invalid page range {part:?}: start > end");
-                    }
-                    if start > page_count {
-                        bail!("page range {part:?} out of range (document has {page_count} pages)");
-                    }
-                    if end > page_count {
-                        warnings.push(format!(
-                            "page range {part:?} clamped to {start}-{page_count} (document has {page_count} pages)"
-                        ));
-                        end = page_count;
-                    }
-                    out.extend(start - 1..end);
-                } else {
-                    let z = to_zero_based(parse_one_based(part)?, page_count)?;
-                    out.push(z.0);
-                }
-            }
-            out.sort_unstable();
-            out.dedup();
-            out
-        }
+        Some(raw) => parse_page_list(raw, page_count, &mut warnings)?,
     };
 
     if max_pages > 0 && indices.len() as u32 > max_pages {
@@ -110,6 +71,62 @@ pub fn parse_page_range(
     }
 
     Ok((indices.into_iter().map(PageZero).collect(), warnings))
+}
+
+/// The sorted, deduplicated zero-based pages of a comma list of one-based
+/// pages and ranges.
+fn parse_page_list(raw: &str, page_count: u32, warnings: &mut Vec<String>) -> Result<Vec<u32>> {
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((a, b)) = part.split_once('-') else {
+            let z = to_zero_based(parse_one_based(part)?, page_count)?;
+            out.push(z.0);
+            continue;
+        };
+        out.extend(parse_page_span(part, a, b, page_count, warnings)?);
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// The zero-based pages of the range `part`, split at its `-` into `a` and
+/// `b` (either may be empty). A range running past the last page is clamped
+/// with a warning.
+fn parse_page_span(
+    part: &str,
+    a: &str,
+    b: &str,
+    page_count: u32,
+    warnings: &mut Vec<String>,
+) -> Result<std::ops::Range<u32>> {
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() && b.is_empty() {
+        bail!("invalid page range {part:?}");
+    }
+    let start = if a.is_empty() { 1 } else { parse_one_based(a)? };
+    let mut end = if b.is_empty() {
+        page_count
+    } else {
+        parse_one_based(b)?
+    };
+    if !b.is_empty() && start > end {
+        bail!("invalid page range {part:?}: start > end");
+    }
+    if start > page_count {
+        bail!("page range {part:?} out of range (document has {page_count} pages)");
+    }
+    if end > page_count {
+        warnings.push(format!(
+            "page range {part:?} clamped to {start}-{page_count} (document has {page_count} pages)"
+        ));
+        end = page_count;
+    }
+    Ok(start - 1..end)
 }
 
 /// A page selection for a command that reads every page it is pointed at.

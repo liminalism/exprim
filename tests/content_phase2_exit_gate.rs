@@ -90,6 +90,22 @@ fn probe(snapshot: &DocumentSnapshot, index: u32) -> String {
     dump_semantic(&page, snapshot.names())
 }
 
+/// One worker: claim the next unprobed page index until none remain, storing
+/// each result in its slot.
+fn probe_worker(
+    snapshot: &DocumentSnapshot,
+    next: &std::sync::atomic::AtomicUsize,
+    slots: &[std::sync::Mutex<Option<String>>],
+) {
+    loop {
+        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if i >= slots.len() {
+            return;
+        }
+        *slots[i].lock().unwrap() = Some(probe(snapshot, i as u32));
+    }
+}
+
 /// Compile every page with `threads` workers, each owning its own
 /// `ParseContext`, one page at a time. Returns per-page dumps in page order.
 fn probe_all(snapshot: &DocumentSnapshot, threads: usize) -> Vec<String> {
@@ -100,15 +116,7 @@ fn probe_all(snapshot: &DocumentSnapshot, threads: usize) -> Vec<String> {
         .collect();
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if i >= page_count {
-                        return;
-                    }
-                    *slots[i].lock().unwrap() = Some(probe(snapshot, i as u32));
-                }
-            });
+            scope.spawn(|| probe_worker(snapshot, &next, &slots));
         }
     });
     slots

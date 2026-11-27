@@ -491,74 +491,8 @@ impl<'a> Loader<'a> {
             let tok = lexer.next_token()?;
             match tok.value {
                 Token::Integer(start) => {
-                    let count_tok = lexer.next_token()?;
-                    let Token::Integer(count) = count_tok.value else {
+                    if !read_classic_subsection(&mut lexer, start, &mut staged)? {
                         break None; // malformed subsection header
-                    };
-                    let (Ok(start), Ok(count)) = (u32::try_from(start), u32::try_from(count))
-                    else {
-                        break None;
-                    };
-                    // A subsection declared as starting at object 1 whose first
-                    // entry is the free-list head (`0000000000 65535 f`) is a
-                    // producer that wrote `1 N` where it meant `0 N`: object 0
-                    // is *always* that head. Taken literally every entry lands
-                    // one object number too high, so the real object 1 is
-                    // recorded free and every reference to it dies — in
-                    // pdfjs/issue7229 that is the page's only image, and the
-                    // page renders blank. PDFium and pdf.js both correct this.
-                    let mut start = start;
-                    if start == 1 && count > 0 {
-                        let probe = lexer.pos();
-                        let head = (
-                            lexer.next_token().map(|t| t.value),
-                            lexer.next_token().map(|t| t.value),
-                            lexer.next_token().map(|t| t.value),
-                        );
-                        if let (
-                            Ok(Token::Integer(0)),
-                            Ok(Token::Integer(65535)),
-                            Ok(Token::Keyword(k)),
-                        ) = head
-                            && k.as_slice() == b"f"
-                        {
-                            start = 0;
-                        }
-                        lexer.set_pos(probe);
-                    }
-                    for i in 0..count {
-                        let save_entry = lexer.pos();
-                        let (o, g, k) = (
-                            lexer.next_token()?,
-                            lexer.next_token()?,
-                            lexer.next_token()?,
-                        );
-                        let (
-                            Token::Integer(entry_off),
-                            Token::Integer(entry_gen),
-                            Token::Keyword(kind),
-                        ) = (o.value, g.value, k.value)
-                        else {
-                            // Subsection shorter than declared: stop here,
-                            // keep what parsed (count lies are common).
-                            lexer.set_pos(save_entry);
-                            break;
-                        };
-                        let number = start.saturating_add(i);
-                        let generation = u16::try_from(entry_gen.clamp(0, i64::from(u16::MAX)))
-                            .unwrap_or(u16::MAX);
-                        match kind.as_slice() {
-                            b"n" if entry_off >= 0 => staged.push((
-                                number,
-                                generation,
-                                ObjectLocation::Offset(entry_off as u64),
-                            )),
-                            b"f" => staged.push((number, generation, ObjectLocation::Free)),
-                            _ => {
-                                lexer.set_pos(save_entry);
-                                break;
-                            }
-                        }
                     }
                 }
                 Token::Keyword(kw) if kw == b"trailer" => {
@@ -755,15 +689,16 @@ impl<'a> Loader<'a> {
             for i in 0..count_usize {
                 let number = start_num.saturating_add(i as u32);
                 let entry = &seg[i * stride..(i + 1) * stride];
-                if let Some((generation, location)) = Self::decode_stream_entry(entry, &widths) {
-                    self.record(number, generation, location);
-                    entry_counts.tally(location);
-                    if let Some(staged) = staged.as_mut() {
-                        staged.push(RevisionXrefEntry {
-                            id: ObjectId::new(number, generation),
-                            location,
-                        });
-                    }
+                let Some((generation, location)) = Self::decode_stream_entry(entry, &widths) else {
+                    continue;
+                };
+                self.record(number, generation, location);
+                entry_counts.tally(location);
+                if let Some(staged) = staged.as_mut() {
+                    staged.push(RevisionXrefEntry {
+                        id: ObjectId::new(number, generation),
+                        location,
+                    });
                 }
             }
             seg_start = seg_end;
@@ -1296,6 +1231,98 @@ impl<'a> Loader<'a> {
         }
         XrefMap::from_parts(locations.into_boxed_slice(), generations.into_boxed_slice())
     }
+}
+
+/// Read one classic-table subsection whose first header integer `start` has
+/// been consumed: its count, then up to that many entries into `staged`.
+/// `Ok(false)` for a malformed header, which ends the table without a
+/// trailer.
+fn read_classic_subsection(
+    lexer: &mut Lexer<'_>,
+    start: i64,
+    staged: &mut Vec<(u32, u16, ObjectLocation)>,
+) -> Result<bool, StructureError> {
+    let count_tok = lexer.next_token()?;
+    let Token::Integer(count) = count_tok.value else {
+        return Ok(false);
+    };
+    let (Ok(start), Ok(count)) = (u32::try_from(start), u32::try_from(count)) else {
+        return Ok(false);
+    };
+    let start = corrected_subsection_start(lexer, start, count);
+    read_classic_entries(lexer, start, count, staged)?;
+    Ok(true)
+}
+
+/// A subsection declared as starting at object 1 whose first
+/// entry is the free-list head (`0000000000 65535 f`) is a
+/// producer that wrote `1 N` where it meant `0 N`: object 0
+/// is *always* that head. Taken literally every entry lands
+/// one object number too high, so the real object 1 is
+/// recorded free and every reference to it dies — in
+/// pdfjs/issue7229 that is the page's only image, and the
+/// page renders blank. PDFium and pdf.js both correct this.
+///
+/// Returns the corrected start; the lexer is left where it was.
+fn corrected_subsection_start(lexer: &mut Lexer<'_>, start: u32, count: u32) -> u32 {
+    if start != 1 || count == 0 {
+        return start;
+    }
+    let probe = lexer.pos();
+    let head = (
+        lexer.next_token().map(|t| t.value),
+        lexer.next_token().map(|t| t.value),
+        lexer.next_token().map(|t| t.value),
+    );
+    let mut start = start;
+    if let (Ok(Token::Integer(0)), Ok(Token::Integer(65535)), Ok(Token::Keyword(k))) = head
+        && k.as_slice() == b"f"
+    {
+        start = 0;
+    }
+    lexer.set_pos(probe);
+    start
+}
+
+/// Read up to `count` classic entries (`offset generation n|f`) numbered
+/// from `start` into `staged`. A short or malformed entry rewinds the lexer
+/// to it and ends the subsection, keeping what parsed (count lies are
+/// common).
+fn read_classic_entries(
+    lexer: &mut Lexer<'_>,
+    start: u32,
+    count: u32,
+    staged: &mut Vec<(u32, u16, ObjectLocation)>,
+) -> Result<(), StructureError> {
+    for i in 0..count {
+        let save_entry = lexer.pos();
+        let (o, g, k) = (
+            lexer.next_token()?,
+            lexer.next_token()?,
+            lexer.next_token()?,
+        );
+        let (Token::Integer(entry_off), Token::Integer(entry_gen), Token::Keyword(kind)) =
+            (o.value, g.value, k.value)
+        else {
+            // Subsection shorter than declared: stop here,
+            // keep what parsed (count lies are common).
+            lexer.set_pos(save_entry);
+            break;
+        };
+        let number = start.saturating_add(i);
+        let generation = u16::try_from(entry_gen.clamp(0, i64::from(u16::MAX))).unwrap_or(u16::MAX);
+        match kind.as_slice() {
+            b"n" if entry_off >= 0 => {
+                staged.push((number, generation, ObjectLocation::Offset(entry_off as u64)))
+            }
+            b"f" => staged.push((number, generation, ObjectLocation::Free)),
+            _ => {
+                lexer.set_pos(save_entry);
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Scan `window` for an `N G obj` header whose object number is `number`,

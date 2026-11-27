@@ -519,14 +519,15 @@ fn parse_encoding(clear: &[u8], by_name: &HashMap<Vec<u8>, u32>) -> Box<[Option<
     let region = &clear[at..];
     if find(&region[..region.len().min(64)], b"StandardEncoding").is_some() {
         for code in 0..256usize {
-            if let Some(c) = crate::font::encoding::BaseEncoding::Standard.to_char(code as u8) {
-                let mut buf = [0u8; 4];
-                let s = c.encode_utf8(&mut buf);
-                // Standard encoding maps through names; approximate by the
-                // single-letter names the AGL subset covers.
-                if let Some(&gid) = by_name.get(s.as_bytes()) {
-                    enc[code] = Some(gid);
-                }
+            let Some(c) = crate::font::encoding::BaseEncoding::Standard.to_char(code as u8) else {
+                continue;
+            };
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            // Standard encoding maps through names; approximate by the
+            // single-letter names the AGL subset covers.
+            if let Some(&gid) = by_name.get(s.as_bytes()) {
+                enc[code] = Some(gid);
             }
         }
         return enc;

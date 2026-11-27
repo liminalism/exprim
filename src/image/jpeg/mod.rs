@@ -197,13 +197,7 @@ impl HuffTable {
                 }
                 if l as u32 <= HUFF_LOOKAHEAD {
                     // Populate every lookahead prefix of each code.
-                    for i in 0..n {
-                        let c = (code + i as i32) as usize;
-                        let shift = HUFF_LOOKAHEAD as usize - l;
-                        for tail in 0..(1usize << shift) {
-                            fast[(c << shift) | tail] = (values[k + i], l as u8);
-                        }
-                    }
+                    fill_fast_prefixes(&mut fast, code, l, &values[k..k + n]);
                 }
                 code += n as i32;
                 max_code[l] = code - 1;
@@ -238,6 +232,23 @@ impl HuffTable {
             val_ptr,
             values,
         })
+    }
+}
+
+/// Point every lookahead prefix of the `l`-bit codes `first_code..` (one per
+/// entry of `values`) at that code's value and length.
+fn fill_fast_prefixes(
+    fast: &mut [(u8, u8); HUFF_FAST_SIZE],
+    first_code: i32,
+    l: usize,
+    values: &[u8],
+) {
+    let shift = HUFF_LOOKAHEAD as usize - l;
+    for (i, &value) in values.iter().enumerate() {
+        let c = (first_code + i as i32) as usize;
+        for tail in 0..(1usize << shift) {
+            fast[(c << shift) | tail] = (value, l as u8);
+        }
     }
 }
 
@@ -1253,27 +1264,43 @@ impl<'a> Decoder<'a> {
                     },
                 )?;
             } else {
-                let mcu_x = mcu % geom.mcus_x;
-                let mcu_y = mcu / geom.mcus_x;
-                for (si, g) in geom.comps.iter().enumerate() {
-                    for by in 0..g.v {
-                        for bx in 0..g.h {
-                            let row = mcu_y * g.v + by;
-                            let col = mcu_x * g.h + bx;
-                            f(
-                                reader,
-                                Event::Block {
-                                    si,
-                                    ci: g.ci,
-                                    off: (row * g.bw + col) * 64,
-                                },
-                            )?;
-                        }
-                    }
-                }
+                visit_interleaved_mcu(geom, mcu, reader, f)?;
             }
         }
         Ok(())
+    }
+
+    /// Every scan component's `(DC, AC)` Huffman tables, resolved once so the
+    /// block loops need no per-block `Option` re-proof.
+    fn sequential_tables(
+        &self,
+        scan_comps: &[ScanComp],
+    ) -> Result<Vec<(&HuffTable, &HuffTable)>, ImageError> {
+        let mut tables: Vec<(&HuffTable, &HuffTable)> = Vec::with_capacity(scan_comps.len());
+        for sc in scan_comps {
+            match (
+                self.dc_tables[sc.dc_tbl].as_ref(),
+                self.ac_tables[sc.ac_tbl].as_ref(),
+            ) {
+                (Some(dc), Some(ac)) => tables.push((dc, ac)),
+                _ => return Err(err("scan references a missing Huffman table")),
+            }
+        }
+        Ok(tables)
+    }
+
+    /// Quantization table `tq` in natural order, with the AAN scale factors
+    /// and the 1/8 descale folded in (the exact reciprocal of the encoder's
+    /// forward scale).
+    fn dequant_table(&self, tq: usize) -> Result<[f32; 64], ImageError> {
+        let raw = self.quant[tq].ok_or_else(|| err("missing quantization table"))?;
+        let mut dq = [0f32; 64];
+        for zig in 0..64 {
+            let pos = ZIGZAG_INV[zig] as usize;
+            dq[pos] =
+                raw[zig] as f32 * AAN_SCALE_FACTORS[pos / 8] * AAN_SCALE_FACTORS[pos % 8] / 8.0;
+        }
+        Ok(dq)
     }
 
     /// Baseline / extended sequential scan: full DC+AC per block.
@@ -1285,16 +1312,7 @@ impl<'a> Decoder<'a> {
     ) -> Result<(), ImageError> {
         // Resolve every scan component's tables up front: the loop below then
         // needs no per-block `Option` re-proof (the checked branch is here).
-        let mut tables: Vec<(&HuffTable, &HuffTable)> = Vec::with_capacity(scan_comps.len());
-        for sc in scan_comps {
-            match (
-                self.dc_tables[sc.dc_tbl].as_ref(),
-                self.ac_tables[sc.ac_tbl].as_ref(),
-            ) {
-                (Some(dc), Some(ac)) => tables.push((dc, ac)),
-                _ => return Err(err("scan references a missing Huffman table")),
-            }
-        }
+        let tables = self.sequential_tables(scan_comps)?;
         let geom = ScanGeom::of(frame, scan_comps);
         let comps = &mut frame.comps;
         let mut preds = [0i32; 4];
@@ -1338,34 +1356,17 @@ impl<'a> Decoder<'a> {
     ) -> Result<DecodedImage, ImageError> {
         // Resolve every scan component's tables up front (the checked branch
         // that proves the per-MCU lookups below).
-        let mut tables: Vec<(&HuffTable, &HuffTable)> = Vec::with_capacity(scan_comps.len());
-        for sc in scan_comps {
-            match (
-                self.dc_tables[sc.dc_tbl].as_ref(),
-                self.ac_tables[sc.ac_tbl].as_ref(),
-            ) {
-                (Some(dc), Some(ac)) => tables.push((dc, ac)),
-                _ => return Err(err("scan references a missing Huffman table")),
-            }
-        }
+        let tables = self.sequential_tables(scan_comps)?;
 
         let (w, h) = (frame.out_w(), frame.out_h());
         let dct = frame.dct_size;
-        let (mcus_x, mcus_y) = (frame.mcus_x, frame.mcus_y);
+        let mcus_y = frame.mcus_y;
 
         // Per-scan-component dequantization tables (natural order, AAN scale and
         // the 1/8 descale folded in — identical to the coefficient path).
         let mut dqs: Vec<[f32; 64]> = Vec::with_capacity(scan_comps.len());
         for sc in scan_comps {
-            let c = &frame.comps[sc.comp];
-            let raw = self.quant[c.tq].ok_or_else(|| err("missing quantization table"))?;
-            let mut dq = [0f32; 64];
-            for zig in 0..64 {
-                let pos = ZIGZAG_INV[zig] as usize;
-                dq[pos] =
-                    raw[zig] as f32 * AAN_SCALE_FACTORS[pos / 8] * AAN_SCALE_FACTORS[pos % 8] / 8.0;
-            }
-            dqs.push(dq);
+            dqs.push(self.dequant_table(frame.comps[sc.comp].tq)?);
         }
 
         // Two reusable sample bands per scan component: one being decoded and
@@ -1393,72 +1394,23 @@ impl<'a> Decoder<'a> {
         let modes = component_upsampling(frame);
         let stride = w * bpp;
         let mut out = zeroed_arc(stride * h);
-        let ncomp = scan_comps.len();
-        let mut sampled = vec![vec![0u8; w]; ncomp];
+        let mut sampled = vec![vec![0u8; w]; scan_comps.len()];
 
-        let mut preds = [0i32; 4];
-        let mut to_restart = self.restart_interval;
-        let mut scratch = [0i16; 64];
-        let mut fbuf = [0f32; 64];
+        let mut blocks = StreamBlocks {
+            tables,
+            dqs,
+            preds: [0i32; 4],
+            to_restart: self.restart_interval,
+            restart_interval: self.restart_interval,
+            scratch: [0i16; 64],
+            fbuf: [0f32; 64],
+        };
 
         for my in 0..mcus_y {
             if self.limits.is_cancelled() {
                 return Err(ImageError::Cancelled);
             }
-            for mx in 0..mcus_x {
-                if self.restart_interval > 0 {
-                    if to_restart == 0 {
-                        reader.restart();
-                        preds = [0; 4];
-                        to_restart = self.restart_interval;
-                    }
-                    to_restart -= 1;
-                }
-                for (si, sc) in scan_comps.iter().enumerate() {
-                    let c = &frame.comps[sc.comp];
-                    let (dc, ac) = tables[si];
-                    let dq = &dqs[si];
-                    let band = &mut bands[si];
-                    let bstride = c.bw * dct;
-                    for by in 0..c.v {
-                        for bx in 0..c.h {
-                            scratch.fill(0);
-                            let any_ac = decode_block_sequential(
-                                reader,
-                                dc,
-                                ac,
-                                &mut preds[si],
-                                &mut scratch,
-                            );
-                            let base = (by * dct) * bstride + (mx * c.h + bx) * dct;
-                            if any_ac {
-                                if dct == 8 {
-                                    idct_block(&scratch, dq, &mut fbuf);
-                                    store_band_block(&fbuf, band, base, bstride);
-                                } else if dct == 1 {
-                                    // The block mean is the DC term; no IDCT.
-                                    band[base] =
-                                        (scratch[0] as f32 * dq[0] + 128.5).clamp(0.0, 255.0) as u8;
-                                } else {
-                                    idct_block(&scratch, dq, &mut fbuf);
-                                    let mut small = [0f32; 64];
-                                    reduce_block(&fbuf, dct, &mut small);
-                                    store_band_block_scaled(&small, dct, band, base, bstride);
-                                }
-                            } else {
-                                // DC-only block: the IDCT is the same constant at
-                                // every sample (= coeffs[0]·dequant[0]); fill the
-                                // 8×8 band region directly, skipping IDCT + store.
-                                let byte =
-                                    (scratch[0] as f32 * dq[0] + 128.5).clamp(0.0, 255.0) as u8;
-                                for yy in 0..dct {
-                                    band[base + yy * bstride..base + yy * bstride + dct].fill(byte);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            blocks.decode_mcu_row(reader, frame, scan_comps, &mut bands);
 
             if my == 0 {
                 std::mem::swap(&mut previous_bands, &mut bands);
@@ -1480,12 +1432,7 @@ impl<'a> Decoder<'a> {
                 unique_arc_mut(&mut out),
                 stride,
             );
-            for si in 0..ncomp {
-                let c = &frame.comps[scan_comps[si].comp];
-                let bstride = c.bw * dct;
-                let start = previous_bands[si].len() - bstride;
-                above_tail[si].copy_from_slice(&previous_bands[si][start..]);
-            }
+            save_band_tails(frame, scan_comps, &previous_bands, &mut above_tail);
             std::mem::swap(&mut previous_bands, &mut bands);
         }
 
@@ -1580,6 +1527,7 @@ impl<'a> Decoder<'a> {
         let c = &mut frame.comps[sc.comp];
         let (bw, bw_used, bh_used) = (c.bw, c.bw_used.max(1), c.bh_used);
         let coeffs = &mut c.coeffs;
+        let band = AcBand { ss, se, al };
         let mut eob_run: u32 = 0;
         let mut to_restart = self.restart_interval;
 
@@ -1604,90 +1552,9 @@ impl<'a> Decoder<'a> {
             let block = &mut coeffs[off..off + 64];
 
             if ah == 0 {
-                // AC first scan (T.81 G.1.2.2).
-                if eob_run > 0 {
-                    eob_run -= 1;
-                    continue;
-                }
-                let mut k = ss;
-                while k <= se {
-                    let rs = reader.decode(ac);
-                    let r = (rs >> 4) as usize;
-                    let s = rs & 15;
-                    if s == 0 {
-                        if r < 15 {
-                            eob_run = (1u32 << r) - 1;
-                            if r > 0 {
-                                eob_run += reader.read_bits(r as u8);
-                            }
-                            break;
-                        }
-                        k += 16; // ZRL
-                        continue;
-                    }
-                    k += r;
-                    if k > se {
-                        break; // corrupt run — tolerate
-                    }
-                    block[ZIGZAG_INV[k] as usize] = (extend(reader.read_bits(s), s) << al) as i16;
-                    k += 1;
-                }
+                decode_ac_first(reader, ac, block, band, &mut eob_run);
             } else {
-                // AC refinement (T.81 G.1.2.3; the libjpeg
-                // decode_mcu_AC_refine structure).
-                let p1 = 1i16 << al;
-                let m1 = -1i16 << al;
-                let mut k = ss;
-                if eob_run == 0 {
-                    while k <= se {
-                        let rs = reader.decode(ac);
-                        let mut r = (rs >> 4) as i32;
-                        let s = rs & 15;
-                        let mut new_val = 0i16;
-                        if s == 0 {
-                            if r < 15 {
-                                eob_run = 1u32 << r;
-                                if r > 0 {
-                                    eob_run += reader.read_bits(r as u8);
-                                }
-                                break;
-                            }
-                            // r == 15: pass over 16 zero-history coefficients.
-                        } else {
-                            // In a refinement scan the magnitude is one bit.
-                            new_val = if reader.read_bit() != 0 { p1 } else { m1 };
-                        }
-                        while k <= se {
-                            let coef = &mut block[ZIGZAG_INV[k] as usize];
-                            if *coef != 0 {
-                                if reader.read_bit() != 0 && (*coef & p1) == 0 {
-                                    *coef += if *coef >= 0 { p1 } else { m1 };
-                                }
-                            } else {
-                                if r == 0 {
-                                    if s != 0 {
-                                        *coef = new_val;
-                                    }
-                                    k += 1;
-                                    break;
-                                }
-                                r -= 1;
-                            }
-                            k += 1;
-                        }
-                    }
-                }
-                if eob_run > 0 {
-                    // Correction bits for the rest of the band.
-                    while k <= se {
-                        let coef = &mut block[ZIGZAG_INV[k] as usize];
-                        if *coef != 0 && reader.read_bit() != 0 && (*coef & p1) == 0 {
-                            *coef += if *coef >= 0 { p1 } else { m1 };
-                        }
-                        k += 1;
-                    }
-                    eob_run -= 1;
-                }
+                decode_ac_refine(reader, ac, block, band, &mut eob_run);
             }
         }
         Ok(())
@@ -1717,50 +1584,359 @@ impl<'a> Decoder<'a> {
             // coefficients + planes + output at once: 4.5·W·H bytes instead
             // of 7.5 for a 4:2:0 RGB image, 7 instead of 12 for 4:4:4.
             let coeffs = std::mem::take(&mut c.coeffs);
-            let raw = self.quant[c.tq].ok_or_else(|| err("missing quantization table"))?;
-            let mut dq = [0f32; 64];
-            for zig in 0..64 {
-                let pos = ZIGZAG_INV[zig] as usize;
-                dq[pos] =
-                    raw[zig] as f32 * AAN_SCALE_FACTORS[pos / 8] * AAN_SCALE_FACTORS[pos % 8] / 8.0;
-            }
-            let dct = frame.dct_size;
-            let pw = c.bw * dct;
-            let ph = c.bh * dct;
-            let mut plane = vec![0u8; pw * ph];
-            let mut block = [0f32; 64];
-            for brow in 0..c.bh {
-                if self.limits.is_cancelled() {
-                    return Err(ImageError::Cancelled);
-                }
-                for bcol in 0..c.bw {
-                    let off = (brow * c.bw + bcol) * 64;
-                    // `coeffs` is allocated as `bw * bh * 64`, so the block is
-                    // always present; take it as a fixed-size reference so the
-                    // AVX2 kernel's 64-element read is guaranteed by the type.
-                    let Some(coeff_block) = coeffs.get(off..).and_then(<[i16]>::first_chunk) else {
-                        continue;
-                    };
-                    idct_block(coeff_block, &dq, &mut block);
-                    let base = brow * dct * pw + bcol * dct;
-                    if dct == 8 {
-                        for (y, row) in block.chunks_exact(8).enumerate() {
-                            let dst = &mut plane[base + y * pw..base + y * pw + 8];
-                            for (d, &v) in dst.iter_mut().zip(row) {
-                                *d = (v + 128.5).clamp(0.0, 255.0) as u8;
-                            }
-                        }
-                    } else {
-                        let mut small = [0f32; 64];
-                        reduce_block(&block, dct, &mut small);
-                        store_band_block_scaled(&small, dct, &mut plane, base, pw);
-                    }
-                }
-            }
-            planes.push(plane);
+            let dq = self.dequant_table(c.tq)?;
+            planes.push(self.component_plane(c, &coeffs, &dq, frame.dct_size)?);
         }
 
         assemble(&frame, &planes, self.adobe_transform, self.saw_jfif)
+    }
+
+    /// IDCT one component's coefficient blocks into its sample plane
+    /// (`bw·dct` × `bh·dct`), checking for cancellation once per block row.
+    fn component_plane(
+        &self,
+        c: &Component,
+        coeffs: &[i16],
+        dq: &[f32; 64],
+        dct: usize,
+    ) -> Result<Vec<u8>, ImageError> {
+        let pw = c.bw * dct;
+        let ph = c.bh * dct;
+        let mut plane = vec![0u8; pw * ph];
+        let mut block = [0f32; 64];
+        for brow in 0..c.bh {
+            if self.limits.is_cancelled() {
+                return Err(ImageError::Cancelled);
+            }
+            for bcol in 0..c.bw {
+                let off = (brow * c.bw + bcol) * 64;
+                // `coeffs` is allocated as `bw * bh * 64`, so the block is
+                // always present; take it as a fixed-size reference so the
+                // AVX2 kernel's 64-element read is guaranteed by the type.
+                let Some(coeff_block) = coeffs.get(off..).and_then(<[i16]>::first_chunk) else {
+                    continue;
+                };
+                idct_block(coeff_block, dq, &mut block);
+                let base = brow * dct * pw + bcol * dct;
+                if dct == 8 {
+                    store_plane_block(&block, &mut plane, base, pw);
+                } else {
+                    let mut small = [0f32; 64];
+                    reduce_block(&block, dct, &mut small);
+                    store_band_block_scaled(&small, dct, &mut plane, base, pw);
+                }
+            }
+        }
+        Ok(plane)
+    }
+}
+
+/// The reusable state of a streaming sequential scan: resolved Huffman and
+/// dequantization tables per scan component, DC predictors, the restart
+/// countdown and the block scratch buffers.
+struct StreamBlocks<'t> {
+    tables: Vec<(&'t HuffTable, &'t HuffTable)>,
+    dqs: Vec<[f32; 64]>,
+    preds: [i32; 4],
+    to_restart: usize,
+    restart_interval: usize,
+    scratch: [i16; 64],
+    fbuf: [f32; 64],
+}
+
+impl StreamBlocks<'_> {
+    /// Entropy-decode and reconstruct one MCU row into the per-component
+    /// sample `bands`, resynchronizing at restart markers.
+    #[allow(
+        clippy::excessive_nesting,
+        reason = "the streaming baseline kernel: MCU, component, block row and block column are \
+                  the T.81 A.2.3 interleaved decode order, and the per-block IDCT/DC-fill dispatch \
+                  stays inline in the measured innermost loop"
+    )]
+    fn decode_mcu_row(
+        &mut self,
+        reader: &mut BitReader,
+        frame: &Frame,
+        scan_comps: &[ScanComp],
+        bands: &mut [Vec<u8>],
+    ) {
+        let StreamBlocks {
+            tables,
+            dqs,
+            preds,
+            to_restart,
+            restart_interval,
+            scratch,
+            fbuf,
+        } = self;
+        let dct = frame.dct_size;
+        for mx in 0..frame.mcus_x {
+            if *restart_interval > 0 {
+                if *to_restart == 0 {
+                    reader.restart();
+                    *preds = [0; 4];
+                    *to_restart = *restart_interval;
+                }
+                *to_restart -= 1;
+            }
+            for (si, sc) in scan_comps.iter().enumerate() {
+                let c = &frame.comps[sc.comp];
+                let (dc, ac) = tables[si];
+                let dq = &dqs[si];
+                let band = &mut bands[si];
+                let bstride = c.bw * dct;
+                for by in 0..c.v {
+                    for bx in 0..c.h {
+                        scratch.fill(0);
+                        let any_ac =
+                            decode_block_sequential(reader, dc, ac, &mut preds[si], scratch);
+                        let base = (by * dct) * bstride + (mx * c.h + bx) * dct;
+                        if any_ac {
+                            if dct == 8 {
+                                idct_block(scratch, dq, fbuf);
+                                store_band_block(fbuf, band, base, bstride);
+                            } else if dct == 1 {
+                                // The block mean is the DC term; no IDCT.
+                                band[base] =
+                                    (scratch[0] as f32 * dq[0] + 128.5).clamp(0.0, 255.0) as u8;
+                            } else {
+                                idct_block(scratch, dq, fbuf);
+                                let mut small = [0f32; 64];
+                                reduce_block(fbuf, dct, &mut small);
+                                store_band_block_scaled(&small, dct, band, base, bstride);
+                            }
+                        } else {
+                            // DC-only block: the IDCT is the same constant at
+                            // every sample (= coeffs[0]·dequant[0]); fill the
+                            // 8×8 band region directly, skipping IDCT + store.
+                            let byte = (scratch[0] as f32 * dq[0] + 128.5).clamp(0.0, 255.0) as u8;
+                            for yy in 0..dct {
+                                band[base + yy * bstride..base + yy * bstride + dct].fill(byte);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Emit the blocks of interleaved MCU `mcu` in scan order: each component's
+/// `h`×`v` blocks, row by row.
+#[inline]
+fn visit_interleaved_mcu(
+    geom: &ScanGeom,
+    mcu: usize,
+    reader: &mut BitReader,
+    f: &mut dyn FnMut(&mut BitReader, Event) -> Result<(), ImageError>,
+) -> Result<(), ImageError> {
+    let mcu_x = mcu % geom.mcus_x;
+    let mcu_y = mcu / geom.mcus_x;
+    for (si, g) in geom.comps.iter().enumerate() {
+        for by in 0..g.v {
+            for bx in 0..g.h {
+                let row = mcu_y * g.v + by;
+                let col = mcu_x * g.h + bx;
+                f(
+                    reader,
+                    Event::Block {
+                        si,
+                        ci: g.ci,
+                        off: (row * g.bw + col) * 64,
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Keep the last source row of every component's finished band as the
+/// lookbehind row for the band that follows.
+fn save_band_tails(
+    frame: &Frame,
+    scan_comps: &[ScanComp],
+    bands: &[Vec<u8>],
+    above_tail: &mut [Vec<u8>],
+) {
+    let dct = frame.dct_size;
+    for si in 0..scan_comps.len() {
+        let c = &frame.comps[scan_comps[si].comp];
+        let bstride = c.bw * dct;
+        let start = bands[si].len() - bstride;
+        above_tail[si].copy_from_slice(&bands[si][start..]);
+    }
+}
+
+/// Store a full 8×8 IDCT block into a component plane with the level shift.
+#[inline]
+fn store_plane_block(block: &[f32; 64], plane: &mut [u8], base: usize, pw: usize) {
+    for (y, row) in block.chunks_exact(8).enumerate() {
+        let dst = &mut plane[base + y * pw..base + y * pw + 8];
+        for (d, &v) in dst.iter_mut().zip(row) {
+            *d = (v + 128.5).clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// The spectral band and point transform of a progressive AC scan.
+#[derive(Clone, Copy)]
+struct AcBand {
+    ss: usize,
+    se: usize,
+    al: u8,
+}
+
+/// An EOBn run length (T.81 G.1.2.2): `2^r` plus `r` appended bits.
+#[inline]
+fn read_eob_run(reader: &mut BitReader, r: u8) -> u32 {
+    let mut run = 1u32 << r;
+    if r > 0 {
+        run += reader.read_bits(r);
+    }
+    run
+}
+
+/// AC first scan (T.81 G.1.2.2) of one block, or one more block of a
+/// pending EOB run.
+#[inline]
+fn decode_ac_first(
+    reader: &mut BitReader,
+    ac: &HuffTable,
+    block: &mut [i16],
+    band: AcBand,
+    eob_run: &mut u32,
+) {
+    if *eob_run > 0 {
+        *eob_run -= 1;
+        return;
+    }
+    let mut k = band.ss;
+    while k <= band.se {
+        let rs = reader.decode(ac);
+        let r = (rs >> 4) as usize;
+        let s = rs & 15;
+        if s == 0 {
+            if r < 15 {
+                // This block is the run's first; the rest are skipped.
+                *eob_run = read_eob_run(reader, r as u8) - 1;
+                break;
+            }
+            k += 16; // ZRL
+            continue;
+        }
+        k += r;
+        if k > band.se {
+            break; // corrupt run — tolerate
+        }
+        block[ZIGZAG_INV[k] as usize] = (extend(reader.read_bits(s), s) << band.al) as i16;
+        k += 1;
+    }
+}
+
+/// AC refinement (T.81 G.1.2.3; the libjpeg decode_mcu_AC_refine structure)
+/// of one block: its coded symbols unless an EOB run is pending, then the
+/// correction bits for the rest of the band while one is.
+#[inline]
+fn decode_ac_refine(
+    reader: &mut BitReader,
+    ac: &HuffTable,
+    block: &mut [i16],
+    band: AcBand,
+    eob_run: &mut u32,
+) {
+    let mut k = band.ss;
+    if *eob_run == 0 {
+        k = decode_ac_refine_symbols(reader, ac, block, band, eob_run);
+    }
+    if *eob_run > 0 {
+        // Correction bits for the rest of the band.
+        while k <= band.se {
+            let coef = &mut block[ZIGZAG_INV[k] as usize];
+            if *coef != 0 {
+                refine_nonzero(reader, coef, band.al);
+            }
+            k += 1;
+        }
+        *eob_run -= 1;
+    }
+}
+
+/// Decode refinement symbols from `band.ss` until the band ends or an EOB run
+/// starts (setting `eob_run`); returns the band position reached.
+#[inline]
+fn decode_ac_refine_symbols(
+    reader: &mut BitReader,
+    ac: &HuffTable,
+    block: &mut [i16],
+    band: AcBand,
+    eob_run: &mut u32,
+) -> usize {
+    let p1 = 1i16 << band.al;
+    let m1 = -1i16 << band.al;
+    let mut k = band.ss;
+    while k <= band.se {
+        let rs = reader.decode(ac);
+        let r = (rs >> 4) as i32;
+        let s = rs & 15;
+        if s == 0 && r < 15 {
+            *eob_run = read_eob_run(reader, r as u8);
+            break;
+        }
+        // s == 0 with r == 15: pass over 16 zero-history coefficients.
+        // Otherwise, in a refinement scan the magnitude is one bit.
+        let new_val = if s == 0 {
+            None
+        } else if reader.read_bit() != 0 {
+            Some(p1)
+        } else {
+            Some(m1)
+        };
+        k = refine_zero_run(reader, block, band, k, r, new_val);
+    }
+    k
+}
+
+/// From band position `k`, refine every nonzero-history coefficient with one
+/// correction bit while skipping `r` zero-history ones; the next zero-history
+/// coefficient receives `new_val` (if any). Returns the position after it, or
+/// past the band.
+#[inline]
+fn refine_zero_run(
+    reader: &mut BitReader,
+    block: &mut [i16],
+    band: AcBand,
+    mut k: usize,
+    mut r: i32,
+    new_val: Option<i16>,
+) -> usize {
+    while k <= band.se {
+        let coef = &mut block[ZIGZAG_INV[k] as usize];
+        if *coef != 0 {
+            refine_nonzero(reader, coef, band.al);
+            k += 1;
+            continue;
+        }
+        if r == 0 {
+            if let Some(v) = new_val {
+                *coef = v;
+            }
+            return k + 1;
+        }
+        r -= 1;
+        k += 1;
+    }
+    k
+}
+
+/// Apply one correction bit to a coefficient with nonzero history: if the
+/// bit is set and this bit plane is still clear, grow its magnitude by it.
+#[inline]
+fn refine_nonzero(reader: &mut BitReader, coef: &mut i16, al: u8) {
+    let p1 = 1i16 << al;
+    let m1 = -1i16 << al;
+    if reader.read_bit() != 0 && (*coef & p1) == 0 {
+        *coef += if *coef >= 0 { p1 } else { m1 };
     }
 }
 
@@ -2038,16 +2214,23 @@ fn reduce_block(fbuf: &[f32; 64], dct_size: usize, out: &mut [f32; 64]) {
     let inv = 1.0 / (step * step) as f32;
     for oy in 0..dct_size {
         for ox in 0..dct_size {
-            let mut acc = 0.0f32;
-            for yy in 0..step {
-                let row = (oy * step + yy) * 8 + ox * step;
-                for xx in 0..step {
-                    acc += fbuf[row + xx];
-                }
-            }
-            out[oy * dct_size + ox] = acc * inv;
+            out[oy * dct_size + ox] = square_sum(fbuf, oy, ox, step) * inv;
         }
     }
+}
+
+/// Sum of the `step`×`step` square of `fbuf` at square position `(oy, ox)`,
+/// accumulated row by row.
+#[inline]
+fn square_sum(fbuf: &[f32; 64], oy: usize, ox: usize, step: usize) -> f32 {
+    let mut acc = 0.0f32;
+    for yy in 0..step {
+        let row = (oy * step + yy) * 8 + ox * step;
+        for xx in 0..step {
+            acc += fbuf[row + xx];
+        }
+    }
+    acc
 }
 
 /// Store a `dct_size` x `dct_size` reduced block into a sample band.
@@ -2829,17 +3012,14 @@ fn assemble_row(kind: RowKind, out_row: &mut [u8], w: usize, rows: &[&[u8]]) {
         RowKind::Rgb(is_rgb) => {
             let (r0, r1, r2) = (rows[0], rows[1], rows[2]);
             #[cfg(target_arch = "x86_64")]
-            if !is_rgb {
-                if is_x86_feature_detected!("avx2") {
-                    // SAFETY: guarded by the runtime AVX2 feature probe; every
-                    // component row has already been expanded to `w` samples.
-                    let done =
-                        unsafe { rgb_ycc_row_avx2(ChromaX::Identity, out_row, w, r0, r1, r2) };
-                    for x in done..w {
-                        store_three(out_row, x, r0[x], r1[x], r2[x], false);
-                    }
-                    return;
+            if !is_rgb && is_x86_feature_detected!("avx2") {
+                // SAFETY: guarded by the runtime AVX2 feature probe; every
+                // component row has already been expanded to `w` samples.
+                let done = unsafe { rgb_ycc_row_avx2(ChromaX::Identity, out_row, w, r0, r1, r2) };
+                for x in done..w {
+                    store_three(out_row, x, r0[x], r1[x], r2[x], false);
                 }
+                return;
             }
             for x in 0..w {
                 store_three(out_row, x, r0[x], r1[x], r2[x], is_rgb);
@@ -2853,6 +3033,21 @@ fn assemble_row(kind: RowKind, out_row: &mut [u8], w: usize, rows: &[&[u8]]) {
                 out_row[dst..dst + 4].copy_from_slice(&px);
             }
         }
+    }
+}
+
+/// The second source row vertical fancy upsampling blends with row `sy` for
+/// output row `y`: the row above for an even `y`, the row below for an odd
+/// one (clamped to the plane). `sy` itself for modes with no vertical context.
+#[inline]
+fn far_source_row(mode: Upsample, y: usize, sy: usize, source_h: usize) -> usize {
+    if !mode.needs_vertical_context() {
+        return sy;
+    }
+    if y & 1 == 0 {
+        sy.saturating_sub(1)
+    } else {
+        (sy + 1).min(source_h - 1)
     }
 }
 
@@ -2916,15 +3111,7 @@ fn emit_stream_band(
             let band_rows = c.v * dct;
             let band_start = my * band_rows;
             let sy = (y * c.v / frame.vmax).min(source_h - 1);
-            let far_sy = if modes[ci].needs_vertical_context() {
-                if y & 1 == 0 {
-                    sy.saturating_sub(1)
-                } else {
-                    (sy + 1).min(source_h - 1)
-                }
-            } else {
-                sy
-            };
+            let far_sy = far_source_row(modes[ci], y, sy, source_h);
             let below = below_bands.map(|next| next[si].as_slice());
             let near = stream_source_row(
                 sy,
@@ -3003,15 +3190,7 @@ fn assemble(
             let c = &frame.comps[ci];
             let (source_w, source_h, source_stride) = geom[ci];
             let sy = (y * c.v / frame.vmax).min(source_h - 1);
-            let far_sy = if modes[ci].needs_vertical_context() {
-                if y & 1 == 0 {
-                    sy.saturating_sub(1)
-                } else {
-                    (sy + 1).min(source_h - 1)
-                }
-            } else {
-                sy
-            };
+            let far_sy = far_source_row(modes[ci], y, sy, source_h);
             let near = &planes[ci][sy * source_stride..(sy + 1) * source_stride];
             let far = &planes[ci][far_sy * source_stride..(far_sy + 1) * source_stride];
             upsample_component_row(
@@ -3315,6 +3494,63 @@ mod entropy_tests {
         (r.pos - stuffed) * 8 - r.count as usize
     }
 
+    /// Random entropy-coded bytes for one trial: stuffed `0xFF 0x00` pairs,
+    /// and on every third trial an EOI marker somewhere in the second half.
+    fn random_scan_data(rng: &mut Rng, trial: u32) -> Vec<u8> {
+        let len = 64 + rng.below(4096) as usize;
+        let mut data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+        // Stuffed bytes, and sometimes a marker part-way or at the end.
+        for i in 0..data.len() - 1 {
+            if data[i] == 0xFF && rng.below(4) != 0 {
+                data[i + 1] = 0x00;
+            }
+        }
+        if trial % 3 == 0 {
+            let at = data.len() / 2 + rng.below(data.len() as u64 / 2) as usize;
+            if at + 1 < data.len() {
+                data[at] = 0xFF;
+                data[at + 1] = 0xD9;
+            }
+        }
+        data
+    }
+
+    /// Decode `data` block by block with both decoders and require identical
+    /// coefficients, flags, predictions and (before any marker) bit counts.
+    fn assert_decoders_agree(trial: u32, dc: &HuffTable, ac: &HuffTable, data: &[u8]) {
+        let mut fast = BitReader::new(data, 0);
+        let mut slow = BitReader::new(data, 0);
+        let (mut pred_fast, mut pred_slow) = (0i32, 0i32);
+        let mut blocks = 0;
+        let mut past_marker = 0;
+        while blocks < 4000 {
+            let mut a = [0i16; 64];
+            let mut b = [0i16; 64];
+            let any_a = decode_block_sequential(&mut fast, dc, ac, &mut pred_fast, &mut a);
+            let any_b = decode_block_reference(&mut slow, dc, ac, &mut pred_slow, &mut b);
+            assert_eq!(a, b, "trial {trial} block {blocks}: coefficients");
+            assert_eq!(any_a, any_b, "trial {trial} block {blocks}: any_ac");
+            assert_eq!(pred_fast, pred_slow, "trial {trial} block {blocks}: pred");
+            // The two readers refill at different moments (per symbol vs
+            // per bit), so one may touch a marker a few bytes before the
+            // other; bit positions are compared only while neither has.
+            if !fast.hit_marker && !slow.hit_marker {
+                assert_eq!(
+                    consumed(&fast),
+                    consumed(&slow),
+                    "trial {trial} block {blocks}: bits"
+                );
+            } else {
+                // Run a few more blocks into the zero padding, then stop.
+                past_marker += 1;
+                if past_marker > 8 {
+                    break;
+                }
+            }
+            blocks += 1;
+        }
+    }
+
     /// The lookahead decoder (10-bit symbol table plus the combined
     /// run/coefficient table) must produce the same coefficients, the same
     /// DC prediction, the same `any_ac` flag and consume the same bits as the
@@ -3326,52 +3562,8 @@ mod entropy_tests {
         for trial in 0..400 {
             let dc = random_table(&mut rng);
             let ac = random_table(&mut rng);
-            let len = 64 + rng.below(4096) as usize;
-            let mut data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
-            // Stuffed bytes, and sometimes a marker part-way or at the end.
-            for i in 0..data.len() - 1 {
-                if data[i] == 0xFF && rng.below(4) != 0 {
-                    data[i + 1] = 0x00;
-                }
-            }
-            if trial % 3 == 0 {
-                let at = data.len() / 2 + rng.below(data.len() as u64 / 2) as usize;
-                if at + 1 < data.len() {
-                    data[at] = 0xFF;
-                    data[at + 1] = 0xD9;
-                }
-            }
-            let mut fast = BitReader::new(&data, 0);
-            let mut slow = BitReader::new(&data, 0);
-            let (mut pred_fast, mut pred_slow) = (0i32, 0i32);
-            let mut blocks = 0;
-            let mut past_marker = 0;
-            while blocks < 4000 {
-                let mut a = [0i16; 64];
-                let mut b = [0i16; 64];
-                let any_a = decode_block_sequential(&mut fast, &dc, &ac, &mut pred_fast, &mut a);
-                let any_b = decode_block_reference(&mut slow, &dc, &ac, &mut pred_slow, &mut b);
-                assert_eq!(a, b, "trial {trial} block {blocks}: coefficients");
-                assert_eq!(any_a, any_b, "trial {trial} block {blocks}: any_ac");
-                assert_eq!(pred_fast, pred_slow, "trial {trial} block {blocks}: pred");
-                // The two readers refill at different moments (per symbol vs
-                // per bit), so one may touch a marker a few bytes before the
-                // other; bit positions are compared only while neither has.
-                if !fast.hit_marker && !slow.hit_marker {
-                    assert_eq!(
-                        consumed(&fast),
-                        consumed(&slow),
-                        "trial {trial} block {blocks}: bits"
-                    );
-                } else {
-                    // Run a few more blocks into the zero padding, then stop.
-                    past_marker += 1;
-                    if past_marker > 8 {
-                        break;
-                    }
-                }
-                blocks += 1;
-            }
+            let data = random_scan_data(&mut rng, trial);
+            assert_decoders_agree(trial, &dc, &ac, &data);
         }
     }
 

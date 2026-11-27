@@ -327,48 +327,68 @@ fn fill_polygon(
 ) {
     for y in 0..h {
         let yc = y as f64 + 0.5;
-        let mut crossings: Vec<(f64, i32)> = Vec::new();
-        for sp in subpaths {
-            let len = sp.len();
-            if len < 2 {
+        let crossings = scanline_crossings(subpaths, yc);
+        fill_scanline(px, w, y, crossings, color, even_odd);
+    }
+}
+
+/// Where the closed subpaths cross the horizontal line `y = yc`, with each
+/// edge's winding direction, sorted by x.
+fn scanline_crossings(subpaths: &[Vec<Point>], yc: f64) -> Vec<(f64, i32)> {
+    let mut crossings: Vec<(f64, i32)> = Vec::new();
+    for sp in subpaths {
+        let len = sp.len();
+        if len < 2 {
+            continue;
+        }
+        for i in 0..len {
+            let a = sp[i];
+            let bpt = sp[(i + 1) % len];
+            let (y0, y1) = (a.y, bpt.y);
+            if !((y0 <= yc && y1 > yc) || (y1 <= yc && y0 > yc)) {
                 continue;
             }
-            for i in 0..len {
-                let a = sp[i];
-                let bpt = sp[(i + 1) % len];
-                let (y0, y1) = (a.y, bpt.y);
-                if (y0 <= yc && y1 > yc) || (y1 <= yc && y0 > yc) {
-                    let t = (yc - y0) / (y1 - y0);
-                    let x = a.x + t * (bpt.x - a.x);
-                    crossings.push((x, if y1 > y0 { 1 } else { -1 }));
-                }
+            let t = (yc - y0) / (y1 - y0);
+            let x = a.x + t * (bpt.x - a.x);
+            crossings.push((x, if y1 > y0 { 1 } else { -1 }));
+        }
+    }
+    crossings.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    crossings
+}
+
+/// Paint the inside spans of pixel row `y` from its sorted crossings.
+fn fill_scanline(
+    px: &mut [[u8; 4]],
+    w: usize,
+    y: usize,
+    crossings: Vec<(f64, i32)>,
+    color: [u8; 4],
+    even_odd: bool,
+) {
+    let mut span = |x0: f64, x1: f64| {
+        let start = x0.round().max(0.0) as usize;
+        let end = (x1.round() as i64).clamp(0, w as i64) as usize;
+        for x in start..end.min(w) {
+            px[y * w + x] = color;
+        }
+    };
+    if even_odd {
+        for pair in crossings.chunks(2) {
+            if let [a, b] = pair {
+                span(a.0, b.0);
             }
         }
-        crossings.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        let mut span = |x0: f64, x1: f64| {
-            let start = x0.round().max(0.0) as usize;
-            let end = (x1.round() as i64).clamp(0, w as i64) as usize;
-            for x in start..end.min(w) {
-                px[y * w + x] = color;
-            }
-        };
-        if even_odd {
-            for pair in crossings.chunks(2) {
-                if let [a, b] = pair {
-                    span(a.0, b.0);
-                }
-            }
-        } else {
-            let mut wind = 0;
-            let mut start = 0.0;
-            for (x, dir) in crossings {
-                let prev = wind;
-                wind += dir;
-                if prev == 0 && wind != 0 {
-                    start = x;
-                } else if prev != 0 && wind == 0 {
-                    span(start, x);
-                }
+    } else {
+        let mut wind = 0;
+        let mut start = 0.0;
+        for (x, dir) in crossings {
+            let prev = wind;
+            wind += dir;
+            if prev == 0 && wind != 0 {
+                start = x;
+            } else if prev != 0 && wind == 0 {
+                span(start, x);
             }
         }
     }

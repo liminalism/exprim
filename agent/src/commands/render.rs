@@ -817,16 +817,19 @@ fn pack(page: &HostPage) -> Packed {
                 let row = &row[..width * 4];
                 match channels {
                     4 => pixels.extend_from_slice(row),
-                    3 => {
-                        for px in row.chunks_exact(4) {
-                            pixels.extend_from_slice(&px[..3]);
-                        }
-                    }
+                    3 => push_rgb(&mut pixels, row),
                     _ => pixels.extend(row.chunks_exact(4).map(|px| px[0])),
                 }
             }
             Packed { pixels, channels }
         }
+    }
+}
+
+/// Append an RGBA row's pixels without their alpha.
+fn push_rgb(pixels: &mut Vec<u8>, row: &[u8]) {
+    for px in row.chunks_exact(4) {
+        pixels.extend_from_slice(&px[..3]);
     }
 }
 
@@ -1185,15 +1188,27 @@ impl Packed3 {
         for (place, digit) in number.to_string().bytes().enumerate() {
             let glyph = DIGITS[usize::from(digit - b'0')];
             let origin = left + place as u32 * 12;
-            for (row, bits) in glyph.iter().enumerate() {
-                for column in 0..5u32 {
-                    if bits & (0x10 >> column) != 0 {
-                        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                            self.put(origin + column * 2 + dx, top + row as u32 * 2 + dy, INK);
-                        }
-                    }
+            self.draw_digit(origin, top, &glyph, INK);
+        }
+    }
+
+    /// Draw one 5x7 `glyph` at double size with its top-left corner at
+    /// (`left`, `top`).
+    fn draw_digit(&mut self, left: u32, top: u32, glyph: &[u8; 7], ink: [u8; 3]) {
+        for (row, bits) in glyph.iter().enumerate() {
+            for column in 0..5u32 {
+                if bits & (0x10 >> column) == 0 {
+                    continue;
                 }
+                self.put_dot(left + column * 2, top + row as u32 * 2, ink);
             }
+        }
+    }
+
+    /// One 2x2 digit dot with its top-left corner at (`x`, `y`).
+    fn put_dot(&mut self, x: u32, y: u32, ink: [u8; 3]) {
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            self.put(x + dx, y + dy, ink);
         }
     }
 }

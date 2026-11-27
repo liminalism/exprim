@@ -188,22 +188,8 @@ impl Outline {
                 let cur = old[s + i];
                 // Nearest distinct neighbors (wrap), so duplicated points do
                 // not produce zero-length edge normals.
-                let mut prev = cur;
-                for k in 1..n {
-                    let c = old[s + (i + n - k) % n];
-                    if c != cur {
-                        prev = c;
-                        break;
-                    }
-                }
-                let mut next = cur;
-                for k in 1..n {
-                    let c = old[s + (i + k) % n];
-                    if c != cur {
-                        next = c;
-                        break;
-                    }
-                }
+                let prev = nearest_distinct(&old[s..e], i, true);
+                let next = nearest_distinct(&old[s..e], i, false);
                 if prev == cur || next == cur {
                     continue; // degenerate contour of identical points
                 }
@@ -237,6 +223,26 @@ impl Outline {
             }
         }
     }
+}
+
+/// The point of closed contour `contour` nearest to index `i`, walking
+/// backward or forward with wrap-around, that differs from `contour[i]`;
+/// `contour[i]` itself when every point coincides with it.
+fn nearest_distinct(contour: &[[f32; 2]], i: usize, backward: bool) -> [f32; 2] {
+    let n = contour.len();
+    let cur = contour[i];
+    for k in 1..n {
+        let j = if backward {
+            (i + n - k) % n
+        } else {
+            (i + k) % n
+        };
+        let c = contour[j];
+        if c != cur {
+            return c;
+        }
+    }
+    cur
 }
 
 impl OutlinePen for Outline {
@@ -599,13 +605,15 @@ impl FontProgram {
         let index = self.name_index.get_or_init(|| {
             let mut map: std::collections::HashMap<Box<[u8]>, u32> =
                 std::collections::HashMap::new();
-            if let Some(font) = self.font_ref()
-                && let Ok(post) = font.post()
-            {
-                for gid in 0..self.num_glyphs {
-                    if let Some(n) = post.glyph_name(skrifa::raw::types::GlyphId16::new(gid)) {
-                        map.entry(n.as_bytes().into()).or_insert(gid as u32);
-                    }
+            let Some(font) = self.font_ref() else {
+                return map;
+            };
+            let Ok(post) = font.post() else {
+                return map;
+            };
+            for gid in 0..self.num_glyphs {
+                if let Some(n) = post.glyph_name(skrifa::raw::types::GlyphId16::new(gid)) {
+                    map.entry(n.as_bytes().into()).or_insert(gid as u32);
                 }
             }
             map
@@ -651,9 +659,7 @@ impl FontProgram {
     /// Microsoft (3,1) table, as found in pdf.js issue5701.
     fn native_byte_cmap_gid(&self, code: u8, prefer_mac: bool) -> Option<u32> {
         let data: &[u8] = &self.data;
-        let u16at = |o: usize| -> Option<u32> {
-            Some(((*data.get(o)? as u32) << 8) | *data.get(o + 1)? as u32)
-        };
+        let u16at = |o: usize| be_u16_at(data, o);
         let u32at = |o: usize| -> Option<u32> { Some((u16at(o)? << 16) | u16at(o + 2)?) };
         // Resolve the sfnt table directory (through a `ttcf` header for the
         // collection case).
@@ -692,18 +698,8 @@ impl FontProgram {
                     continue;
                 }
                 let sub = cmap + u32at(rec + 4)? as usize;
-                let gid = match u16at(sub)? {
-                    0 => *data.get(sub + 6 + code as usize)? as u32,
-                    6 => {
-                        let first = u16at(sub + 6)?;
-                        let count = u16at(sub + 8)?;
-                        let c = code as u32;
-                        if c < first || c >= first + count {
-                            continue;
-                        }
-                        u16at(sub + 10 + 2 * (c - first) as usize)?
-                    }
-                    _ => continue,
+                let Some(gid) = byte_subtable_gid(data, sub, code)? else {
+                    continue;
                 };
                 if gid != 0 {
                     return Some(gid);
@@ -727,6 +723,33 @@ impl FontProgram {
             .ok()?;
         if out.is_empty() { None } else { Some(out) }
     }
+}
+
+/// Big-endian `u16` at byte offset `o` of `data`, widened; `None` past the end.
+fn be_u16_at(data: &[u8], o: usize) -> Option<u32> {
+    Some(((*data.get(o)? as u32) << 8) | *data.get(o + 1)? as u32)
+}
+
+/// The glyph id `code` maps to in the cmap subtable at offset `sub`, if that
+/// subtable is format 0 or 6. `Some(None)` when it is another format or a
+/// format 6 table whose range misses `code`; `None` when a read runs past the
+/// end of the font, which abandons the whole lookup.
+fn byte_subtable_gid(data: &[u8], sub: usize, code: u8) -> Option<Option<u32>> {
+    let u16at = |o: usize| be_u16_at(data, o);
+    let gid = match u16at(sub)? {
+        0 => *data.get(sub + 6 + code as usize)? as u32,
+        6 => {
+            let first = u16at(sub + 6)?;
+            let count = u16at(sub + 8)?;
+            let c = code as u32;
+            if c < first || c >= first + count {
+                return Some(None);
+            }
+            u16at(sub + 10 + 2 * (c - first) as usize)?
+        }
+        _ => return Some(None),
+    };
+    Some(Some(gid))
 }
 
 /// Prefer a non-private-use, lower codepoint when several map to one glyph.

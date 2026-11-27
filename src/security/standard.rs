@@ -459,47 +459,53 @@ impl StandardHandler {
             return None; // Unknown future revision.
         }
         for pwd in candidate_encodings(password) {
-            if v5 {
-                if let Some(key) = derive_file_key_v5(enc, &pwd) {
-                    return Some((
-                        Self {
-                            key,
-                            cipher: Cipher::Aes256,
-                        },
-                        PasswordRole::User,
-                    ));
-                }
-                if let Some(key) = derive_file_key_v5_owner(enc, &pwd) {
-                    return Some((
-                        Self {
-                            key,
-                            cipher: Cipher::Aes256,
-                        },
-                        PasswordRole::Owner,
-                    ));
-                }
-            } else {
-                if let Some(key) = check_user_password_r234(enc, &pwd) {
-                    return Some((
-                        Self {
-                            key,
-                            cipher: enc.cipher,
-                        },
-                        PasswordRole::User,
-                    ));
-                }
-                if let Some(key) = check_owner_password_r234(enc, &pwd) {
-                    return Some((
-                        Self {
-                            key,
-                            cipher: enc.cipher,
-                        },
-                        PasswordRole::Owner,
-                    ));
-                }
+            if let Some(found) = Self::authenticate(enc, v5, &pwd) {
+                return Some(found);
             }
         }
         None
+    }
+
+    /// Validate one encoding of the password: as the user password first,
+    /// then as the owner password (the owner check only runs when the user
+    /// check fails).
+    fn authenticate(enc: &EncryptDict, v5: bool, pwd: &[u8]) -> Option<(Self, PasswordRole)> {
+        if v5 {
+            if let Some(key) = derive_file_key_v5(enc, pwd) {
+                return Some((
+                    Self {
+                        key,
+                        cipher: Cipher::Aes256,
+                    },
+                    PasswordRole::User,
+                ));
+            }
+            let key = derive_file_key_v5_owner(enc, pwd)?;
+            return Some((
+                Self {
+                    key,
+                    cipher: Cipher::Aes256,
+                },
+                PasswordRole::Owner,
+            ));
+        }
+        if let Some(key) = check_user_password_r234(enc, pwd) {
+            return Some((
+                Self {
+                    key,
+                    cipher: enc.cipher,
+                },
+                PasswordRole::User,
+            ));
+        }
+        let key = check_owner_password_r234(enc, pwd)?;
+        Some((
+            Self {
+                key,
+                cipher: enc.cipher,
+            },
+            PasswordRole::Owner,
+        ))
     }
 
     /// The `/U` entry a conforming writer would store for `password`

@@ -191,47 +191,70 @@ fn scheduled_renders_match_cold_renders_at_any_worker_count_and_order() {
     let reverse: Vec<usize> = forward.iter().rev().copied().collect();
     for workers in [1usize, 2, 4] {
         for (order_name, order) in [("forward", &forward), ("reverse", &reverse)] {
-            for repeat in 0..2 {
-                let backend: Arc<dyn RenderBackend> = Arc::new(CpuBackend::default());
-                let scheduler = RenderScheduler::new(
-                    backend,
-                    SchedulerOptions {
-                        compile_workers: workers,
-                        render_workers: workers,
-                        reorder_window_depth: SchedulerOptions::reorder_window_for(
-                            workers, workers,
-                        ),
-                        ..SchedulerOptions::default()
-                    },
-                );
-                let make_request = |snapshot: &DocumentSnapshot, position: PageIndex| {
-                    let (page, dim) = items[order[position.0 as usize]];
-                    request(snapshot, page, dim)
-                };
-                let mut got = vec![None; items.len()];
-                scheduler.render_range(
-                    &snapshot,
-                    0..items.len() as u32,
-                    &make_request,
-                    None,
-                    &mut |output| {
-                        let item = order[output.page.0 as usize];
-                        let page = output.result.expect("render");
-                        let RenderedPage::Host(host) = page else {
-                            panic!("host residency was requested");
-                        };
-                        got[item] = Some(hash(&host));
-                    },
-                );
-                for (item, (&(page, dim), want)) in items.iter().zip(&cold).enumerate() {
-                    assert_eq!(
-                        got[item],
-                        Some(*want),
-                        "page {page} at {dim} px differs from its cold render \
-                         ({workers} workers, {order_name} order, repeat {repeat})"
-                    );
-                }
-            }
+            assert_scheduled_matches_cold(&snapshot, &items, &cold, workers, order_name, order);
         }
     }
+}
+
+/// Render the items through the scheduler twice in `order` and require each
+/// hash to equal its cold render.
+fn assert_scheduled_matches_cold(
+    snapshot: &DocumentSnapshot,
+    items: &[(u32, u32)],
+    cold: &[u64],
+    workers: usize,
+    order_name: &str,
+    order: &[usize],
+) {
+    for repeat in 0..2 {
+        let got = render_scheduled(snapshot, items, order, workers);
+        for (item, (&(page, dim), want)) in items.iter().zip(cold).enumerate() {
+            assert_eq!(
+                got[item],
+                Some(*want),
+                "page {page} at {dim} px differs from its cold render \
+                 ({workers} workers, {order_name} order, repeat {repeat})"
+            );
+        }
+    }
+}
+
+/// Render every item through a fresh scheduler with `workers` compile and
+/// render workers, submitting them in `order`; each item's hash, by item.
+fn render_scheduled(
+    snapshot: &DocumentSnapshot,
+    items: &[(u32, u32)],
+    order: &[usize],
+    workers: usize,
+) -> Vec<Option<u64>> {
+    let backend: Arc<dyn RenderBackend> = Arc::new(CpuBackend::default());
+    let scheduler = RenderScheduler::new(
+        backend,
+        SchedulerOptions {
+            compile_workers: workers,
+            render_workers: workers,
+            reorder_window_depth: SchedulerOptions::reorder_window_for(workers, workers),
+            ..SchedulerOptions::default()
+        },
+    );
+    let make_request = |snapshot: &DocumentSnapshot, position: PageIndex| {
+        let (page, dim) = items[order[position.0 as usize]];
+        request(snapshot, page, dim)
+    };
+    let mut got = vec![None; items.len()];
+    scheduler.render_range(
+        snapshot,
+        0..items.len() as u32,
+        &make_request,
+        None,
+        &mut |output| {
+            let item = order[output.page.0 as usize];
+            let page = output.result.expect("render");
+            let RenderedPage::Host(host) = page else {
+                panic!("host residency was requested");
+            };
+            got[item] = Some(hash(&host));
+        },
+    );
+    got
 }

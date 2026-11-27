@@ -62,43 +62,65 @@ pub fn ordered<T, S, R>(
         for _ in 0..workers.min(items.len()) {
             let sender = sender.clone();
             let (next, stop, init, work) = (&next, &stop, &init, &work);
-            scope.spawn(move || {
-                let mut state = init();
-                loop {
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let index = next.fetch_add(1, Ordering::AcqRel);
-                    let Some(item) = items.get(index) else {
-                        break;
-                    };
-                    let result = work(&mut state, index, item);
-                    if sender.send((index, result)).is_err() {
-                        break;
-                    }
-                }
-            });
+            scope.spawn(move || run_worker(items, next, stop, init, work, sender));
         }
         // Only the workers hold senders now: the channel closes when the
         // last of them finishes.
         drop(sender);
 
-        let mut waiting: BTreeMap<usize, R> = BTreeMap::new();
-        let mut due = 0usize;
-        'receive: for (index, result) in &receiver {
-            waiting.insert(index, result);
-            while let Some(result) = waiting.remove(&due) {
-                let item = &items[due];
-                due += 1;
-                if deliver(due - 1, item, result).is_break() {
-                    stop.store(true, Ordering::Release);
-                    break 'receive;
-                }
-            }
-        }
+        deliver_in_order(items, &receiver, &stop, &mut deliver);
         // Dropping the receiver unblocks any worker still sending.
         drop(receiver);
     });
+}
+
+/// One worker: claim the next unclaimed item until none remain or the run
+/// stops, sending each result back with its index.
+fn run_worker<T, S, R>(
+    items: &[T],
+    next: &AtomicUsize,
+    stop: &AtomicBool,
+    init: &(impl Fn() -> S + Sync),
+    work: &(impl Fn(&mut S, usize, &T) -> R + Sync),
+    sender: mpsc::Sender<(usize, R)>,
+) {
+    let mut state = init();
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let index = next.fetch_add(1, Ordering::AcqRel);
+        let Some(item) = items.get(index) else {
+            break;
+        };
+        let result = work(&mut state, index, item);
+        if sender.send((index, result)).is_err() {
+            break;
+        }
+    }
+}
+
+/// Hand results to `deliver` in input order as they arrive, holding back
+/// any that come early. On `Break`, tell the workers to stop and return.
+fn deliver_in_order<T, R>(
+    items: &[T],
+    receiver: &mpsc::Receiver<(usize, R)>,
+    stop: &AtomicBool,
+    deliver: &mut impl FnMut(usize, &T, R) -> ControlFlow<()>,
+) {
+    let mut waiting: BTreeMap<usize, R> = BTreeMap::new();
+    let mut due = 0usize;
+    for (index, result) in receiver {
+        waiting.insert(index, result);
+        while let Some(result) = waiting.remove(&due) {
+            let item = &items[due];
+            due += 1;
+            if deliver(due - 1, item, result).is_break() {
+                stop.store(true, Ordering::Release);
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

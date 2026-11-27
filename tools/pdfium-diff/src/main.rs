@@ -30,7 +30,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use compare::{compare, write_triptych, Diff};
+use compare::{Diff, compare, write_triptych};
 use exprim::document::{DocumentLimits, DocumentSnapshot, PageIndex, ParseContext};
 use exprim::page_ir::{DeviceSize, Matrix};
 use exprim::render_api::{
@@ -42,9 +42,9 @@ use exprim::render_scheduler::{PipelineOutput, RenderScheduler, SchedulerOptions
 use exprim::source::{OwnedBytesSource, PdfSource};
 
 #[cfg(feature = "bench-profiling")]
-use std::hash::{Hash, Hasher};
-#[cfg(feature = "bench-profiling")]
 use exprim::source::MmapSource;
+#[cfg(feature = "bench-profiling")]
+use std::hash::{Hash, Hasher};
 
 /// Pages sampled per document, spread across it.
 const SAMPLE: usize = 6;
@@ -247,7 +247,9 @@ fn main() {
         eprintln!("       pdfium-diff --count <file.pdf|dir>…   (enumerate, no render)");
         eprintln!("       pdfium-diff bench <file.pdf> [scale] [per_page_n]");
         eprintln!("       pdfium-diff bench <libpdfium.dll> <file.pdf> [scale] [per_page_n]");
-        eprintln!("       pdfium-diff profile <scale> <file.pdf> [page] [runs] [out.jsonl]   (needs --features bench-profiling)");
+        eprintln!(
+            "       pdfium-diff profile <scale> <file.pdf> [page] [runs] [out.jsonl]   (needs --features bench-profiling)"
+        );
         eprintln!(
             "       pdfium-diff pipeline-profile <scale> <file.pdf> [runs] [out.jsonl] [compile-workers] [render-workers]"
         );
@@ -340,8 +342,6 @@ fn supervise_diff(lib: &Path, scale: f64, files: Vec<PathBuf>, out_dir: PathBuf)
     };
     let total = files.len();
     let mut skipped = 0usize;
-    let mut crashed = 0usize;
-    let mut timed_out = 0usize;
 
     // Per-FILE progress cap (not per chunk): the watchdog restarts whenever
     // the worker's marker advances to the next file. Override with
@@ -382,180 +382,254 @@ fn supervise_diff(lib: &Path, scale: f64, files: Vec<PathBuf>, out_dir: PathBuf)
 
     let chunk_dir = out_dir.join("chunks");
     let _ = std::fs::create_dir_all(&chunk_dir);
-    let mut queue: std::collections::VecDeque<Vec<(PathBuf, String)>> =
+    let queue: std::collections::VecDeque<Vec<(PathBuf, String)>> =
         work.chunks(chunk_size).map(|c| c.to_vec()).collect();
 
-    struct Running {
-        child: std::process::Child,
-        chunk: Vec<(PathBuf, String)>,
-        manifest: PathBuf,
-        fragment: PathBuf,
-        marker: PathBuf,
-        last_marker: String,
-        last_progress: Instant,
-    }
-
-    let merge_fragment = |fragment: &Path| {
-        if let Ok(text) = std::fs::read_to_string(fragment) {
-            if !text.is_empty() {
-                if let Ok(mut csv) = std::fs::OpenOptions::new().append(true).open(&csv_path) {
-                    let _ = csv.write_all(text.as_bytes());
-                    let _ = csv.flush();
-                }
-            }
-        }
+    let mut pool = Pool {
+        exe,
+        lib,
+        scale,
+        out_dir: &out_dir,
+        chunk_dir: &chunk_dir,
+        csv_path: &csv_path,
+        queue,
+        running: Vec::new(),
+        seq: 0,
+        dispatched_files: 0,
+        crashed: 0,
+        timed_out: 0,
     };
-
-    let mut seq = 0usize;
-    let mut dispatched_files = 0usize;
-    let mut running: Vec<Running> = Vec::new();
     let mut last_report = Instant::now();
     loop {
-        // Fill the pool.
-        while running.len() < workers {
-            let Some(chunk) = queue.pop_front() else {
-                break;
-            };
-            seq += 1;
-            let manifest = chunk_dir.join(format!("chunk-{seq}.txt"));
-            let fragment = chunk_dir.join(format!("chunk-{seq}.csv"));
-            let marker = chunk_dir.join(format!("chunk-{seq}.cur"));
-            let mut lines = String::new();
-            for (file, skips) in &chunk {
-                lines.push_str(&file.display().to_string());
-                lines.push('\t');
-                lines.push_str(skips);
-                lines.push('\n');
-            }
-            let _ = std::fs::write(&manifest, lines);
-            let _ = std::fs::remove_file(&fragment);
-            let _ = std::fs::remove_file(&marker);
-            match Command::new(&exe)
-                .arg("--worker-chunk")
-                .arg(lib)
-                .arg(scale.to_string())
-                .arg(&out_dir)
-                .arg(&manifest)
-                .arg(&fragment)
-                .arg(&marker)
-                .spawn()
-            {
-                Ok(child) => {
-                    dispatched_files += chunk.len();
-                    running.push(Running {
-                        child,
-                        chunk,
-                        manifest,
-                        fragment,
-                        marker,
-                        last_marker: String::new(),
-                        last_progress: Instant::now(),
-                    });
-                }
-                Err(error) => {
-                    crashed += 1;
-                    eprintln!("could not start chunk worker ({error}); terminal-failing its files");
-                    for (file, _) in &chunk {
-                        append_terminal_failure(
-                            &csv_path,
-                            file,
-                            &format!("could not start worker: {error}"),
-                        );
-                    }
-                }
-            }
-        }
-        if running.is_empty() && queue.is_empty() {
+        pool.fill(workers);
+        if pool.running.is_empty() && pool.queue.is_empty() {
             break;
         }
         if last_report.elapsed() > Duration::from_secs(10) {
+            let Pool {
+                dispatched_files,
+                crashed,
+                timed_out,
+                ..
+            } = pool;
             eprintln!(
                 "[{dispatched_files}/{total}] {} workers busy; {} chunks queued; {crashed} failures; {timed_out} timeouts; {skipped} terminally skipped",
-                running.len(),
-                queue.len()
+                pool.running.len(),
+                pool.queue.len()
             );
             last_report = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(100));
-
-        let mut index = 0;
-        while index < running.len() {
-            let slot = &mut running[index];
-            let status = match slot.child.try_wait() {
-                Ok(Some(status)) => Some(Ok(status)),
-                Ok(None) => {
-                    // Per-file watchdog: progress = the marker advancing.
-                    let cur = std::fs::read_to_string(&slot.marker).unwrap_or_default();
-                    if cur != slot.last_marker {
-                        slot.last_marker = cur;
-                        slot.last_progress = Instant::now();
-                        None
-                    } else if slot.last_progress.elapsed() >= worker_timeout {
-                        let _ = slot.child.kill();
-                        let _ = slot.child.wait();
-                        Some(Err(format!(
-                            "worker timed out after {}s (killed)",
-                            worker_timeout.as_secs()
-                        )))
-                    } else {
-                        None
-                    }
-                }
-                Err(error) => {
-                    let _ = slot.child.kill();
-                    let _ = slot.child.wait();
-                    Some(Err(format!("waiting on worker failed: {error}")))
-                }
-            };
-            let Some(outcome) = status else {
-                index += 1;
-                continue;
-            };
-            let slot = running.swap_remove(index);
-            // Completed rows are kept whatever happened to the process.
-            merge_fragment(&slot.fragment);
-            match outcome {
-                Ok(status) if status.success() => {}
-                bad => {
-                    let reason = match bad {
-                        Ok(status) => {
-                            crashed += 1;
-                            format!("worker exited unsuccessfully ({status})")
-                        }
-                        Err(reason) => {
-                            timed_out += 1;
-                            reason
-                        }
-                    };
-                    // The marker names the in-flight file: terminal-row it,
-                    // requeue everything after it (files before it completed
-                    // and their rows were just merged).
-                    let marker = std::fs::read_to_string(&slot.marker).unwrap_or_default();
-                    let offender = slot
-                        .chunk
-                        .iter()
-                        .position(|(f, _)| f.display().to_string() == marker)
-                        .unwrap_or(0);
-                    let (file, _) = &slot.chunk[offender];
-                    append_terminal_failure(&csv_path, file, &reason);
-                    eprintln!("  {reason}; excising {}", file.display());
-                    dispatched_files -= slot.chunk.len() - offender;
-                    dispatched_files += 1;
-                    let rest: Vec<(PathBuf, String)> = slot.chunk[offender + 1..].to_vec();
-                    if !rest.is_empty() {
-                        queue.push_front(rest);
-                    }
-                }
-            }
-            let _ = std::fs::remove_file(&slot.manifest);
-            let _ = std::fs::remove_file(&slot.fragment);
-            let _ = std::fs::remove_file(&slot.marker);
-        }
+        pool.poll(worker_timeout);
     }
+    let Pool {
+        crashed, timed_out, ..
+    } = pool;
     let _ = std::fs::remove_dir(&chunk_dir);
     eprintln!(
         "controller complete: {total} files; {crashed} worker failures; {timed_out} timeouts; {skipped} terminally skipped"
     );
+}
+
+/// One chunk worker process and what it was given.
+struct Running {
+    child: std::process::Child,
+    chunk: Vec<(PathBuf, String)>,
+    manifest: PathBuf,
+    fragment: PathBuf,
+    marker: PathBuf,
+    last_marker: String,
+    last_progress: Instant,
+}
+
+/// The chunk-worker pool of a supervised diff: the chunks still queued, the
+/// workers running, and the tallies its progress lines report.
+struct Pool<'a> {
+    exe: PathBuf,
+    lib: &'a Path,
+    scale: f64,
+    out_dir: &'a Path,
+    chunk_dir: &'a Path,
+    csv_path: &'a Path,
+    queue: std::collections::VecDeque<Vec<(PathBuf, String)>>,
+    running: Vec<Running>,
+    seq: usize,
+    dispatched_files: usize,
+    crashed: usize,
+    timed_out: usize,
+}
+
+impl Pool<'_> {
+    /// Start queued chunks until `workers` are running or the queue is empty.
+    fn fill(&mut self, workers: usize) {
+        while self.running.len() < workers {
+            let Some(chunk) = self.queue.pop_front() else {
+                break;
+            };
+            self.start(chunk);
+        }
+    }
+
+    /// Write a chunk's manifest and spawn a worker on it. A worker that
+    /// cannot start terminal-fails every file of its chunk.
+    fn start(&mut self, chunk: Vec<(PathBuf, String)>) {
+        self.seq += 1;
+        let seq = self.seq;
+        let manifest = self.chunk_dir.join(format!("chunk-{seq}.txt"));
+        let fragment = self.chunk_dir.join(format!("chunk-{seq}.csv"));
+        let marker = self.chunk_dir.join(format!("chunk-{seq}.cur"));
+        let mut lines = String::new();
+        for (file, skips) in &chunk {
+            lines.push_str(&file.display().to_string());
+            lines.push('\t');
+            lines.push_str(skips);
+            lines.push('\n');
+        }
+        let _ = std::fs::write(&manifest, lines);
+        let _ = std::fs::remove_file(&fragment);
+        let _ = std::fs::remove_file(&marker);
+        match Command::new(&self.exe)
+            .arg("--worker-chunk")
+            .arg(self.lib)
+            .arg(self.scale.to_string())
+            .arg(self.out_dir)
+            .arg(&manifest)
+            .arg(&fragment)
+            .arg(&marker)
+            .spawn()
+        {
+            Ok(child) => {
+                self.dispatched_files += chunk.len();
+                self.running.push(Running {
+                    child,
+                    chunk,
+                    manifest,
+                    fragment,
+                    marker,
+                    last_marker: String::new(),
+                    last_progress: Instant::now(),
+                });
+            }
+            Err(error) => {
+                self.crashed += 1;
+                eprintln!("could not start chunk worker ({error}); terminal-failing its files");
+                for (file, _) in &chunk {
+                    append_terminal_failure(
+                        self.csv_path,
+                        file,
+                        &format!("could not start worker: {error}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Retire every worker that has finished, failed or stalled.
+    fn poll(&mut self, worker_timeout: Duration) {
+        let mut index = 0;
+        while index < self.running.len() {
+            let Some(outcome) = poll_worker(&mut self.running[index], worker_timeout) else {
+                index += 1;
+                continue;
+            };
+            let slot = self.running.swap_remove(index);
+            self.retire(slot, outcome);
+        }
+    }
+
+    /// Merge a finished worker's rows; on failure, excise the file it was on
+    /// and requeue the rest of its chunk. Its scratch files are removed.
+    fn retire(&mut self, slot: Running, outcome: Result<std::process::ExitStatus, String>) {
+        // Completed rows are kept whatever happened to the process.
+        merge_fragment(&slot.fragment, self.csv_path);
+        let failure = match outcome {
+            Ok(status) if status.success() => None,
+            Ok(status) => {
+                self.crashed += 1;
+                Some(format!("worker exited unsuccessfully ({status})"))
+            }
+            Err(reason) => {
+                self.timed_out += 1;
+                Some(reason)
+            }
+        };
+        if let Some(reason) = failure {
+            self.excise(&slot, &reason);
+        }
+        let _ = std::fs::remove_file(&slot.manifest);
+        let _ = std::fs::remove_file(&slot.fragment);
+        let _ = std::fs::remove_file(&slot.marker);
+    }
+
+    /// The marker names the in-flight file: terminal-row it, requeue
+    /// everything after it (files before it completed and their rows were
+    /// just merged).
+    fn excise(&mut self, slot: &Running, reason: &str) {
+        let marker = std::fs::read_to_string(&slot.marker).unwrap_or_default();
+        let offender = slot
+            .chunk
+            .iter()
+            .position(|(f, _)| f.display().to_string() == marker)
+            .unwrap_or(0);
+        let (file, _) = &slot.chunk[offender];
+        append_terminal_failure(self.csv_path, file, reason);
+        eprintln!("  {reason}; excising {}", file.display());
+        self.dispatched_files -= slot.chunk.len() - offender;
+        self.dispatched_files += 1;
+        let rest: Vec<(PathBuf, String)> = slot.chunk[offender + 1..].to_vec();
+        if !rest.is_empty() {
+            self.queue.push_front(rest);
+        }
+    }
+}
+
+/// Whether a worker is done: its exit status, an error when it stalled
+/// past `worker_timeout` (killed) or could not be waited on, or `None`
+/// while it is still running. Progress is its marker advancing.
+fn poll_worker(
+    slot: &mut Running,
+    worker_timeout: Duration,
+) -> Option<Result<std::process::ExitStatus, String>> {
+    match slot.child.try_wait() {
+        Ok(Some(status)) => Some(Ok(status)),
+        Ok(None) => {
+            // Per-file watchdog: progress = the marker advancing.
+            let cur = std::fs::read_to_string(&slot.marker).unwrap_or_default();
+            if cur != slot.last_marker {
+                slot.last_marker = cur;
+                slot.last_progress = Instant::now();
+                None
+            } else if slot.last_progress.elapsed() >= worker_timeout {
+                let _ = slot.child.kill();
+                let _ = slot.child.wait();
+                Some(Err(format!(
+                    "worker timed out after {}s (killed)",
+                    worker_timeout.as_secs()
+                )))
+            } else {
+                None
+            }
+        }
+        Err(error) => {
+            let _ = slot.child.kill();
+            let _ = slot.child.wait();
+            Some(Err(format!("waiting on worker failed: {error}")))
+        }
+    }
+}
+
+/// Append a worker's CSV fragment, if it wrote any rows, to the run's CSV.
+fn merge_fragment(fragment: &Path, csv_path: &Path) {
+    let Ok(text) = std::fs::read_to_string(fragment) else {
+        return;
+    };
+    if text.is_empty() {
+        return;
+    }
+    if let Ok(mut csv) = std::fs::OpenOptions::new().append(true).open(csv_path) {
+        let _ = csv.write_all(text.as_bytes());
+        let _ = csv.flush();
+    }
 }
 
 /// The results.csv header. The trailing `flags=annot` token is a version
@@ -681,6 +755,37 @@ fn select_rerun_targets(csv: &Path, class: &str) -> Vec<PathBuf> {
     out
 }
 
+/// The CSV note for a page with `degraded` dropped codec draws: a *silent
+/// blank* when nothing else painted either, else a degraded page.
+fn degraded_note(degraded: u32, ours_ink: f64) -> &'static str {
+    if degraded == 0 {
+        return "";
+    }
+    if ours_ink < 0.001 {
+        "silent-blank(codec)"
+    } else {
+        "degraded(codec)"
+    }
+}
+
+/// `<stem>-p<page>.ppm` with every character but alphanumerics, `-` and `.`
+/// replaced by `_`.
+fn triptych_name(file: &Path, page: i32) -> String {
+    let name = format!(
+        "{}-p{page}.ppm",
+        file.file_stem().unwrap_or_default().to_string_lossy()
+    );
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// The shared per-document worker loop: render sampled pages with both engines,
 /// grade, append to `<out_dir>/results.csv` (resumable), and print a ranked
 /// summary. The controller starts this with exactly one document per process.
@@ -755,32 +860,10 @@ fn diff_one_file(
                 // painted. If nothing else painted either, it is a *silent
                 // blank* — the worst kind of miss because ink_delta alone
                 // could still look mild. Flag it explicitly (Workstream B3).
-                let note: &'static str = if degraded > 0 {
-                    if d.ours_ink < 0.001 {
-                        "silent-blank(codec)"
-                    } else {
-                        "degraded(codec)"
-                    }
-                } else {
-                    ""
-                };
+                let note = degraded_note(degraded, d.ours_ink);
                 if dump && (d.is_suspect() || degraded > 0) {
-                    let name = format!(
-                        "{}-p{page}.ppm",
-                        file.file_stem().unwrap_or_default().to_string_lossy()
-                    );
-                    let name: String = name
-                        .chars()
-                        .map(|c| {
-                            if c.is_alphanumeric() || c == '-' || c == '.' {
-                                c
-                            } else {
-                                '_'
-                            }
-                        })
-                        .collect();
                     let _ = write_triptych(
-                        &out_dir.join(name),
+                        &out_dir.join(triptych_name(file, page)),
                         &ours,
                         &theirs.bgra,
                         theirs.width,
@@ -1030,44 +1113,63 @@ fn bench(args: &[String]) {
     // Argument grammar (after optional leading pdfium.dll path):
     //   <file.pdf> [scale] [per_page_n] [whole_n]
     // Two-arg shorthand when the sole numeric is an integer >= 10 (or any
-    // integer when written without a decimal and clearly a page count): 
+    // integer when written without a decimal and clearly a page count):
     //   <file.pdf> <per_page_n>          — scale defaults to 2.0
     // Scale is always accepted as a float (e.g. 1, 1.0, 2, 2.5). With two or
     // more trailing numbers the first is always scale.
     let (lib, file, scale, per_page_n, whole_n_arg) = match args.len() {
         0 => {
             eprintln!("usage: pdfium-diff bench <file.pdf> [scale] [per_page_n] [whole_n]");
-            eprintln!("       pdfium-diff bench <libpdfium.dll> <file.pdf> [scale] [per_page_n] [whole_n]");
+            eprintln!(
+                "       pdfium-diff bench <libpdfium.dll> <file.pdf> [scale] [per_page_n] [whole_n]"
+            );
             eprintln!();
             eprintln!("  <file.pdf>     input PDF file (required)");
-            eprintln!("  scale          pixels per point (default: 2.0 = 144 dpi). Use 1 or 1.0 for 72 dpi.");
+            eprintln!(
+                "  scale          pixels per point (default: 2.0 = 144 dpi). Use 1 or 1.0 for 72 dpi."
+            );
             eprintln!("  per_page_n     pages for single-thread per-page timing (default: 10)");
-            eprintln!("  whole_n        pages for parallel whole-doc throughput (default: all pages)");
+            eprintln!(
+                "  whole_n        pages for parallel whole-doc throughput (default: all pages)"
+            );
             eprintln!();
             eprintln!("  Timing excludes PNG encode/write. Sample PNGs are written after timing.");
             eprintln!("  Per-page reports compile vs raster split for ours.");
             eprintln!();
-            eprintln!("  bench myfile.pdf              → scale 2.0, 10 sample pages, all pages whole-doc");
-            eprintln!("  bench myfile.pdf 50           → scale 2.0, 50 sample pages (integer-only = page count)");
+            eprintln!(
+                "  bench myfile.pdf              → scale 2.0, 10 sample pages, all pages whole-doc"
+            );
+            eprintln!(
+                "  bench myfile.pdf 50           → scale 2.0, 50 sample pages (integer-only = page count)"
+            );
             eprintln!("  bench myfile.pdf 1.5          → scale 1.5, 10 sample pages");
-            eprintln!("  bench myfile.pdf 2 10 40      → scale 2, 10 per-page samples, 40 whole-doc pages");
+            eprintln!(
+                "  bench myfile.pdf 2 10 40      → scale 2, 10 per-page samples, 40 whole-doc pages"
+            );
             eprintln!("  bench myfile.pdf 1 6 20       → scale 1, 6 samples, 20 whole-doc pages");
             eprintln!();
-            eprintln!("If <libpdfium.dll> is omitted, loads pdfium.dll from next to this executable.");
+            eprintln!(
+                "If <libpdfium.dll> is omitted, loads pdfium.dll from next to this executable."
+            );
             eprintln!("Sample PNGs are saved to bench-out/<stem>/ next to the exe.");
             std::process::exit(2);
         }
         1 => {
-            let lib = find_pdfium().expect("pdfium.dll not found next to exe; pass path explicitly");
+            let lib =
+                find_pdfium().expect("pdfium.dll not found next to exe; pass path explicitly");
             (lib, PathBuf::from(&args[0]), 2.0, 10, None)
         }
         2 => {
             let first = PathBuf::from(&args[0]);
             let second = PathBuf::from(&args[1]);
-            if first.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) {
+            if first
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("dll"))
+            {
                 (first, second, 2.0, 10, None)
             } else {
-                let lib = find_pdfium().expect("pdfium.dll not found next to exe; pass path explicitly");
+                let lib =
+                    find_pdfium().expect("pdfium.dll not found next to exe; pass path explicitly");
                 // One trailing token: integer-only → per_page_n at default scale;
                 // any value with a decimal point (or non-integer float parse that
                 // is not a clean u32) → scale.
@@ -1090,13 +1192,17 @@ fn bench(args: &[String]) {
             // First numeric after the file is ALWAYS scale.
             let first = PathBuf::from(&args[0]);
             let second = PathBuf::from(&args[1]);
-            if first.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) {
+            if first
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("dll"))
+            {
                 let scale: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2.0);
                 let per_page_n: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
                 let whole_n = args.get(4).and_then(|s| s.parse().ok());
                 (first, second, scale, per_page_n, whole_n)
             } else {
-                let lib = find_pdfium().expect("pdfium.dll not found next to exe; pass path explicitly");
+                let lib =
+                    find_pdfium().expect("pdfium.dll not found next to exe; pass path explicitly");
                 let scale: f64 = args[1].parse().expect("scale must be a number");
                 let per_page_n: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
                 let whole_n = args.get(3).and_then(|s| s.parse().ok());
@@ -1161,8 +1267,7 @@ fn bench(args: &[String]) {
     let mut ours_pp: Vec<Duration> = Vec::with_capacity(n as usize);
     let mut ours_compile: Vec<Duration> = Vec::with_capacity(n as usize);
     let mut ours_raster: Vec<Duration> = Vec::with_capacity(n as usize);
-    let mut sample_hosts: Vec<Option<(Vec<u8>, u32, u32, usize)>> =
-        Vec::with_capacity(n as usize);
+    let mut sample_hosts: Vec<Option<(Vec<u8>, u32, u32, usize)>> = Vec::with_capacity(n as usize);
     for p in 0..n {
         let mut ctx = ParseContext::new();
         let t_total = Instant::now();
@@ -1206,21 +1311,20 @@ fn bench(args: &[String]) {
     let t_png = Instant::now();
     for (p, host) in sample_hosts.into_iter().enumerate() {
         if let Some((pixels, width, height, stride)) = host {
-            save_rgba(
-                &out.join("ours"),
-                p as u32,
-                &pixels,
-                width,
-                height,
-                stride,
-            );
+            save_rgba(&out.join("ours"), p as u32, &pixels, width, height, stride);
         }
     }
     // PDFium sample dump re-uses a single open via render_doc_timed-style path
     // only for the same indices; open cost is not charged to the render table.
     for &p in &indices {
         if let Ok(bmp) = pdfium.render(&file, p, scale) {
-            save_bgra(&out.join("pdfium"), p as u32, &bmp.bgra, bmp.width, bmp.height);
+            save_bgra(
+                &out.join("pdfium"),
+                p as u32,
+                &bmp.bgra,
+                bmp.width,
+                bmp.height,
+            );
         }
     }
     let png_phase = t_png.elapsed();
@@ -1410,11 +1514,7 @@ fn mean_ms(v: &[Duration]) -> f64 {
     v.iter().map(|d| ms(*d)).sum::<f64>() / v.len() as f64
 }
 fn safe_ratio(ours: f64, pdfium: f64) -> f64 {
-    if pdfium <= 0.0 {
-        0.0
-    } else {
-        ours / pdfium
-    }
+    if pdfium <= 0.0 { 0.0 } else { ours / pdfium }
 }
 
 /// Raw-byte counts of common PDF stream filters. Not a full COS parse: a
@@ -2077,8 +2177,10 @@ fn mem_stats() -> Option<MemStats> {
     }
     #[cfg(target_os = "windows")]
     {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
         unsafe {
             let process = GetCurrentProcess();
             let mut pmc: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();

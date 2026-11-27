@@ -178,6 +178,67 @@ pub struct TextRequest<'a> {
     pub start_char: usize,
 }
 
+/// The character budget of a text run, carried from page to page.
+struct CharBudget {
+    max_chars: usize,
+    start_char: usize,
+    text_only: bool,
+    /// Characters (or, for the geometry layouts, bytes) charged so far.
+    used: usize,
+    /// Where the first page was cut, when it alone was over the budget.
+    next_char: Option<usize>,
+}
+
+impl CharBudget {
+    /// Charge one extracted page at selection `index`. On the first page the
+    /// text starts at `start_char` (noted in `entry`); a first page that is
+    /// over the budget on its own is kept, cut at a line when it is text.
+    /// When the budget stops the run, `stopped` says where and why; `None`
+    /// means the page is not kept, else how the run goes on after it.
+    fn charge(
+        &mut self,
+        index: usize,
+        first: bool,
+        data: &mut TextPageData,
+        entry: &mut serde_json::Value,
+        stopped: &mut Option<(usize, String)>,
+    ) -> Result<Option<std::ops::ControlFlow<()>>> {
+        let mut offset = 0;
+        if index == 0 && self.start_char > 0 {
+            offset = self.start_char;
+            if let Some(text) = &mut data.text {
+                *text = text.chars().skip(offset).collect();
+            }
+            entry["start_char"] = serde_json::json!(offset);
+        }
+        let cost = if self.text_only {
+            data.text.as_ref().map_or(0, |text| text.chars().count())
+        } else {
+            serde_json::to_vec(&data)?.len()
+        };
+        let mut flow = std::ops::ControlFlow::Continue(());
+        if self.max_chars > 0 && self.used + cost > self.max_chars {
+            let reason = format!("character budget max_chars={} reached", self.max_chars);
+            if !first {
+                *stopped = Some((index, reason));
+                return Ok(None);
+            }
+            // The first page alone is over budget: return
+            // what fits of it and say where it was cut.
+            if self.text_only {
+                if let Some(text) = &mut data.text {
+                    let kept = cut_at_line(text, self.max_chars);
+                    self.next_char = Some(offset + kept);
+                }
+                *stopped = Some((index, reason));
+                flow = std::ops::ControlFlow::Break(());
+            }
+        }
+        self.used += cost;
+        Ok(Some(flow))
+    }
+}
+
 /// Extract a page selection, in parallel, into one value that says exactly
 /// how far it got.
 ///
@@ -212,9 +273,15 @@ pub fn text_pages(
     }
 
     let mut out: Vec<serde_json::Value> = Vec::new();
-    let (mut used_bytes, mut used_chars) = (0u64, 0usize);
+    let mut used_bytes = 0u64;
+    let mut budget = CharBudget {
+        max_chars: request.max_chars,
+        start_char: request.start_char,
+        text_only,
+        used: 0,
+        next_char: None,
+    };
     let mut stopped: Option<(usize, String)> = None;
-    let mut next_char: Option<usize> = None;
     let mut failure: Option<anyhow::Error> = None;
 
     for_pages(
@@ -259,38 +326,17 @@ pub fn text_pages(
                         entry["error"] = serde_json::json!(format!("{error:#}"));
                     }
                     PageOutcome::Done(mut data) => {
-                        let mut offset = 0;
-                        if index == 0 && request.start_char > 0 {
-                            offset = request.start_char;
-                            if let Some(text) = &mut data.text {
-                                *text = text.chars().skip(offset).collect();
-                            }
-                            entry["start_char"] = serde_json::json!(offset);
-                        }
-                        let cost = if text_only {
-                            data.text.as_ref().map_or(0, |text| text.chars().count())
-                        } else {
-                            serde_json::to_vec(&data)?.len()
+                        let first = out.is_empty();
+                        flow = match budget.charge(
+                            index,
+                            first,
+                            &mut data,
+                            &mut entry,
+                            &mut stopped,
+                        )? {
+                            Some(page_flow) => page_flow,
+                            None => return Ok(ControlFlow::Break(())),
                         };
-                        if request.max_chars > 0 && used_chars + cost > request.max_chars {
-                            let reason =
-                                format!("character budget max_chars={} reached", request.max_chars);
-                            if !out.is_empty() {
-                                stopped = Some((index, reason));
-                                return Ok(ControlFlow::Break(()));
-                            }
-                            // The first page alone is over budget: return
-                            // what fits of it and say where it was cut.
-                            if text_only {
-                                if let Some(text) = &mut data.text {
-                                    let kept = cut_at_line(text, request.max_chars);
-                                    next_char = Some(offset + kept);
-                                }
-                                stopped = Some((index, reason));
-                                flow = ControlFlow::Break(());
-                            }
-                        }
-                        used_chars += cost;
                         entry["data"] = serde_json::to_value(&data)?;
                     }
                 }
@@ -337,7 +383,7 @@ pub fn text_pages(
     if let Some((index, reason)) = stopped {
         let next = selection[index].one_based();
         result["next_page"] = serde_json::json!(next);
-        match next_char {
+        match budget.next_char {
             Some(next_char) => {
                 result["next_char"] = serde_json::json!(next_char);
                 warnings.push(format!(

@@ -457,123 +457,18 @@ fn run_ops(
                     i = ge + 1;
                     continue;
                 }
-                // Group backdrop (ISO 32000-1 §11.4.7): an *isolated* group
-                // starts transparent; a *non-isolated* group's elements
-                // composite against the backdrop behind it. We seed the
-                // backdrop only for a non-isolated group whose own composite
-                // blend is Normal (the common wrapper case) — there the
-                // seeded offscreen is composited back by a plain replace/lerp,
-                // which is exact for an opaque backdrop and cannot double-count
-                // it. A non-isolated group with a *non-Normal* composite blend
-                // (e.g. a Multiply group) is still rendered on a transparent
-                // offscreen (its content isolated) and composited with that
-                // blend against the parent — which, when the parent is the page
-                // or an already-seeded non-isolated wrapper, now holds the real
-                // backdrop, so `Multiply` finally hits the tone underneath
-                // instead of transparency (the Young-Turks gold, the Medieval
-                // page tone). This is Stage 1: full non-isolated compositing
-                // with backdrop removal for a non-Normal group whose *content*
-                // carries its own non-Normal blends remains approximated.
-                let blend = choose_blend(group.blend);
-                // The soft mask in force at the invocation modulates the
-                // *group's* composite, not its contents (§11.6.6 — lowering
-                // pushes a None reset inside the group for that reason). Its
-                // stack slot is stable across the group's ops, which are
-                // balanced, so remember the depth rather than borrowing across
-                // the `run_ops` mutable borrow.
-                let soft_slot = soft.len().checked_sub(1);
-                let seed = !group.isolated && matches!(blend, BlendChoice::Normal);
-                // The common wrapper group: non-isolated, Normal, fully
-                // opaque, no soft mask in force. Its seeded offscreen would
-                // start as a copy of the parent's pixels, take the content,
-                // and be copied back whole (`composite_group_seeded` at
-                // opacity 255 without a mask is a row copy). Painting the
-                // content on the parent writes the same bytes to the same
-                // pixels — every op is confined to its own bounds, which lie
-                // inside the group's — without a group-sized buffer (page
-                // sized for a page-level wrapper) and its two full copies.
-                let soft_in_force = soft_slot
-                    .and_then(|ix| soft.get(ix))
-                    .is_some_and(Option::is_some);
-                let parent_rect = DeviceRect {
-                    x: surface.origin_x as i32,
-                    y: surface.origin_y as i32,
-                    width: surface.width as u32,
-                    height: surface.height as u32,
-                };
-                #[cfg(test)]
-                let direct_allowed = !GROUPS_ALWAYS_OFFSCREEN.with(std::cell::Cell::get);
-                #[cfg(not(test))]
-                let direct_allowed = true;
-                if direct_allowed
-                    && seed
-                    && !group.knockout
-                    && group.opacity == 255
-                    && !soft_in_force
-                    && rect_contains(parent_rect, group.bounds)
-                {
-                    #[cfg(test)]
-                    DIRECT_GROUPS.with(|count| count.set(count.get() + 1));
-                    run_ops(
-                        page,
-                        i + 1,
-                        ge,
-                        surface,
-                        raster,
-                        kernels,
-                        masks,
-                        soft,
-                        stats,
-                    );
-                    stats.transparency_groups += 1;
-                    i = ge + 1;
-                    if stats.cancelled {
-                        return;
-                    }
-                    masks.op_done(at);
-                    continue;
-                }
-                let mut off = if seed {
-                    Surface::offscreen_seeded(surface, group.bounds)
-                } else {
-                    Surface::offscreen(group.bounds)
-                };
-                if group.knockout {
-                    run_knockout_group(
-                        page,
-                        i + 1,
-                        ge,
-                        &mut off,
-                        raster,
-                        kernels,
-                        masks,
-                        soft,
-                        stats,
-                    );
-                } else {
-                    run_ops(
-                        page,
-                        i + 1,
-                        ge,
-                        &mut off,
-                        raster,
-                        kernels,
-                        masks,
-                        soft,
-                        stats,
-                    );
-                }
-                let group_soft = soft_slot
-                    .and_then(|ix| soft.get(ix))
-                    .and_then(Option::as_ref);
-                if seed {
-                    // Seeded offscreen already holds backdrop∘content; fold it
-                    // back at group opacity without re-compositing the backdrop.
-                    composite_group_seeded(surface, &off, group.opacity, group_soft);
-                } else {
-                    composite_group(surface, &off, group.opacity, blend, group_soft);
-                }
-                stats.transparency_groups += 1;
+                run_group(
+                    page,
+                    group,
+                    i + 1,
+                    ge,
+                    surface,
+                    raster,
+                    kernels,
+                    masks,
+                    soft,
+                    stats,
+                );
                 i = ge + 1;
             }
             PreparedOp::EndGroup => i += 1,
@@ -616,6 +511,113 @@ fn run_ops(
         // consumer was this op (or one nested in it) is no longer needed.
         masks.op_done(at);
     }
+}
+
+/// Execute a transparency group's ops `[start, end)` and composite them
+/// onto `surface`: directly on the parent for an opaque wrapper group, else
+/// through an offscreen (seeded with the backdrop for a non-isolated Normal
+/// group, knockout-composited for a knockout group).
+#[allow(clippy::too_many_arguments)]
+fn run_group(
+    page: &CpuPreparedPage,
+    group: &crate::render_cpu::prepared::PreparedGroup,
+    start: usize,
+    end: usize,
+    surface: &mut Surface,
+    raster: &mut RasterKernel,
+    kernels: &KernelSet,
+    masks: &mut ClipMasks,
+    soft: &mut Vec<Option<ClipMask>>,
+    stats: &mut RenderStats,
+) {
+    // Group backdrop (ISO 32000-1 §11.4.7): an *isolated* group
+    // starts transparent; a *non-isolated* group's elements
+    // composite against the backdrop behind it. We seed the
+    // backdrop only for a non-isolated group whose own composite
+    // blend is Normal (the common wrapper case) — there the
+    // seeded offscreen is composited back by a plain replace/lerp,
+    // which is exact for an opaque backdrop and cannot double-count
+    // it. A non-isolated group with a *non-Normal* composite blend
+    // (e.g. a Multiply group) is still rendered on a transparent
+    // offscreen (its content isolated) and composited with that
+    // blend against the parent — which, when the parent is the page
+    // or an already-seeded non-isolated wrapper, now holds the real
+    // backdrop, so `Multiply` finally hits the tone underneath
+    // instead of transparency (the Young-Turks gold, the Medieval
+    // page tone). This is Stage 1: full non-isolated compositing
+    // with backdrop removal for a non-Normal group whose *content*
+    // carries its own non-Normal blends remains approximated.
+    let blend = choose_blend(group.blend);
+    // The soft mask in force at the invocation modulates the
+    // *group's* composite, not its contents (§11.6.6 — lowering
+    // pushes a None reset inside the group for that reason). Its
+    // stack slot is stable across the group's ops, which are
+    // balanced, so remember the depth rather than borrowing across
+    // the `run_ops` mutable borrow.
+    let soft_slot = soft.len().checked_sub(1);
+    let seed = !group.isolated && matches!(blend, BlendChoice::Normal);
+    // The common wrapper group: non-isolated, Normal, fully
+    // opaque, no soft mask in force. Its seeded offscreen would
+    // start as a copy of the parent's pixels, take the content,
+    // and be copied back whole (`composite_group_seeded` at
+    // opacity 255 without a mask is a row copy). Painting the
+    // content on the parent writes the same bytes to the same
+    // pixels — every op is confined to its own bounds, which lie
+    // inside the group's — without a group-sized buffer (page
+    // sized for a page-level wrapper) and its two full copies.
+    let soft_in_force = soft_slot
+        .and_then(|ix| soft.get(ix))
+        .is_some_and(Option::is_some);
+    let parent_rect = DeviceRect {
+        x: surface.origin_x as i32,
+        y: surface.origin_y as i32,
+        width: surface.width as u32,
+        height: surface.height as u32,
+    };
+    #[cfg(test)]
+    let direct_allowed = !GROUPS_ALWAYS_OFFSCREEN.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let direct_allowed = true;
+    if direct_allowed
+        && seed
+        && !group.knockout
+        && group.opacity == 255
+        && !soft_in_force
+        && rect_contains(parent_rect, group.bounds)
+    {
+        #[cfg(test)]
+        DIRECT_GROUPS.with(|count| count.set(count.get() + 1));
+        run_ops(
+            page, start, end, surface, raster, kernels, masks, soft, stats,
+        );
+        stats.transparency_groups += 1;
+        return;
+    }
+    let mut off = if seed {
+        Surface::offscreen_seeded(surface, group.bounds)
+    } else {
+        Surface::offscreen(group.bounds)
+    };
+    if group.knockout {
+        run_knockout_group(
+            page, start, end, &mut off, raster, kernels, masks, soft, stats,
+        );
+    } else {
+        run_ops(
+            page, start, end, &mut off, raster, kernels, masks, soft, stats,
+        );
+    }
+    let group_soft = soft_slot
+        .and_then(|ix| soft.get(ix))
+        .and_then(Option::as_ref);
+    if seed {
+        // Seeded offscreen already holds backdrop∘content; fold it
+        // back at group opacity without re-compositing the backdrop.
+        composite_group_seeded(surface, &off, group.opacity, group_soft);
+    } else {
+        composite_group(surface, &off, group.opacity, blend, group_soft);
+    }
+    stats.transparency_groups += 1;
 }
 
 #[cfg(test)]
@@ -742,24 +744,29 @@ fn run_knockout_group(
                 stats,
             );
             scratch_is_initial = false;
-            // Fold changed pixels into the accumulator.
-            let (gw, gh) = (off.width, off.height);
-            for ly in 0..gh {
-                let srow = scratch.local_row(ly);
-                let irow = initial.local_row(ly);
-                let orow = off.row_mut(initial.origin_y + ly);
-                for lx in 0..gw {
-                    let r = lx * 4..lx * 4 + 4;
-                    if srow[r.clone()] != irow[r.clone()] {
-                        orow[r.clone()].copy_from_slice(&srow[r]);
-                    }
-                }
-            }
+            fold_changed_pixels(off, &scratch, &initial);
         } else {
             // State op: execute against the accumulator (it paints nothing).
             run_ops(page, i, next, off, raster, kernels, masks, soft, stats);
         }
         i = next;
+    }
+}
+
+/// Fold the pixels a knockout element changed (where `scratch` differs from
+/// `initial`) into the accumulator `off`.
+fn fold_changed_pixels(off: &mut Surface, scratch: &Surface, initial: &Surface) {
+    let (gw, gh) = (off.width, off.height);
+    for ly in 0..gh {
+        let srow = scratch.local_row(ly);
+        let irow = initial.local_row(ly);
+        let orow = off.row_mut(initial.origin_y + ly);
+        for lx in 0..gw {
+            let r = lx * 4..lx * 4 + 4;
+            if srow[r.clone()] != irow[r.clone()] {
+                orow[r.clone()].copy_from_slice(&srow[r]);
+            }
+        }
     }
 }
 
@@ -844,181 +851,10 @@ fn paint_image(
     // Lowering already performs this expansion behind the content-keyed image
     // cache (`prepared.rs::promote_through_cache`), so a lowered image arrives
     // here as RGB8 and only images built elsewhere expand per draw.
-    let promoted_indexed;
-    let img = if matches!(
-        img.color_space,
-        crate::page_ir::ImageColorSpace::Indexed { .. }
-    ) && !matches!(img.mask, Some(crate::page_ir::ImageMask::ColorKey(_)))
-    {
-        #[cfg(feature = "profiling")]
-        let promote_start = Instant::now();
-        let promoted = img.indexed_promoted_to_rgb8();
-        #[cfg(feature = "profiling")]
-        stats
-            .profile
-            .add_duration("render.image.indexed_promotion", promote_start.elapsed());
-        match promoted {
-            Some(rgb) => {
-                promoted_indexed = rgb;
-                &promoted_indexed
-            }
-            None => img,
-        }
-    } else {
-        img
-    };
-    let fast_rgb8_base = blend_is_normal
-        && cmask.is_none()
-        && soft.is_none()
-        && img.alpha == 255
-        && img.smask.is_none()
-        && img.mask.is_none()
-        && !img.is_stencil
-        && img.bpc == 8
-        && img.decode.is_none()
-        && matches!(img.color_space, crate::page_ir::ImageColorSpace::Rgb)
-        && img.footprint[0] <= 1.0
-        && img.footprint[1] <= 1.0
-        && img.inv.b.abs() < 1e-12
-        && img.inv.c.abs() < 1e-12
-        && img.samples.len() >= img.width as usize * img.height as usize * 3;
-    let fast_rgb8 =
-        fast_rgb8_base && img.interpolation == crate::page_ir::InterpolationMode::Nearest;
-    // Magnified/1:1 continuous-tone JPEG/JPX is forced to Bilinear in
-    // prepared.rs; without a dedicated path those draws fall into the generic
-    // per-pixel bilinear loop (~tens of Mpix/s). Same axis-aligned eligibility
-    // as nearest, with bilinear taps matching `PreparedImage::bilinear`.
-    let fast_rgb8_bilinear =
-        fast_rgb8_base && img.interpolation == crate::page_ir::InterpolationMode::Bilinear;
-    // Native one-byte-per-texel twins of `fast_rgb8` / `fast_rgb8_bilinear`:
-    // 8-bit grayscale scans and MRC layers sample straight from `img.samples`
-    // without allocating a `3 * width * height` RGB8 promotion copy.
-    let fast_gray8_base = blend_is_normal
-        && cmask.is_none()
-        && soft.is_none()
-        && img.alpha == 255
-        && img.smask.is_none()
-        && img.mask.is_none()
-        && !img.is_stencil
-        && img.bpc == 8
-        && img.decode.is_none()
-        && img.sample_lut.is_none()
-        && matches!(img.color_space, crate::page_ir::ImageColorSpace::Gray)
-        && img.footprint[0] <= 1.0
-        && img.footprint[1] <= 1.0
-        && img.inv.b.abs() < 1e-12
-        && img.inv.c.abs() < 1e-12
-        && img.samples.len() >= img.width as usize * img.height as usize;
-    let fast_gray8 =
-        fast_gray8_base && img.interpolation == crate::page_ir::InterpolationMode::Nearest;
-    let fast_gray8_bilinear =
-        fast_gray8_base && img.interpolation == crate::page_ir::InterpolationMode::Bilinear;
-    // The low-bit-depth twin of `fast_rgb8`: a 1-, 2- or 4-bit single-component
-    // image — the bilevel JBIG2 or CCITT page of a scan, an MRC producer or
-    // A preprocessor's own output — drawn axis-aligned at or above its own resolution,
-    // sampled through its prepared lookup table. Without it such a draw took
-    // the generic per-pixel loop (~30 ns a pixel, 100 ms for a 1474×2400
-    // page). Minified draws keep the summed-area `fast_binary` path below.
-    let lut_nearest = if blend_is_normal
-        && cmask.is_none()
-        && soft.is_none()
-        && img.alpha == 255
-        && img.smask.is_none()
-        && img.mask.is_none()
-        && img.footprint[0] <= 1.0
-        && img.footprint[1] <= 1.0
-        && img.inv.b.abs() < 1e-12
-        && img.inv.c.abs() < 1e-12
-        && img.interpolation == crate::page_ir::InterpolationMode::Nearest
-    {
-        img.lut_nearest_opaque()
-    } else {
-        None
-    };
-    // The area-minified twin of `fast_rgb8`: same eligibility, but the image is
-    // minified on at least one axis (footprint > 1), so each destination pixel
-    // box-averages its source footprint (what the generic path's
-    // `area_average` does) instead of point-sampling. Off-diagonal inverse
-    // terms must be *exactly* zero so per-column/row source boxes reproduce the
-    // generic per-pixel `inv.apply` bit-for-bit. Interpolation is not checked:
-    // minification ignores it (`shade` area-averages regardless of the
-    // Nearest/Bilinear hint), so a minified Bilinear draw lands here too.
-    let rgb8_area_shape = blend_is_normal
-        && cmask.is_none()
-        && soft.is_none()
-        && img.alpha == 255
-        && !img.is_stencil
-        && img.bpc == 8
-        && img.decode.is_none()
-        && matches!(img.color_space, crate::page_ir::ImageColorSpace::Rgb)
-        && (img.footprint[0] > 1.0 || img.footprint[1] > 1.0)
-        && img.inv.b == 0.0
-        && img.inv.c == 0.0
-        && img.samples.len() >= img.width as usize * img.height as usize * 3;
-    let fast_rgb8_area = rgb8_area_shape && img.smask.is_none() && img.mask.is_none();
-    // The MRC shape: the same opaque axis-aligned minified RGB8 source, but cut
-    // out by a one-bit JBIG2 layer. Without this the draw falls into the
-    // generic per-pixel loop and pays a fresh inverse map, two base tap boxes,
-    // and a mask lookup for every destination pixel — all of which depend only
-    // on the destination column or row once the placement is axis-aligned.
-    let rgb8_area_min_mask = if rgb8_area_shape {
-        area_min_mask(img)
-    } else {
-        None
-    };
-    let gray8_area_shape = blend_is_normal
-        && cmask.is_none()
-        && soft.is_none()
-        && img.alpha == 255
-        && !img.is_stencil
-        && img.bpc == 8
-        && img.decode.is_none()
-        && img.sample_lut.is_none()
-        && !matches!(img.mask, Some(crate::page_ir::ImageMask::ColorKey(_)))
-        && matches!(img.color_space, crate::page_ir::ImageColorSpace::Gray)
-        && (img.footprint[0] > 1.0 || img.footprint[1] > 1.0)
-        && img.inv.b == 0.0
-        && img.inv.c == 0.0
-        && img.samples.len() >= img.width as usize * img.height as usize;
-    let fast_gray8_area = gray8_area_shape && img.smask.is_none() && img.mask.is_none();
-    let gray8_area_min_mask = if gray8_area_shape {
-        area_min_mask(img)
-    } else {
-        None
-    };
-    // The same, for an opaque axis-aligned minified CMYK image: the source is
-    // converted to RGB8 once and then box-averaged identically. Eligibility
-    // mirrors `fast_rgb8_area` but for the CMYK colour space; the sample-length
-    // and size checks live in `cmyk_source_as_rgb8`.
-    let fast_cmyk_area = blend_is_normal
-        && cmask.is_none()
-        && soft.is_none()
-        && img.alpha == 255
-        && img.smask.is_none()
-        && img.mask.is_none()
-        && !img.is_stencil
-        && img.bpc == 8
-        && img.decode.is_none()
-        && matches!(img.color_space, crate::page_ir::ImageColorSpace::Cmyk)
-        && (img.footprint[0] > 1.0 || img.footprint[1] > 1.0)
-        && img.inv.b == 0.0
-        && img.inv.c == 0.0;
-    let fast_binary = blend_is_normal && soft.is_none() && img.is_binary_box_filterable();
-    // An `/ImageMask` stencil in solid colour is a one-bit image whose
-    // painting bit is opaque and whose masking bit is transparent, so it takes
-    // the bilevel box filter when minified and a transparent-skip nearest walk
-    // otherwise, on the interior rectangle; the border band stays generic.
-    // The placement must be axis-aligned with off-diagonal terms exactly zero
-    // (that is what makes the per-axis tables and the interior test reproduce
-    // the generic `inv.apply`), and a magnified Bilinear stencil keeps the
-    // generic sampler, whose four-tap blend this path does not reproduce.
-    let stencil_lut = if blend_is_normal && soft.is_none() {
-        stencil_fast_lut(img)
-    } else {
-        None
-    };
-
-    if fast_rgb8 {
+    let promoted_indexed = promote_indexed_for_draw(img, stats);
+    let img = promoted_indexed.as_ref().unwrap_or(img);
+    let paths = ImagePaths::for_draw(img, cmask, soft, blend_is_normal);
+    if paths.fast_rgb8 {
         let result = paint_axis_aligned_rgb8_nearest_opaque(img, surface, x0, y0, x1, y1);
         covered = result.0;
         #[cfg(feature = "profiling")]
@@ -1026,7 +862,7 @@ fn paint_image(
             sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
             sample_taps = result.1;
         }
-    } else if fast_gray8 {
+    } else if paths.fast_gray8 {
         let result = paint_axis_aligned_gray8_nearest_opaque(img, surface, x0, y0, x1, y1);
         covered = result.0;
         #[cfg(feature = "profiling")]
@@ -1034,7 +870,7 @@ fn paint_image(
             sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
             sample_taps = result.1;
         }
-    } else if fast_rgb8_bilinear {
+    } else if paths.fast_rgb8_bilinear {
         let result = paint_axis_aligned_rgb8_bilinear_opaque(img, surface, x0, y0, x1, y1);
         covered = result.0;
         #[cfg(feature = "profiling")]
@@ -1042,7 +878,7 @@ fn paint_image(
             sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
             sample_taps = result.1;
         }
-    } else if fast_gray8_bilinear {
+    } else if paths.fast_gray8_bilinear {
         let result = paint_axis_aligned_gray8_bilinear_opaque(img, surface, x0, y0, x1, y1);
         covered = result.0;
         #[cfg(feature = "profiling")]
@@ -1050,7 +886,7 @@ fn paint_image(
             sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
             sample_taps = result.1;
         }
-    } else if let Some(lut) = lut_nearest {
+    } else if let Some(lut) = paths.lut_nearest {
         let result = paint_axis_aligned_lut_nearest_opaque(img, lut, surface, x0, y0, x1, y1);
         covered = result.0;
         #[cfg(feature = "profiling")]
@@ -1058,7 +894,7 @@ fn paint_image(
             sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
             sample_taps = result.1;
         }
-    } else if fast_rgb8_area {
+    } else if paths.fast_rgb8_area {
         let result = paint_axis_aligned_rgb8_area_min_opaque(img, surface, x0, y0, x1, y1);
         covered = result.0;
         #[cfg(feature = "profiling")]
@@ -1066,7 +902,7 @@ fn paint_image(
             sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
             sample_taps = result.1;
         }
-    } else if fast_gray8_area {
+    } else if paths.fast_gray8_area {
         let result = paint_axis_aligned_gray8_area_min_opaque(img, surface, x0, y0, x1, y1);
         covered = result.0;
         #[cfg(feature = "profiling")]
@@ -1074,7 +910,7 @@ fn paint_image(
             sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
             sample_taps = result.1;
         }
-    } else if let Some(mask) = rgb8_area_min_mask {
+    } else if let Some(mask) = paths.rgb8_area_min_mask {
         let result = paint_axis_aligned_rgb8_area_min_masked(img, mask, surface, x0, y0, x1, y1);
         covered = result.0;
         #[cfg(feature = "profiling")]
@@ -1082,7 +918,7 @@ fn paint_image(
             sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
             sample_taps = result.1;
         }
-    } else if let Some(mask) = gray8_area_min_mask {
+    } else if let Some(mask) = paths.gray8_area_min_mask {
         let result = paint_axis_aligned_gray8_area_min_masked(img, mask, surface, x0, y0, x1, y1);
         covered = result.0;
         #[cfg(feature = "profiling")]
@@ -1090,7 +926,8 @@ fn paint_image(
             sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
             sample_taps = result.1;
         }
-    } else if let Some(result) = fast_cmyk_area
+    } else if let Some(result) = paths
+        .fast_cmyk_area
         .then(|| paint_axis_aligned_cmyk_area_min_opaque(img, surface, x0, y0, x1, y1))
         .flatten()
     {
@@ -1101,7 +938,7 @@ fn paint_image(
             sample_attempts = (x1 - x0) as u64 * (y1 - y0) as u64;
             sample_taps = result.1;
         }
-    } else if let Some(lut) = fast_binary.then(|| img.binary_box_lut()).flatten() {
+    } else if let Some(lut) = paths.fast_binary.then(|| img.binary_box_lut()).flatten() {
         let result = paint_axis_aligned_binary_box(img, lut, surface, cmask, x0, y0, x1, y1);
         covered = result.0;
         #[cfg(feature = "profiling")]
@@ -1109,7 +946,7 @@ fn paint_image(
             sample_attempts = result.1;
             sample_taps = result.2;
         }
-    } else if let Some(lut) = stencil_lut {
+    } else if let Some(lut) = paths.stencil_lut {
         let totals = paint_axis_aligned_stencil(img, lut, surface, cmask, blend, x0, y0, x1, y1);
         covered = totals.0;
         #[cfg(feature = "profiling")]
@@ -1144,19 +981,19 @@ fn paint_image(
         profile.increment("image.sample_attempts", sample_attempts);
         profile.increment("image.source_sample_taps", sample_taps);
         profile.increment("image.painted_pixels", covered);
-        if fast_rgb8 || fast_gray8 {
+        if paths.fast_rgb8 || paths.fast_gray8 {
             profile.increment("image.fast_rgb8_nearest_pixels", covered);
         }
-        if fast_rgb8_bilinear || fast_gray8_bilinear {
+        if paths.fast_rgb8_bilinear || paths.fast_gray8_bilinear {
             profile.increment("image.fast_rgb8_bilinear_pixels", covered);
         }
-        if lut_nearest.is_some() {
+        if paths.lut_nearest.is_some() {
             profile.increment("image.fast_lut_nearest_pixels", covered);
         }
-        if fast_rgb8_area || fast_gray8_area {
+        if paths.fast_rgb8_area || paths.fast_gray8_area {
             profile.increment("image.fast_rgb8_area_min_pixels", covered);
             profile.add_duration("render.image.area_min", image_start.elapsed());
-        } else if let Some(mask) = rgb8_area_min_mask.or(gray8_area_min_mask) {
+        } else if let Some(mask) = paths.rgb8_area_min_mask.or(paths.gray8_area_min_mask) {
             profile.increment("image.fast_rgb8_area_min_masked_pixels", covered);
             profile.add_duration("render.image.area_min_masked", image_start.elapsed());
             profile.increment(
@@ -1171,10 +1008,10 @@ fn paint_image(
         if fast_cmyk_area_used {
             profile.increment("image.fast_cmyk_area_min_pixels", covered);
         }
-        if fast_binary {
+        if paths.fast_binary {
             profile.increment("image.fast_binary_box_pixels", covered);
         }
-        if stencil_lut.is_some() {
+        if paths.stencil_lut.is_some() {
             profile.increment("image.fast_stencil_pixels", covered);
         }
         if opaque_clip_elided {
@@ -1229,6 +1066,225 @@ fn paint_image(
         }
         if soft.is_some() {
             profile.increment("image.soft_masked_draws", 1);
+        }
+    }
+}
+
+/// An Indexed (palette) image expanded to RGB8 for a draw, unless it keys a
+/// colour-key mask on its raw indices (see the note in [`paint_image`]).
+/// `None` keeps the original.
+fn promote_indexed_for_draw(
+    img: &crate::render_cpu::image::PreparedImage,
+    stats: &mut RenderStats,
+) -> Option<crate::render_cpu::image::PreparedImage> {
+    #[cfg(not(feature = "profiling"))]
+    let _ = stats;
+    if !matches!(
+        img.color_space,
+        crate::page_ir::ImageColorSpace::Indexed { .. }
+    ) || matches!(img.mask, Some(crate::page_ir::ImageMask::ColorKey(_)))
+    {
+        return None;
+    }
+    #[cfg(feature = "profiling")]
+    let promote_start = Instant::now();
+    let promoted = img.indexed_promoted_to_rgb8();
+    #[cfg(feature = "profiling")]
+    stats
+        .profile
+        .add_duration("render.image.indexed_promotion", promote_start.elapsed());
+    promoted
+}
+
+/// Which of [`paint_image`]'s fast paths a draw is eligible for, in the
+/// order they are tried; the generic per-pixel body takes the rest.
+struct ImagePaths<'a> {
+    fast_rgb8: bool,
+    fast_gray8: bool,
+    fast_rgb8_bilinear: bool,
+    fast_gray8_bilinear: bool,
+    lut_nearest: Option<&'a [[u8; 4]]>,
+    fast_rgb8_area: bool,
+    fast_gray8_area: bool,
+    rgb8_area_min_mask: Option<AreaMinMask<'a>>,
+    gray8_area_min_mask: Option<AreaMinMask<'a>>,
+    fast_cmyk_area: bool,
+    fast_binary: bool,
+    stencil_lut: Option<([u8; 4], [u8; 4])>,
+}
+
+impl<'a> ImagePaths<'a> {
+    /// The fast paths `img` qualifies for under the clip mask `cmask`, the
+    /// soft mask `soft` and its blend (`blend_is_normal`).
+    fn for_draw(
+        img: &'a crate::render_cpu::image::PreparedImage,
+        cmask: Option<&ClipMask>,
+        soft: Option<&ClipMask>,
+        blend_is_normal: bool,
+    ) -> Self {
+        let fast_rgb8_base = blend_is_normal
+            && cmask.is_none()
+            && soft.is_none()
+            && img.alpha == 255
+            && img.smask.is_none()
+            && img.mask.is_none()
+            && !img.is_stencil
+            && img.bpc == 8
+            && img.decode.is_none()
+            && matches!(img.color_space, crate::page_ir::ImageColorSpace::Rgb)
+            && img.footprint[0] <= 1.0
+            && img.footprint[1] <= 1.0
+            && img.inv.b.abs() < 1e-12
+            && img.inv.c.abs() < 1e-12
+            && img.samples.len() >= img.width as usize * img.height as usize * 3;
+        let fast_rgb8 =
+            fast_rgb8_base && img.interpolation == crate::page_ir::InterpolationMode::Nearest;
+        // Magnified/1:1 continuous-tone JPEG/JPX is forced to Bilinear in
+        // prepared.rs; without a dedicated path those draws fall into the generic
+        // per-pixel bilinear loop (~tens of Mpix/s). Same axis-aligned eligibility
+        // as nearest, with bilinear taps matching `PreparedImage::bilinear`.
+        let fast_rgb8_bilinear =
+            fast_rgb8_base && img.interpolation == crate::page_ir::InterpolationMode::Bilinear;
+        // Native one-byte-per-texel twins of `fast_rgb8` / `fast_rgb8_bilinear`:
+        // 8-bit grayscale scans and MRC layers sample straight from `img.samples`
+        // without allocating a `3 * width * height` RGB8 promotion copy.
+        let fast_gray8_base = blend_is_normal
+            && cmask.is_none()
+            && soft.is_none()
+            && img.alpha == 255
+            && img.smask.is_none()
+            && img.mask.is_none()
+            && !img.is_stencil
+            && img.bpc == 8
+            && img.decode.is_none()
+            && img.sample_lut.is_none()
+            && matches!(img.color_space, crate::page_ir::ImageColorSpace::Gray)
+            && img.footprint[0] <= 1.0
+            && img.footprint[1] <= 1.0
+            && img.inv.b.abs() < 1e-12
+            && img.inv.c.abs() < 1e-12
+            && img.samples.len() >= img.width as usize * img.height as usize;
+        let fast_gray8 =
+            fast_gray8_base && img.interpolation == crate::page_ir::InterpolationMode::Nearest;
+        let fast_gray8_bilinear =
+            fast_gray8_base && img.interpolation == crate::page_ir::InterpolationMode::Bilinear;
+        // The low-bit-depth twin of `fast_rgb8`: a 1-, 2- or 4-bit single-component
+        // image — the bilevel JBIG2 or CCITT page of a scan, an MRC producer or
+        // A preprocessor's own output — drawn axis-aligned at or above its own resolution,
+        // sampled through its prepared lookup table. Without it such a draw took
+        // the generic per-pixel loop (~30 ns a pixel, 100 ms for a 1474×2400
+        // page). Minified draws keep the summed-area `fast_binary` path below.
+        let lut_nearest = if blend_is_normal
+            && cmask.is_none()
+            && soft.is_none()
+            && img.alpha == 255
+            && img.smask.is_none()
+            && img.mask.is_none()
+            && img.footprint[0] <= 1.0
+            && img.footprint[1] <= 1.0
+            && img.inv.b.abs() < 1e-12
+            && img.inv.c.abs() < 1e-12
+            && img.interpolation == crate::page_ir::InterpolationMode::Nearest
+        {
+            img.lut_nearest_opaque()
+        } else {
+            None
+        };
+        // The area-minified twin of `fast_rgb8`: same eligibility, but the image is
+        // minified on at least one axis (footprint > 1), so each destination pixel
+        // box-averages its source footprint (what the generic path's
+        // `area_average` does) instead of point-sampling. Off-diagonal inverse
+        // terms must be *exactly* zero so per-column/row source boxes reproduce the
+        // generic per-pixel `inv.apply` bit-for-bit. Interpolation is not checked:
+        // minification ignores it (`shade` area-averages regardless of the
+        // Nearest/Bilinear hint), so a minified Bilinear draw lands here too.
+        let rgb8_area_shape = blend_is_normal
+            && cmask.is_none()
+            && soft.is_none()
+            && img.alpha == 255
+            && !img.is_stencil
+            && img.bpc == 8
+            && img.decode.is_none()
+            && matches!(img.color_space, crate::page_ir::ImageColorSpace::Rgb)
+            && (img.footprint[0] > 1.0 || img.footprint[1] > 1.0)
+            && img.inv.b == 0.0
+            && img.inv.c == 0.0
+            && img.samples.len() >= img.width as usize * img.height as usize * 3;
+        let fast_rgb8_area = rgb8_area_shape && img.smask.is_none() && img.mask.is_none();
+        // The MRC shape: the same opaque axis-aligned minified RGB8 source, but cut
+        // out by a one-bit JBIG2 layer. Without this the draw falls into the
+        // generic per-pixel loop and pays a fresh inverse map, two base tap boxes,
+        // and a mask lookup for every destination pixel — all of which depend only
+        // on the destination column or row once the placement is axis-aligned.
+        let rgb8_area_min_mask = if rgb8_area_shape {
+            area_min_mask(img)
+        } else {
+            None
+        };
+        let gray8_area_shape = blend_is_normal
+            && cmask.is_none()
+            && soft.is_none()
+            && img.alpha == 255
+            && !img.is_stencil
+            && img.bpc == 8
+            && img.decode.is_none()
+            && img.sample_lut.is_none()
+            && !matches!(img.mask, Some(crate::page_ir::ImageMask::ColorKey(_)))
+            && matches!(img.color_space, crate::page_ir::ImageColorSpace::Gray)
+            && (img.footprint[0] > 1.0 || img.footprint[1] > 1.0)
+            && img.inv.b == 0.0
+            && img.inv.c == 0.0
+            && img.samples.len() >= img.width as usize * img.height as usize;
+        let fast_gray8_area = gray8_area_shape && img.smask.is_none() && img.mask.is_none();
+        let gray8_area_min_mask = if gray8_area_shape {
+            area_min_mask(img)
+        } else {
+            None
+        };
+        // The same, for an opaque axis-aligned minified CMYK image: the source is
+        // converted to RGB8 once and then box-averaged identically. Eligibility
+        // mirrors `fast_rgb8_area` but for the CMYK colour space; the sample-length
+        // and size checks live in `cmyk_source_as_rgb8`.
+        let fast_cmyk_area = blend_is_normal
+            && cmask.is_none()
+            && soft.is_none()
+            && img.alpha == 255
+            && img.smask.is_none()
+            && img.mask.is_none()
+            && !img.is_stencil
+            && img.bpc == 8
+            && img.decode.is_none()
+            && matches!(img.color_space, crate::page_ir::ImageColorSpace::Cmyk)
+            && (img.footprint[0] > 1.0 || img.footprint[1] > 1.0)
+            && img.inv.b == 0.0
+            && img.inv.c == 0.0;
+        let fast_binary = blend_is_normal && soft.is_none() && img.is_binary_box_filterable();
+        // An `/ImageMask` stencil in solid colour is a one-bit image whose
+        // painting bit is opaque and whose masking bit is transparent, so it takes
+        // the bilevel box filter when minified and a transparent-skip nearest walk
+        // otherwise, on the interior rectangle; the border band stays generic.
+        // The placement must be axis-aligned with off-diagonal terms exactly zero
+        // (that is what makes the per-axis tables and the interior test reproduce
+        // the generic `inv.apply`), and a magnified Bilinear stencil keeps the
+        // generic sampler, whose four-tap blend this path does not reproduce.
+        let stencil_lut = if blend_is_normal && soft.is_none() {
+            stencil_fast_lut(img)
+        } else {
+            None
+        };
+        Self {
+            fast_rgb8,
+            fast_gray8,
+            fast_rgb8_bilinear,
+            fast_gray8_bilinear,
+            lut_nearest,
+            fast_rgb8_area,
+            fast_gray8_area,
+            rgb8_area_min_mask,
+            gray8_area_min_mask,
+            fast_cmyk_area,
+            fast_binary,
+            stencil_lut,
         }
     }
 }
@@ -1804,94 +1860,20 @@ fn paint_binary_box_rows(
     x0: usize,
     y0: usize,
 ) -> (u64, u64, u64) {
-    let alpha = img.alpha as u16;
-    let output_origin = surface.origin_x;
-    // Fixed for the whole draw; resolve it once rather than per pixel.
-    let clip_win = cmask.map(ClipMask::clip_window);
-    let base = (window.byte_lo * 8) as u32;
     let span = window.nbytes * 8;
-
-    let paint_band = |first_y: usize,
-                      band: &mut [u8],
-                      band_rows: &[Option<crate::render_cpu::image::AxisTaps>],
-                      stride: usize|
-     -> (u64, u64, u64) {
-        let mut colw = vec![0u32; span];
-        let mut prefix = vec![0u64; span + 1];
-        let (mut painted, mut attempts, mut taps) = (0u64, 0u64, 0u64);
-        for (i, (row, row_taps)) in band.chunks_exact_mut(stride).zip(band_rows).enumerate() {
-            let y = first_y + i;
-            // Whether any referenced bit of this row's taps is set; when none
-            // is, every box counts zero ones and the sums are not built.
-            let any = row_taps
-                .as_ref()
-                .is_some_and(|ty| window.column_sums(ty, &mut colw, &mut prefix));
-            // All-zero / all-one boxes short-circuit without division; the
-            // mixed boxes memoize on `(weight, weighted ones)`. Clip coverage
-            // and destination blending stay per pixel.
-            let mut memo_key = (u64::MAX, u64::MAX);
-            let mut memo_color = [0u8; 4];
-            for (local_x, col_taps) in source_columns.iter().enumerate() {
-                let x = x0 + local_x;
-                let cov = clip_win.as_ref().map_or(255, |cw| cw.coverage(x, y));
-                if cov == 0 {
-                    continue;
-                }
-                attempts += 1;
-                let (Some(tx), Some(ty)) = (col_taps, row_taps) else {
-                    continue;
-                };
-                let weight = tx.total * ty.total;
-                if weight == 0 {
-                    continue;
-                }
-                taps += (tx.hi - tx.lo + 1) as u64 * (ty.hi - ty.lo + 1) as u64;
-                let ones_w = if any {
-                    row_band_weighted_ones(tx, base, &colw, &prefix)
-                } else {
-                    0
-                };
-                let color = if ones_w == 0 {
-                    zero
-                } else if ones_w >= weight {
-                    one
-                } else if memo_key == (weight, ones_w) {
-                    memo_color
-                } else {
-                    let c = crate::render_cpu::image::mix_bilevel(zero, one, ones_w, weight);
-                    memo_key = (weight, ones_w);
-                    memo_color = c;
-                    c
-                };
-                let a = mul_div_255(mul_div_255(color[3] as u16, alpha), cov);
-                if a == 0 {
-                    continue;
-                }
-                let target = (x - output_origin) * 4;
-                if a == 255 {
-                    row[target] = color[0];
-                    row[target + 1] = color[1];
-                    row[target + 2] = color[2];
-                    row[target + 3] = 255;
-                } else {
-                    let ia = 255 - a;
-                    row[target] = (mul_div_255(color[0] as u16, a)
-                        + mul_div_255(row[target] as u16, ia))
-                        as u8;
-                    row[target + 1] = (mul_div_255(color[1] as u16, a)
-                        + mul_div_255(row[target + 1] as u16, ia))
-                        as u8;
-                    row[target + 2] = (mul_div_255(color[2] as u16, a)
-                        + mul_div_255(row[target + 2] as u16, ia))
-                        as u8;
-                    row[target + 3] = (a + mul_div_255(row[target + 3] as u16, ia)) as u8;
-                }
-                painted += 1;
-            }
-        }
-        (painted, attempts, taps)
+    let band_painter = BilevelBandPainter {
+        alpha: img.alpha as u16,
+        zero,
+        one,
+        output_origin: surface.origin_x,
+        // Fixed for the whole draw; resolve it once rather than per pixel.
+        clip_win: cmask.map(ClipMask::clip_window),
+        base: (window.byte_lo * 8) as u32,
+        span,
+        window,
+        source_columns,
+        x0,
     };
-
     let dest_w = source_columns.len();
     let dest_h = source_rows.len();
     let (output, first_output_y, output_stride) = surface.rows_mut_abs(y0, y0 + dest_h);
@@ -1911,12 +1893,140 @@ fn paint_binary_box_rows(
             .zip(row_slice.par_chunks(BAND))
             .enumerate()
             .map(|(i, (band, rows))| {
-                paint_band(first_output_y + i * BAND, band, rows, output_stride)
+                band_painter.paint_band(first_output_y + i * BAND, band, rows, output_stride)
             })
             .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
     } else {
-        paint_band(first_output_y, output, row_slice, output_stride)
+        band_painter.paint_band(first_output_y, output, row_slice, output_stride)
     }
+}
+
+/// What every destination band of [`paint_binary_box_rows`] paints with: the
+/// draw's two mixed colours and alpha, its clip window, the referenced source
+/// window and the destination columns' taps.
+struct BilevelBandPainter<'a> {
+    alpha: u16,
+    zero: [u8; 4],
+    one: [u8; 4],
+    output_origin: usize,
+    clip_win: Option<crate::render_cpu::mask::MaskWindow<'a>>,
+    /// First referenced source bit column.
+    base: u32,
+    /// Referenced source bit columns.
+    span: usize,
+    window: &'a BilevelWindow<'a>,
+    source_columns: &'a [Option<crate::render_cpu::image::AxisTaps>],
+    x0: usize,
+}
+
+impl BilevelBandPainter<'_> {
+    /// Paint one band of destination rows, the first at device row
+    /// `first_y`, with its own column-sum scratch. Returns the painted,
+    /// attempted and tap counts.
+    fn paint_band(
+        &self,
+        first_y: usize,
+        band: &mut [u8],
+        band_rows: &[Option<crate::render_cpu::image::AxisTaps>],
+        stride: usize,
+    ) -> (u64, u64, u64) {
+        let mut colw = vec![0u32; self.span];
+        let mut prefix = vec![0u64; self.span + 1];
+        let mut counts = (0u64, 0u64, 0u64);
+        for (i, (row, row_taps)) in band.chunks_exact_mut(stride).zip(band_rows).enumerate() {
+            let y = first_y + i;
+            // Whether any referenced bit of this row's taps is set; when none
+            // is, every box counts zero ones and the sums are not built.
+            let any = row_taps
+                .as_ref()
+                .is_some_and(|ty| self.window.column_sums(ty, &mut colw, &mut prefix));
+            self.paint_row(row, y, row_taps.as_ref(), any, &colw, &prefix, &mut counts);
+        }
+        counts
+    }
+
+    /// Paint destination row `y` from its source row taps; `any` says
+    /// whether `colw` / `prefix` hold this row's column sums. Adds to the
+    /// painted, attempted and tap counts.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn paint_row(
+        &self,
+        row: &mut [u8],
+        y: usize,
+        row_taps: Option<&crate::render_cpu::image::AxisTaps>,
+        any: bool,
+        colw: &[u32],
+        prefix: &[u64],
+        (painted, attempts, taps): &mut (u64, u64, u64),
+    ) {
+        let (zero, one) = (self.zero, self.one);
+        // All-zero / all-one boxes short-circuit without division; the
+        // mixed boxes memoize on `(weight, weighted ones)`. Clip coverage
+        // and destination blending stay per pixel.
+        let mut memo_key = (u64::MAX, u64::MAX);
+        let mut memo_color = [0u8; 4];
+        for (local_x, col_taps) in self.source_columns.iter().enumerate() {
+            let x = self.x0 + local_x;
+            let cov = self.clip_win.as_ref().map_or(255, |cw| cw.coverage(x, y));
+            if cov == 0 {
+                continue;
+            }
+            *attempts += 1;
+            let (Some(tx), Some(ty)) = (col_taps, row_taps) else {
+                continue;
+            };
+            let weight = tx.total * ty.total;
+            if weight == 0 {
+                continue;
+            }
+            *taps += (tx.hi - tx.lo + 1) as u64 * (ty.hi - ty.lo + 1) as u64;
+            let ones_w = if any {
+                row_band_weighted_ones(tx, self.base, colw, prefix)
+            } else {
+                0
+            };
+            let color = if ones_w == 0 {
+                zero
+            } else if ones_w >= weight {
+                one
+            } else if memo_key == (weight, ones_w) {
+                memo_color
+            } else {
+                let c = crate::render_cpu::image::mix_bilevel(zero, one, ones_w, weight);
+                memo_key = (weight, ones_w);
+                memo_color = c;
+                c
+            };
+            let a = mul_div_255(mul_div_255(color[3] as u16, self.alpha), cov);
+            if a == 0 {
+                continue;
+            }
+            let target = (x - self.output_origin) * 4;
+            source_over_pixel(row, target, color, a);
+            *painted += 1;
+        }
+    }
+}
+
+/// Source-over `color` at effective alpha `a` (1..=255) onto the
+/// premultiplied RGBA pixel at byte `target` of `row`; `a == 255` replaces it.
+#[inline(always)]
+fn source_over_pixel(row: &mut [u8], target: usize, color: [u8; 4], a: u16) {
+    if a == 255 {
+        row[target] = color[0];
+        row[target + 1] = color[1];
+        row[target + 2] = color[2];
+        row[target + 3] = 255;
+        return;
+    }
+    let ia = 255 - a;
+    row[target] = (mul_div_255(color[0] as u16, a) + mul_div_255(row[target] as u16, ia)) as u8;
+    row[target + 1] =
+        (mul_div_255(color[1] as u16, a) + mul_div_255(row[target + 1] as u16, ia)) as u8;
+    row[target + 2] =
+        (mul_div_255(color[2] as u16, a) + mul_div_255(row[target + 2] as u16, ia)) as u8;
+    row[target + 3] = (a + mul_div_255(row[target + 3] as u16, ia)) as u8;
 }
 
 /// A summed-area table of set bits over the referenced source sub-rectangle of a
@@ -1971,19 +2081,13 @@ impl BilevelIntegral {
                 let (before, rest) = blk.split_at_mut(i * stride);
                 let cur = &mut rest[..stride];
                 let mut rowsum = 0u32;
-                if i == 0 {
-                    for (lx, bitpos) in (base_bit..base_bit + sw).enumerate() {
-                        let byte = samples[bitpos >> 3];
-                        rowsum += ((byte >> (7 - (bitpos & 7))) & 1) as u32;
-                        cur[lx + 1] = rowsum;
-                    }
-                } else {
-                    let prev = &before[(i - 1) * stride..i * stride];
-                    for (lx, bitpos) in (base_bit..base_bit + sw).enumerate() {
-                        let byte = samples[bitpos >> 3];
-                        rowsum += ((byte >> (7 - (bitpos & 7))) & 1) as u32;
-                        cur[lx + 1] = prev[lx + 1] + rowsum;
-                    }
+                // The block's first row starts from zero, the rest from the
+                // row above.
+                let prev = (i > 0).then(|| &before[(i - 1) * stride..i * stride]);
+                for (lx, bitpos) in (base_bit..base_bit + sw).enumerate() {
+                    let byte = samples[bitpos >> 3];
+                    rowsum += ((byte >> (7 - (bitpos & 7))) & 1) as u32;
+                    cur[lx + 1] = prev.map_or(0, |prev| prev[lx + 1]) + rowsum;
                 }
             }
         });
@@ -3634,6 +3738,11 @@ fn paint_axis_aligned_gray8_area_min_masked(
     paint_axis_aligned_area_min_masked::<1>(img, mask, surface, x0, y0, x1, y1)
 }
 
+/// A destination column's or row's prepared lookup for the masked
+/// area-minification path: whether it is interior, and — when its centre
+/// maps into the image — the base image's tap box and the mask's lookup.
+type MaskedAxisPrep = (bool, Option<(crate::render_cpu::image::AxisTaps, MaskAxis)>);
+
 fn paint_axis_aligned_area_min_masked<const BPP: usize>(
     img: &crate::render_cpu::image::PreparedImage,
     mask: AreaMinMask<'_>,
@@ -3651,67 +3760,8 @@ fn paint_axis_aligned_area_min_masked<const BPP: usize>(
     // rectangle of whole destination columns and rows: the prepared body runs
     // there, and the border band keeps the generic per-pixel
     // treatment. The draw therefore stays pixel-identical, edges included.
-    let half_u = 0.5 * img.inv.a.abs();
-    let half_v = 0.5 * img.inv.d.abs();
-    let mask_footprint = match mask {
-        AreaMinMask::Soft(sm) | AreaMinMask::Soft8(sm) => img.smask_footprint(sm),
-        AreaMinMask::Stencil(_) => [0.0, 0.0],
-    };
-
-    // Per destination column: whether it is interior in u, the base image's X
-    // tap box, and the mask's X lookup.
-    let mut columns: Vec<(bool, Option<(crate::render_cpu::image::AxisTaps, MaskAxis)>)> =
-        Vec::with_capacity(x1 - x0);
-    for x in x0..x1 {
-        let u = img.inv.a * (x as f64 + 0.5) + img.inv.e;
-        let interior = u >= half_u && u <= 1.0 - half_u;
-        if !(0.0..1.0).contains(&u) {
-            columns.push((interior, None));
-            continue;
-        }
-        let base = img.box_taps_x(u * img.width as f64 - 0.5);
-        let axis = match mask {
-            AreaMinMask::Soft(sm) | AreaMinMask::Soft8(sm) => {
-                crate::render_cpu::image::PreparedImage::smask_box_taps(
-                    u * sm.width as f64 - 0.5,
-                    mask_footprint[0],
-                    sm.width,
-                )
-                .map(MaskAxis::Taps)
-            }
-            AreaMinMask::Stencil(sm) => Some(MaskAxis::Texel(
-                crate::render_cpu::image::stencil_col(sm, u),
-            )),
-        };
-        columns.push((interior, base.zip(axis)));
-    }
-
-    // Per destination row, the same.
-    let mut rows: Vec<(bool, Option<(crate::render_cpu::image::AxisTaps, MaskAxis)>)> =
-        Vec::with_capacity(y1 - y0);
-    for y in y0..y1 {
-        let v = img.inv.d * (y as f64 + 0.5) + img.inv.f;
-        let interior = v >= half_v && v <= 1.0 - half_v;
-        if !(0.0..1.0).contains(&v) {
-            rows.push((interior, None));
-            continue;
-        }
-        let base = img.box_taps_y((1.0 - v) * img.height as f64 - 0.5);
-        let axis = match mask {
-            AreaMinMask::Soft(sm) | AreaMinMask::Soft8(sm) => {
-                crate::render_cpu::image::PreparedImage::smask_box_taps(
-                    (1.0 - v) * sm.height as f64 - 0.5,
-                    mask_footprint[1],
-                    sm.height,
-                )
-                .map(MaskAxis::Taps)
-            }
-            AreaMinMask::Stencil(sm) => Some(MaskAxis::Texel(
-                crate::render_cpu::image::stencil_row(sm, v),
-            )),
-        };
-        rows.push((interior, base.zip(axis)));
-    }
+    let columns = masked_area_min_columns(img, mask, x0, x1);
+    let rows = masked_area_min_rows(img, mask, y0, y1);
 
     let output_origin = surface.origin_x;
     let dest_w = x1 - x0;
@@ -3745,7 +3795,6 @@ fn paint_axis_aligned_area_min_masked<const BPP: usize>(
     let border_cols: Vec<usize> = (0..columns.len())
         .filter(|x| !(body_start..body_end).contains(x))
         .collect();
-    let border_cols = border_cols.as_slice();
     // The body's soft-mask texel span, to test a whole row's boxes for clear
     // at once, and its summed tap widths for the tap telemetry.
     let body_mask_span = body_masks.iter().fold(None, |span, mx| match (span, mx) {
@@ -3761,37 +3810,6 @@ fn paint_axis_aligned_area_min_masked<const BPP: usize>(
         (MaskAxis::Taps(a), MaskAxis::Taps(b)) => a.lo <= b.lo,
         _ => false,
     });
-
-    // A border-band pixel, or one whose center maps outside the image: the
-    // generic per-pixel treatment, minus the clip and soft-clip terms this
-    // path's eligibility already excluded. Returns whether it painted.
-    let paint_generic = |x: usize, y: usize, px: &mut [u8]| -> bool {
-        let (dx, dy) = (x as f64 + 0.5, y as f64 + 0.5);
-        let edge = img.edge_coverage(dx, dy);
-        if edge == Some(0) {
-            return false;
-        }
-        let color = match edge {
-            None => img.shade(dx, dy),
-            Some(_) => img.shade_clamped(dx, dy),
-        };
-        let Some(color) = color else { return false };
-        let cov = match edge {
-            Some(ec) => mul_div_255(255, ec),
-            None => 255,
-        };
-        let a = mul_div_255(color[3] as u16, cov);
-        if a == 0 {
-            return false;
-        }
-        composite_px_blended(
-            px,
-            [color[0], color[1], color[2]],
-            a as u8,
-            BlendChoice::Normal,
-        );
-        true
-    };
 
     // The row filter: a body row with many visible pixels (a cover under a
     // mostly opaque layer) is box-averaged a whole row at a time, a sparse
@@ -3810,23 +3828,207 @@ fn paint_axis_aligned_area_min_masked<const BPP: usize>(
     let row_offset = first_output_y.saturating_sub(y0);
     let row_slice = rows.get(row_offset..).unwrap_or(&[]);
 
-    // One band of destination rows: reads only its own base/mask source rows
-    // and writes only its own output rows, so bands are independent and the
-    // per-pixel arithmetic is untouched by how they are scheduled.
-    let paint_band = |first_y: usize,
-                      band: &mut [u8],
-                      band_rows: &[(
-        bool,
-        Option<(crate::render_cpu::image::AxisTaps, MaskAxis)>,
-    )]|
-     -> (u64, u64) {
+    let painter = MaskedAreaMinPainter::<BPP> {
+        img,
+        mask,
+        rgb,
+        stride,
+        output_origin,
+        output_stride,
+        x0,
+        body_start,
+        body_end,
+        body_taps: &body_taps,
+        body_masks: &body_masks,
+        border_cols: &border_cols,
+        body_mask_span,
+        body_col_taps,
+        masks_ascending,
+        alpha_clear,
+        alpha_set,
+        template: template.as_ref(),
+    };
+    let parallel = image_row_parallel_enabled()
+        && dest_w.saturating_mul(dest_h) >= IMAGE_ROW_PAR_PIXEL_THRESHOLD;
+    if parallel {
+        const BAND: usize = 32;
+        output
+            .par_chunks_mut(output_stride * BAND)
+            .zip(row_slice.par_chunks(BAND))
+            .enumerate()
+            .map(|(i, (band, rows))| painter.paint_band(first_output_y + i * BAND, band, rows))
+            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+    } else {
+        painter.paint_band(first_output_y, output, row_slice)
+    }
+}
+
+/// The soft mask's source footprint for the masked area-minification path
+/// (zero for a hard stencil, which is point-sampled).
+fn area_min_mask_footprint(
+    img: &crate::render_cpu::image::PreparedImage,
+    mask: AreaMinMask<'_>,
+) -> [f64; 2] {
+    match mask {
+        AreaMinMask::Soft(sm) | AreaMinMask::Soft8(sm) => img.smask_footprint(sm),
+        AreaMinMask::Stencil(_) => [0.0, 0.0],
+    }
+}
+
+/// Per destination column `x0..x1`: whether it is interior in u, the base
+/// image's X tap box, and the mask's X lookup.
+fn masked_area_min_columns(
+    img: &crate::render_cpu::image::PreparedImage,
+    mask: AreaMinMask<'_>,
+    x0: usize,
+    x1: usize,
+) -> Vec<MaskedAxisPrep> {
+    let half_u = 0.5 * img.inv.a.abs();
+    let mask_footprint = area_min_mask_footprint(img, mask);
+    let mut columns: Vec<MaskedAxisPrep> = Vec::with_capacity(x1 - x0);
+    for x in x0..x1 {
+        let u = img.inv.a * (x as f64 + 0.5) + img.inv.e;
+        let interior = u >= half_u && u <= 1.0 - half_u;
+        if !(0.0..1.0).contains(&u) {
+            columns.push((interior, None));
+            continue;
+        }
+        let base = img.box_taps_x(u * img.width as f64 - 0.5);
+        let axis = match mask {
+            AreaMinMask::Soft(sm) | AreaMinMask::Soft8(sm) => {
+                crate::render_cpu::image::PreparedImage::smask_box_taps(
+                    u * sm.width as f64 - 0.5,
+                    mask_footprint[0],
+                    sm.width,
+                )
+                .map(MaskAxis::Taps)
+            }
+            AreaMinMask::Stencil(sm) => Some(MaskAxis::Texel(
+                crate::render_cpu::image::stencil_col(sm, u),
+            )),
+        };
+        columns.push((interior, base.zip(axis)));
+    }
+    columns
+}
+
+/// Per destination row `y0..y1`, the same as [`masked_area_min_columns`].
+fn masked_area_min_rows(
+    img: &crate::render_cpu::image::PreparedImage,
+    mask: AreaMinMask<'_>,
+    y0: usize,
+    y1: usize,
+) -> Vec<MaskedAxisPrep> {
+    let half_v = 0.5 * img.inv.d.abs();
+    let mask_footprint = area_min_mask_footprint(img, mask);
+    let mut rows: Vec<MaskedAxisPrep> = Vec::with_capacity(y1 - y0);
+    for y in y0..y1 {
+        let v = img.inv.d * (y as f64 + 0.5) + img.inv.f;
+        let interior = v >= half_v && v <= 1.0 - half_v;
+        if !(0.0..1.0).contains(&v) {
+            rows.push((interior, None));
+            continue;
+        }
+        let base = img.box_taps_y((1.0 - v) * img.height as f64 - 0.5);
+        let axis = match mask {
+            AreaMinMask::Soft(sm) | AreaMinMask::Soft8(sm) => {
+                crate::render_cpu::image::PreparedImage::smask_box_taps(
+                    (1.0 - v) * sm.height as f64 - 0.5,
+                    mask_footprint[1],
+                    sm.height,
+                )
+                .map(MaskAxis::Taps)
+            }
+            AreaMinMask::Stencil(sm) => Some(MaskAxis::Texel(
+                crate::render_cpu::image::stencil_row(sm, v),
+            )),
+        };
+        rows.push((interior, base.zip(axis)));
+    }
+    rows
+}
+
+/// A border-band pixel, or one whose center maps outside the image: the
+/// generic per-pixel treatment, minus the clip and soft-clip terms the
+/// masked area-minification path's eligibility already excluded. Returns
+/// whether it painted.
+#[inline(always)]
+fn paint_generic_area_min_px(
+    img: &crate::render_cpu::image::PreparedImage,
+    x: usize,
+    y: usize,
+    px: &mut [u8],
+) -> bool {
+    let (dx, dy) = (x as f64 + 0.5, y as f64 + 0.5);
+    let edge = img.edge_coverage(dx, dy);
+    if edge == Some(0) {
+        return false;
+    }
+    let color = match edge {
+        None => img.shade(dx, dy),
+        Some(_) => img.shade_clamped(dx, dy),
+    };
+    let Some(color) = color else { return false };
+    let cov = match edge {
+        Some(ec) => mul_div_255(255, ec),
+        None => 255,
+    };
+    let a = mul_div_255(color[3] as u16, cov);
+    if a == 0 {
+        return false;
+    }
+    composite_px_blended(
+        px,
+        [color[0], color[1], color[2]],
+        a as u8,
+        BlendChoice::Normal,
+    );
+    true
+}
+
+/// What every band of [`paint_axis_aligned_area_min_masked`] paints with:
+/// the image and mask, the prepared body columns and border band, and the
+/// row filter template.
+struct MaskedAreaMinPainter<'a, const BPP: usize> {
+    img: &'a crate::render_cpu::image::PreparedImage,
+    mask: AreaMinMask<'a>,
+    rgb: &'a [u8],
+    stride: usize,
+    output_origin: usize,
+    output_stride: usize,
+    x0: usize,
+    body_start: usize,
+    body_end: usize,
+    body_taps: &'a [crate::render_cpu::image::AxisTaps],
+    body_masks: &'a [MaskAxis],
+    border_cols: &'a [usize],
+    body_mask_span: Option<(u32, u32)>,
+    body_col_taps: u64,
+    masks_ascending: bool,
+    alpha_clear: u8,
+    alpha_set: u8,
+    template: Option<&'a RowBoxFilter<'a, BPP>>,
+}
+
+impl<const BPP: usize> MaskedAreaMinPainter<'_, BPP> {
+    /// One band of destination rows: reads only its own base/mask source rows
+    /// and writes only its own output rows, so bands are independent and the
+    /// per-pixel arithmetic is untouched by how they are scheduled. Returns
+    /// the painted pixel and tap counts.
+    fn paint_band(
+        &self,
+        first_y: usize,
+        band: &mut [u8],
+        band_rows: &[MaskedAxisPrep],
+    ) -> (u64, u64) {
         let mut painted = 0u64;
         let mut taps = 0u64;
-        let mut filter = template.as_ref().map(RowBoxFilter::fresh);
-        let mut alphas = vec![0u8; body_taps.len()];
-        let mut colors = vec![0u8; body_taps.len() * 4];
+        let mut filter = self.template.map(RowBoxFilter::fresh);
+        let mut alphas = vec![0u8; self.body_taps.len()];
+        let mut colors = vec![0u8; self.body_taps.len() * 4];
+        let border = || self.border_cols.iter().map(|&local_x| self.x0 + local_x);
         for (i, (row, &(row_interior, row_axes))) in band
-            .chunks_exact_mut(output_stride)
+            .chunks_exact_mut(self.output_stride)
             .zip(band_rows)
             .enumerate()
         {
@@ -3835,7 +4037,7 @@ fn paint_axis_aligned_area_min_masked<const BPP: usize>(
             // boxes span, so a box that is uniformly clear or set — most of a
             // scanned page's foreground mask, most of a cover's opacity layer
             // — is classified without its per-tap filter.
-            let summary = match (mask, row_axes) {
+            let summary = match (self.mask, row_axes) {
                 (AreaMinMask::Soft(sm), Some((_, MaskAxis::Taps(mty)))) => {
                     Some(MaskRowSummary::bits(sm, &mty))
                 }
@@ -3846,7 +4048,7 @@ fn paint_axis_aligned_area_min_masked<const BPP: usize>(
             };
             // The one-bit mask rows this row's boxes span, with their bit
             // offsets and weights laid out once for the mixed-box filter.
-            let mask_rows = match (mask, row_axes) {
+            let mask_rows = match (self.mask, row_axes) {
                 (AreaMinMask::Soft(sm), Some((_, MaskAxis::Taps(mty)))) => {
                     BilevelMaskRows::new(sm, &mty)
                 }
@@ -3856,186 +4058,292 @@ fn paint_axis_aligned_area_min_masked<const BPP: usize>(
             // (no inverting `/Decode`): the body paints nothing, so only the
             // border band remains — the blank lines and margins of a scanned
             // page's foreground layer cost one scan of the mask union.
-            if alpha_clear == 0
+            if self.alpha_clear == 0
                 && row_interior
                 && let (Some(summary), Some((ty, _)), Some((lo, hi))) =
-                    (&summary, row_axes, body_mask_span)
+                    (&summary, row_axes, self.body_mask_span)
                 && summary.clear_over(lo, hi)
             {
-                taps += body_col_taps * (ty.hi - ty.lo + 1) as u64;
-                for &local_x in border_cols {
-                    let x = x0 + local_x;
-                    if paint_generic(x, y, &mut row[(x - output_origin) * 4..][..4]) {
-                        painted += 1;
-                    }
-                }
+                taps += self.body_col_taps * (ty.hi - ty.lo + 1) as u64;
+                painted += self.paint_generic(row, y, border());
                 continue;
             }
 
             // The border band, generically.
-            for &local_x in border_cols {
-                let x = x0 + local_x;
-                if paint_generic(x, y, &mut row[(x - output_origin) * 4..][..4]) {
-                    painted += 1;
-                }
-            }
-            let (Some((ty, my)), true) = (row_axes, row_interior && !body_taps.is_empty()) else {
+            painted += self.paint_generic(row, y, border());
+            let (Some((ty, my)), true) = (row_axes, row_interior && !self.body_taps.is_empty())
+            else {
                 // Not a body row: the body columns are generic too.
-                for x in x0 + body_start..x0 + body_end {
-                    if paint_generic(x, y, &mut row[(x - output_origin) * 4..][..4]) {
-                        painted += 1;
-                    }
-                }
+                painted +=
+                    self.paint_generic(row, y, self.x0 + self.body_start..self.x0 + self.body_end);
                 continue;
             };
-            taps += body_col_taps * (ty.hi - ty.lo + 1) as u64;
+            taps += self.body_col_taps * (ty.hi - ty.lo + 1) as u64;
 
-            // Pass 1: each body pixel's mask alpha, first — a transparent
-            // pixel skips the box average.
-            //
-            // A scanned page's foreground mask is clear over most of every
-            // row, so the pass walks the union row's set texels: every box
-            // that ends before the next set texel is clear, and a whole run
-            // of them takes one fill instead of a window test each. Only a
-            // box that reaches a set texel is classified per column. The
-            // alpha of a clear box is `alpha_clear` either way (a clear
-            // window is `uniform == Some(false)`; a box too wide to test
-            // filters to coverage 0.0, which decodes to the same byte), so
-            // the row's alphas are unchanged.
-            let mut visible = 0usize;
-            // The first set texel at or after the last queried `lo`, once
-            // known; valid for every later box because `lo` only grows.
-            let mut next_set: Option<Option<usize>> = None;
-            let mut k = 0usize;
-            while k < body_masks.len() {
-                let mx = body_masks[k];
-                if masks_ascending && let (Some(s), MaskAxis::Taps(mtx)) = (&summary, mx) {
-                    let lo = mtx.lo as usize;
-                    let ns = match next_set {
-                        Some(ns) if ns.is_none_or(|p| p >= lo) => ns,
-                        _ => {
-                            let ns = s.next_set(lo);
-                            next_set = Some(ns);
-                            ns
-                        }
-                    };
-                    let run_end = match ns {
-                        // No set texel from here on: every remaining box is
-                        // clear.
-                        None => body_masks.len(),
-                        Some(p) if p > mtx.hi as usize => {
-                            // Every box ending before `p` is clear.
-                            k + body_masks[k..]
-                                .iter()
-                                .take_while(
-                                    |m| matches!(m, MaskAxis::Taps(t) if (t.hi as usize) < p),
-                                )
-                                .count()
-                        }
-                        Some(_) => k,
-                    };
-                    if run_end > k {
-                        alphas[k..run_end].fill(alpha_clear);
-                        if alpha_clear != 0 {
-                            visible += run_end - k;
-                        }
-                        k = run_end;
-                        continue;
-                    }
-                }
-                let a = &mut alphas[k];
-                k += 1;
-                // After the run walk the box is known to reach a set texel,
-                // so only the all-set test remains of the uniform check.
-                let known_set = masks_ascending && next_set.is_some();
-                let uniform = summary.as_ref().and_then(|s| match mx {
-                    MaskAxis::Taps(mtx) if known_set => s.all_set(&mtx).then_some(true),
-                    MaskAxis::Taps(mtx) => s.uniform(&mtx),
-                    MaskAxis::Texel(_) => None,
-                });
-                let alpha = match (mask, mx, my) {
-                    _ if uniform.is_some() => {
-                        if uniform == Some(true) {
-                            alpha_set
-                        } else {
-                            alpha_clear
-                        }
-                    }
-                    (AreaMinMask::Soft(sm), MaskAxis::Taps(mtx), MaskAxis::Taps(mty)) => {
-                        let coverage = match &mask_rows {
-                            Some(rows) if mtx.hi - mtx.lo < 57 => {
-                                bilevel_coverage_prepared(sm, rows, &mtx)
-                            }
-                            _ => bilevel_smask_coverage_windowed(sm, &mtx, &mty),
-                        };
-                        (255.0 * crate::render_cpu::image::apply_smask_decode(sm, coverage)) as u8
-                    }
-                    (AreaMinMask::Soft8(sm), MaskAxis::Taps(mtx), MaskAxis::Taps(mty)) => {
-                        let coverage =
-                            crate::render_cpu::image::gray8_smask_coverage(sm, &mtx, &mty);
-                        (255.0 * crate::render_cpu::image::apply_smask_decode(sm, coverage)) as u8
-                    }
-                    (AreaMinMask::Stencil(sm), MaskAxis::Texel(col), MaskAxis::Texel(srow)) => {
-                        if crate::render_cpu::image::stencil_hides_at(sm, col, srow) {
-                            0
-                        } else {
-                            255
-                        }
-                    }
-                    // The axis kinds are built from `mask` above, so the mixed
-                    // combinations cannot occur.
-                    _ => 0,
-                };
-                *a = alpha;
-                visible += (alpha != 0) as usize;
-            }
+            let visible = self.body_alphas(&mut alphas, summary.as_ref(), mask_rows.as_ref(), my);
             if visible == 0 {
                 continue;
             }
 
             // Pass 2: colour and composite the visible body pixels — a dense
             // row through the row filter, a sparse one pixel by pixel.
-            let dense = visible * 2 >= body_taps.len()
+            let dense = visible * 2 >= self.body_taps.len()
                 && filter
                     .as_mut()
                     .is_some_and(|f| f.average_row(&ty, &mut colors));
-            let body_row = &mut row[(x0 + body_start - output_origin) * 4..];
-            for (k, ((&alpha, tx), px)) in alphas
-                .iter()
-                .zip(&body_taps)
-                .zip(body_row.chunks_exact_mut(4))
-                .enumerate()
-            {
-                if alpha == 0 {
-                    continue;
-                }
-                let color = if dense {
-                    [colors[k * 4], colors[k * 4 + 1], colors[k * 4 + 2]]
-                } else if BPP == 1 {
-                    let g = gray8_box_average(rgb, stride, tx, &ty, tx.total * ty.total);
-                    [g, g, g]
-                } else {
-                    rgb8_box_average(rgb, stride, tx, &ty, tx.total * ty.total)
-                };
-                composite_px_blended(px, color, alpha, BlendChoice::Normal);
+            painted += self.composite_body(row, &alphas, &colors, dense, &ty);
+        }
+        (painted, taps)
+    }
+
+    /// Paint the device columns `xs` of row `y` generically; returns how
+    /// many painted.
+    #[inline]
+    fn paint_generic(&self, row: &mut [u8], y: usize, xs: impl Iterator<Item = usize>) -> u64 {
+        let mut painted = 0u64;
+        for x in xs {
+            if paint_generic_area_min_px(
+                self.img,
+                x,
+                y,
+                &mut row[(x - self.output_origin) * 4..][..4],
+            ) {
                 painted += 1;
             }
         }
-        (painted, taps)
-    };
+        painted
+    }
 
-    let parallel = image_row_parallel_enabled()
-        && dest_w.saturating_mul(dest_h) >= IMAGE_ROW_PAR_PIXEL_THRESHOLD;
-    if parallel {
-        const BAND: usize = 32;
-        output
-            .par_chunks_mut(output_stride * BAND)
-            .zip(row_slice.par_chunks(BAND))
+    /// Pass 1: each body pixel's mask alpha into `alphas`, first — a
+    /// transparent pixel skips the box average. Returns how many are visible.
+    ///
+    /// A scanned page's foreground mask is clear over most of every
+    /// row, so the pass walks the union row's set texels: every box
+    /// that ends before the next set texel is clear, and a whole run
+    /// of them takes one fill instead of a window test each. Only a
+    /// box that reaches a set texel is classified per column. The
+    /// alpha of a clear box is `alpha_clear` either way (a clear
+    /// window is `uniform == Some(false)`; a box too wide to test
+    /// filters to coverage 0.0, which decodes to the same byte), so
+    /// the row's alphas are unchanged.
+    #[inline]
+    fn body_alphas(
+        &self,
+        alphas: &mut [u8],
+        summary: Option<&MaskRowSummary>,
+        mask_rows: Option<&BilevelMaskRows>,
+        my: MaskAxis,
+    ) -> usize {
+        let mut visible = 0usize;
+        // The first set texel at or after the last queried `lo`, once
+        // known; valid for every later box because `lo` only grows.
+        let mut next_set: Option<Option<usize>> = None;
+        let mut k = 0usize;
+        while k < self.body_masks.len() {
+            let mx = self.body_masks[k];
+            if let Some(run_end) = self.clear_run_end(summary, mx, k, &mut next_set) {
+                alphas[k..run_end].fill(self.alpha_clear);
+                if self.alpha_clear != 0 {
+                    visible += run_end - k;
+                }
+                k = run_end;
+                continue;
+            }
+            let a = &mut alphas[k];
+            k += 1;
+            // After the run walk the box is known to reach a set texel,
+            // so only the all-set test remains of the uniform check.
+            let known_set = self.masks_ascending && next_set.is_some();
+            let uniform = summary.and_then(|s| match mx {
+                MaskAxis::Taps(mtx) if known_set => s.all_set(&mtx).then_some(true),
+                MaskAxis::Taps(mtx) => s.uniform(&mtx),
+                MaskAxis::Texel(_) => None,
+            });
+            let alpha = self.box_alpha(mx, my, uniform, mask_rows);
+            *a = alpha;
+            visible += (alpha != 0) as usize;
+        }
+        visible
+    }
+
+    /// When the body boxes ascend and box `k` (mask lookup `mx`) ends before
+    /// the next set texel of the row's mask union, the end of the run of
+    /// clear boxes starting at `k`. `next_set` caches that texel.
+    #[inline(always)]
+    fn clear_run_end(
+        &self,
+        summary: Option<&MaskRowSummary>,
+        mx: MaskAxis,
+        k: usize,
+        next_set: &mut Option<Option<usize>>,
+    ) -> Option<usize> {
+        if !self.masks_ascending {
+            return None;
+        }
+        let (Some(s), MaskAxis::Taps(mtx)) = (summary, mx) else {
+            return None;
+        };
+        let lo = mtx.lo as usize;
+        let ns = match *next_set {
+            Some(ns) if ns.is_none_or(|p| p >= lo) => ns,
+            _ => {
+                let ns = s.next_set(lo);
+                *next_set = Some(ns);
+                ns
+            }
+        };
+        let run_end = match ns {
+            // No set texel from here on: every remaining box is
+            // clear.
+            None => self.body_masks.len(),
+            Some(p) if p > mtx.hi as usize => {
+                // Every box ending before `p` is clear.
+                k + self.body_masks[k..]
+                    .iter()
+                    .take_while(|m| matches!(m, MaskAxis::Taps(t) if (t.hi as usize) < p))
+                    .count()
+            }
+            Some(_) => k,
+        };
+        (run_end > k).then_some(run_end)
+    }
+
+    /// The mask alpha of one body box: `uniform` when the row summary
+    /// classified it, else the box's soft-mask coverage or stencil test.
+    #[inline(always)]
+    fn box_alpha(
+        &self,
+        mx: MaskAxis,
+        my: MaskAxis,
+        uniform: Option<bool>,
+        mask_rows: Option<&BilevelMaskRows>,
+    ) -> u8 {
+        match (self.mask, mx, my) {
+            _ if uniform.is_some() => {
+                if uniform == Some(true) {
+                    self.alpha_set
+                } else {
+                    self.alpha_clear
+                }
+            }
+            (AreaMinMask::Soft(sm), MaskAxis::Taps(mtx), MaskAxis::Taps(mty)) => {
+                let coverage = match mask_rows {
+                    Some(rows) if mtx.hi - mtx.lo < 57 => bilevel_coverage_prepared(sm, rows, &mtx),
+                    _ => bilevel_smask_coverage_windowed(sm, &mtx, &mty),
+                };
+                (255.0 * crate::render_cpu::image::apply_smask_decode(sm, coverage)) as u8
+            }
+            (AreaMinMask::Soft8(sm), MaskAxis::Taps(mtx), MaskAxis::Taps(mty)) => {
+                let coverage = crate::render_cpu::image::gray8_smask_coverage(sm, &mtx, &mty);
+                (255.0 * crate::render_cpu::image::apply_smask_decode(sm, coverage)) as u8
+            }
+            (AreaMinMask::Stencil(sm), MaskAxis::Texel(col), MaskAxis::Texel(srow)) => {
+                if crate::render_cpu::image::stencil_hides_at(sm, col, srow) {
+                    0
+                } else {
+                    255
+                }
+            }
+            // The axis kinds are built from `mask` above, so the mixed
+            // combinations cannot occur.
+            _ => 0,
+        }
+    }
+
+    /// Pass 2 body: colour each visible body pixel (from the row filter's
+    /// `colors` when `dense`, else its own box average over source row taps
+    /// `ty`) and composite it under its alpha. Returns how many painted.
+    #[inline]
+    fn composite_body(
+        &self,
+        row: &mut [u8],
+        alphas: &[u8],
+        colors: &[u8],
+        dense: bool,
+        ty: &crate::render_cpu::image::AxisTaps,
+    ) -> u64 {
+        let mut painted = 0u64;
+        let body_row = &mut row[(self.x0 + self.body_start - self.output_origin) * 4..];
+        for (k, ((&alpha, tx), px)) in alphas
+            .iter()
+            .zip(self.body_taps)
+            .zip(body_row.chunks_exact_mut(4))
             .enumerate()
-            .map(|(i, (band, rows))| paint_band(first_output_y + i * BAND, band, rows))
-            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
-    } else {
-        paint_band(first_output_y, output, row_slice)
+        {
+            if alpha == 0 {
+                continue;
+            }
+            let color = if dense {
+                [colors[k * 4], colors[k * 4 + 1], colors[k * 4 + 2]]
+            } else if BPP == 1 {
+                let g = gray8_box_average(self.rgb, self.stride, tx, ty, tx.total * ty.total);
+                [g, g, g]
+            } else {
+                rgb8_box_average(self.rgb, self.stride, tx, ty, tx.total * ty.total)
+            };
+            composite_px_blended(px, color, alpha, BlendChoice::Normal);
+            painted += 1;
+        }
+        painted
+    }
+}
+
+/// One band of destination rows of [`area_min_box_average_opaque`] with its
+/// own row cache; bands are independent, and each row's bytes do not depend
+/// on the cache. Returns the painted pixel and tap counts.
+fn paint_opaque_box_band<const BPP: usize>(
+    template: &RowBoxFilter<'_, BPP>,
+    band: &mut [u8],
+    band_rows: &[Option<crate::render_cpu::image::AxisTaps>],
+    output_stride: usize,
+    first_target: usize,
+    col_span: u64,
+) -> (u64, u64) {
+    let cols = template.cols;
+    let mut filter = template.fresh();
+    let (mut painted, mut taps) = (0u64, 0u64);
+    for (row, ty) in band.chunks_exact_mut(output_stride).zip(band_rows) {
+        let Some(ty) = ty else { continue };
+        average_row_opaque(
+            &mut filter,
+            template.rgb,
+            template.stride,
+            cols,
+            ty,
+            row,
+            first_target,
+        );
+        painted += cols.len() as u64;
+        taps += col_span * (ty.hi - ty.lo + 1) as u64;
+    }
+    (painted, taps)
+}
+
+/// Box-average each column `cols` of one destination row over source row
+/// taps `ty` and write it opaque from byte `first_target` of `row`: through
+/// the row filter, or per pixel when the filter declines the row.
+#[inline]
+fn average_row_opaque<const BPP: usize>(
+    filter: &mut RowBoxFilter<'_, BPP>,
+    rgb: &[u8],
+    stride: usize,
+    cols: &[crate::render_cpu::image::AxisTaps],
+    ty: &crate::render_cpu::image::AxisTaps,
+    row: &mut [u8],
+    first_target: usize,
+) {
+    if filter.average_row(ty, &mut row[first_target..]) {
+        return;
+    }
+    for (x, tx) in cols.iter().enumerate() {
+        let c = if BPP == 1 {
+            let g = gray8_box_average(rgb, stride, tx, ty, tx.total * ty.total);
+            [g, g, g]
+        } else {
+            rgb8_box_average(rgb, stride, tx, ty, tx.total * ty.total)
+        };
+        let t = first_target + x * 4;
+        row[t..t + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
     }
 }
 
@@ -4108,30 +4416,16 @@ fn area_min_box_average_opaque<const BPP: usize>(
         let row_offset = first_output_y.saturating_sub(y0);
         let row_slice = source_rows.get(row_offset..).unwrap_or(&[]);
         let first_target = (x0 + bx0 - output_origin) * 4;
-        // One band of destination rows with its own row cache; bands are
-        // independent, and each row's bytes do not depend on the cache.
         let paint_band =
             |band: &mut [u8], band_rows: &[Option<crate::render_cpu::image::AxisTaps>]| {
-                let mut filter = template.fresh();
-                let (mut painted, mut taps) = (0u64, 0u64);
-                for (row, ty) in band.chunks_exact_mut(output_stride).zip(band_rows) {
-                    let Some(ty) = ty else { continue };
-                    if !filter.average_row(ty, &mut row[first_target..]) {
-                        for (x, tx) in cols.iter().enumerate() {
-                            let c = if BPP == 1 {
-                                let g = gray8_box_average(rgb, stride, tx, ty, tx.total * ty.total);
-                                [g, g, g]
-                            } else {
-                                rgb8_box_average(rgb, stride, tx, ty, tx.total * ty.total)
-                            };
-                            let t = first_target + x * 4;
-                            row[t..t + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
-                        }
-                    }
-                    painted += cols.len() as u64;
-                    taps += col_span * (ty.hi - ty.lo + 1) as u64;
-                }
-                (painted, taps)
+                paint_opaque_box_band(
+                    template,
+                    band,
+                    band_rows,
+                    output_stride,
+                    first_target,
+                    col_span,
+                )
             };
         let parallel = image_row_parallel_enabled()
             && dest_w.saturating_mul(dest_h) >= IMAGE_ROW_PAR_PIXEL_THRESHOLD;
@@ -4333,20 +4627,7 @@ impl<'a, const BPP: usize> RowBoxFilter<'a, BPP> {
         let n = cols.len();
         let taps_used = cols.iter().map(|t| (t.hi - t.lo) as usize + 1).max()?;
         let taps4 = if taps_used <= 4 {
-            cols.iter()
-                .map(|t| {
-                    let (lo, span) = (t.lo as usize, (t.hi - t.lo) as usize);
-                    let mut offsets = [lo * BPP; 4];
-                    let mut weights = [0u32; 4];
-                    for (k, (o, w)) in offsets.iter_mut().zip(&mut weights).enumerate() {
-                        if k <= span {
-                            *o = (lo + k) * BPP;
-                            *w = t.weight_at((lo + k) as u32) as u32;
-                        }
-                    }
-                    (offsets, weights)
-                })
-                .collect()
+            cols.iter().map(Self::four_taps).collect()
         } else {
             Vec::new()
         };
@@ -4362,6 +4643,22 @@ impl<'a, const BPP: usize> RowBoxFilter<'a, BPP> {
             acc: vec![0.0; BPP * n],
             kernel: image_kernel(),
         })
+    }
+
+    /// A column's box as four texel byte offsets within a source row and
+    /// their weights, the absent ones weighted zero (and pointed at a texel
+    /// that exists).
+    fn four_taps(t: &crate::render_cpu::image::AxisTaps) -> ([usize; 4], [u32; 4]) {
+        let (lo, span) = (t.lo as usize, (t.hi - t.lo) as usize);
+        let mut offsets = [lo * BPP; 4];
+        let mut weights = [0u32; 4];
+        for (k, (o, w)) in offsets.iter_mut().zip(&mut weights).enumerate() {
+            if k <= span {
+                *o = (lo + k) * BPP;
+                *w = t.weight_at((lo + k) as u32) as u32;
+            }
+        }
+        (offsets, weights)
     }
 
     /// The same filter with an empty row cache, for another band of rows.
@@ -4385,19 +4682,10 @@ impl<'a, const BPP: usize> RowBoxFilter<'a, BPP> {
         let row_base = row as usize * self.stride;
         let src = &self.rgb[row_base..row_base + self.stride];
         if BPP == 1 {
-            let fixed = |taps: usize, out: &mut [f64]| {
-                for (x, (o, w)) in self.taps4.iter().enumerate() {
-                    let mut sum = 0u32;
-                    for k in 0..taps {
-                        sum += w[k] * src[o[k]] as u32;
-                    }
-                    out[x] = sum as f64;
-                }
-            };
             match (self.taps4.is_empty(), self.taps_used) {
-                (false, 1..=2) => return fixed(2, planes),
-                (false, 3) => return fixed(3, planes),
-                (false, _) => return fixed(4, planes),
+                (false, 1..=2) => return self.fixed_gray(src, 2, planes),
+                (false, 3) => return self.fixed_gray(src, 3, planes),
+                (false, _) => return self.fixed_gray(src, 4, planes),
                 (true, _) => {}
             }
             for (x, tx) in self.cols.iter().enumerate() {
@@ -4414,27 +4702,10 @@ impl<'a, const BPP: usize> RowBoxFilter<'a, BPP> {
         let n = self.cols.len();
         let (r, rest) = planes.split_at_mut(n);
         let (g, b) = rest.split_at_mut(n);
-        // Weights are at most `S` and texels 255, so four products fit `u32`;
-        // the absent taps add `0 · texel`. The tap count is fixed per draw so
-        // the loop body is straight-line code.
-        let fixed = |taps: usize, r: &mut [f64], g: &mut [f64], b: &mut [f64]| {
-            for (x, (o, w)) in self.taps4.iter().enumerate() {
-                let mut sum = [0u32; 3];
-                for k in 0..taps {
-                    let t = &src[o[k]..o[k] + 3];
-                    sum[0] += w[k] * t[0] as u32;
-                    sum[1] += w[k] * t[1] as u32;
-                    sum[2] += w[k] * t[2] as u32;
-                }
-                r[x] = sum[0] as f64;
-                g[x] = sum[1] as f64;
-                b[x] = sum[2] as f64;
-            }
-        };
         match (self.taps4.is_empty(), self.taps_used) {
-            (false, 1..=2) => return fixed(2, r, g, b),
-            (false, 3) => return fixed(3, r, g, b),
-            (false, _) => return fixed(4, r, g, b),
+            (false, 1..=2) => return self.fixed_rgb(src, 2, r, g, b),
+            (false, 3) => return self.fixed_rgb(src, 3, r, g, b),
+            (false, _) => return self.fixed_rgb(src, 4, r, g, b),
             (true, _) => {}
         }
         for (x, tx) in self.cols.iter().enumerate() {
@@ -4450,6 +4721,41 @@ impl<'a, const BPP: usize> RowBoxFilter<'a, BPP> {
             r[x] = a0 as f64;
             g[x] = a1 as f64;
             b[x] = a2 as f64;
+        }
+    }
+
+    /// The gray horizontal pass over the source row `src` with `taps` (2..=4)
+    /// fixed taps per column.
+    #[inline(always)]
+    fn fixed_gray(&self, src: &[u8], taps: usize, out: &mut [f64]) {
+        for (x, (o, w)) in self.taps4.iter().enumerate() {
+            let mut sum = 0u32;
+            for k in 0..taps {
+                sum += w[k] * src[o[k]] as u32;
+            }
+            out[x] = sum as f64;
+        }
+    }
+
+    /// The RGB horizontal pass over the source row `src` with `taps` (2..=4)
+    /// fixed taps per column, into planes `r`, `g`, `b`.
+    ///
+    /// Weights are at most `S` and texels 255, so four products fit `u32`;
+    /// the absent taps add `0 · texel`. The tap count is fixed per draw so
+    /// the loop body is straight-line code.
+    #[inline(always)]
+    fn fixed_rgb(&self, src: &[u8], taps: usize, r: &mut [f64], g: &mut [f64], b: &mut [f64]) {
+        for (x, (o, w)) in self.taps4.iter().enumerate() {
+            let mut sum = [0u32; 3];
+            for k in 0..taps {
+                let t = &src[o[k]..o[k] + 3];
+                sum[0] += w[k] * t[0] as u32;
+                sum[1] += w[k] * t[1] as u32;
+                sum[2] += w[k] * t[2] as u32;
+            }
+            r[x] = sum[0] as f64;
+            g[x] = sum[1] as f64;
+            b[x] = sum[2] as f64;
         }
     }
 
@@ -5313,58 +5619,14 @@ fn render_tiling_impl(
         let Some(cm) = masks.get(cid) else {
             return; // unreachable: just made resident above
         };
-        let mw = cm.stride();
-        for ly in 0..h {
-            let dy = by + ly;
-            if dy < cm.bounds.y as usize || dy >= cm.bounds.y as usize + cm.bounds.height as usize {
-                for lx in 0..w {
-                    fmask[ly * w + lx] = 0;
-                }
-                continue;
-            }
-            let base = (dy - cm.bounds.y as usize) * mw;
-            let cmx = cm.bounds.x as usize;
-            let cmw = cm.bounds.width as usize;
-            for lx in 0..w {
-                let dx = bx + lx;
-                let v = if dx >= cmx && dx < cmx + cmw {
-                    cm.data[base + (dx - cmx)]
-                } else {
-                    0
-                };
-                fmask[ly * w + lx] = mul_div_255(fmask[ly * w + lx] as u16, v as u16) as u8;
-            }
-        }
+        intersect_fill_mask_with_clip(&mut fmask, cm, b);
     }
 
     // An /ImageMask stencil painted with this pattern: the pattern shows only
     // through the stencil's per-pixel coverage. Sampled with the same edge
     // coverage as an ordinary stencil blit, then folded into the fill mask.
     if let Some(stencil) = &t.stencil {
-        for ly in 0..h {
-            for lx in 0..w {
-                let idx = ly * w + lx;
-                if fmask[idx] == 0 {
-                    continue;
-                }
-                let (dx, dy) = ((bx + lx) as f64 + 0.5, (by + ly) as f64 + 0.5);
-                let edge = stencil.edge_coverage(dx, dy);
-                let scov = if edge == Some(0) {
-                    0
-                } else {
-                    let color = match edge {
-                        None => stencil.shade(dx, dy),
-                        Some(_) => stencil.shade_clamped(dx, dy),
-                    };
-                    let base = color.map(|c| c[3] as u16).unwrap_or(0);
-                    match edge {
-                        Some(ec) => mul_div_255(base, ec),
-                        None => base,
-                    }
-                };
-                fmask[idx] = mul_div_255(fmask[idx] as u16, scov) as u8;
-            }
-        }
+        fold_stencil_into_fill_mask(&mut fmask, stencil, b);
     }
 
     #[cfg(feature = "profiling")]
@@ -5461,6 +5723,98 @@ fn render_tiling_impl(
 
     // Composite the tiled offscreen onto `surface`, masked by the fill shape
     // and scaled by the fill's constant alpha.
+    composite_tiled_fill(surface, &pat, &fmask, t);
+    #[cfg(feature = "profiling")]
+    {
+        stats.hot.ns_tiling_composite += lap.lap_ns();
+        stats.hot.clock_reads += 4;
+    }
+    stats.commands += 1;
+    stats.ops_painted += 1;
+}
+
+/// Intersect a tiling fill's shape mask (over `b`, the fill bounds) with
+/// the clip mask `cm`: zero outside the clip's envelope, multiplied inside.
+fn intersect_fill_mask_with_clip(fmask: &mut [u8], cm: &ClipMask, b: DeviceRect) {
+    let (w, h) = (b.width as usize, b.height as usize);
+    let (bx, by) = (b.x as usize, b.y as usize);
+    let mw = cm.stride();
+    for ly in 0..h {
+        let dy = by + ly;
+        if dy < cm.bounds.y as usize || dy >= cm.bounds.y as usize + cm.bounds.height as usize {
+            for lx in 0..w {
+                fmask[ly * w + lx] = 0;
+            }
+            continue;
+        }
+        let base = (dy - cm.bounds.y as usize) * mw;
+        let cmx = cm.bounds.x as usize;
+        let cmw = cm.bounds.width as usize;
+        for lx in 0..w {
+            let dx = bx + lx;
+            let v = if dx >= cmx && dx < cmx + cmw {
+                cm.data[base + (dx - cmx)]
+            } else {
+                0
+            };
+            fmask[ly * w + lx] = mul_div_255(fmask[ly * w + lx] as u16, v as u16) as u8;
+        }
+    }
+}
+
+/// Fold an `/ImageMask` stencil's per-pixel coverage into a tiling fill's
+/// shape mask (over `b`, the fill bounds), sampled with the same edge
+/// coverage as an ordinary stencil blit.
+fn fold_stencil_into_fill_mask(
+    fmask: &mut [u8],
+    stencil: &crate::render_cpu::image::PreparedImage,
+    b: DeviceRect,
+) {
+    let (w, h) = (b.width as usize, b.height as usize);
+    let (bx, by) = (b.x as usize, b.y as usize);
+    for ly in 0..h {
+        for lx in 0..w {
+            let idx = ly * w + lx;
+            if fmask[idx] == 0 {
+                continue;
+            }
+            let (dx, dy) = ((bx + lx) as f64 + 0.5, (by + ly) as f64 + 0.5);
+            let scov = stencil_coverage(stencil, dx, dy);
+            fmask[idx] = mul_div_255(fmask[idx] as u16, scov) as u8;
+        }
+    }
+}
+
+/// A stencil's coverage at device point `(dx, dy)`: its sampled alpha,
+/// scaled by the edge coverage of a border pixel.
+#[inline(always)]
+fn stencil_coverage(stencil: &crate::render_cpu::image::PreparedImage, dx: f64, dy: f64) -> u16 {
+    let edge = stencil.edge_coverage(dx, dy);
+    if edge == Some(0) {
+        return 0;
+    }
+    let color = match edge {
+        None => stencil.shade(dx, dy),
+        Some(_) => stencil.shade_clamped(dx, dy),
+    };
+    let base = color.map(|c| c[3] as u16).unwrap_or(0);
+    match edge {
+        Some(ec) => mul_div_255(base, ec),
+        None => base,
+    }
+}
+
+/// Composite a tiling fill's offscreen `pat` onto `surface`, masked by the
+/// fill shape `fmask` and scaled by the fill's constant alpha.
+fn composite_tiled_fill(
+    surface: &mut Surface,
+    pat: &Surface,
+    fmask: &[u8],
+    t: &crate::render_cpu::prepared::PreparedTiling,
+) {
+    let b = t.bounds;
+    let (w, h) = (b.width as usize, b.height as usize);
+    let (bx, by) = (b.x as usize, b.y as usize);
     let sox = surface.origin_x;
     // Composite blend: `Normal` keeps the exact integer source-over below; a
     // non-Normal pattern fill un-premultiplies the cell pixel and goes
@@ -5474,7 +5828,7 @@ fn render_tiling_impl(
         if dy < surface.origin_y || dy >= surface.origin_y + surface.height {
             continue;
         }
-        // `pat` is this function's own offscreen (built above), distinct from
+        // `pat` is the fill's own offscreen, distinct from
         // `surface`, so the row can be borrowed rather than copied.
         let prow = pat.local_row(ly);
         let srow = surface.row_mut(dy);
@@ -5491,34 +5845,13 @@ fn render_tiling_impl(
             let dst = &mut srow[(bx + lx - sox) * 4..(bx + lx - sox) * 4 + 4];
             if !blend_is_normal {
                 // Straight source color + effective alpha for the compositor.
-                let (rgb, sa) = if t.uncolored {
-                    let stencil = src[3] as u16;
-                    let a = mul_div_255(mul_div_255(t.under[3] as u16, stencil), kk);
-                    ([t.under[0], t.under[1], t.under[2]], a as u8)
-                } else {
-                    let s3 = src[3] as u16;
-                    let un = |ch: usize| ((src[ch] as u16 * 255 + s3 / 2) / s3).min(255) as u8;
-                    ([un(0), un(1), un(2)], mul_div_255(s3, kk) as u8)
-                };
+                let (rgb, sa) = tile_source_straight(t, src, kk);
                 composite_px_blended(dst, rgb, sa, blend);
                 continue;
             }
             // Effective premultiplied source: the cell pixel (colored) or the
             // under-color through the cell's alpha stencil (uncolored).
-            let (spr, sa) = if t.uncolored {
-                let stencil = src[3] as u16;
-                let a = mul_div_255(mul_div_255(t.under[3] as u16, stencil), kk);
-                let pm = |ch: usize| {
-                    mul_div_255(
-                        mul_div_255(mul_div_255(t.under[ch] as u16, t.under[3] as u16), stencil),
-                        kk,
-                    ) as u8
-                };
-                ([pm(0), pm(1), pm(2)], a as u8)
-            } else {
-                let pm = |ch: usize| mul_div_255(src[ch] as u16, kk) as u8;
-                ([pm(0), pm(1), pm(2)], mul_div_255(src[3] as u16, kk) as u8)
-            };
+            let (spr, sa) = tile_source_premultiplied(t, src, kk);
             if sa == 0 {
                 continue;
             }
@@ -5529,13 +5862,49 @@ fn render_tiling_impl(
             dst[3] = (sa as u16 + mul_div_255(dst[3] as u16, ia)) as u8;
         }
     }
-    #[cfg(feature = "profiling")]
-    {
-        stats.hot.ns_tiling_composite += lap.lap_ns();
-        stats.hot.clock_reads += 4;
+}
+
+/// A tiling fill's source at one pixel as straight colour and effective
+/// alpha (coverage × fill alpha `kk`): the cell pixel un-premultiplied
+/// (colored), or the under-color through the cell's alpha (uncolored).
+#[inline(always)]
+fn tile_source_straight(
+    t: &crate::render_cpu::prepared::PreparedTiling,
+    src: &[u8],
+    kk: u16,
+) -> ([u8; 3], u8) {
+    if t.uncolored {
+        let stencil = src[3] as u16;
+        let a = mul_div_255(mul_div_255(t.under[3] as u16, stencil), kk);
+        return ([t.under[0], t.under[1], t.under[2]], a as u8);
     }
-    stats.commands += 1;
-    stats.ops_painted += 1;
+    let s3 = src[3] as u16;
+    let un = |ch: usize| ((src[ch] as u16 * 255 + s3 / 2) / s3).min(255) as u8;
+    ([un(0), un(1), un(2)], mul_div_255(s3, kk) as u8)
+}
+
+/// A tiling fill's source at one pixel as premultiplied colour and
+/// effective alpha (coverage × fill alpha `kk`): the cell pixel (colored),
+/// or the under-color through the cell's alpha stencil (uncolored).
+#[inline(always)]
+fn tile_source_premultiplied(
+    t: &crate::render_cpu::prepared::PreparedTiling,
+    src: &[u8],
+    kk: u16,
+) -> ([u8; 3], u8) {
+    if t.uncolored {
+        let stencil = src[3] as u16;
+        let a = mul_div_255(mul_div_255(t.under[3] as u16, stencil), kk);
+        let pm = |ch: usize| {
+            mul_div_255(
+                mul_div_255(mul_div_255(t.under[ch] as u16, t.under[3] as u16), stencil),
+                kk,
+            ) as u8
+        };
+        return ([pm(0), pm(1), pm(2)], a as u8);
+    }
+    let pm = |ch: usize| mul_div_255(src[ch] as u16, kk) as u8;
+    ([pm(0), pm(1), pm(2)], mul_div_255(src[3] as u16, kk) as u8)
 }
 
 /// Evaluate a shading at device point `(dx, dy)`. Returns the straight RGBA
@@ -5870,19 +6239,8 @@ fn paint_glyph_run(
             let row = surface.row_mut(y as usize);
 
             if simple {
-                if let Some(sh) = &gr.shading {
-                    shade_glyph_span(
-                        &mut row[dst0..dst1],
-                        src,
-                        sh,
-                        rx0 as usize,
-                        y as usize,
-                        gr.alpha,
-                        blend,
-                    );
-                } else {
-                    (kernels.blend_mask)(&mut row[dst0..dst1], src, gr.rgb, gr.alpha);
-                }
+                let dst = &mut row[dst0..dst1];
+                blit_glyph_span(dst, src, gr, kernels, blend, rx0 as usize, y as usize);
                 covered += src.iter().filter(|&&c| c != 0).count() as u64;
                 continue;
             }
@@ -5891,50 +6249,14 @@ fn paint_glyph_run(
             scratch.clear();
             scratch.extend_from_slice(src);
             if let Some(m) = mask {
-                let mw = m.stride();
-                let (mbx, mby) = (m.bounds.x as usize, m.bounds.y as usize);
-                let (mbw, mbh) = (m.bounds.width as usize, m.bounds.height as usize);
-                let in_row = (y as usize) >= mby && (y as usize) < mby + mbh;
-                let base = if in_row { (y as usize - mby) * mw } else { 0 };
-                for (i, c) in scratch.iter_mut().enumerate() {
-                    let x = rx0 as usize + i;
-                    let mv = if in_row && x >= mbx && x < mbx + mbw {
-                        m.data[base + (x - mbx)]
-                    } else {
-                        0
-                    };
-                    *c = mul_div_255(*c as u16, mv as u16) as u8;
-                }
+                modulate_span_by_mask(&mut scratch, m, rx0 as usize, y as usize, 0);
             }
             if let Some(sm) = soft {
-                let sw = sm.stride();
-                let (sbx, sby) = (sm.bounds.x as usize, sm.bounds.y as usize);
-                let (sbw, sbh) = (sm.bounds.width as usize, sm.bounds.height as usize);
-                let in_row = (y as usize) >= sby && (y as usize) < sby + sbh;
-                let base = if in_row { (y as usize - sby) * sw } else { 0 };
-                for (i, c) in scratch.iter_mut().enumerate() {
-                    let x = rx0 as usize + i;
-                    let sv = if in_row && x >= sbx && x < sbx + sbw {
-                        sm.data[base + (x - sbx)]
-                    } else {
-                        sm.outside
-                    };
-                    *c = mul_div_255(*c as u16, sv as u16) as u8;
-                }
+                modulate_span_by_mask(&mut scratch, sm, rx0 as usize, y as usize, sm.outside);
             }
             covered += scratch.iter().filter(|&&c| c != 0).count() as u64;
             let dst = &mut row[dst0..dst1];
-            if let Some(sh) = &gr.shading {
-                shade_glyph_span(dst, &scratch, sh, rx0 as usize, y as usize, gr.alpha, blend);
-            } else {
-                match blend {
-                    BlendChoice::Normal => (kernels.blend_mask)(dst, &scratch, gr.rgb, gr.alpha),
-                    BlendChoice::Separable(f) => blend_span(dst, &scratch, gr.rgb, gr.alpha, f),
-                    BlendChoice::NonSeparable(f) => {
-                        blend_span_nonsep(dst, &scratch, gr.rgb, gr.alpha, f)
-                    }
-                }
-            }
+            blit_glyph_span(dst, &scratch, gr, kernels, blend, rx0 as usize, y as usize);
         }
     }
 
@@ -5948,6 +6270,61 @@ fn paint_glyph_run(
         profile.add_duration("render.path.glyph_runs", elapsed);
         profile.increment("render.glyph_runs", 1);
         profile.increment("render.glyph_blits", gr.placements.len() as u64);
+    }
+}
+
+/// Composite one glyph-run coverage span onto `dst` (device row `y` from
+/// column `x0`): coloured by the run's shading, or its solid colour under
+/// `blend`.
+#[inline]
+fn blit_glyph_span(
+    dst: &mut [u8],
+    cov: &[u8],
+    gr: &PreparedGlyphRun,
+    kernels: &KernelSet,
+    blend: BlendChoice,
+    x0: usize,
+    y: usize,
+) {
+    if let Some(sh) = &gr.shading {
+        shade_glyph_span(dst, cov, sh, x0, y, gr.alpha, blend);
+        return;
+    }
+    match blend {
+        BlendChoice::Normal => (kernels.blend_mask)(dst, cov, gr.rgb, gr.alpha),
+        BlendChoice::Separable(f) => blend_span(dst, cov, gr.rgb, gr.alpha, f),
+        BlendChoice::NonSeparable(f) => blend_span_nonsep(dst, cov, gr.rgb, gr.alpha, f),
+    }
+}
+
+/// Multiply a coverage span (device row `y` from column `x0`) by mask `m`,
+/// reading `outside` beyond the mask's extent.
+#[inline]
+fn modulate_span_by_mask(span: &mut [u8], m: &ClipMask, x0: usize, y: usize, outside: u8) {
+    let mw = m.stride();
+    let (mbx, mby) = (m.bounds.x as usize, m.bounds.y as usize);
+    let (mbw, mbh) = (m.bounds.width as usize, m.bounds.height as usize);
+    let in_row = y >= mby && y < mby + mbh;
+    let base = if in_row { (y - mby) * mw } else { 0 };
+    for (i, c) in span.iter_mut().enumerate() {
+        let x = x0 + i;
+        let mv = if in_row && x >= mbx && x < mbx + mbw {
+            m.data[base + (x - mbx)]
+        } else {
+            outside
+        };
+        *c = mul_div_255(*c as u16, mv as u16) as u8;
+    }
+}
+
+/// Write a run-aware row's constant runs into its coverage buffer, for a
+/// consumer that wants the plain buffer.
+#[inline]
+fn write_constant_runs(cov: &mut [u8], runs: &[crate::render_cpu::raster::CovRun]) {
+    for r in runs {
+        if let Some(c) = r.fill {
+            cov[r.x0 as usize..r.x1 as usize].fill(c);
+        }
     }
 }
 
@@ -6088,11 +6465,7 @@ fn paint_command(
                         );
                         false
                     } else {
-                        for r in runs {
-                            if let Some(c) = r.fill {
-                                cov[r.x0 as usize..r.x1 as usize].fill(c);
-                            }
-                        }
+                        write_constant_runs(cov, runs);
                         dispatch_row(
                             surface, kernels, y, x0, x1, cov, bx0, bx1, mask, soft, rgb, alpha,
                             opaque, premul, blend, shading, stencil,
@@ -6186,20 +6559,27 @@ fn composite_group(
             if src[3] == 0 {
                 continue;
             }
-            let alpha = match soft {
-                Some(sm) => {
-                    let sv = soft_mask_at(sm, group.origin_x + lx, abs_y);
-                    if sv == 0 {
-                        continue;
-                    }
-                    mul_div_255(opacity as u16, sv as u16) as u8
-                }
-                None => opacity,
+            let Some(alpha) = masked_opacity(soft, opacity, group.origin_x + lx, abs_y) else {
+                continue;
             };
             let plx = group.origin_x + lx - pox;
-            composite_layer_px(&mut prow[plx * 4..plx * 4 + 4], src, alpha, blend);
+            composite_layer_px(&mut prow[plx * 4..plx * 4 + 4], src, alpha as u8, blend);
         }
     }
+}
+
+/// A group's composite weight at device pixel `(x, y)`: `opacity` scaled by
+/// the soft mask in force, `None` where the mask is zero.
+#[inline(always)]
+fn masked_opacity(soft: Option<&ClipMask>, opacity: u8, x: usize, y: usize) -> Option<u16> {
+    let Some(sm) = soft else {
+        return Some(opacity as u16);
+    };
+    let sv = soft_mask_at(sm, x, y);
+    if sv == 0 {
+        return None;
+    }
+    Some(mul_div_255(opacity as u16, sv as u16))
 }
 
 /// Sample a soft mask at absolute device coordinates, yielding `sm.outside`
@@ -6248,15 +6628,8 @@ fn composite_group_seeded(
             let src = &grow[lx * 4..lx * 4 + 4];
             // Masking the lerp weight is exactly right here: at mask 0 the
             // parent keeps the backdrop it already shares with the offscreen.
-            let t = match soft {
-                Some(sm) => {
-                    let sv = soft_mask_at(sm, group.origin_x + lx, abs_y);
-                    if sv == 0 {
-                        continue;
-                    }
-                    mul_div_255(opacity as u16, sv as u16)
-                }
-                None => opacity as u16,
+            let Some(t) = masked_opacity(soft, opacity, group.origin_x + lx, abs_y) else {
+                continue;
             };
             let plx = group.origin_x + lx - pox;
             let dst = &mut prow[plx * 4..plx * 4 + 4];
@@ -6753,60 +7126,59 @@ mod rgb8_area_min_tests {
         ];
         for &(sw, sh, dev_w, dev_h) in &cases {
             for _trial in 0..8 {
-                let samples: Vec<u8> = (0..(sw * sh * 3)).map(|_| rng.byte()).collect();
-                let img = make_image(sw, sh, dev_w, dev_h, samples);
-                // Fast path renders into `fast`.
-                let mut fast =
-                    Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
-                let (painted, taps) = paint_axis_aligned_rgb8_area_min_opaque(
-                    &img,
-                    &mut fast,
-                    0,
-                    0,
-                    dev_w as usize,
-                    dev_h as usize,
-                );
-                // Reference: generic `shade()` + opaque source-over over a
-                // transparent surface (which reduces to a direct copy).
-                let mut reference =
-                    Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
-                let mut ref_painted = 0u64;
-                let _ = taps; // profiling-only telemetry; not asserted here
-                for y in 0..dev_h as usize {
-                    let row = reference.row_mut(y);
-                    for x in 0..dev_w as usize {
-                        let color = img.shade(x as f64 + 0.5, y as f64 + 0.5);
-                        if let Some(c) = color {
-                            let a = mul_div_255(mul_div_255(c[3] as u16, 255), 255);
-                            if a == 0 {
-                                continue;
-                            }
-                            let ia = 255 - a;
-                            let px = &mut row[x * 4..x * 4 + 4];
-                            px[0] =
-                                (mul_div_255(c[0] as u16, a) + mul_div_255(px[0] as u16, ia)) as u8;
-                            px[1] =
-                                (mul_div_255(c[1] as u16, a) + mul_div_255(px[1] as u16, ia)) as u8;
-                            px[2] =
-                                (mul_div_255(c[2] as u16, a) + mul_div_255(px[2] as u16, ia)) as u8;
-                            px[3] = (a + mul_div_255(px[3] as u16, ia)) as u8;
-                            ref_painted += 1;
-                        }
-                    }
-                }
-                assert_eq!(
-                    painted, ref_painted,
-                    "painted count sw={sw} sh={sh} dev={dev_w}x{dev_h}"
-                );
-                for y in 0..dev_h as usize {
-                    let fr = fast.row_mut(y).to_vec();
-                    let rr = reference.row_mut(y).to_vec();
-                    assert_eq!(
-                        fr, rr,
-                        "row {y} differs sw={sw} sh={sh} dev={dev_w}x{dev_h}"
-                    );
-                }
+                check_area_min_opaque_case(&mut rng, sw, sh, dev_w, dev_h);
             }
+        }
+    }
+
+    /// One fuzzed image of [`fast_path_matches_generic_shade`].
+    fn check_area_min_opaque_case(rng: &mut Rng, sw: u32, sh: u32, dev_w: u32, dev_h: u32) {
+        let samples: Vec<u8> = (0..(sw * sh * 3)).map(|_| rng.byte()).collect();
+        let img = make_image(sw, sh, dev_w, dev_h, samples);
+        // Fast path renders into `fast`.
+        let mut fast = Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
+        let (painted, taps) = paint_axis_aligned_rgb8_area_min_opaque(
+            &img,
+            &mut fast,
+            0,
+            0,
+            dev_w as usize,
+            dev_h as usize,
+        );
+        // Reference: generic `shade()` + opaque source-over over a
+        // transparent surface (which reduces to a direct copy).
+        let mut reference = Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
+        let mut ref_painted = 0u64;
+        let _ = taps; // profiling-only telemetry; not asserted here
+        for y in 0..dev_h as usize {
+            let row = reference.row_mut(y);
+            for x in 0..dev_w as usize {
+                let color = img.shade(x as f64 + 0.5, y as f64 + 0.5);
+                let Some(c) = color else { continue };
+                let a = mul_div_255(mul_div_255(c[3] as u16, 255), 255);
+                if a == 0 {
+                    continue;
+                }
+                let ia = 255 - a;
+                let px = &mut row[x * 4..x * 4 + 4];
+                px[0] = (mul_div_255(c[0] as u16, a) + mul_div_255(px[0] as u16, ia)) as u8;
+                px[1] = (mul_div_255(c[1] as u16, a) + mul_div_255(px[1] as u16, ia)) as u8;
+                px[2] = (mul_div_255(c[2] as u16, a) + mul_div_255(px[2] as u16, ia)) as u8;
+                px[3] = (a + mul_div_255(px[3] as u16, ia)) as u8;
+                ref_painted += 1;
+            }
+        }
+        assert_eq!(
+            painted, ref_painted,
+            "painted count sw={sw} sh={sh} dev={dev_w}x{dev_h}"
+        );
+        for y in 0..dev_h as usize {
+            let fr = fast.row_mut(y).to_vec();
+            let rr = reference.row_mut(y).to_vec();
+            assert_eq!(
+                fr, rr,
+                "row {y} differs sw={sw} sh={sh} dev={dev_w}x{dev_h}"
+            );
         }
     }
 
@@ -6879,55 +7251,64 @@ mod rgb8_area_min_tests {
             // Mask geometries: same as the base, coarser, and finer.
             for &(mw, mh) in &[(sw, sh), (sw * 2, sh * 2), (sw.div_ceil(2), sh.div_ceil(2))] {
                 for trial in 0..6 {
-                    let samples: Vec<u8> = (0..(sw * sh * 3)).map(|_| rng.byte()).collect();
-                    let mut img = make_image(sw, sh, dev_w, dev_h, samples);
-                    let mask = bilevel(mw, mh, &mut rng);
-                    // Alternate the two encodings, and exercise `/Decode [1 0]`
-                    // polarity on the soft-mask side.
-                    let soft = trial % 2 == 0;
-                    if soft {
-                        let mut sm = (*mask).clone();
-                        if trial % 4 == 0 {
-                            sm.decode = Some(Arc::from(vec![[1.0f32, 0.0f32]]));
-                        }
-                        img.smask = Some(Arc::new(sm));
-                    } else {
-                        img.mask = Some(crate::page_ir::ImageMask::Stencil(mask));
-                    }
-
-                    let Some(kind) = area_min_mask(&img) else {
-                        // Only a non-minifying soft mask is turned away, and
-                        // then the generic path is already what runs.
-                        assert!(soft, "a stencil mask is always eligible");
-                        continue;
-                    };
-                    let mut fast =
-                        Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
-                    let (painted, _taps) = paint_axis_aligned_rgb8_area_min_masked(
-                        &img,
-                        kind,
-                        &mut fast,
-                        0,
-                        0,
-                        dev_w as usize,
-                        dev_h as usize,
-                    );
-
-                    let (mut reference, ref_painted) = generic_masked_reference(&img, dev_w, dev_h);
-                    let what = if soft { "smask" } else { "stencil" };
-                    assert_eq!(
-                        painted, ref_painted,
-                        "{what} painted count sw={sw} sh={sh} mask={mw}x{mh} dev={dev_w}x{dev_h}"
-                    );
-                    for y in 0..dev_h as usize {
-                        assert_eq!(
-                            fast.row_mut(y).to_vec(),
-                            reference.row_mut(y).to_vec(),
-                            "{what} row {y} differs sw={sw} sh={sh} mask={mw}x{mh} dev={dev_w}x{dev_h}"
-                        );
-                    }
+                    check_masked_area_min_case(&mut rng, (sw, sh, dev_w, dev_h), (mw, mh), trial);
                 }
             }
+        }
+    }
+
+    /// One fuzzed image and mask of [`masked_fast_path_matches_generic_shade`].
+    fn check_masked_area_min_case(
+        rng: &mut Rng,
+        (sw, sh, dev_w, dev_h): (u32, u32, u32, u32),
+        (mw, mh): (u32, u32),
+        trial: i32,
+    ) {
+        let samples: Vec<u8> = (0..(sw * sh * 3)).map(|_| rng.byte()).collect();
+        let mut img = make_image(sw, sh, dev_w, dev_h, samples);
+        let mask = bilevel(mw, mh, rng);
+        // Alternate the two encodings, and exercise `/Decode [1 0]`
+        // polarity on the soft-mask side.
+        let soft = trial % 2 == 0;
+        if soft {
+            let mut sm = (*mask).clone();
+            if trial % 4 == 0 {
+                sm.decode = Some(Arc::from(vec![[1.0f32, 0.0f32]]));
+            }
+            img.smask = Some(Arc::new(sm));
+        } else {
+            img.mask = Some(crate::page_ir::ImageMask::Stencil(mask));
+        }
+
+        let Some(kind) = area_min_mask(&img) else {
+            // Only a non-minifying soft mask is turned away, and
+            // then the generic path is already what runs.
+            assert!(soft, "a stencil mask is always eligible");
+            return;
+        };
+        let mut fast = Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
+        let (painted, _taps) = paint_axis_aligned_rgb8_area_min_masked(
+            &img,
+            kind,
+            &mut fast,
+            0,
+            0,
+            dev_w as usize,
+            dev_h as usize,
+        );
+
+        let (mut reference, ref_painted) = generic_masked_reference(&img, dev_w, dev_h);
+        let what = if soft { "smask" } else { "stencil" };
+        assert_eq!(
+            painted, ref_painted,
+            "{what} painted count sw={sw} sh={sh} mask={mw}x{mh} dev={dev_w}x{dev_h}"
+        );
+        for y in 0..dev_h as usize {
+            assert_eq!(
+                fast.row_mut(y).to_vec(),
+                reference.row_mut(y).to_vec(),
+                "{what} row {y} differs sw={sw} sh={sh} mask={mw}x{mh} dev={dev_w}x{dev_h}"
+            );
         }
     }
 
@@ -6950,50 +7331,58 @@ mod rgb8_area_min_tests {
         for &(sw, sh, dev_w, dev_h) in &cases {
             for &(mw, mh) in &[(sw, sh), (sw * 2, sh * 2), (sw.div_ceil(2), sh.div_ceil(2))] {
                 for trial in 0..4 {
-                    let samples: Vec<u8> = (0..(sw * sh * 3)).map(|_| rng.byte()).collect();
-                    let mut img = make_image(sw, sh, dev_w, dev_h, samples);
-                    // Mostly opaque with transparent holes, like a cover's
-                    // transparency layer, so both the skip and the composite
-                    // run; odd trials invert through `/Decode [1 0]`.
-                    let mask: Vec<u8> = (0..mw * mh)
-                        .map(|_| if rng.byte() < 40 { rng.byte() } else { 255 })
-                        .collect();
-                    img.smask = Some(Arc::new(crate::page_ir::ImageSMask {
-                        width: mw,
-                        height: mh,
-                        bits_per_component: 8,
-                        decode: (trial % 2 == 1).then(|| Arc::from(vec![[1.0f32, 0.0f32]])),
-                        samples: Arc::from(mask),
-                        codec: None,
-                        codec_data: None,
-                        codec_parms: None,
-                    }));
-                    let Some(kind) = area_min_mask(&img) else {
-                        // A non-minifying mask is turned away; the generic
-                        // path is then already what runs.
-                        continue;
-                    };
-                    assert!(matches!(kind, AreaMinMask::Soft8(_)));
-                    let mut fast =
-                        Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
-                    let (painted, _taps) = paint_axis_aligned_rgb8_area_min_masked(
-                        &img,
-                        kind,
-                        &mut fast,
-                        0,
-                        0,
-                        dev_w as usize,
-                        dev_h as usize,
-                    );
-                    let (mut reference, ref_painted) = generic_masked_reference(&img, dev_w, dev_h);
-                    let what = format!(
-                        "smask8 sw={sw} sh={sh} mask={mw}x{mh} dev={dev_w}x{dev_h} trial={trial}"
-                    );
-                    assert_eq!(painted, ref_painted, "{what}: painted count");
-                    assert_surfaces_equal(&mut fast, &mut reference, &what);
+                    check_masked8_area_min_case(&mut rng, (sw, sh, dev_w, dev_h), (mw, mh), trial);
                 }
             }
         }
+    }
+
+    /// One fuzzed image and mask of [`masked8_fast_path_matches_generic_shade`].
+    fn check_masked8_area_min_case(
+        rng: &mut Rng,
+        (sw, sh, dev_w, dev_h): (u32, u32, u32, u32),
+        (mw, mh): (u32, u32),
+        trial: i32,
+    ) {
+        let samples: Vec<u8> = (0..(sw * sh * 3)).map(|_| rng.byte()).collect();
+        let mut img = make_image(sw, sh, dev_w, dev_h, samples);
+        // Mostly opaque with transparent holes, like a cover's
+        // transparency layer, so both the skip and the composite
+        // run; odd trials invert through `/Decode [1 0]`.
+        let mask: Vec<u8> = (0..mw * mh)
+            .map(|_| if rng.byte() < 40 { rng.byte() } else { 255 })
+            .collect();
+        img.smask = Some(Arc::new(crate::page_ir::ImageSMask {
+            width: mw,
+            height: mh,
+            bits_per_component: 8,
+            decode: (trial % 2 == 1).then(|| Arc::from(vec![[1.0f32, 0.0f32]])),
+            samples: Arc::from(mask),
+            codec: None,
+            codec_data: None,
+            codec_parms: None,
+        }));
+        let Some(kind) = area_min_mask(&img) else {
+            // A non-minifying mask is turned away; the generic
+            // path is then already what runs.
+            return;
+        };
+        assert!(matches!(kind, AreaMinMask::Soft8(_)));
+        let mut fast = Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
+        let (painted, _taps) = paint_axis_aligned_rgb8_area_min_masked(
+            &img,
+            kind,
+            &mut fast,
+            0,
+            0,
+            dev_w as usize,
+            dev_h as usize,
+        );
+        let (mut reference, ref_painted) = generic_masked_reference(&img, dev_w, dev_h);
+        let what =
+            format!("smask8 sw={sw} sh={sh} mask={mw}x{mh} dev={dev_w}x{dev_h} trial={trial}");
+        assert_eq!(painted, ref_painted, "{what}: painted count");
+        assert_surfaces_equal(&mut fast, &mut reference, &what);
     }
 
     /// A blocky mask like a scanned page's foreground layer or a cover's
@@ -7020,75 +7409,91 @@ mod rgb8_area_min_tests {
                 (sw.div_ceil(2), sh.div_ceil(2)),
             ] {
                 for trial in 0..8 {
-                    let samples: Vec<u8> = (0..(sw * sh * 3)).map(|_| rng.byte()).collect();
-                    let mut img = make_image(sw, sh, dev_w, dev_h, samples);
-                    let one_bit = trial % 2 == 0;
-                    // Blocks of 16x8 mask texels: clear, set, or noisy, with
-                    // every fourth band of rows clear across the whole width
-                    // (a blank line).
-                    let block = |x: u32, y: u32, rng: &mut Rng| -> u8 {
-                        if (y / 8) % 4 == 3 {
-                            return 0;
-                        }
-                        let kind = ((x / 16) * 7 + (y / 8) * 3 + trial) % 5;
-                        match kind {
-                            0 | 1 => 0,
-                            2 | 3 => 255,
-                            _ => rng.byte(),
-                        }
-                    };
-                    let samples: Vec<u8> = if one_bit {
-                        let row_bytes = (mw as usize).div_ceil(8);
-                        let mut packed = vec![0u8; row_bytes * mh as usize];
-                        for y in 0..mh {
-                            for x in 0..mw {
-                                if block(x, y, &mut rng) >= 128 {
-                                    packed[y as usize * row_bytes + x as usize / 8] |=
-                                        0x80 >> (x % 8);
-                                }
-                            }
-                        }
-                        packed
-                    } else {
-                        (0..mh)
-                            .flat_map(|y| (0..mw).map(move |x| (x, y)))
-                            .map(|(x, y)| block(x, y, &mut rng))
-                            .collect()
-                    };
-                    img.smask = Some(Arc::new(crate::page_ir::ImageSMask {
-                        width: mw,
-                        height: mh,
-                        bits_per_component: if one_bit { 1 } else { 8 },
-                        decode: (trial % 4 >= 2).then(|| Arc::from(vec![[1.0f32, 0.0f32]])),
-                        samples: Arc::from(samples),
-                        codec: None,
-                        codec_data: None,
-                        codec_parms: None,
-                    }));
-                    let Some(kind) = area_min_mask(&img) else {
-                        continue;
-                    };
-                    let what = format!(
-                        "bits={} sw={sw} sh={sh} mask={mw}x{mh} dev={dev_w}x{dev_h} trial={trial}",
-                        if one_bit { 1 } else { 8 }
-                    );
-                    let mut fast =
-                        Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
-                    let (painted, _taps) = paint_axis_aligned_rgb8_area_min_masked(
-                        &img,
-                        kind,
-                        &mut fast,
-                        0,
-                        0,
-                        dev_w as usize,
-                        dev_h as usize,
-                    );
-                    let (mut reference, ref_painted) = generic_masked_reference(&img, dev_w, dev_h);
-                    assert_eq!(painted, ref_painted, "{what}: painted count");
-                    assert_surfaces_equal(&mut fast, &mut reference, &what);
+                    check_uniform_boxes_case(&mut rng, (sw, sh, dev_w, dev_h), (mw, mh), trial);
                 }
             }
         }
+    }
+
+    /// One fuzzed image and blocky mask of
+    /// [`masked_uniform_boxes_match_generic_shade`].
+    fn check_uniform_boxes_case(
+        rng: &mut Rng,
+        (sw, sh, dev_w, dev_h): (u32, u32, u32, u32),
+        (mw, mh): (u32, u32),
+        trial: u32,
+    ) {
+        let samples: Vec<u8> = (0..(sw * sh * 3)).map(|_| rng.byte()).collect();
+        let mut img = make_image(sw, sh, dev_w, dev_h, samples);
+        let one_bit = trial.is_multiple_of(2);
+        // Blocks of 16x8 mask texels: clear, set, or noisy, with
+        // every fourth band of rows clear across the whole width
+        // (a blank line).
+        let block = |x: u32, y: u32, rng: &mut Rng| -> u8 {
+            if (y / 8) % 4 == 3 {
+                return 0;
+            }
+            let kind = ((x / 16) * 7 + (y / 8) * 3 + trial) % 5;
+            match kind {
+                0 | 1 => 0,
+                2 | 3 => 255,
+                _ => rng.byte(),
+            }
+        };
+        let levels: Vec<u8> = (0..mh)
+            .flat_map(|y| (0..mw).map(move |x| (x, y)))
+            .map(|(x, y)| block(x, y, rng))
+            .collect();
+        let samples = if one_bit {
+            pack_mask_levels(&levels, mw, mh)
+        } else {
+            levels
+        };
+        img.smask = Some(Arc::new(crate::page_ir::ImageSMask {
+            width: mw,
+            height: mh,
+            bits_per_component: if one_bit { 1 } else { 8 },
+            decode: (trial % 4 >= 2).then(|| Arc::from(vec![[1.0f32, 0.0f32]])),
+            samples: Arc::from(samples),
+            codec: None,
+            codec_data: None,
+            codec_parms: None,
+        }));
+        let Some(kind) = area_min_mask(&img) else {
+            return;
+        };
+        let what = format!(
+            "bits={} sw={sw} sh={sh} mask={mw}x{mh} dev={dev_w}x{dev_h} trial={trial}",
+            if one_bit { 1 } else { 8 }
+        );
+        let mut fast = Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
+        let (painted, _taps) = paint_axis_aligned_rgb8_area_min_masked(
+            &img,
+            kind,
+            &mut fast,
+            0,
+            0,
+            dev_w as usize,
+            dev_h as usize,
+        );
+        let (mut reference, ref_painted) = generic_masked_reference(&img, dev_w, dev_h);
+        assert_eq!(painted, ref_painted, "{what}: painted count");
+        assert_surfaces_equal(&mut fast, &mut reference, &what);
+    }
+
+    /// Pack a row-major `mw x mh` grid of mask levels into a one-bit mask
+    /// (byte-aligned rows, MSB first), set where the level is at least 128.
+    fn pack_mask_levels(levels: &[u8], mw: u32, mh: u32) -> Vec<u8> {
+        let row_bytes = (mw as usize).div_ceil(8);
+        let mut packed = vec![0u8; row_bytes * mh as usize];
+        for y in 0..mh {
+            for x in 0..mw {
+                if levels[(y * mw + x) as usize] >= 128 {
+                    packed[y as usize * row_bytes + x as usize / 8] |= 0x80 >> (x % 8);
+                }
+            }
+        }
+        packed
     }
 
     /// The windowed one-bit coverage and the regrouped RGB8 box sum must equal
@@ -7104,15 +7509,7 @@ mod rgb8_area_min_tests {
             let row_bytes = (mw as usize).div_ceil(8);
             let density = rng.byte();
             let mut samples: Vec<u8> = (0..row_bytes * mh as usize)
-                .map(|_| {
-                    let mut b = 0u8;
-                    for bit in 0..8 {
-                        if rng.byte() < density {
-                            b |= 1 << bit;
-                        }
-                    }
-                    b
-                })
+                .map(|_| random_bits_byte(&mut rng, density))
                 .collect();
             if rng.byte() < 32 {
                 // A truncated payload: the filters read missing bytes as zero.
@@ -7154,23 +7551,45 @@ mod rgb8_area_min_tests {
             let rgb: Vec<u8> = (0..mw * mh * 3).map(|_| rng.byte()).collect();
             let stride = mw as usize * 3;
             let weight = tx.total * ty.total;
-            let mut acc = [0u64; 3];
-            for sr in ty.lo..=ty.hi {
-                for col in tx.lo..=tx.hi {
-                    let w = ty.weight_at(sr) * tx.weight_at(col);
-                    let o = sr as usize * stride + col as usize * 3;
-                    for c in 0..3 {
-                        acc[c] += w * rgb[o + c] as u64;
-                    }
-                }
-            }
-            let expect = acc.map(|a| ((a + weight / 2) / weight).min(255) as u8);
+            let expect = per_tap_rgb8_box_average(&rgb, stride, &tx, &ty);
             assert_eq!(
                 rgb8_box_average(&rgb, stride, &tx, &ty, weight),
                 expect,
                 "box {tx:?} {ty:?}"
             );
         }
+    }
+
+    /// A byte whose bits are each set with probability `density / 256`.
+    fn random_bits_byte(rng: &mut Rng, density: u8) -> u8 {
+        let mut b = 0u8;
+        for bit in 0..8 {
+            if rng.byte() < density {
+                b |= 1 << bit;
+            }
+        }
+        b
+    }
+
+    /// The RGB8 box average over taps `tx` x `ty`, one weighted tap at a time.
+    fn per_tap_rgb8_box_average(
+        rgb: &[u8],
+        stride: usize,
+        tx: &crate::render_cpu::image::AxisTaps,
+        ty: &crate::render_cpu::image::AxisTaps,
+    ) -> [u8; 3] {
+        let weight = tx.total * ty.total;
+        let mut acc = [0u64; 3];
+        for sr in ty.lo..=ty.hi {
+            for col in tx.lo..=tx.hi {
+                let w = ty.weight_at(sr) * tx.weight_at(col);
+                let o = sr as usize * stride + col as usize * 3;
+                for c in 0..3 {
+                    acc[c] += w * rgb[o + c] as u64;
+                }
+            }
+        }
+        acc.map(|a| ((a + weight / 2) / weight).min(255) as u8)
     }
 
     /// The row filter must reproduce the per-pixel box average byte for byte
@@ -7184,59 +7603,59 @@ mod rgb8_area_min_tests {
         let mut rng = Rng(0x0b0c_5f11_7e40_0004);
         for kernel in available_kernels() {
             for trial in 0..60 {
-                let sw = 1 + (rng.next() % 90) as u32;
-                let sh = 1 + (rng.next() % 90) as u32;
-                let rgb: Vec<u8> = (0..sw * sh * 3)
-                    .map(|_| match trial % 3 {
-                        0 => rng.byte(),
-                        1 => 255 - (rng.byte() & 3),
-                        _ => [0, 255][(rng.byte() & 1) as usize],
-                    })
-                    .collect();
-                let stride = sw as usize * 3;
-                let half = |rng: &mut Rng| 0.5 + (rng.next() % 1200) as f64 / 100.0;
-                let (hx, hy) = (half(&mut rng), half(&mut rng));
-                let pos =
-                    |len: u32, rng: &mut Rng| (rng.next() % (len as u64 * 64)) as f64 / 64.0 - 0.5;
-                let n = 1 + (rng.next() % 40) as usize;
-                let mut cols: Vec<crate::render_cpu::image::AxisTaps> = (0..n)
-                    .filter_map(|_| {
-                        crate::render_cpu::image::axis_box_taps(pos(sw, &mut rng), hx, sw)
-                    })
-                    .collect();
-                if cols.is_empty() {
-                    continue;
-                }
-                cols.sort_by_key(|t| t.lo);
-                let rows: Vec<crate::render_cpu::image::AxisTaps> = (0..30)
-                    .filter_map(|_| {
-                        crate::render_cpu::image::axis_box_taps(pos(sh, &mut rng), hy, sh)
-                    })
-                    .collect();
-                let max_row_total = rows.iter().map(|t| t.total).max().unwrap_or(1);
-                let mut filter =
-                    RowBoxFilter::<3>::new(&rgb, stride, &cols, max_row_total).unwrap();
-                filter.kernel = kernel;
-                let mut dst = vec![0u8; cols.len() * 4];
-                for ty in &rows {
-                    let served = filter.average_row(ty, &mut dst);
-                    assert_eq!(
-                        served,
-                        ((ty.hi - ty.lo) as usize) < RowBoxFilter::<3>::MAX_ROWS,
-                        "{kernel:?} {ty:?}"
-                    );
-                    if !served {
-                        continue;
-                    }
-                    for (x, tx) in cols.iter().enumerate() {
-                        let expect = rgb8_box_average(&rgb, stride, tx, ty, tx.total * ty.total);
-                        assert_eq!(
-                            dst[x * 4..x * 4 + 4],
-                            [expect[0], expect[1], expect[2], 255],
-                            "{kernel:?} trial={trial} col={tx:?} row={ty:?}"
-                        );
-                    }
-                }
+                check_row_box_filter_case(&mut rng, kernel, trial);
+            }
+        }
+    }
+
+    /// One fuzzed image and set of boxes of
+    /// [`row_box_filter_matches_per_pixel_box_average`].
+    fn check_row_box_filter_case(rng: &mut Rng, kernel: ImageKernel, trial: i32) {
+        let sw = 1 + (rng.next() % 90) as u32;
+        let sh = 1 + (rng.next() % 90) as u32;
+        let rgb: Vec<u8> = (0..sw * sh * 3)
+            .map(|_| match trial % 3 {
+                0 => rng.byte(),
+                1 => 255 - (rng.byte() & 3),
+                _ => [0, 255][(rng.byte() & 1) as usize],
+            })
+            .collect();
+        let stride = sw as usize * 3;
+        let half = |rng: &mut Rng| 0.5 + (rng.next() % 1200) as f64 / 100.0;
+        let (hx, hy) = (half(rng), half(rng));
+        let pos = |len: u32, rng: &mut Rng| (rng.next() % (len as u64 * 64)) as f64 / 64.0 - 0.5;
+        let n = 1 + (rng.next() % 40) as usize;
+        let mut cols: Vec<crate::render_cpu::image::AxisTaps> = (0..n)
+            .filter_map(|_| crate::render_cpu::image::axis_box_taps(pos(sw, rng), hx, sw))
+            .collect();
+        if cols.is_empty() {
+            return;
+        }
+        cols.sort_by_key(|t| t.lo);
+        let rows: Vec<crate::render_cpu::image::AxisTaps> = (0..30)
+            .filter_map(|_| crate::render_cpu::image::axis_box_taps(pos(sh, rng), hy, sh))
+            .collect();
+        let max_row_total = rows.iter().map(|t| t.total).max().unwrap_or(1);
+        let mut filter = RowBoxFilter::<3>::new(&rgb, stride, &cols, max_row_total).unwrap();
+        filter.kernel = kernel;
+        let mut dst = vec![0u8; cols.len() * 4];
+        for ty in &rows {
+            let served = filter.average_row(ty, &mut dst);
+            assert_eq!(
+                served,
+                ((ty.hi - ty.lo) as usize) < RowBoxFilter::<3>::MAX_ROWS,
+                "{kernel:?} {ty:?}"
+            );
+            if !served {
+                continue;
+            }
+            for (x, tx) in cols.iter().enumerate() {
+                let expect = rgb8_box_average(&rgb, stride, tx, ty, tx.total * ty.total);
+                assert_eq!(
+                    dst[x * 4..x * 4 + 4],
+                    [expect[0], expect[1], expect[2], 255],
+                    "{kernel:?} trial={trial} col={tx:?} row={ty:?}"
+                );
             }
         }
     }
@@ -7256,55 +7675,56 @@ mod rgb8_area_min_tests {
         ];
         for &(sw, sh, dev_w, dev_h) in &cases {
             for _trial in 0..8 {
-                let samples: Vec<u8> = (0..(sw * sh * 4)).map(|_| rng.byte()).collect();
-                let img = make_image_cs(sw, sh, dev_w, dev_h, ImageColorSpace::Cmyk, samples);
-                let mut fast =
-                    Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
-                let (painted, _taps) = paint_axis_aligned_cmyk_area_min_opaque(
-                    &img,
-                    &mut fast,
-                    0,
-                    0,
-                    dev_w as usize,
-                    dev_h as usize,
-                )
-                .expect("cmyk fast path applies to this small image");
-                let mut reference =
-                    Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
-                let mut ref_painted = 0u64;
-                for y in 0..dev_h as usize {
-                    let row = reference.row_mut(y);
-                    for x in 0..dev_w as usize {
-                        if let Some(c) = img.shade(x as f64 + 0.5, y as f64 + 0.5) {
-                            let a = mul_div_255(mul_div_255(c[3] as u16, 255), 255);
-                            if a == 0 {
-                                continue;
-                            }
-                            let ia = 255 - a;
-                            let px = &mut row[x * 4..x * 4 + 4];
-                            px[0] =
-                                (mul_div_255(c[0] as u16, a) + mul_div_255(px[0] as u16, ia)) as u8;
-                            px[1] =
-                                (mul_div_255(c[1] as u16, a) + mul_div_255(px[1] as u16, ia)) as u8;
-                            px[2] =
-                                (mul_div_255(c[2] as u16, a) + mul_div_255(px[2] as u16, ia)) as u8;
-                            px[3] = (a + mul_div_255(px[3] as u16, ia)) as u8;
-                            ref_painted += 1;
-                        }
-                    }
-                }
-                assert_eq!(
-                    painted, ref_painted,
-                    "cmyk painted count sw={sw} sh={sh} dev={dev_w}x{dev_h}"
-                );
-                for y in 0..dev_h as usize {
-                    assert_eq!(
-                        fast.row_mut(y).to_vec(),
-                        reference.row_mut(y).to_vec(),
-                        "cmyk row {y} differs sw={sw} sh={sh} dev={dev_w}x{dev_h}"
-                    );
-                }
+                check_cmyk_area_min_case(&mut rng, sw, sh, dev_w, dev_h);
             }
+        }
+    }
+
+    /// One fuzzed image of [`cmyk_fast_path_matches_generic_shade`].
+    fn check_cmyk_area_min_case(rng: &mut Rng, sw: u32, sh: u32, dev_w: u32, dev_h: u32) {
+        let samples: Vec<u8> = (0..(sw * sh * 4)).map(|_| rng.byte()).collect();
+        let img = make_image_cs(sw, sh, dev_w, dev_h, ImageColorSpace::Cmyk, samples);
+        let mut fast = Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
+        let (painted, _taps) = paint_axis_aligned_cmyk_area_min_opaque(
+            &img,
+            &mut fast,
+            0,
+            0,
+            dev_w as usize,
+            dev_h as usize,
+        )
+        .expect("cmyk fast path applies to this small image");
+        let mut reference = Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
+        let mut ref_painted = 0u64;
+        for y in 0..dev_h as usize {
+            let row = reference.row_mut(y);
+            for x in 0..dev_w as usize {
+                let Some(c) = img.shade(x as f64 + 0.5, y as f64 + 0.5) else {
+                    continue;
+                };
+                let a = mul_div_255(mul_div_255(c[3] as u16, 255), 255);
+                if a == 0 {
+                    continue;
+                }
+                let ia = 255 - a;
+                let px = &mut row[x * 4..x * 4 + 4];
+                px[0] = (mul_div_255(c[0] as u16, a) + mul_div_255(px[0] as u16, ia)) as u8;
+                px[1] = (mul_div_255(c[1] as u16, a) + mul_div_255(px[1] as u16, ia)) as u8;
+                px[2] = (mul_div_255(c[2] as u16, a) + mul_div_255(px[2] as u16, ia)) as u8;
+                px[3] = (a + mul_div_255(px[3] as u16, ia)) as u8;
+                ref_painted += 1;
+            }
+        }
+        assert_eq!(
+            painted, ref_painted,
+            "cmyk painted count sw={sw} sh={sh} dev={dev_w}x{dev_h}"
+        );
+        for y in 0..dev_h as usize {
+            assert_eq!(
+                fast.row_mut(y).to_vec(),
+                reference.row_mut(y).to_vec(),
+                "cmyk row {y} differs sw={sw} sh={sh} dev={dev_w}x{dev_h}"
+            );
         }
     }
 
@@ -7376,53 +7796,57 @@ mod rgb8_area_min_tests {
         ];
         for &(sw, sh, dev_w, dev_h) in &cases {
             for _trial in 0..8 {
-                let samples: Vec<u8> = (0..(sw * sh * 3)).map(|_| rng.byte()).collect();
-                let mut img = make_image(sw, sh, dev_w, dev_h, samples);
-                img.interpolation = InterpolationMode::Bilinear;
-                let mut fast =
-                    Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
-                let (painted, taps) = paint_axis_aligned_rgb8_bilinear_opaque(
-                    &img,
-                    &mut fast,
-                    0,
-                    0,
-                    dev_w as usize,
-                    dev_h as usize,
-                );
-                assert_eq!(taps, painted * 4, "tap accounting");
-                let mut reference =
-                    Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
-                let mut ref_painted = 0u64;
-                for y in 0..dev_h as usize {
-                    let row = reference.row_mut(y);
-                    for x in 0..dev_w as usize {
-                        if let Some(c) = img.shade(x as f64 + 0.5, y as f64 + 0.5) {
-                            let a = mul_div_255(mul_div_255(c[3] as u16, 255), 255);
-                            if a == 0 {
-                                continue;
-                            }
-                            // Opaque over transparent → direct write.
-                            let px = &mut row[x * 4..x * 4 + 4];
-                            px[0] = c[0];
-                            px[1] = c[1];
-                            px[2] = c[2];
-                            px[3] = 255;
-                            ref_painted += 1;
-                        }
-                    }
-                }
-                assert_eq!(
-                    painted, ref_painted,
-                    "bilinear painted count sw={sw} sh={sh} dev={dev_w}x{dev_h}"
-                );
-                for y in 0..dev_h as usize {
-                    assert_eq!(
-                        fast.row_mut(y).to_vec(),
-                        reference.row_mut(y).to_vec(),
-                        "bilinear row {y} differs sw={sw} sh={sh} dev={dev_w}x{dev_h}"
-                    );
-                }
+                check_bilinear_case(&mut rng, sw, sh, dev_w, dev_h);
             }
+        }
+    }
+
+    /// One fuzzed image of [`bilinear_fast_path_matches_generic_shade`].
+    fn check_bilinear_case(rng: &mut Rng, sw: u32, sh: u32, dev_w: u32, dev_h: u32) {
+        let samples: Vec<u8> = (0..(sw * sh * 3)).map(|_| rng.byte()).collect();
+        let mut img = make_image(sw, sh, dev_w, dev_h, samples);
+        img.interpolation = InterpolationMode::Bilinear;
+        let mut fast = Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
+        let (painted, taps) = paint_axis_aligned_rgb8_bilinear_opaque(
+            &img,
+            &mut fast,
+            0,
+            0,
+            dev_w as usize,
+            dev_h as usize,
+        );
+        assert_eq!(taps, painted * 4, "tap accounting");
+        let mut reference = Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
+        let mut ref_painted = 0u64;
+        for y in 0..dev_h as usize {
+            let row = reference.row_mut(y);
+            for x in 0..dev_w as usize {
+                let Some(c) = img.shade(x as f64 + 0.5, y as f64 + 0.5) else {
+                    continue;
+                };
+                let a = mul_div_255(mul_div_255(c[3] as u16, 255), 255);
+                if a == 0 {
+                    continue;
+                }
+                // Opaque over transparent → direct write.
+                let px = &mut row[x * 4..x * 4 + 4];
+                px[0] = c[0];
+                px[1] = c[1];
+                px[2] = c[2];
+                px[3] = 255;
+                ref_painted += 1;
+            }
+        }
+        assert_eq!(
+            painted, ref_painted,
+            "bilinear painted count sw={sw} sh={sh} dev={dev_w}x{dev_h}"
+        );
+        for y in 0..dev_h as usize {
+            assert_eq!(
+                fast.row_mut(y).to_vec(),
+                reference.row_mut(y).to_vec(),
+                "bilinear row {y} differs sw={sw} sh={sh} dev={dev_w}x{dev_h}"
+            );
         }
     }
 
@@ -7434,19 +7858,20 @@ mod rgb8_area_min_tests {
         for y in 0..dev_h as usize {
             let row = reference.row_mut(y);
             for x in 0..dev_w as usize {
-                if let Some(c) = img.shade(x as f64 + 0.5, y as f64 + 0.5) {
-                    let a = mul_div_255(mul_div_255(c[3] as u16, 255), 255);
-                    if a == 0 {
-                        continue;
-                    }
-                    let ia = 255 - a;
-                    let px = &mut row[x * 4..x * 4 + 4];
-                    px[0] = (mul_div_255(c[0] as u16, a) + mul_div_255(px[0] as u16, ia)) as u8;
-                    px[1] = (mul_div_255(c[1] as u16, a) + mul_div_255(px[1] as u16, ia)) as u8;
-                    px[2] = (mul_div_255(c[2] as u16, a) + mul_div_255(px[2] as u16, ia)) as u8;
-                    px[3] = (a + mul_div_255(px[3] as u16, ia)) as u8;
-                    painted += 1;
+                let Some(c) = img.shade(x as f64 + 0.5, y as f64 + 0.5) else {
+                    continue;
+                };
+                let a = mul_div_255(mul_div_255(c[3] as u16, 255), 255);
+                if a == 0 {
+                    continue;
                 }
+                let ia = 255 - a;
+                let px = &mut row[x * 4..x * 4 + 4];
+                px[0] = (mul_div_255(c[0] as u16, a) + mul_div_255(px[0] as u16, ia)) as u8;
+                px[1] = (mul_div_255(c[1] as u16, a) + mul_div_255(px[1] as u16, ia)) as u8;
+                px[2] = (mul_div_255(c[2] as u16, a) + mul_div_255(px[2] as u16, ia)) as u8;
+                px[3] = (a + mul_div_255(px[3] as u16, ia)) as u8;
+                painted += 1;
             }
         }
         (reference, painted)
@@ -7501,97 +7926,102 @@ mod rgb8_area_min_tests {
         for &bpc in &[2u8, 4, 8] {
             for base in &bases {
                 for &(sw, sh, dev_w, dev_h) in &cases {
-                    for &with_decode in &[false, true] {
-                        // A palette shorter than `2^bpc` exercises the `hival` clamp.
-                        let hival = ((1u32 << bpc) - 1).min(200 + (rng.byte() as u32 % 56));
-                        let lookup: Vec<u8> = (0..(hival as usize + 1) * base.components())
-                            .map(|_| rng.byte())
-                            .collect();
-                        let color_space = ImageColorSpace::Indexed {
-                            base: Box::new(base.clone()),
-                            hival,
-                            lookup: Arc::from(lookup),
-                        };
-                        let samples = packed_indexed_samples(sw, sh, bpc, &mut rng);
-                        let mut img =
-                            make_image_cs(sw, sh, dev_w, dev_h, color_space.clone(), samples);
-                        img.bpc = bpc;
-                        img.decode = with_decode.then(|| {
-                            // `/Decode [hi lo]`: inverts the index range, in index units.
-                            Arc::from(vec![[hival as f32, 0.0f32]])
-                        });
-                        // What prepared.rs attaches: a LUT for 1/2/4 bpc, none at 8.
-                        img.sample_lut = crate::render_cpu::image::build_sample_lut(
-                            bpc,
-                            &color_space,
-                            img.decode.as_deref(),
-                            false,
-                        );
-                        assert_eq!(img.sample_lut.is_some(), bpc <= 4);
-                        let promoted = img
-                            .indexed_promoted_to_rgb8()
-                            .expect("indexed promotion applies to this small image");
-                        let what = format!(
-                            "indexed bpc={bpc} base={base:?} decode={with_decode} sw={sw} sh={sh} dev={dev_w}x{dev_h}"
-                        );
-                        // Unmasked: the promoted image takes the RGB8 area path.
-                        let mut fast =
-                            Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
-                        let (painted, _taps) = paint_axis_aligned_rgb8_area_min_opaque(
-                            &promoted,
-                            &mut fast,
-                            0,
-                            0,
-                            dev_w as usize,
-                            dev_h as usize,
-                        );
-                        let (mut reference, ref_painted) = generic_reference(&img, dev_w, dev_h);
-                        assert_eq!(painted, ref_painted, "{what}: painted count");
-                        assert_surfaces_equal(&mut fast, &mut reference, &what);
-                        // Cut out by a bilevel soft mask: the promoted image
-                        // takes the masked MRC path.
-                        let mut masked = img.clone();
-                        masked.smask = Some(bilevel(sw, sh, &mut rng));
-                        let promoted_masked = masked.indexed_promoted_to_rgb8().unwrap();
-                        let kind = area_min_mask(&promoted_masked).expect("bilevel mask");
-                        let mut fast =
-                            Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
-                        let (painted, _taps) = paint_axis_aligned_rgb8_area_min_masked(
-                            &promoted_masked,
-                            kind,
-                            &mut fast,
-                            0,
-                            0,
-                            dev_w as usize,
-                            dev_h as usize,
-                        );
-                        let (mut reference, ref_painted) =
-                            generic_masked_reference(&masked, dev_w, dev_h);
-                        assert_eq!(painted, ref_painted, "{what} smask: painted count");
-                        assert_surfaces_equal(&mut fast, &mut reference, &format!("{what} smask"));
-                        // Under an 8-bit soft mask no fast path applies; the
-                        // generic sampler itself must see the same image.
-                        let mut soft8 = img.clone();
-                        soft8.smask = Some(Arc::new(crate::page_ir::ImageSMask {
-                            width: sw,
-                            height: sh,
-                            bits_per_component: 8,
-                            decode: None,
-                            samples: Arc::from(
-                                (0..sw * sh).map(|_| rng.byte()).collect::<Vec<u8>>(),
-                            ),
-                            codec: None,
-                            codec_data: None,
-                            codec_parms: None,
-                        }));
-                        let promoted_soft8 = soft8.indexed_promoted_to_rgb8().unwrap();
-                        let (mut a, pa) = generic_masked_reference(&promoted_soft8, dev_w, dev_h);
-                        let (mut b, pb) = generic_masked_reference(&soft8, dev_w, dev_h);
-                        assert_eq!(pa, pb, "{what} smask8: painted count");
-                        assert_surfaces_equal(&mut a, &mut b, &format!("{what} smask8"));
-                    }
+                    check_indexed_draws(&mut rng, bpc, base, (sw, sh, dev_w, dev_h));
                 }
             }
+        }
+    }
+
+    /// The draws with and without `/Decode` of one bit depth, palette base and
+    /// geometry of [`indexed_fast_path_matches_generic_shade`].
+    fn check_indexed_draws(
+        rng: &mut Rng,
+        bpc: u8,
+        base: &ImageColorSpace,
+        (sw, sh, dev_w, dev_h): (u32, u32, u32, u32),
+    ) {
+        for &with_decode in &[false, true] {
+            // A palette shorter than `2^bpc` exercises the `hival` clamp.
+            let hival = ((1u32 << bpc) - 1).min(200 + (rng.byte() as u32 % 56));
+            let lookup: Vec<u8> = (0..(hival as usize + 1) * base.components())
+                .map(|_| rng.byte())
+                .collect();
+            let color_space = ImageColorSpace::Indexed {
+                base: Box::new(base.clone()),
+                hival,
+                lookup: Arc::from(lookup),
+            };
+            let samples = packed_indexed_samples(sw, sh, bpc, rng);
+            let mut img = make_image_cs(sw, sh, dev_w, dev_h, color_space.clone(), samples);
+            img.bpc = bpc;
+            img.decode = with_decode.then(|| {
+                // `/Decode [hi lo]`: inverts the index range, in index units.
+                Arc::from(vec![[hival as f32, 0.0f32]])
+            });
+            // What prepared.rs attaches: a LUT for 1/2/4 bpc, none at 8.
+            img.sample_lut = crate::render_cpu::image::build_sample_lut(
+                bpc,
+                &color_space,
+                img.decode.as_deref(),
+                false,
+            );
+            assert_eq!(img.sample_lut.is_some(), bpc <= 4);
+            let promoted = img
+                .indexed_promoted_to_rgb8()
+                .expect("indexed promotion applies to this small image");
+            let what = format!(
+                "indexed bpc={bpc} base={base:?} decode={with_decode} sw={sw} sh={sh} dev={dev_w}x{dev_h}"
+            );
+            // Unmasked: the promoted image takes the RGB8 area path.
+            let mut fast = Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
+            let (painted, _taps) = paint_axis_aligned_rgb8_area_min_opaque(
+                &promoted,
+                &mut fast,
+                0,
+                0,
+                dev_w as usize,
+                dev_h as usize,
+            );
+            let (mut reference, ref_painted) = generic_reference(&img, dev_w, dev_h);
+            assert_eq!(painted, ref_painted, "{what}: painted count");
+            assert_surfaces_equal(&mut fast, &mut reference, &what);
+            // Cut out by a bilevel soft mask: the promoted image
+            // takes the masked MRC path.
+            let mut masked = img.clone();
+            masked.smask = Some(bilevel(sw, sh, rng));
+            let promoted_masked = masked.indexed_promoted_to_rgb8().unwrap();
+            let kind = area_min_mask(&promoted_masked).expect("bilevel mask");
+            let mut fast = Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
+            let (painted, _taps) = paint_axis_aligned_rgb8_area_min_masked(
+                &promoted_masked,
+                kind,
+                &mut fast,
+                0,
+                0,
+                dev_w as usize,
+                dev_h as usize,
+            );
+            let (mut reference, ref_painted) = generic_masked_reference(&masked, dev_w, dev_h);
+            assert_eq!(painted, ref_painted, "{what} smask: painted count");
+            assert_surfaces_equal(&mut fast, &mut reference, &format!("{what} smask"));
+            // Under an 8-bit soft mask no fast path applies; the
+            // generic sampler itself must see the same image.
+            let mut soft8 = img.clone();
+            soft8.smask = Some(Arc::new(crate::page_ir::ImageSMask {
+                width: sw,
+                height: sh,
+                bits_per_component: 8,
+                decode: None,
+                samples: Arc::from((0..sw * sh).map(|_| rng.byte()).collect::<Vec<u8>>()),
+                codec: None,
+                codec_data: None,
+                codec_parms: None,
+            }));
+            let promoted_soft8 = soft8.indexed_promoted_to_rgb8().unwrap();
+            let (mut a, pa) = generic_masked_reference(&promoted_soft8, dev_w, dev_h);
+            let (mut b, pb) = generic_masked_reference(&soft8, dev_w, dev_h);
+            assert_eq!(pa, pb, "{what} smask8: painted count");
+            assert_surfaces_equal(&mut a, &mut b, &format!("{what} smask8"));
         }
     }
 
@@ -7613,88 +8043,99 @@ mod rgb8_area_min_tests {
         for variant in 0..4 {
             for &(sw, sh, dev_w, dev_h) in &cases {
                 for &with_decode in &[false, true] {
-                    let (color_space, ncomp) = match variant {
-                        0 => {
-                            let trc: Vec<f32> =
-                                (0..768).map(|_| rng.byte() as f32 / 255.0).collect();
-                            let mut matrix = [0f32; 9];
-                            for m in matrix.iter_mut() {
-                                *m = rng.byte() as f32 / 255.0;
-                            }
-                            (
-                                ImageColorSpace::IccRgb {
-                                    trc: Arc::from(trc),
-                                    matrix,
-                                },
-                                3,
-                            )
-                        }
-                        1 => (
-                            ImageColorSpace::Lab {
-                                white_point: [0.9505, 1.0, 1.089],
-                                range: [-100.0, 100.0, -100.0, 100.0],
-                            },
-                            3,
-                        ),
-                        2 => {
-                            let rgb: Vec<u8> = (0..768).map(|_| rng.byte()).collect();
-                            (
-                                ImageColorSpace::TintLut {
-                                    rgb: Arc::from(rgb),
-                                },
-                                1,
-                            )
-                        }
-                        _ => {
-                            let rgb: Vec<u8> = (0..256 * 256 * 3).map(|_| rng.byte()).collect();
-                            (
-                                ImageColorSpace::TintLut2 {
-                                    rgb: Arc::from(rgb),
-                                },
-                                2,
-                            )
-                        }
-                    };
-                    let samples: Vec<u8> = (0..(sw * sh) as usize * ncomp)
-                        .map(|_| rng.byte())
-                        .collect();
-                    let mut img = make_image_cs(sw, sh, dev_w, dev_h, color_space, samples);
-                    img.decode = with_decode.then(|| {
-                        Arc::from((0..ncomp).map(|_| [1.0f32, 0.0f32]).collect::<Vec<_>>())
-                    });
-                    assert!(img.generic_promotion_eligible());
-                    let promoted = img.generic_promoted_to_rgb8().expect("eligible");
-                    let what = format!(
-                        "variant {variant} decode={with_decode} sw={sw} sh={sh} dev={dev_w}x{dev_h}"
-                    );
-                    let (mut reference, ref_painted) = generic_reference(&img, dev_w, dev_h);
-                    let (mut via_promoted, promoted_painted) =
-                        generic_reference(&promoted, dev_w, dev_h);
-                    assert_eq!(promoted_painted, ref_painted, "{what}: painted (generic)");
-                    assert_surfaces_equal(
-                        &mut via_promoted,
-                        &mut reference,
-                        &format!("{what} (generic over promoted)"),
-                    );
-                    let mut fast =
-                        Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
-                    let (painted, _taps) = paint_axis_aligned_rgb8_area_min_opaque(
-                        &promoted,
-                        &mut fast,
-                        0,
-                        0,
-                        dev_w as usize,
-                        dev_h as usize,
-                    );
-                    assert_eq!(painted, ref_painted, "{what}: painted (fast)");
-                    assert_surfaces_equal(
-                        &mut fast,
-                        &mut reference,
-                        &format!("{what} (fast over promoted)"),
+                    check_generic_promotion_case(
+                        &mut rng,
+                        variant,
+                        (sw, sh, dev_w, dev_h),
+                        with_decode,
                     );
                 }
             }
         }
+    }
+
+    /// One colour space, geometry and `/Decode` of
+    /// [`generic_promotion_matches_generic_shade`].
+    fn check_generic_promotion_case(
+        rng: &mut Rng,
+        variant: u32,
+        (sw, sh, dev_w, dev_h): (u32, u32, u32, u32),
+        with_decode: bool,
+    ) {
+        let (color_space, ncomp) = match variant {
+            0 => {
+                let trc: Vec<f32> = (0..768).map(|_| rng.byte() as f32 / 255.0).collect();
+                let mut matrix = [0f32; 9];
+                for m in matrix.iter_mut() {
+                    *m = rng.byte() as f32 / 255.0;
+                }
+                (
+                    ImageColorSpace::IccRgb {
+                        trc: Arc::from(trc),
+                        matrix,
+                    },
+                    3,
+                )
+            }
+            1 => (
+                ImageColorSpace::Lab {
+                    white_point: [0.9505, 1.0, 1.089],
+                    range: [-100.0, 100.0, -100.0, 100.0],
+                },
+                3,
+            ),
+            2 => {
+                let rgb: Vec<u8> = (0..768).map(|_| rng.byte()).collect();
+                (
+                    ImageColorSpace::TintLut {
+                        rgb: Arc::from(rgb),
+                    },
+                    1,
+                )
+            }
+            _ => {
+                let rgb: Vec<u8> = (0..256 * 256 * 3).map(|_| rng.byte()).collect();
+                (
+                    ImageColorSpace::TintLut2 {
+                        rgb: Arc::from(rgb),
+                    },
+                    2,
+                )
+            }
+        };
+        let samples: Vec<u8> = (0..(sw * sh) as usize * ncomp)
+            .map(|_| rng.byte())
+            .collect();
+        let mut img = make_image_cs(sw, sh, dev_w, dev_h, color_space, samples);
+        img.decode = with_decode
+            .then(|| Arc::from((0..ncomp).map(|_| [1.0f32, 0.0f32]).collect::<Vec<_>>()));
+        assert!(img.generic_promotion_eligible());
+        let promoted = img.generic_promoted_to_rgb8().expect("eligible");
+        let what =
+            format!("variant {variant} decode={with_decode} sw={sw} sh={sh} dev={dev_w}x{dev_h}");
+        let (mut reference, ref_painted) = generic_reference(&img, dev_w, dev_h);
+        let (mut via_promoted, promoted_painted) = generic_reference(&promoted, dev_w, dev_h);
+        assert_eq!(promoted_painted, ref_painted, "{what}: painted (generic)");
+        assert_surfaces_equal(
+            &mut via_promoted,
+            &mut reference,
+            &format!("{what} (generic over promoted)"),
+        );
+        let mut fast = Surface::new(dev_w as usize, dev_h as usize, Background::Transparent);
+        let (painted, _taps) = paint_axis_aligned_rgb8_area_min_opaque(
+            &promoted,
+            &mut fast,
+            0,
+            0,
+            dev_w as usize,
+            dev_h as usize,
+        );
+        assert_eq!(painted, ref_painted, "{what}: painted (fast)");
+        assert_surfaces_equal(
+            &mut fast,
+            &mut reference,
+            &format!("{what} (fast over promoted)"),
+        );
     }
 
     /// An image placed at `(tx, ty)` device pixels, magnifying/1:1 by
@@ -7743,25 +8184,35 @@ mod rgb8_area_min_tests {
         ];
         for &(sw, sh, dev_w, dev_h, tx, ty, surf_w, surf_h) in &cases {
             for _trial in 0..4 {
-                let samples: Vec<u8> = (0..(sw * sh * 3)).map(|_| rng.byte()).collect();
-                let mut img = make_image_placed(sw, sh, dev_w, dev_h, tx, ty, samples);
-                img.interpolation = InterpolationMode::Bilinear;
-                let what = format!("bilinear sw={sw} sh={sh} dev={dev_w}x{dev_h} at ({tx},{ty})");
-                let (mut reference, ref_painted) = generic_reference(&img, surf_w, surf_h);
-                for kernel in available_kernels() {
-                    let Some(columns) = bilinear_columns(&img, 0, surf_w as usize) else {
-                        panic!("{what}: no columns");
-                    };
-                    let Some(rows) = bilinear_rows(&img, 0, surf_h as usize) else {
-                        panic!("{what}: no rows");
-                    };
-                    let mut fast =
-                        Surface::new(surf_w as usize, surf_h as usize, Background::Transparent);
-                    let painted = paint_bilinear_rows(kernel, &img, &mut fast, &columns, &rows);
-                    assert_eq!(painted, ref_painted, "{what} {kernel:?}: painted count");
-                    assert_surfaces_equal(&mut fast, &mut reference, &format!("{what} {kernel:?}"));
-                }
+                check_bilinear_kernels_case(
+                    &mut rng,
+                    (sw, sh, dev_w, dev_h, tx, ty, surf_w, surf_h),
+                );
             }
+        }
+    }
+
+    /// One fuzzed placement of [`bilinear_kernels_match_generic_shade_and_each_other`].
+    fn check_bilinear_kernels_case(
+        rng: &mut Rng,
+        (sw, sh, dev_w, dev_h, tx, ty, surf_w, surf_h): (u32, u32, u32, u32, f64, f64, u32, u32),
+    ) {
+        let samples: Vec<u8> = (0..(sw * sh * 3)).map(|_| rng.byte()).collect();
+        let mut img = make_image_placed(sw, sh, dev_w, dev_h, tx, ty, samples);
+        img.interpolation = InterpolationMode::Bilinear;
+        let what = format!("bilinear sw={sw} sh={sh} dev={dev_w}x{dev_h} at ({tx},{ty})");
+        let (mut reference, ref_painted) = generic_reference(&img, surf_w, surf_h);
+        for kernel in available_kernels() {
+            let Some(columns) = bilinear_columns(&img, 0, surf_w as usize) else {
+                panic!("{what}: no columns");
+            };
+            let Some(rows) = bilinear_rows(&img, 0, surf_h as usize) else {
+                panic!("{what}: no rows");
+            };
+            let mut fast = Surface::new(surf_w as usize, surf_h as usize, Background::Transparent);
+            let painted = paint_bilinear_rows(kernel, &img, &mut fast, &columns, &rows);
+            assert_eq!(painted, ref_painted, "{what} {kernel:?}: painted count");
+            assert_surfaces_equal(&mut fast, &mut reference, &format!("{what} {kernel:?}"));
         }
     }
 
@@ -7862,34 +8313,39 @@ mod rgb8_area_min_tests {
         let src: Vec<u8> = (0..4096).map(|_| rng.byte()).collect();
         for kernel in available_kernels() {
             for &n in &[0usize, 1, 3, 7, 8, 9, 15, 16, 17, 31, 64, 100] {
-                for &off in &[
-                    0usize,
-                    1,
-                    5,
-                    4096 - n * 3 - 40,
-                    4096 - n * 3 - 1,
-                    4096 - n * 3,
-                ] {
-                    if off + n * 3 > src.len() {
-                        continue;
-                    }
-                    let mut expected = vec![0xAAu8; n * 4];
-                    widen_rgb8_to_rgba8_scalar(&src[off..off + n * 3], &mut expected);
-                    let mut got = vec![0xAAu8; n * 4];
-                    widen_rgb8_to_rgba8_opaque(kernel, &src, off, &mut got);
-                    assert_eq!(got, expected, "{kernel:?} rgb n={n} off={off}");
-                }
-                for &off in &[0usize, 1, 5, 4096 - n - 40, 4096 - n - 1, 4096 - n] {
-                    if off + n > src.len() {
-                        continue;
-                    }
-                    let mut expected = vec![0xAAu8; n * 4];
-                    widen_gray8_to_rgba8_scalar(&src[off..off + n], &mut expected);
-                    let mut got = vec![0xAAu8; n * 4];
-                    widen_gray8_to_rgba8_opaque(kernel, &src, off, &mut got);
-                    assert_eq!(got, expected, "{kernel:?} gray n={n} off={off}");
-                }
+                check_widen_at_offsets(kernel, &src, n);
             }
+        }
+    }
+
+    /// Every widen of [`widen_kernels_match_scalar_bit_exact`] for run length `n`.
+    fn check_widen_at_offsets(kernel: ImageKernel, src: &[u8], n: usize) {
+        for &off in &[
+            0usize,
+            1,
+            5,
+            4096 - n * 3 - 40,
+            4096 - n * 3 - 1,
+            4096 - n * 3,
+        ] {
+            if off + n * 3 > src.len() {
+                continue;
+            }
+            let mut expected = vec![0xAAu8; n * 4];
+            widen_rgb8_to_rgba8_scalar(&src[off..off + n * 3], &mut expected);
+            let mut got = vec![0xAAu8; n * 4];
+            widen_rgb8_to_rgba8_opaque(kernel, src, off, &mut got);
+            assert_eq!(got, expected, "{kernel:?} rgb n={n} off={off}");
+        }
+        for &off in &[0usize, 1, 5, 4096 - n - 40, 4096 - n - 1, 4096 - n] {
+            if off + n > src.len() {
+                continue;
+            }
+            let mut expected = vec![0xAAu8; n * 4];
+            widen_gray8_to_rgba8_scalar(&src[off..off + n], &mut expected);
+            let mut got = vec![0xAAu8; n * 4];
+            widen_gray8_to_rgba8_opaque(kernel, src, off, &mut got);
+            assert_eq!(got, expected, "{kernel:?} gray n={n} off={off}");
         }
     }
 
@@ -7909,104 +8365,119 @@ mod rgb8_area_min_tests {
             (40, 200, 1.0, 1.0, 20.0, 9.0),
         ];
         for &(sw, sh, ox, oy, w, h) in &cases {
-            let side = (ox + w).max(oy + h).ceil() as u32 + 3;
-            let samples: Vec<u8> = (0..sw as usize * sh as usize).map(|_| rng.byte()).collect();
-            let base = place(
-                make_image_cs(sw, sh, 1, 1, ImageColorSpace::Gray, samples),
-                ox,
-                oy,
-                w,
-                h,
-            );
-            let promoted_base = base
-                .gray8_promoted_to_rgb8(0..sh as usize)
-                .expect("promotable gray8");
+            check_gray8_native_case(&mut rng, (sw, sh, ox, oy, w, h));
+        }
+    }
 
-            // Check scalar vs AVX2 bilinear directly when magnified / 1:1.
-            if base.footprint[0] <= 1.0 && base.footprint[1] <= 1.0 {
-                let cols = bilinear_columns_with_bpp(&base, 0, side as usize, 1).unwrap();
-                let rows = bilinear_rows(&base, 0, side as usize).unwrap();
-                let mut surf_scalar = Surface::new(side as usize, side as usize, Background::White);
-                paint_gray8_bilinear_rows(
-                    ImageKernel::Scalar,
-                    &base,
+    /// One placement of [`gray8_native_kernels_match_promoted_rgb8_and_scalar_bit_exact`].
+    fn check_gray8_native_case(
+        rng: &mut Rng,
+        (sw, sh, ox, oy, w, h): (u32, u32, f64, f64, f64, f64),
+    ) {
+        let side = (ox + w).max(oy + h).ceil() as u32 + 3;
+        let samples: Vec<u8> = (0..sw as usize * sh as usize).map(|_| rng.byte()).collect();
+        let base = place(
+            make_image_cs(sw, sh, 1, 1, ImageColorSpace::Gray, samples),
+            ox,
+            oy,
+            w,
+            h,
+        );
+        let promoted_base = base
+            .gray8_promoted_to_rgb8(0..sh as usize)
+            .expect("promotable gray8");
+
+        // Check scalar vs AVX2 bilinear directly when magnified / 1:1.
+        if base.footprint[0] <= 1.0 && base.footprint[1] <= 1.0 {
+            let cols = bilinear_columns_with_bpp(&base, 0, side as usize, 1).unwrap();
+            let rows = bilinear_rows(&base, 0, side as usize).unwrap();
+            let mut surf_scalar = Surface::new(side as usize, side as usize, Background::White);
+            paint_gray8_bilinear_rows(ImageKernel::Scalar, &base, &mut surf_scalar, &cols, &rows);
+            for kernel in available_kernels() {
+                let mut surf_k = Surface::new(side as usize, side as usize, Background::White);
+                paint_gray8_bilinear_rows(kernel, &base, &mut surf_k, &cols, &rows);
+                assert_surfaces_equal(
+                    &mut surf_k,
                     &mut surf_scalar,
-                    &cols,
-                    &rows,
+                    &format!("gray8 bilinear {kernel:?} sw={sw} sh={sh}"),
                 );
-                for kernel in available_kernels() {
-                    let mut surf_k = Surface::new(side as usize, side as usize, Background::White);
-                    paint_gray8_bilinear_rows(kernel, &base, &mut surf_k, &cols, &rows);
-                    assert_surfaces_equal(
-                        &mut surf_k,
-                        &mut surf_scalar,
-                        &format!("gray8 bilinear {kernel:?} sw={sw} sh={sh}"),
-                    );
-                }
-            } else {
-                // Check scalar vs AVX2 box_finish_gray8 directly.
-                let n = side as usize;
-                let acc: Vec<f64> = (0..n).map(|i| (i * 137 % 50_000) as f64).collect();
-                let col_total: Vec<f64> = (0..n).map(|i| (256 + (i % 7) * 33) as f64).collect();
-                let mut ref_dst = vec![0u8; n * 4];
-                box_finish_gray8_scalar(&acc, &col_total, 512.0, &mut ref_dst, 0);
-                for kernel in available_kernels() {
-                    let mut got_dst = vec![0u8; n * 4];
-                    box_finish_gray8(kernel, &acc, &col_total, 512.0, &mut got_dst);
-                    assert_eq!(got_dst, ref_dst, "box_finish_gray8 {kernel:?}");
-                }
             }
+        } else {
+            // Check scalar vs AVX2 box_finish_gray8 directly.
+            let n = side as usize;
+            let acc: Vec<f64> = (0..n).map(|i| (i * 137 % 50_000) as f64).collect();
+            let col_total: Vec<f64> = (0..n).map(|i| (256 + (i % 7) * 33) as f64).collect();
+            let mut ref_dst = vec![0u8; n * 4];
+            box_finish_gray8_scalar(&acc, &col_total, 512.0, &mut ref_dst, 0);
+            for kernel in available_kernels() {
+                let mut got_dst = vec![0u8; n * 4];
+                box_finish_gray8(kernel, &acc, &col_total, 512.0, &mut got_dst);
+                assert_eq!(got_dst, ref_dst, "box_finish_gray8 {kernel:?}");
+            }
+        }
 
-            for mask_kind in ["none", "stencil", "smask1", "smask8"] {
-                for interpolation in [InterpolationMode::Nearest, InterpolationMode::Bilinear] {
-                    let mut gray_img = base.clone();
-                    let mut rgb_img = promoted_base.clone();
-                    gray_img.interpolation = interpolation;
-                    rgb_img.interpolation = interpolation;
-                    let (mw, mh) = (sw.div_ceil(2) + 2, sh + 3);
-                    match mask_kind {
-                        "stencil" => {
-                            let m = Some(crate::page_ir::ImageMask::Stencil(bilevel(
-                                mw, mh, &mut rng,
-                            )));
-                            gray_img.mask = m.clone();
-                            rgb_img.mask = m;
-                        }
-                        "smask1" => {
-                            let m = Some(bilevel(mw, mh, &mut rng));
-                            gray_img.smask = m.clone();
-                            rgb_img.smask = m;
-                        }
-                        "smask8" => {
-                            let mask: Vec<u8> = (0..mw * mh)
-                                .map(|_| if rng.byte() < 80 { rng.byte() } else { 255 })
-                                .collect();
-                            let m = Some(Arc::new(crate::page_ir::ImageSMask {
-                                width: mw,
-                                height: mh,
-                                bits_per_component: 8,
-                                decode: None,
-                                samples: Arc::from(mask),
-                                codec: None,
-                                codec_data: None,
-                                codec_parms: None,
-                            }));
-                            gray_img.smask = m.clone();
-                            rgb_img.smask = m;
-                        }
-                        _ => {}
-                    }
-                    let mut got = dispatched(&gray_img, side);
-                    let mut expected = dispatched(&rgb_img, side);
-                    assert_surfaces_equal(
-                        &mut got,
-                        &mut expected,
-                        &format!(
-                            "gray8 vs promoted rgb8 sw={sw} sh={sh} mask={mask_kind} interp={interpolation:?}"
-                        ),
-                    );
+        for mask_kind in ["none", "stencil", "smask1", "smask8"] {
+            for interpolation in [InterpolationMode::Nearest, InterpolationMode::Bilinear] {
+                let mut gray_img = base.clone();
+                let mut rgb_img = promoted_base.clone();
+                gray_img.interpolation = interpolation;
+                rgb_img.interpolation = interpolation;
+                let (mw, mh) = (sw.div_ceil(2) + 2, sh + 3);
+                attach_test_mask(mask_kind, mw, mh, rng, [&mut gray_img, &mut rgb_img]);
+                let mut got = dispatched(&gray_img, side);
+                let mut expected = dispatched(&rgb_img, side);
+                assert_surfaces_equal(
+                    &mut got,
+                    &mut expected,
+                    &format!(
+                        "gray8 vs promoted rgb8 sw={sw} sh={sh} mask={mask_kind} interp={interpolation:?}"
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Attach the same fuzzed `mask_kind` mask (`"stencil"`, `"smask1"`,
+    /// `"smask8"`, anything else none) of `mw x mh` to every image.
+    fn attach_test_mask(
+        mask_kind: &str,
+        mw: u32,
+        mh: u32,
+        rng: &mut Rng,
+        images: [&mut PreparedImage; 2],
+    ) {
+        match mask_kind {
+            "stencil" => {
+                let m = Some(crate::page_ir::ImageMask::Stencil(bilevel(mw, mh, rng)));
+                for img in images {
+                    img.mask = m.clone();
                 }
             }
+            "smask1" => {
+                let m = Some(bilevel(mw, mh, rng));
+                for img in images {
+                    img.smask = m.clone();
+                }
+            }
+            "smask8" => {
+                let mask: Vec<u8> = (0..mw * mh)
+                    .map(|_| if rng.byte() < 80 { rng.byte() } else { 255 })
+                    .collect();
+                let m = Some(Arc::new(crate::page_ir::ImageSMask {
+                    width: mw,
+                    height: mh,
+                    bits_per_component: 8,
+                    decode: None,
+                    samples: Arc::from(mask),
+                    codec: None,
+                    codec_data: None,
+                    codec_parms: None,
+                }));
+                for img in images {
+                    img.smask = m.clone();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -8145,59 +8616,55 @@ mod rgb8_area_min_tests {
         let mut nearest = 0;
         for &(sw, sh, ox, oy, w, h) in &placements {
             let side = (ox + w).max(oy + h).ceil() as u32 + 2;
-            for inverted in [false, true] {
-                for clipped in [false, true] {
-                    for alpha in [255u8, 170] {
-                        let mut img = stencil_image(sw, sh, ox, oy, w, h, inverted, &mut rng);
-                        img.alpha = alpha;
-                        let clip = clipped.then(|| random_clip(side, &mut rng));
-                        let lut = stencil_fast_lut(&img).expect("an axis-aligned stencil");
-                        assert!(
-                            interior_span(img.inv.a, img.inv.e, 0, side as usize).is_some()
-                                && interior_span(img.inv.d, img.inv.f, 0, side as usize).is_some(),
-                            "the placement must have an interior for the fast path"
-                        );
-                        let b = img.bounds;
-                        let (x0, y0) = (b.x as usize, b.y as usize);
-                        let (x1, y1) = (x0 + b.width as usize, y0 + b.height as usize);
-                        let seed = rng.next();
-                        let mut got = backdrop(side, seed);
-                        let fast = paint_axis_aligned_stencil(
-                            &img,
-                            lut,
-                            &mut got,
-                            clip.as_ref(),
-                            BlendChoice::Normal,
-                            x0,
-                            y0,
-                            x1,
-                            y1,
-                        );
-                        let mut want = backdrop(side, seed);
-                        let generic = paint_image_generic(
-                            &img,
-                            &mut want,
-                            clip.as_ref(),
-                            None,
-                            BlendChoice::Normal,
-                            x0,
-                            y0,
-                            x1,
-                            y1,
-                            None,
-                        );
-                        let what = format!(
-                            "stencil {sw}x{sh} at ({ox}, {oy}) size {w}x{h} inverted {inverted} \
-                             clipped {clipped} alpha {alpha}"
-                        );
-                        assert_surfaces_equal(&mut got, &mut want, &what);
-                        assert_eq!(fast.0, generic.0, "{what}: covered pixels");
-                        if img.footprint[0] > 1.0 || img.footprint[1] > 1.0 {
-                            minified += 1;
-                        } else {
-                            nearest += 1;
-                        }
-                    }
+            for (inverted, clipped, alpha) in STENCIL_VARIANTS {
+                let mut img = stencil_image(sw, sh, ox, oy, w, h, inverted, &mut rng);
+                img.alpha = alpha;
+                let clip = clipped.then(|| random_clip(side, &mut rng));
+                let lut = stencil_fast_lut(&img).expect("an axis-aligned stencil");
+                assert!(
+                    interior_span(img.inv.a, img.inv.e, 0, side as usize).is_some()
+                        && interior_span(img.inv.d, img.inv.f, 0, side as usize).is_some(),
+                    "the placement must have an interior for the fast path"
+                );
+                let b = img.bounds;
+                let (x0, y0) = (b.x as usize, b.y as usize);
+                let (x1, y1) = (x0 + b.width as usize, y0 + b.height as usize);
+                let seed = rng.next();
+                let mut got = backdrop(side, seed);
+                let fast = paint_axis_aligned_stencil(
+                    &img,
+                    lut,
+                    &mut got,
+                    clip.as_ref(),
+                    BlendChoice::Normal,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                );
+                let mut want = backdrop(side, seed);
+                let generic = paint_image_generic(
+                    &img,
+                    &mut want,
+                    clip.as_ref(),
+                    None,
+                    BlendChoice::Normal,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    None,
+                );
+                let what = format!(
+                    "stencil {sw}x{sh} at ({ox}, {oy}) size {w}x{h} inverted {inverted} \
+                     clipped {clipped} alpha {alpha}"
+                );
+                assert_surfaces_equal(&mut got, &mut want, &what);
+                assert_eq!(fast.0, generic.0, "{what}: covered pixels");
+                if img.footprint[0] > 1.0 || img.footprint[1] > 1.0 {
+                    minified += 1;
+                } else {
+                    nearest += 1;
                 }
             }
         }
@@ -8206,6 +8673,19 @@ mod rgb8_area_min_tests {
             "{minified} minified, {nearest} nearest"
         );
     }
+
+    /// The (inverted, clipped, alpha) variants every placement of
+    /// [`stencil_fast_path_matches_the_generic_body`] is drawn in.
+    const STENCIL_VARIANTS: [(bool, bool, u8); 8] = [
+        (false, false, 255),
+        (false, false, 170),
+        (false, true, 255),
+        (false, true, 170),
+        (true, false, 255),
+        (true, false, 170),
+        (true, true, 255),
+        (true, true, 170),
+    ];
 
     /// What keeps a stencil on the generic body: a rotated or sheared
     /// placement, a magnified Bilinear draw, and sample data shorter than its
@@ -8365,63 +8845,71 @@ mod rgb8_area_min_tests {
         let mut rng = Rng(0x2b0b_a11d_0e5e_1f00);
         let mut boxes = 0u64;
         for trial in 0..60 {
-            let sw = 3 + (rng.next() % 140) as u32;
-            let sh = 3 + (rng.next() % 120) as u32;
-            let row_bytes = (sw as usize).div_ceil(8);
-            // Mostly sparse, sometimes dense, so the zero-row shortcut and
-            // full bytes are both exercised.
-            let dense = trial % 3 == 0;
-            let bits: Vec<u8> = (0..row_bytes * sh as usize)
-                .map(|_| {
-                    let b = rng.byte();
-                    if dense || b < 40 { rng.byte() } else { 0 }
-                })
-                .collect();
-            let scale = 1.05 + (rng.next() % 1000) as f64 / 150.0;
-            let (w, h) = (sw as f64 / scale, sh as f64 / (scale * 0.8 + 0.3));
-            let (w, h) = if trial % 4 == 1 { (-w, h) } else { (w, h) };
-            let (w, h) = if trial % 5 == 2 { (w, -h) } else { (w, h) };
-            let ox = 1.0 + (rng.next() % 100) as f64 / 37.0 + if w < 0.0 { -w } else { 0.0 };
-            let oy = 0.5 + (rng.next() % 100) as f64 / 41.0 + if h < 0.0 { -h } else { 0.0 };
-            let img = bilevel_image(sw, sh, bits, ox, oy, w, h);
-            let (cols, rows) = binary_taps(&img);
-            if cols.iter().all(Option::is_none) || rows.iter().all(Option::is_none) {
-                // No destination pixel centre lands in the image.
-                assert!(BilevelWindow::new(&img, &cols, &rows).is_none());
-                assert!(BilevelIntegral::build(&img, &cols, &rows).is_none());
-                continue;
-            }
-            let window = BilevelWindow::new(&img, &cols, &rows).expect("complete samples");
-            let sat = BilevelIntegral::build(&img, &cols, &rows).expect("small table");
-            let base = (window.byte_lo * 8) as u32;
-            let mut colw = vec![0u32; window.nbytes * 8];
-            let mut prefix = vec![0u64; window.nbytes * 8 + 1];
-            let row_bits = img.packed_row_bits();
-            for ty in rows.iter().flatten() {
-                let any = window.column_sums(ty, &mut colw, &mut prefix);
-                for tx in cols.iter().flatten() {
-                    let banded = if any {
-                        row_band_weighted_ones(tx, base, &colw, &prefix)
-                    } else {
-                        0
-                    };
-                    let direct: u64 = (ty.lo..=ty.hi)
-                        .map(|y| {
-                            ty.weight_at(y)
-                                * crate::render_cpu::image::weighted_row_ones_in(
-                                    &img.samples,
-                                    y as usize * row_bits,
-                                    tx,
-                                )
-                        })
-                        .sum();
-                    assert_eq!(banded, direct, "trial {trial} tx={tx:?} ty={ty:?}");
-                    assert_eq!(sat.weighted_ones(tx, ty), direct, "trial {trial}");
-                    boxes += 1;
-                }
-            }
+            boxes += check_row_band_trial(&mut rng, trial);
         }
         assert!(boxes > 10_000, "{boxes} boxes");
+    }
+
+    /// One fuzzed image of [`row_band_weighted_ones_match_the_sat_and_the_direct_count`];
+    /// returns how many boxes it checked.
+    fn check_row_band_trial(rng: &mut Rng, trial: i32) -> u64 {
+        let mut boxes = 0u64;
+        let sw = 3 + (rng.next() % 140) as u32;
+        let sh = 3 + (rng.next() % 120) as u32;
+        let row_bytes = (sw as usize).div_ceil(8);
+        // Mostly sparse, sometimes dense, so the zero-row shortcut and
+        // full bytes are both exercised.
+        let dense = trial % 3 == 0;
+        let bits: Vec<u8> = (0..row_bytes * sh as usize)
+            .map(|_| {
+                let b = rng.byte();
+                if dense || b < 40 { rng.byte() } else { 0 }
+            })
+            .collect();
+        let scale = 1.05 + (rng.next() % 1000) as f64 / 150.0;
+        let (w, h) = (sw as f64 / scale, sh as f64 / (scale * 0.8 + 0.3));
+        let (w, h) = if trial % 4 == 1 { (-w, h) } else { (w, h) };
+        let (w, h) = if trial % 5 == 2 { (w, -h) } else { (w, h) };
+        let ox = 1.0 + (rng.next() % 100) as f64 / 37.0 + if w < 0.0 { -w } else { 0.0 };
+        let oy = 0.5 + (rng.next() % 100) as f64 / 41.0 + if h < 0.0 { -h } else { 0.0 };
+        let img = bilevel_image(sw, sh, bits, ox, oy, w, h);
+        let (cols, rows) = binary_taps(&img);
+        if cols.iter().all(Option::is_none) || rows.iter().all(Option::is_none) {
+            // No destination pixel centre lands in the image.
+            assert!(BilevelWindow::new(&img, &cols, &rows).is_none());
+            assert!(BilevelIntegral::build(&img, &cols, &rows).is_none());
+            return 0;
+        }
+        let window = BilevelWindow::new(&img, &cols, &rows).expect("complete samples");
+        let sat = BilevelIntegral::build(&img, &cols, &rows).expect("small table");
+        let base = (window.byte_lo * 8) as u32;
+        let mut colw = vec![0u32; window.nbytes * 8];
+        let mut prefix = vec![0u64; window.nbytes * 8 + 1];
+        let row_bits = img.packed_row_bits();
+        for ty in rows.iter().flatten() {
+            let any = window.column_sums(ty, &mut colw, &mut prefix);
+            for tx in cols.iter().flatten() {
+                let banded = if any {
+                    row_band_weighted_ones(tx, base, &colw, &prefix)
+                } else {
+                    0
+                };
+                let direct: u64 = (ty.lo..=ty.hi)
+                    .map(|y| {
+                        ty.weight_at(y)
+                            * crate::render_cpu::image::weighted_row_ones_in(
+                                &img.samples,
+                                y as usize * row_bits,
+                                tx,
+                            )
+                    })
+                    .sum();
+                assert_eq!(banded, direct, "trial {trial} tx={tx:?} ty={ty:?}");
+                assert_eq!(sat.weighted_ones(tx, ty), direct, "trial {trial}");
+                boxes += 1;
+            }
+        }
+        boxes
     }
 
     /// The row-band painter must leave the same bytes as the per-pixel loop
@@ -8604,87 +9092,99 @@ mod rgb8_area_min_tests {
         ];
         let mut narrowed = 0;
         for &(sw, sh, ox, oy, w, h) in &placements {
-            let side = (ox + w).max(oy + h).ceil() as u32 + 2;
             for mask_kind in ["none", "stencil", "smask1", "smask8"] {
                 for interpolation in [InterpolationMode::Nearest, InterpolationMode::Bilinear] {
-                    for (flipped, cmyk) in
-                        [(false, false), (true, false), (false, true), (true, true)]
-                    {
-                        let (space, comps) = if cmyk {
-                            (ImageColorSpace::Cmyk, 4)
-                        } else {
-                            (ImageColorSpace::Gray, 1)
-                        };
-                        let samples: Vec<u8> = (0..sw as usize * sh as usize * comps)
-                            .map(|_| rng.byte())
-                            .collect();
-                        let mut img =
-                            place(make_image_cs(sw, sh, 1, 1, space, samples), ox, oy, w, h);
-                        if flipped {
-                            // v runs the other way down the same rectangle.
-                            img.inv.d = -img.inv.d;
-                            img.inv.f = 1.0 - img.inv.f;
-                        }
-                        img.interpolation = interpolation;
-                        let (mw, mh) = (sw.div_ceil(2) + 1, sh + 3);
-                        match mask_kind {
-                            "stencil" => {
-                                img.mask = Some(crate::page_ir::ImageMask::Stencil(bilevel(
-                                    mw, mh, &mut rng,
-                                )));
-                            }
-                            "smask1" => img.smask = Some(bilevel(mw, mh, &mut rng)),
-                            "smask8" => {
-                                let mask: Vec<u8> = (0..mw * mh)
-                                    .map(|_| if rng.byte() < 60 { rng.byte() } else { 255 })
-                                    .collect();
-                                img.smask = Some(Arc::new(crate::page_ir::ImageSMask {
-                                    width: mw,
-                                    height: mh,
-                                    bits_per_component: 8,
-                                    decode: None,
-                                    samples: Arc::from(mask),
-                                    codec: None,
-                                    codec_data: None,
-                                    codec_parms: None,
-                                }));
-                            }
-                            _ => {}
-                        }
-                        let mut whole = dispatched(&img, side);
-                        let (top, bottom) =
-                            (img.bounds.y as u32, img.bounds.y as u32 + img.bounds.height);
-                        let mut windows: Vec<(u32, u32)> =
-                            (top..bottom).map(|y| (y, y + 1)).collect();
-                        for _ in 0..6 {
-                            let a = top + rng.next() as u32 % (bottom - top);
-                            let b = a + 1 + rng.next() as u32 % (bottom - a);
-                            windows.push((a, b));
-                        }
-                        for (a, b) in windows {
-                            let mut part = img.clone();
-                            part.bounds.y = a as i32;
-                            part.bounds.height = b - a;
-                            let band = part.source_rows_for(a as usize, b as usize);
-                            if band.len() < sh as usize {
-                                narrowed += 1;
-                            }
-                            let mut got = dispatched(&part, side);
-                            for y in a as usize..b as usize {
-                                assert_eq!(
-                                    got.row_mut(y).to_vec(),
-                                    whole.row_mut(y).to_vec(),
-                                    "{mask_kind} {interpolation:?} flipped={flipped} cmyk={cmyk}                                      src {sw}x{sh} \
-                                     at ({ox}, {oy}) size {w}x{h}: rows {a}..{b}, row {y}"
-                                );
-                            }
-                        }
-                    }
+                    narrowed += check_row_window_draws(
+                        &mut rng,
+                        (sw, sh, ox, oy, w, h),
+                        mask_kind,
+                        interpolation,
+                    );
                 }
             }
         }
         // The windows did narrow the expansion, or this tested nothing.
         assert!(narrowed > 1000, "only {narrowed} windows narrowed the band");
+    }
+
+    /// The plain, flipped, CMYK and flipped CMYK draws of one placement, mask
+    /// and interpolation of [`gray_expansion_over_a_row_window_matches_the_whole_draw`];
+    /// returns how many row windows narrowed the expanded band.
+    fn check_row_window_draws(
+        rng: &mut Rng,
+        (sw, sh, ox, oy, w, h): (u32, u32, f64, f64, f64, f64),
+        mask_kind: &str,
+        interpolation: InterpolationMode,
+    ) -> u32 {
+        let side = (ox + w).max(oy + h).ceil() as u32 + 2;
+        let mut narrowed = 0;
+        for (flipped, cmyk) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (space, comps) = if cmyk {
+                (ImageColorSpace::Cmyk, 4)
+            } else {
+                (ImageColorSpace::Gray, 1)
+            };
+            let samples: Vec<u8> = (0..sw as usize * sh as usize * comps)
+                .map(|_| rng.byte())
+                .collect();
+            let mut img = place(make_image_cs(sw, sh, 1, 1, space, samples), ox, oy, w, h);
+            if flipped {
+                // v runs the other way down the same rectangle.
+                img.inv.d = -img.inv.d;
+                img.inv.f = 1.0 - img.inv.f;
+            }
+            img.interpolation = interpolation;
+            let (mw, mh) = (sw.div_ceil(2) + 1, sh + 3);
+            match mask_kind {
+                "stencil" => {
+                    img.mask = Some(crate::page_ir::ImageMask::Stencil(bilevel(mw, mh, rng)));
+                }
+                "smask1" => img.smask = Some(bilevel(mw, mh, rng)),
+                "smask8" => {
+                    let mask: Vec<u8> = (0..mw * mh)
+                        .map(|_| if rng.byte() < 60 { rng.byte() } else { 255 })
+                        .collect();
+                    img.smask = Some(Arc::new(crate::page_ir::ImageSMask {
+                        width: mw,
+                        height: mh,
+                        bits_per_component: 8,
+                        decode: None,
+                        samples: Arc::from(mask),
+                        codec: None,
+                        codec_data: None,
+                        codec_parms: None,
+                    }));
+                }
+                _ => {}
+            }
+            let mut whole = dispatched(&img, side);
+            let (top, bottom) = (img.bounds.y as u32, img.bounds.y as u32 + img.bounds.height);
+            let mut windows: Vec<(u32, u32)> = (top..bottom).map(|y| (y, y + 1)).collect();
+            for _ in 0..6 {
+                let a = top + rng.next() as u32 % (bottom - top);
+                let b = a + 1 + rng.next() as u32 % (bottom - a);
+                windows.push((a, b));
+            }
+            for (a, b) in windows {
+                let mut part = img.clone();
+                part.bounds.y = a as i32;
+                part.bounds.height = b - a;
+                let band = part.source_rows_for(a as usize, b as usize);
+                if band.len() < sh as usize {
+                    narrowed += 1;
+                }
+                let mut got = dispatched(&part, side);
+                for y in a as usize..b as usize {
+                    assert_eq!(
+                        got.row_mut(y).to_vec(),
+                        whole.row_mut(y).to_vec(),
+                        "{mask_kind} {interpolation:?} flipped={flipped} cmyk={cmyk}                                      src {sw}x{sh} \
+                         at ({ox}, {oy}) size {w}x{h}: rows {a}..{b}, row {y}"
+                    );
+                }
+            }
+        }
+        narrowed
     }
 
     /// Every image fast path must equal the full generic body — interior
@@ -8743,60 +9243,14 @@ mod rgb8_area_min_tests {
         ];
         let mut checked = 0;
         for &(sw, sh, ox, oy, w, h) in &placements {
-            let side = (ox + w).max(oy + h).ceil() as u32 + 2;
             for (space_name, space, comps) in &spaces {
                 for mask_kind in ["none", "stencil", "smask1", "smask8"] {
-                    for interpolation in [InterpolationMode::Nearest, InterpolationMode::Bilinear] {
-                        let samples: Vec<u8> = (0..sw as usize * sh as usize * comps)
-                            .map(|_| rng.byte())
-                            .collect();
-                        let mut img = place(
-                            make_image_cs(sw, sh, 1, 1, space.clone(), samples),
-                            ox,
-                            oy,
-                            w,
-                            h,
-                        );
-                        img.interpolation = interpolation;
-                        let (mw, mh) = (sw.div_ceil(2) + 1, sh + 3);
-                        match mask_kind {
-                            "stencil" => {
-                                img.mask = Some(crate::page_ir::ImageMask::Stencil(bilevel(
-                                    mw, mh, &mut rng,
-                                )));
-                            }
-                            "smask1" => img.smask = Some(bilevel(mw, mh, &mut rng)),
-                            "smask8" => {
-                                let mask: Vec<u8> = (0..mw * mh)
-                                    .map(|_| if rng.byte() < 60 { rng.byte() } else { 255 })
-                                    .collect();
-                                img.smask = Some(Arc::new(crate::page_ir::ImageSMask {
-                                    width: mw,
-                                    height: mh,
-                                    bits_per_component: 8,
-                                    decode: None,
-                                    samples: Arc::from(mask),
-                                    codec: None,
-                                    codec_data: None,
-                                    codec_parms: None,
-                                }));
-                            }
-                            _ => {}
-                        }
-                        let mut got = dispatched(&img, side);
-                        // `paint_image` turns a minified hard stencil into a
-                        // coverage soft mask before choosing any path.
-                        let generic_img = img
-                            .minified_stencil_as_coverage()
-                            .unwrap_or_else(|| img.clone());
-                        let (mut want, _) = generic_masked_reference(&generic_img, side, side);
-                        let what = format!(
-                            "{space_name} {mask_kind} {interpolation:?} src {sw}x{sh} at \
-                             ({ox}, {oy}) size {w}x{h}"
-                        );
-                        assert_surfaces_equal(&mut got, &mut want, &what);
-                        checked += 1;
-                    }
+                    checked += check_fractional_draws(
+                        &mut rng,
+                        (sw, sh, ox, oy, w, h),
+                        (space_name, space, *comps),
+                        mask_kind,
+                    );
                 }
             }
         }
@@ -8842,6 +9296,69 @@ mod rgb8_area_min_tests {
             }
         }
         assert_eq!(checked, 5 * 4 * 4 * 2 + 5 * 2 * 2 + 5 * 2);
+    }
+
+    /// The nearest and bilinear draws of one placement, colour space and mask
+    /// of [`fractional_placements_match_the_generic_body_including_the_border_ring`];
+    /// returns how many it checked.
+    fn check_fractional_draws(
+        rng: &mut Rng,
+        (sw, sh, ox, oy, w, h): (u32, u32, f64, f64, f64, f64),
+        (space_name, space, comps): (&str, &ImageColorSpace, usize),
+        mask_kind: &str,
+    ) -> u32 {
+        let side = (ox + w).max(oy + h).ceil() as u32 + 2;
+        let mut checked = 0;
+        for interpolation in [InterpolationMode::Nearest, InterpolationMode::Bilinear] {
+            let samples: Vec<u8> = (0..sw as usize * sh as usize * comps)
+                .map(|_| rng.byte())
+                .collect();
+            let mut img = place(
+                make_image_cs(sw, sh, 1, 1, space.clone(), samples),
+                ox,
+                oy,
+                w,
+                h,
+            );
+            img.interpolation = interpolation;
+            let (mw, mh) = (sw.div_ceil(2) + 1, sh + 3);
+            match mask_kind {
+                "stencil" => {
+                    img.mask = Some(crate::page_ir::ImageMask::Stencil(bilevel(mw, mh, rng)));
+                }
+                "smask1" => img.smask = Some(bilevel(mw, mh, rng)),
+                "smask8" => {
+                    let mask: Vec<u8> = (0..mw * mh)
+                        .map(|_| if rng.byte() < 60 { rng.byte() } else { 255 })
+                        .collect();
+                    img.smask = Some(Arc::new(crate::page_ir::ImageSMask {
+                        width: mw,
+                        height: mh,
+                        bits_per_component: 8,
+                        decode: None,
+                        samples: Arc::from(mask),
+                        codec: None,
+                        codec_data: None,
+                        codec_parms: None,
+                    }));
+                }
+                _ => {}
+            }
+            let mut got = dispatched(&img, side);
+            // `paint_image` turns a minified hard stencil into a
+            // coverage soft mask before choosing any path.
+            let generic_img = img
+                .minified_stencil_as_coverage()
+                .unwrap_or_else(|| img.clone());
+            let (mut want, _) = generic_masked_reference(&generic_img, side, side);
+            let what = format!(
+                "{space_name} {mask_kind} {interpolation:?} src {sw}x{sh} at \
+                 ({ox}, {oy}) size {w}x{h}"
+            );
+            assert_surfaces_equal(&mut got, &mut want, &what);
+            checked += 1;
+        }
+        checked
     }
 
     /// `img` re-placed by the forward map `[a b c d e f]` from its unit
@@ -8907,6 +9424,29 @@ mod rgb8_area_min_tests {
         out
     }
 
+    /// `backdrop_px` after `img` paints the device pixel `(x, y)` at full
+    /// weight from its nearest edge sample (`shade_clamped()`).
+    fn edge_sample_expected(
+        img: &PreparedImage,
+        backdrop_px: &[u8],
+        x: usize,
+        y: usize,
+    ) -> Vec<u8> {
+        let mut clamped = backdrop_px.to_vec();
+        if let Some(c) = img.shade_clamped(x as f64 + 0.5, y as f64 + 0.5) {
+            let a = mul_div_255(c[3] as u16, img.alpha as u16);
+            if a > 0 {
+                composite_px_blended(
+                    &mut clamped,
+                    [c[0], c[1], c[2]],
+                    a as u8,
+                    BlendChoice::Normal,
+                );
+            }
+        }
+        clamped
+    }
+
     /// Paint `img` with the generic body over a seeded backdrop. Returns
     /// `(mismatches, partial, border)`: the pixels that differ from the
     /// pixel-centre expectation, the border pixels (those `edge_coverage`
@@ -8941,27 +9481,33 @@ mod rgb8_area_min_tests {
                 if gp != full.as_slice() {
                     mismatches += 1;
                 }
-                if img.edge_coverage(x as f64 + 0.5, y as f64 + 0.5).is_some() {
-                    border += 1;
-                    let mut clamped = rp.to_vec();
-                    if let Some(c) = img.shade_clamped(x as f64 + 0.5, y as f64 + 0.5) {
-                        let a = mul_div_255(c[3] as u16, img.alpha as u16);
-                        if a > 0 {
-                            composite_px_blended(
-                                &mut clamped,
-                                [c[0], c[1], c[2]],
-                                a as u8,
-                                BlendChoice::Normal,
-                            );
-                        }
-                    }
-                    if gp != rp && gp != full.as_slice() && gp != clamped.as_slice() {
-                        partial += 1;
-                    }
+                if img.edge_coverage(x as f64 + 0.5, y as f64 + 0.5).is_none() {
+                    continue;
+                }
+                border += 1;
+                let clamped = edge_sample_expected(img, rp, x, y);
+                if gp != rp && gp != full.as_slice() && gp != clamped.as_slice() {
+                    partial += 1;
                 }
             }
         }
         (mismatches, partial, border)
+    }
+
+    /// `img` rotated 15 degrees about its first corner (and moved 6 px right).
+    fn rotated_15_degrees(img: &PreparedImage) -> PreparedImage {
+        let unit = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)].map(|(u, v)| {
+            let m = img.inv.invert().expect("invertible");
+            m.apply(crate::page_ir::Point { x: u, y: v })
+        });
+        let forward = forward_rect(
+            unit[0].x + 6.0,
+            unit[0].y,
+            unit[1].x - unit[0].x,
+            unit[2].y - unit[0].y,
+            15.0,
+        );
+        place_forward(img.clone(), forward)
     }
 
     /// Masked images on an axis-aligned placement with fractional device
@@ -9064,18 +9610,7 @@ mod rgb8_area_min_tests {
 
                     // The same draw rotated 15 degrees about its first corner
                     // keeps fractional edge coverage.
-                    let unit = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)].map(|(u, v)| {
-                        let m = img.inv.invert().expect("invertible");
-                        m.apply(crate::page_ir::Point { x: u, y: v })
-                    });
-                    let forward = forward_rect(
-                        unit[0].x + 6.0,
-                        unit[0].y,
-                        unit[1].x - unit[0].x,
-                        unit[2].y - unit[0].y,
-                        15.0,
-                    );
-                    let rotated = place_forward(img.clone(), forward);
+                    let rotated = rotated_15_degrees(&img);
                     let (_, partial, _) = generic_edge_census(&rotated, side + 8, seed);
                     assert!(
                         partial > 0,

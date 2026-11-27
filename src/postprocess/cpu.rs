@@ -392,13 +392,7 @@ fn resize(src: &Raster, spec: &ResizeSpec) -> Result<Raster, PostprocessError> {
         let src_row = &src.data[row * sw * ch..(row + 1) * sw * ch];
         let mid_row = &mut mid[row * dw * ch..(row + 1) * dw * ch];
         for (d, taps) in h_taps.iter().enumerate() {
-            let mut acc = [0.0f32; 4];
-            for (i, &w) in taps.weights.iter().enumerate() {
-                let s = (taps.start + i).min(sw - 1) * ch;
-                for c in 0..ch {
-                    acc[c] += w * src_row[s + c] as f32;
-                }
-            }
+            let acc = row_tap_sum(src_row, taps, sw, ch);
             mid_row[d * ch..d * ch + ch].copy_from_slice(&acc[..ch]);
         }
     }
@@ -408,26 +402,8 @@ fn resize(src: &Raster, spec: &ResizeSpec) -> Result<Raster, PostprocessError> {
     for (d, taps) in v_taps.iter().enumerate() {
         let dst_row = &mut data[d * dw * ch..(d + 1) * dw * ch];
         for x in 0..dw {
-            let mut acc = [0.0f32; 4];
-            for (i, &w) in taps.weights.iter().enumerate() {
-                let s = (taps.start + i).min(sh - 1);
-                let base = s * dw * ch + x * ch;
-                for c in 0..ch {
-                    acc[c] += w * mid[base + c];
-                }
-            }
-            let out = &mut dst_row[x * ch..x * ch + ch];
-            for c in 0..ch {
-                out[c] = acc[c].round().clamp(0.0, 255.0) as u8;
-            }
-            // Negative-lobe kernels can break the premultiplied invariant
-            // (color > alpha); restore it so downstream ops stay valid.
-            if ch == 4 {
-                let a = out[3];
-                for c in out.iter_mut().take(3) {
-                    *c = (*c).min(a);
-                }
-            }
+            let acc = column_tap_sum(&mid, taps, x, sh, dw, ch);
+            store_resized_pixel(&mut dst_row[x * ch..x * ch + ch], acc);
         }
     }
     Ok(Raster {
@@ -436,6 +412,51 @@ fn resize(src: &Raster, spec: &ResizeSpec) -> Result<Raster, PostprocessError> {
         format: src.format,
         data,
     })
+}
+
+/// Weighted sum of one destination pixel's horizontal taps over `src_row`.
+#[inline]
+fn row_tap_sum(src_row: &[u8], taps: &Taps, sw: usize, ch: usize) -> [f32; 4] {
+    let mut acc = [0.0f32; 4];
+    for (i, &w) in taps.weights.iter().enumerate() {
+        let s = (taps.start + i).min(sw - 1) * ch;
+        for c in 0..ch {
+            acc[c] += w * src_row[s + c] as f32;
+        }
+    }
+    acc
+}
+
+/// Weighted sum of one destination pixel's vertical taps down column `x` of
+/// the intermediate `mid` raster (`dw` pixels wide, `sh` rows).
+#[inline]
+fn column_tap_sum(mid: &[f32], taps: &Taps, x: usize, sh: usize, dw: usize, ch: usize) -> [f32; 4] {
+    let mut acc = [0.0f32; 4];
+    for (i, &w) in taps.weights.iter().enumerate() {
+        let s = (taps.start + i).min(sh - 1);
+        let base = s * dw * ch + x * ch;
+        for c in 0..ch {
+            acc[c] += w * mid[base + c];
+        }
+    }
+    acc
+}
+
+/// Round a resized pixel's accumulated channels into `out` (`ch` bytes).
+#[inline]
+fn store_resized_pixel(out: &mut [u8], acc: [f32; 4]) {
+    let ch = out.len();
+    for c in 0..ch {
+        out[c] = acc[c].round().clamp(0.0, 255.0) as u8;
+    }
+    // Negative-lobe kernels can break the premultiplied invariant
+    // (color > alpha); restore it so downstream ops stay valid.
+    if ch == 4 {
+        let a = out[3];
+        for c in out.iter_mut().take(3) {
+            *c = (*c).min(a);
+        }
+    }
 }
 
 fn resize_nearest(src: &Raster, dw: u32, dh: u32) -> Raster {
@@ -624,42 +645,48 @@ fn dither(raster: &mut Raster, spec: &DitherSpec) -> Result<(), PostprocessError
                 *v = if *v >= 128 { 255 } else { 0 };
             }
         }
-        DitherSpec::Bayer4 => {
-            for y in 0..h {
-                for x in 0..w {
-                    let i = y * w + x;
-                    // Threshold in (0, 255): cell (m + 0.5) / 16 · 255.
-                    let t = ((BAYER4[y & 3][x & 3] as u16 * 2 + 1) * 255 / 32) as u8;
-                    raster.data[i] = if raster.data[i] > t { 255 } else { 0 };
-                }
-            }
-        }
-        DitherSpec::FloydSteinberg => {
-            // Classic raster-order error diffusion (7/16, 3/16, 5/16, 1/16).
-            // Only the current and next rows can carry pending error. Padding
-            // both ends removes neighbour branches while reducing scratch from
-            // `4 * width * height` bytes to `8 * (width + 2)` bytes.
-            let mut current = vec![0i32; w + 2];
-            let mut next = vec![0i32; w + 2];
-            for y in 0..h {
-                for x in 0..w {
-                    let i = y * w + x;
-                    let slot = x + 1;
-                    let v = raster.data[i] as i32 + current[slot] / 16;
-                    let out = if v >= 128 { 255 } else { 0 };
-                    raster.data[i] = out as u8;
-                    let e = v - out;
-                    current[slot + 1] += e * 7;
-                    next[slot - 1] += e * 3;
-                    next[slot] += e * 5;
-                    next[slot + 1] += e;
-                }
-                std::mem::swap(&mut current, &mut next);
-                next.fill(0);
-            }
-        }
+        DitherSpec::Bayer4 => dither_bayer4(&mut raster.data, w, h),
+        DitherSpec::FloydSteinberg => dither_floyd_steinberg(&mut raster.data, w, h),
     }
     Ok(())
+}
+
+/// Ordered dither of a `w × h` Gray8 plane against the 4×4 Bayer matrix.
+fn dither_bayer4(data: &mut [u8], w: usize, h: usize) {
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            // Threshold in (0, 255): cell (m + 0.5) / 16 · 255.
+            let t = ((BAYER4[y & 3][x & 3] as u16 * 2 + 1) * 255 / 32) as u8;
+            data[i] = if data[i] > t { 255 } else { 0 };
+        }
+    }
+}
+
+/// Floyd–Steinberg error diffusion of a `w × h` Gray8 plane.
+fn dither_floyd_steinberg(data: &mut [u8], w: usize, h: usize) {
+    // Classic raster-order error diffusion (7/16, 3/16, 5/16, 1/16).
+    // Only the current and next rows can carry pending error. Padding
+    // both ends removes neighbour branches while reducing scratch from
+    // `4 * width * height` bytes to `8 * (width + 2)` bytes.
+    let mut current = vec![0i32; w + 2];
+    let mut next = vec![0i32; w + 2];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let slot = x + 1;
+            let v = data[i] as i32 + current[slot] / 16;
+            let out = if v >= 128 { 255 } else { 0 };
+            data[i] = out as u8;
+            let e = v - out;
+            current[slot + 1] += e * 7;
+            next[slot - 1] += e * 3;
+            next[slot] += e * 5;
+            next[slot + 1] += e;
+        }
+        std::mem::swap(&mut current, &mut next);
+        next.fill(0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,34 +1038,50 @@ mod tests {
         );
     }
 
+    /// Floyd–Steinberg over a whole-frame error buffer: the reference the
+    /// two-row scanline implementation is checked against.
+    fn full_frame_reference(mut data: Vec<u8>, width: usize, height: usize) -> Vec<u8> {
+        let mut errors = vec![0i32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let i = y * width + x;
+                let value = i32::from(data[i]) + errors[i] / 16;
+                let output = if value >= 128 { 255 } else { 0 };
+                data[i] = output as u8;
+                let error = value - output;
+                spread_error(&mut errors, width, height, x, y, error);
+            }
+        }
+        data
+    }
+
+    /// Distribute pixel `(x, y)`'s error to the neighbours inside the frame.
+    fn spread_error(
+        errors: &mut [i32],
+        width: usize,
+        height: usize,
+        x: usize,
+        y: usize,
+        error: i32,
+    ) {
+        let i = y * width + x;
+        if x + 1 < width {
+            errors[i + 1] += error * 7;
+        }
+        if y + 1 >= height {
+            return;
+        }
+        if x > 0 {
+            errors[i + width - 1] += error * 3;
+        }
+        errors[i + width] += error * 5;
+        if x + 1 < width {
+            errors[i + width + 1] += error;
+        }
+    }
+
     #[test]
     fn floyd_steinberg_scanlines_match_full_frame_error_storage() {
-        fn full_frame_reference(mut data: Vec<u8>, width: usize, height: usize) -> Vec<u8> {
-            let mut errors = vec![0i32; width * height];
-            for y in 0..height {
-                for x in 0..width {
-                    let i = y * width + x;
-                    let value = i32::from(data[i]) + errors[i] / 16;
-                    let output = if value >= 128 { 255 } else { 0 };
-                    data[i] = output as u8;
-                    let error = value - output;
-                    if x + 1 < width {
-                        errors[i + 1] += error * 7;
-                    }
-                    if y + 1 < height {
-                        if x > 0 {
-                            errors[i + width - 1] += error * 3;
-                        }
-                        errors[i + width] += error * 5;
-                        if x + 1 < width {
-                            errors[i + width + 1] += error;
-                        }
-                    }
-                }
-            }
-            data
-        }
-
         let (width, height) = (7usize, 5usize);
         let source: Vec<u8> = (0..width * height)
             .map(|i| ((i * 37 + i / width * 19 + 11) & 0xff) as u8)

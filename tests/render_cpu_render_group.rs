@@ -502,6 +502,25 @@ fn triangle(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> PathData {
     }
 }
 
+/// Require the tight and widened renders to agree everywhere but the
+/// widening mark at (60, 62); the number of partially covered pixels in
+/// column 39 of the tight render.
+fn assert_matches_widened(name: &str, tight: &HostPage, wide: &HostPage) -> usize {
+    let mut edge_pixels = 0;
+    for y in 0..64 {
+        for x in 0..64 {
+            if (x, y) == (60, 62) {
+                continue;
+            }
+            assert_eq!(px(tight, x, y), px(wide, x, y), "{name}: pixel ({x},{y})");
+            if x == 39 && !matches!(px(tight, x, y)[0], 0 | 255) {
+                edge_pixels += 1;
+            }
+        }
+    }
+    edge_pixels
+}
+
 /// B14: a group whose clipped content crosses the offscreen's right edge
 /// anti-aliases its last column exactly as a wider offscreen does. The
 /// group's offscreen ends where its clipped content ends (x = 40 here), and
@@ -556,18 +575,7 @@ fn group_content_crossing_the_offscreen_right_edge_keeps_its_coverage() {
             64,
         );
         let wide = render(paths, paints, ops(true), vec![g], 64);
-        let mut edge_pixels = 0;
-        for y in 0..64 {
-            for x in 0..64 {
-                if (x, y) == (60, 62) {
-                    continue;
-                }
-                assert_eq!(px(&tight, x, y), px(&wide, x, y), "{name}: pixel ({x},{y})");
-                if x == 39 && !matches!(px(&tight, x, y)[0], 0 | 255) {
-                    edge_pixels += 1;
-                }
-            }
-        }
+        let edge_pixels = assert_matches_widened(name, &tight, &wide);
         assert!(
             edge_pixels > 0,
             "{name}: the content's edge crosses column 39"

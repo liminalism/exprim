@@ -285,36 +285,7 @@ pub(crate) fn call_method(
             let mut used = 0u64;
             let mut over_budget = None;
             let mut summary = search::search_pages(snapshot, &selection, &spec, |event| {
-                let (entry, entry_lines) = match event {
-                    search::SearchEvent::Page(page, data, page_warnings) => {
-                        let mut entry_lines: Vec<String> = page_warnings
-                            .iter()
-                            .map(|warning| format!("warning: p.{}: {warning}", page.one_based()))
-                            .collect();
-                        entry_lines.extend(
-                            data.matches
-                                .iter()
-                                .map(|found| search::match_line(page.one_based(), found)),
-                        );
-                        let mut entry = serde_json::json!({
-                            "page": page.one_based(),
-                            "page_index": page.0,
-                            "data": data,
-                        });
-                        if !page_warnings.is_empty() {
-                            entry["warnings"] = serde_json::json!(page_warnings);
-                        }
-                        (entry, entry_lines)
-                    }
-                    search::SearchEvent::Failed(page, error, _) => (
-                        serde_json::json!({
-                            "page": page.one_based(),
-                            "page_index": page.0,
-                            "error": error,
-                        }),
-                        vec![format!("p.{}: error: {error}", page.one_based())],
-                    ),
-                };
+                let (entry, entry_lines) = search_event_entry(event);
                 let size = serde_json::to_vec(&entry)?.len() as u64;
                 if bounds.max_bytes > 0 && !out.is_empty() && used + size > bounds.max_bytes {
                     over_budget = entry["page"].as_u64();
@@ -522,45 +493,13 @@ pub(crate) fn call_method(
                 });
                 match result {
                     Ok(rendered) => {
-                        let data = &rendered.data;
-                        let mut line = format!(
-                            "page {}: {}x{} px at {:.0} dpi, {} {}, {} bytes",
-                            page.one_based(),
-                            data.width,
-                            data.height,
-                            data.dpi,
-                            data.format,
-                            data.color,
-                            data.bytes
-                        );
-                        if let Some(region) = data.region {
-                            line.push_str(&format!(
-                                ", region [{}]",
-                                region
-                                    .map(|edge| crate::views::round2(edge).to_string())
-                                    .join(",")
-                            ));
-                        }
-                        if !data.path.is_empty() {
-                            line.push_str(&format!(", wrote {}", data.path));
-                        }
-                        if data.degraded_draws > 0 {
-                            line.push_str(&format!(
-                                ", {} drawing operations degraded",
-                                data.degraded_draws
-                            ));
-                        }
-                        lines.push(line);
-                        lines.extend(
-                            rendered.warnings.iter().map(|warning| {
-                                format!("warning: p.{}: {warning}", page.one_based())
-                            }),
-                        );
-                        entry["data"] = serde_json::to_value(data)?;
-                        if !rendered.warnings.is_empty() {
-                            entry["warnings"] = serde_json::json!(rendered.warnings);
-                        }
-                        reply_images.extend(rendered.image);
+                        record_rendered_page(
+                            page,
+                            rendered,
+                            &mut entry,
+                            &mut lines,
+                            &mut reply_images,
+                        )?;
                     }
                     Err(_) if crate::deadline::expired() => {
                         let message = crate::deadline::message(out.len(), selection.len());
@@ -593,6 +532,101 @@ pub(crate) fn call_method(
         }
         other => bail!("unknown method {other:?}"),
     }
+}
+
+/// One search event as a reply entry and its prose lines: a page's matches
+/// (its warnings first), or a page that failed.
+fn search_event_entry(event: search::SearchEvent) -> (Value, Vec<String>) {
+    match event {
+        search::SearchEvent::Page(page, data, page_warnings) => {
+            let mut entry_lines: Vec<String> = page_warnings
+                .iter()
+                .map(|warning| format!("warning: p.{}: {warning}", page.one_based()))
+                .collect();
+            entry_lines.extend(
+                data.matches
+                    .iter()
+                    .map(|found| search::match_line(page.one_based(), found)),
+            );
+            let mut entry = serde_json::json!({
+                "page": page.one_based(),
+                "page_index": page.0,
+                "data": data,
+            });
+            if !page_warnings.is_empty() {
+                entry["warnings"] = serde_json::json!(page_warnings);
+            }
+            (entry, entry_lines)
+        }
+        search::SearchEvent::Failed(page, error, _) => (
+            serde_json::json!({
+                "page": page.one_based(),
+                "page_index": page.0,
+                "error": error,
+            }),
+            vec![format!("p.{}: error: {error}", page.one_based())],
+        ),
+    }
+}
+
+/// Report one rendered page: its prose line and warnings into `lines`, its
+/// data and warnings into `entry`, and its image, if any, into `images`.
+fn record_rendered_page(
+    page: crate::pages::PageZero,
+    rendered: render::RenderedPage,
+    entry: &mut Value,
+    lines: &mut Vec<String>,
+    images: &mut Vec<render::EncodedImage>,
+) -> Result<()> {
+    lines.push(rendered_page_line(page, &rendered.data));
+    lines.extend(
+        rendered
+            .warnings
+            .iter()
+            .map(|warning| format!("warning: p.{}: {warning}", page.one_based())),
+    );
+    entry["data"] = serde_json::to_value(&rendered.data)?;
+    if !rendered.warnings.is_empty() {
+        entry["warnings"] = serde_json::json!(rendered.warnings);
+    }
+    images.extend(rendered.image);
+    Ok(())
+}
+
+/// The prose line for one rendered page: size, resolution, format, bytes,
+/// and the region, output path and degraded draws where they apply.
+fn rendered_page_line(
+    page: crate::pages::PageZero,
+    data: &crate::views::render::RenderPageData,
+) -> String {
+    let mut line = format!(
+        "page {}: {}x{} px at {:.0} dpi, {} {}, {} bytes",
+        page.one_based(),
+        data.width,
+        data.height,
+        data.dpi,
+        data.format,
+        data.color,
+        data.bytes
+    );
+    if let Some(region) = data.region {
+        line.push_str(&format!(
+            ", region [{}]",
+            region
+                .map(|edge| crate::views::round2(edge).to_string())
+                .join(",")
+        ));
+    }
+    if !data.path.is_empty() {
+        line.push_str(&format!(", wrote {}", data.path));
+    }
+    if data.degraded_draws > 0 {
+        line.push_str(&format!(
+            ", {} drawing operations degraded",
+            data.degraded_draws
+        ));
+    }
+    line
 }
 
 pub(crate) fn is_method(name: &str) -> bool {

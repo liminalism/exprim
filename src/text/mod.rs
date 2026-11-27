@@ -321,6 +321,51 @@ fn finish_word(
     text.clear();
 }
 
+/// The layout state of one text run while [`Builder::append_run`] appends
+/// its characters: the font's scale facts, the pen position along the run,
+/// and the gap accumulated since the last glyph.
+struct RunPen {
+    font_key: Option<FontKey>,
+    upem: f64,
+    vertical: bool,
+    /// Horizontal scaling `Th` as a factor.
+    th: f64,
+    cursor: f64,
+    font_size_abs: f64,
+    base_space: f64,
+    space_threshold: f64,
+    spacing: f64,
+    item_index: usize,
+}
+
+impl RunPen {
+    /// Whether the gap accumulated before a glyph of `advance` (glyph-space
+    /// units) is wide enough to stand for a word break.
+    fn gap_opens_word(&self, advance: f64) -> bool {
+        if self.spacing == 0.0 || self.item_index == 0 {
+            return false;
+        }
+        let threshold = if self.space_threshold > 0.0 {
+            self.space_threshold
+        } else {
+            self.font_size_abs * normalize_threshold(advance) / 1000.0
+        };
+        threshold > 0.0 && self.spacing >= threshold
+    }
+
+    /// The pen's position in text space, lifted by `rise`.
+    fn position(&self, rise: f64) -> Point {
+        Point {
+            x: if self.vertical { 0.0 } else { self.cursor },
+            y: if self.vertical {
+                self.cursor + rise
+            } else {
+                rise
+            },
+        }
+    }
+}
+
 struct Builder<'a> {
     page: &'a SemanticPage,
     options: &'a TextPageOptions,
@@ -577,7 +622,6 @@ impl<'a> Builder<'a> {
         let upem = self.cache.units_per_em(font_key).unwrap_or(1000.0);
         let vertical = font.metrics.is_vertical();
         let th = run.horizontal_scale / 100.0;
-        let mut cursor = 0.0f64;
 
         // PDFium's in-object word spacing (`CPDF_TextPage::ProcessTextObject`).
         // Many producers (TeX, dvips, Distiller) never emit a space glyph:
@@ -586,114 +630,36 @@ impl<'a> Builder<'a> {
         let font_size_abs = run.font_size.abs();
         let base_space = base_space(&run, &font, font_size_abs);
         let space_threshold = space_glyph_threshold(&font, font_size_abs);
-        let mut spacing = 0.0f64;
-        let mut item_index = 0usize;
+        let mut pen = RunPen {
+            font_key,
+            upem,
+            vertical,
+            th,
+            cursor: 0.0,
+            font_size_abs,
+            base_space,
+            space_threshold,
+            spacing: 0.0,
+            item_index: 0,
+        };
 
         for element in run.elements.iter() {
             match element {
                 TextElement::Adjust(value) => {
-                    cursor += if vertical {
+                    pen.cursor += if pen.vertical {
                         -value / 1000.0 * run.font_size
                     } else {
-                        -value / 1000.0 * run.font_size * th
+                        -value / 1000.0 * run.font_size * pen.th
                     };
-                    item_index += 1;
+                    pen.item_index += 1;
                     // A displacement after nothing, or after a space, cannot
                     // open a new word.
                     if self.text.last().is_some_and(|&unit| unit != 0x20) {
-                        spacing = -value / 1000.0 * font_size_abs;
+                        pen.spacing = -value / 1000.0 * pen.font_size_abs;
                     }
                 }
                 TextElement::Show(bytes) => {
-                    for decoded in font.metrics.decode(bytes) {
-                        if run.char_spacing.abs() > 0.001 {
-                            spacing += run.char_spacing;
-                        }
-                        spacing -= base_space;
-                        if spacing != 0.0 && item_index > 0 {
-                            let threshold = if space_threshold > 0.0 {
-                                space_threshold
-                            } else {
-                                font_size_abs * normalize_threshold(decoded.advance as f64) / 1000.0
-                            };
-                            if threshold > 0.0 && spacing >= threshold {
-                                self.append_in_object_space(
-                                    id,
-                                    run.font,
-                                    run.text_matrix.then(self.ctm),
-                                    Point {
-                                        x: if vertical { 0.0 } else { cursor },
-                                        y: if vertical {
-                                            cursor + run.rise
-                                        } else {
-                                            run.rise
-                                        },
-                                    },
-                                );
-                            }
-                        }
-                        spacing = 0.0;
-                        item_index += 1;
-                        let word_space = if decoded.word_space {
-                            run.word_spacing
-                        } else {
-                            0.0
-                        };
-                        let (x, y, advance) = if let Some(placement) = vertical
-                            .then(|| font.metrics.vertical(decoded.cid))
-                            .flatten()
-                        {
-                            (
-                                -(placement.origin.0 as f64) / 1000.0 * run.font_size * th,
-                                cursor + run.rise
-                                    - (placement.origin.1 as f64) / 1000.0 * run.font_size,
-                                placement.advance as f64 / 1000.0 * run.font_size
-                                    + run.char_spacing
-                                    + word_space,
-                            )
-                        } else {
-                            (
-                                cursor,
-                                run.rise,
-                                (decoded.advance as f64 / 1000.0 * run.font_size
-                                    + run.char_spacing
-                                    + word_space)
-                                    * th,
-                            )
-                        };
-                        let gid = font.glyph_map.gid(decoded.cid);
-                        let local_box = glyph_box(
-                            self.cache.outline_bounds(font_key, gid),
-                            font.font_bbox,
-                            font.type3_matrix,
-                            x,
-                            y,
-                            advance,
-                            run.font_size,
-                            th,
-                            upem,
-                        );
-                        let matrix = run.text_matrix.then(self.ctm);
-                        let char_box = transform_rect(local_box, matrix);
-                        let loose_char_box = transform_rect(
-                            loose_glyph_box(font.font_bbox, x, y, advance, run.font_size, th),
-                            matrix,
-                        );
-                        let origin = matrix.apply(Point { x, y });
-                        self.append_decoded(
-                            id,
-                            decoded,
-                            gid,
-                            origin,
-                            char_box,
-                            loose_char_box,
-                            matrix,
-                            &font,
-                            run.font,
-                            run.font_size,
-                        );
-                        cursor += advance;
-                    }
+                    self.append_run_string(id, &run, &font, &mut pen, bytes)
                 }
             }
         }
@@ -760,6 +726,93 @@ impl<'a> Builder<'a> {
             && object_matrix.a * object_matrix.d - object_matrix.b * object_matrix.c < 0.0
         {
             self.chars[chars_before..].reverse();
+        }
+    }
+
+    /// Append the characters of one shown string of `run`, generating a
+    /// space before any glyph whose preceding gap reaches the word threshold.
+    fn append_run_string(
+        &mut self,
+        id: TextRunId,
+        run: &crate::content::semantic::TextRun,
+        font: &crate::content::semantic::SemFont,
+        pen: &mut RunPen,
+        bytes: &[u8],
+    ) {
+        for decoded in font.metrics.decode(bytes) {
+            if run.char_spacing.abs() > 0.001 {
+                pen.spacing += run.char_spacing;
+            }
+            pen.spacing -= pen.base_space;
+            if pen.gap_opens_word(decoded.advance as f64) {
+                self.append_in_object_space(
+                    id,
+                    run.font,
+                    run.text_matrix.then(self.ctm),
+                    pen.position(run.rise),
+                );
+            }
+            pen.spacing = 0.0;
+            pen.item_index += 1;
+            let word_space = if decoded.word_space {
+                run.word_spacing
+            } else {
+                0.0
+            };
+            let (x, y, advance) = if let Some(placement) = pen
+                .vertical
+                .then(|| font.metrics.vertical(decoded.cid))
+                .flatten()
+            {
+                (
+                    -(placement.origin.0 as f64) / 1000.0 * run.font_size * pen.th,
+                    pen.cursor + run.rise - (placement.origin.1 as f64) / 1000.0 * run.font_size,
+                    placement.advance as f64 / 1000.0 * run.font_size
+                        + run.char_spacing
+                        + word_space,
+                )
+            } else {
+                (
+                    pen.cursor,
+                    run.rise,
+                    (decoded.advance as f64 / 1000.0 * run.font_size
+                        + run.char_spacing
+                        + word_space)
+                        * pen.th,
+                )
+            };
+            let gid = font.glyph_map.gid(decoded.cid);
+            let local_box = glyph_box(
+                self.cache.outline_bounds(pen.font_key, gid),
+                font.font_bbox,
+                font.type3_matrix,
+                x,
+                y,
+                advance,
+                run.font_size,
+                pen.th,
+                pen.upem,
+            );
+            let matrix = run.text_matrix.then(self.ctm);
+            let char_box = transform_rect(local_box, matrix);
+            let loose_char_box = transform_rect(
+                loose_glyph_box(font.font_bbox, x, y, advance, run.font_size, pen.th),
+                matrix,
+            );
+            let origin = matrix.apply(Point { x, y });
+            self.append_decoded(
+                id,
+                decoded,
+                gid,
+                origin,
+                char_box,
+                loose_char_box,
+                matrix,
+                font,
+                run.font,
+                run.font_size,
+            );
+            pen.cursor += advance;
         }
     }
 

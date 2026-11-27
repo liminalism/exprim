@@ -61,29 +61,7 @@ pub fn dump_semantic(page: &SemanticPage, names: &NameTable) -> String {
             );
         }
     }
-    if !page.text_runs.is_empty() {
-        out.push_str("runs:\n");
-        for (i, r) in page.text_runs.iter().enumerate() {
-            let _ = writeln!(
-                out,
-                "  run#{i} font#{} size {} mode {} matrix {}",
-                r.font.0,
-                num(r.font_size),
-                r.render_mode,
-                matrix(&r.text_matrix),
-            );
-            for el in r.elements.iter() {
-                match el {
-                    TextElement::Show(s) => {
-                        let _ = writeln!(out, "    show \"{}\"", escape(s));
-                    }
-                    TextElement::Adjust(n) => {
-                        let _ = writeln!(out, "    adjust {}", num(*n));
-                    }
-                }
-            }
-        }
-    }
+    dump_text_runs(&mut out, page);
     if !page.images.is_empty() {
         out.push_str("images:\n");
         for (i, im) in page.images.iter().enumerate() {
@@ -100,6 +78,34 @@ pub fn dump_semantic(page: &SemanticPage, names: &NameTable) -> String {
     }
 
     out
+}
+
+/// Append the `runs:` table: each text run's header, then its elements.
+fn dump_text_runs(out: &mut String, page: &SemanticPage) {
+    if page.text_runs.is_empty() {
+        return;
+    }
+    out.push_str("runs:\n");
+    for (i, r) in page.text_runs.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "  run#{i} font#{} size {} mode {} matrix {}",
+            r.font.0,
+            num(r.font_size),
+            r.render_mode,
+            matrix(&r.text_matrix),
+        );
+        for el in r.elements.iter() {
+            match el {
+                TextElement::Show(s) => {
+                    let _ = writeln!(out, "    show \"{}\"", escape(s));
+                }
+                TextElement::Adjust(n) => {
+                    let _ = writeln!(out, "    adjust {}", num(*n));
+                }
+            }
+        }
+    }
 }
 
 fn write_op(out: &mut String, op: &SemanticOp, names: &NameTable) {

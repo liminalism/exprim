@@ -1494,9 +1494,7 @@ impl PreparedImage {
                     let bit = row as usize * row_bits + col as usize * self.bpc as usize;
                     let raw = read_bits(&self.samples, bit, self.bpc as usize) as usize;
                     let p = lut.get(raw).copied().unwrap_or([0, 0, 0, 255]);
-                    for c in 0..4 {
-                        acc[c] += w * p[c] as u64;
-                    }
+                    accumulate_weighted(&mut acc, w, p);
                 }
             }
             return weighted_average_rgba(acc, weight).map(|rgba| (rgba, taps));
@@ -1510,9 +1508,7 @@ impl PreparedImage {
                 // toward the divisor, or the average would ignore the gaps.
                 if let Some(p) = self.pixel(col, row) {
                     let w = wy * tx.weight_at(col);
-                    for c in 0..4 {
-                        acc[c] += w * p[c] as u64;
-                    }
+                    accumulate_weighted(&mut acc, w, p);
                 }
             }
         }
@@ -1620,9 +1616,7 @@ impl PreparedImage {
                 // Transparent stencil texels contribute zero coverage, but
                 // their area remains in the denominator.
                 if let Some(pixel) = pixel {
-                    for channel in 0..4 {
-                        acc[channel] += weight * pixel[channel] as u64;
-                    }
+                    accumulate_weighted(&mut acc, weight, pixel);
                 }
             }
         }
@@ -2143,6 +2137,14 @@ pub(crate) fn mix_bilevel(zero: [u8; 4], one: [u8; 4], ones_w: u64, weight: u64)
     out
 }
 
+/// Add texel `p`, weighted by `w`, to the RGBA accumulator of an area average.
+#[inline(always)]
+fn accumulate_weighted(acc: &mut [u64; 4], w: u64, p: [u8; 4]) {
+    for c in 0..4 {
+        acc[c] += w * p[c] as u64;
+    }
+}
+
 #[inline]
 fn weighted_average_rgba(acc: [u64; 4], weight: u64) -> Option<[u8; 4]> {
     (weight != 0).then(|| {
@@ -2352,36 +2354,48 @@ fn sample_smask(sm: &ImageSMask, u: f64, v: f64, footprint: [f64; 2]) -> f32 {
     let fx = u * sm.width as f64 - 0.5;
     let fy = (1.0 - v) * sm.height as f64 - 0.5;
 
-    let raw = if footprint[0] > 1.0 || footprint[1] > 1.0 {
-        let Some(tx) = PreparedImage::smask_box_taps(fx, footprint[0], sm.width) else {
+    if footprint[0] > 1.0 || footprint[1] > 1.0 {
+        let Some(raw) = smask_area_sample(sm, fx, fy, footprint, row_bits, maxv) else {
             return 1.0;
         };
-        let Some(ty) = PreparedImage::smask_box_taps(fy, footprint[1], sm.height) else {
-            return 1.0;
-        };
-        let weight = tx.total.saturating_mul(ty.total).max(1);
-        if sm.bits_per_component == 1 {
-            bilevel_smask_coverage(sm, &tx, &ty)
-        } else {
-            let bpc = sm.bits_per_component as usize;
-            let mut acc = 0.0f64;
-            for row in ty.lo..=ty.hi {
-                let wy = ty.weight_at(row) as f64;
-                for col in tx.lo..=tx.hi {
-                    let bit = row as usize * row_bits + col as usize * bpc;
-                    let sample = read_bits(&sm.samples, bit, bpc) as f64 / maxv as f64;
-                    acc += wy * tx.weight_at(col) as f64 * sample;
-                }
-            }
-            (acc / weight as f64) as f32
-        }
-    } else {
-        let col = clampi((u * sm.width as f64) as i64, sm.width) as usize;
-        let row = clampi(((1.0 - v) * sm.height as f64) as i64, sm.height) as usize;
-        let bit = row * row_bits + col * sm.bits_per_component as usize;
-        read_bits(&sm.samples, bit, sm.bits_per_component as usize) as f32 / maxv
-    };
+        return apply_smask_decode(sm, raw);
+    }
+    let col = clampi((u * sm.width as f64) as i64, sm.width) as usize;
+    let row = clampi(((1.0 - v) * sm.height as f64) as i64, sm.height) as usize;
+    let bit = row * row_bits + col * sm.bits_per_component as usize;
+    let raw = read_bits(&sm.samples, bit, sm.bits_per_component as usize) as f32 / maxv;
     apply_smask_decode(sm, raw)
+}
+
+/// Box-filtered soft-mask sample over a minifying `footprint` centred on mask
+/// texel coordinate `(fx, fy)`, before `/Decode`. `None` when the footprint
+/// misses the mask.
+#[inline]
+fn smask_area_sample(
+    sm: &ImageSMask,
+    fx: f64,
+    fy: f64,
+    footprint: [f64; 2],
+    row_bits: usize,
+    maxv: f32,
+) -> Option<f32> {
+    let tx = PreparedImage::smask_box_taps(fx, footprint[0], sm.width)?;
+    let ty = PreparedImage::smask_box_taps(fy, footprint[1], sm.height)?;
+    let weight = tx.total.saturating_mul(ty.total).max(1);
+    if sm.bits_per_component == 1 {
+        return Some(bilevel_smask_coverage(sm, &tx, &ty));
+    }
+    let bpc = sm.bits_per_component as usize;
+    let mut acc = 0.0f64;
+    for row in ty.lo..=ty.hi {
+        let wy = ty.weight_at(row) as f64;
+        for col in tx.lo..=tx.hi {
+            let bit = row as usize * row_bits + col as usize * bpc;
+            let sample = read_bits(&sm.samples, bit, bpc) as f64 / maxv as f64;
+            acc += wy * tx.weight_at(col) as f64 * sample;
+        }
+    }
+    Some((acc / weight as f64) as f32)
 }
 
 /// Read a big-endian `bits`-wide field starting at bit offset `bit`.
@@ -2635,22 +2649,27 @@ mod tests {
                 assert!(image.generic_promotion_eligible(), "{space:?}");
                 let promoted = image.generic_promoted_to_rgb8().expect("promotes");
                 assert_eq!(promoted.bpc, 8);
-                for row in 0..h {
-                    for col in 0..w {
-                        let want = image.pixel(col, row).unwrap();
-                        let got = promoted.pixel(col, row).unwrap();
-                        assert_eq!(
-                            got[..3],
-                            want[..3],
-                            "{space:?} ({col},{row}) {:?}",
-                            image.decode
-                        );
-                    }
-                }
+                assert_same_rgb(&image, &promoted, &space);
                 // The same family at 8 bits keeps its dedicated paths.
                 let mut eight = image.clone();
                 eight.bpc = 8;
                 assert!(!eight.generic_promotion_eligible());
+            }
+        }
+    }
+
+    /// Every texel of `promoted` has the colour of the same texel of `image`.
+    fn assert_same_rgb(image: &PreparedImage, promoted: &PreparedImage, space: &ImageColorSpace) {
+        for row in 0..image.height {
+            for col in 0..image.width {
+                let want = image.pixel(col, row).unwrap();
+                let got = promoted.pixel(col, row).unwrap();
+                assert_eq!(
+                    got[..3],
+                    want[..3],
+                    "{space:?} ({col},{row}) {:?}",
+                    image.decode
+                );
             }
         }
     }

@@ -737,6 +737,39 @@ mod tests {
         bytes
     }
 
+    /// Compile every page on each of `threads` threads started together,
+    /// returning each thread's pages with the decode budget each one used.
+    fn compile_pages_concurrently(
+        snapshot: &DocumentSnapshot,
+        threads: usize,
+        pages: u32,
+    ) -> Vec<Vec<(CompiledPage, usize)>> {
+        let barrier = std::sync::Barrier::new(threads);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        compile_every_page(snapshot, pages)
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        })
+    }
+
+    /// Compile pages `0..pages`, each with a fresh context, pairing each
+    /// with the decode budget it used.
+    fn compile_every_page(snapshot: &DocumentSnapshot, pages: u32) -> Vec<(CompiledPage, usize)> {
+        (0..pages)
+            .map(|page| {
+                let mut ctx = ParseContext::new();
+                let compiled = compile(snapshot, page, &mut ctx);
+                (compiled, ctx.decoded_bytes_used)
+            })
+            .collect()
+    }
+
     #[test]
     fn concurrent_compiles_share_one_decode_of_each_image() {
         const PAGES: u32 = 6;
@@ -754,24 +787,7 @@ mod tests {
             // Held across the run, as overlapping compiles of a scheduler
             // keep it open, so the sharing is deterministic here.
             let session = snapshot.image_sample_session();
-            let barrier = std::sync::Barrier::new(THREADS);
-            let results: Vec<Vec<(CompiledPage, usize)>> = std::thread::scope(|scope| {
-                let workers: Vec<_> = (0..THREADS)
-                    .map(|_| {
-                        scope.spawn(|| {
-                            barrier.wait();
-                            (0..PAGES)
-                                .map(|page| {
-                                    let mut ctx = ParseContext::new();
-                                    let compiled = compile(&snapshot, page, &mut ctx);
-                                    (compiled, ctx.decoded_bytes_used)
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .collect();
-                workers.into_iter().map(|w| w.join().unwrap()).collect()
-            });
+            let results = compile_pages_concurrently(&snapshot, THREADS, PAGES);
             let first = page_samples(&results[0][0].0);
             let objects = [10, 11, 12, 14];
             for (slot, n) in objects.iter().enumerate() {

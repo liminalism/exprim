@@ -119,25 +119,35 @@ fn parse_charset(data: &[u8], offset: usize, n_glyphs: usize) -> Option<Vec<u16>
         }
         // Formats 1/2: ranges of consecutive CIDs. They differ only in the
         // width of the run length.
-        1 | 2 => {
-            while out.len() < n_glyphs {
-                let first = r.u16()?;
-                let n_left = if format == 1 {
-                    r.u8()? as u32
-                } else {
-                    r.u16()? as u32
-                };
-                for i in 0..=n_left {
-                    if out.len() >= n_glyphs {
-                        break;
-                    }
-                    out.push(first.checked_add(i as u16)?);
-                }
-            }
-        }
+        1 | 2 => read_charset_ranges(&mut r, format, n_glyphs, &mut out)?,
         _ => return None,
     }
     Some(out)
+}
+
+/// Append the CIDs of charset format 1 or 2 range records to `out` until it
+/// holds `n_glyphs` entries; `None` on truncation or a CID past `u16::MAX`.
+fn read_charset_ranges(
+    r: &mut Reader<'_>,
+    format: u8,
+    n_glyphs: usize,
+    out: &mut Vec<u16>,
+) -> Option<()> {
+    while out.len() < n_glyphs {
+        let first = r.u16()?;
+        let n_left = if format == 1 {
+            r.u8()? as u32
+        } else {
+            r.u16()? as u32
+        };
+        for i in 0..=n_left {
+            if out.len() >= n_glyphs {
+                break;
+            }
+            out.push(first.checked_add(i as u16)?);
+        }
+    }
+    Some(())
 }
 
 /// If `data` is an SFNT (`OTTO`/`0x00010000`/`true`) carrying a `CFF ` table,
@@ -186,21 +196,27 @@ fn parse_cff_encoding(data: &[u8], offset: usize, n_glyphs: usize) -> Option<Vec
                 gid += 1;
             }
         }
-        1 => {
-            let n_ranges = r.u8()? as usize;
-            for _ in 0..n_ranges {
-                let first = r.u8()?;
-                let n_left = r.u8()?;
-                for i in 0..=n_left {
-                    if (gid as usize) >= n_glyphs {
-                        break;
-                    }
-                    out.push((first.saturating_add(i), gid));
-                    gid += 1;
-                }
-            }
-        }
+        1 => out = read_encoding_ranges(&mut r, n_glyphs)?,
         _ => return None,
+    }
+    Some(out)
+}
+
+/// Encoding format 1 body: runs of consecutive codes, assigned GIDs from 1.
+fn read_encoding_ranges(r: &mut Reader<'_>, n_glyphs: usize) -> Option<Vec<(u8, u16)>> {
+    let mut out = Vec::new();
+    let mut gid: u16 = 1;
+    let n_ranges = r.u8()? as usize;
+    for _ in 0..n_ranges {
+        let first = r.u8()?;
+        let n_left = r.u8()?;
+        for i in 0..=n_left {
+            if (gid as usize) >= n_glyphs {
+                break;
+            }
+            out.push((first.saturating_add(i), gid));
+            gid += 1;
+        }
     }
     Some(out)
 }
@@ -612,10 +628,7 @@ fn read_font_matrix_upem(dict: &[u8]) -> Option<u16> {
                 i += 2;
                 if op2 == 7 {
                     let s = *operands.first()?;
-                    if s > 0.0 {
-                        return Some(((1.0 / s).round() as i64).clamp(16, 16384) as u16);
-                    }
-                    return None;
+                    return (s > 0.0).then(|| ((1.0 / s).round() as i64).clamp(16, 16384) as u16);
                 }
                 operands.clear();
             }
@@ -634,22 +647,7 @@ fn read_font_matrix_upem(dict: &[u8]) -> Option<u16> {
             30 => {
                 // Nibble-encoded real: decode enough to recover the value.
                 i += 1;
-                let mut s = String::new();
-                'outer: while i < dict.len() {
-                    let b = dict[i];
-                    i += 1;
-                    for nib in [b >> 4, b & 0x0f] {
-                        match nib {
-                            0..=9 => s.push((b'0' + nib) as char),
-                            0xa => s.push('.'),
-                            0xb => s.push('E'),
-                            0xc => s.push_str("E-"),
-                            0xe => s.push('-'),
-                            0xf => break 'outer,
-                            _ => {}
-                        }
-                    }
-                }
+                let s = real_operand_text(dict, &mut i);
                 operands.push(s.parse().unwrap_or(0.0));
             }
             32..=246 => {
@@ -670,6 +668,28 @@ fn read_font_matrix_upem(dict: &[u8]) -> Option<u16> {
         }
     }
     None
+}
+
+/// Spell out the nibble-encoded real starting at `dict[*i]` as decimal text,
+/// advancing `*i` past the byte holding its `0xf` terminator (or to the end).
+fn real_operand_text(dict: &[u8], i: &mut usize) -> String {
+    let mut s = String::new();
+    while *i < dict.len() {
+        let b = dict[*i];
+        *i += 1;
+        for nib in [b >> 4, b & 0x0f] {
+            match nib {
+                0..=9 => s.push((b'0' + nib) as char),
+                0xa => s.push('.'),
+                0xb => s.push('E'),
+                0xc => s.push_str("E-"),
+                0xe => s.push('-'),
+                0xf => return s,
+                _ => {}
+            }
+        }
+    }
+    s
 }
 
 struct Reader<'a> {
@@ -766,14 +786,7 @@ fn parse_dict(data: &[u8]) -> Vec<(u16, Vec<i32>)> {
             }
             // 30: a real number, nibble-encoded and terminated by 0xf.
             30 => {
-                i += 1;
-                while i < data.len() {
-                    let b = data[i];
-                    i += 1;
-                    if b & 0x0f == 0x0f || b >> 4 == 0x0f {
-                        break;
-                    }
-                }
+                i = skip_real_operand(data, i + 1);
                 operands.push(0);
             }
             32..=246 => {
@@ -794,6 +807,19 @@ fn parse_dict(data: &[u8]) -> Vec<(u16, Vec<i32>)> {
         }
     }
     out
+}
+
+/// The index just past a nibble-encoded real whose bytes start at `i`: past
+/// the byte holding an `0xf` nibble, or the end of `data`.
+fn skip_real_operand(data: &[u8], mut i: usize) -> usize {
+    while i < data.len() {
+        let b = data[i];
+        i += 1;
+        if b & 0x0f == 0x0f || b >> 4 == 0x0f {
+            break;
+        }
+    }
+    i
 }
 
 /// A Private DICT operator defined by the CFF spec (Appendix H). Anything
@@ -836,10 +862,8 @@ fn dict_token(pd: &[u8], i: usize) -> DictToken {
             let mut j = i + 1;
             while j < pd.len() {
                 let (hi, lo) = (pd[j] >> 4, pd[j] & 0x0f);
-                for nib in [hi, lo] {
-                    if nib == 0x0d {
-                        return DictToken::Bad; // reserved nibble
-                    }
+                if hi == 0x0d || lo == 0x0d {
+                    return DictToken::Bad; // reserved nibble
                 }
                 j += 1;
                 if hi == 0x0f || lo == 0x0f {

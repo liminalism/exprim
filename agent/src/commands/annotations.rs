@@ -161,6 +161,73 @@ fn is_comment(subtype: &str) -> bool {
     )
 }
 
+/// A link as reported: its rectangle and its destination page or URL; the
+/// text under it is filled in later.
+fn link_view(link: &exprim::document::DocumentLink) -> LinkView {
+    let (target_page, uri) = match &link.target {
+        DocumentLinkTarget::Internal(destination) => (Some(destination.page.0 + 1), None),
+        DocumentLinkTarget::Uri(uri) => (None, Some(uri.to_string())),
+    };
+    LinkView {
+        rect: link.rect,
+        text: String::new(),
+        target_page,
+        uri,
+    }
+}
+
+/// A comment's rectangle from its page's annotation list: matched by object
+/// where there is one, by its position on the page otherwise.
+fn comment_rect(
+    snapshot: &DocumentSnapshot,
+    record: &exprim::doctor::AnnotationRecord,
+    position: usize,
+) -> Option<[f64; 4]> {
+    let page = snapshot.page(PageIndex(record.page)).ok()?;
+    page.annotations
+        .iter()
+        .find(|annotation| record.object.is_some() && annotation.source == record.object)
+        .or_else(|| page.annotations.get(position))
+        .map(|annotation| annotation.rect)
+}
+
+/// The words whose centres lie inside `rect`, as one tidied line cut to
+/// [`MAX_UNDER_TEXT`] characters.
+fn text_under(words: &[crate::views::text::WordView], rect: [f64; 4]) -> String {
+    let (x0, x1) = (rect[0].min(rect[2]), rect[0].max(rect[2]));
+    let (y0, y1) = (rect[1].min(rect[3]), rect[1].max(rect[3]));
+    let inside: Vec<&str> = words
+        .iter()
+        .filter(|word| {
+            let x = (word.bbox[0] + word.bbox[2]) * 0.5;
+            let y = (word.bbox[1] + word.bbox[3]) * 0.5;
+            x >= x0 && x <= x1 && y >= y0 && y <= y1
+        })
+        .map(|word| word.text.as_str())
+        .collect();
+    let text = crate::views::tidy_line(&inside.join(" "));
+    match text.char_indices().nth(MAX_UNDER_TEXT) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text,
+    }
+}
+
+/// Fill in the text under each of a page's links and text-markup comments.
+fn attach_text_under(entry: &mut PageAnnotations, words: &[crate::views::text::WordView]) {
+    for link in &mut entry.links {
+        link.text = text_under(words, link.rect);
+    }
+    for comment in &mut entry.comments {
+        let markup = matches!(
+            comment.subtype.as_str(),
+            "Highlight" | "Underline" | "StrikeOut" | "Squiggly"
+        );
+        if let (true, Some(rect)) = (markup, comment.rect) {
+            comment.marked_text = text_under(words, rect);
+        }
+    }
+}
+
 /// Everything the selected pages carry, and the document's form fields.
 pub fn collect(
     snapshot: &DocumentSnapshot,
@@ -196,24 +263,8 @@ pub fn collect(
             if page_links.len() > item_limit {
                 cut_pages += 1;
             }
-            entry(&mut by_page, index).links = page_links
-                .iter()
-                .take(item_limit)
-                .map(|link| {
-                    let (target_page, uri) = match &link.target {
-                        DocumentLinkTarget::Internal(destination) => {
-                            (Some(destination.page.0 + 1), None)
-                        }
-                        DocumentLinkTarget::Uri(uri) => (None, Some(uri.to_string())),
-                    };
-                    LinkView {
-                        rect: link.rect,
-                        text: String::new(),
-                        target_page,
-                        uri,
-                    }
-                })
-                .collect();
+            entry(&mut by_page, index).links =
+                page_links.iter().take(item_limit).map(link_view).collect();
         }
     }
 
@@ -234,15 +285,7 @@ pub fn collect(
             }
             // The rectangle lives on the page's annotation list: matched by
             // object where there is one, by position otherwise.
-            let rect = snapshot.page(PageIndex(record.page)).ok().and_then(|page| {
-                page.annotations
-                    .iter()
-                    .find(|annotation| {
-                        record.object.is_some() && annotation.source == record.object
-                    })
-                    .or_else(|| page.annotations.get(position))
-                    .map(|annotation| annotation.rect)
-            });
+            let rect = comment_rect(snapshot, record, position);
             let comments = &mut entry(&mut by_page, record.page).comments;
             if comments.len() >= item_limit {
                 continue;
@@ -294,37 +337,8 @@ pub fn collect(
                 // The link is still worth reporting without its text.
                 return ControlFlow::Continue(());
             };
-            let under = |rect: [f64; 4]| -> String {
-                let (x0, x1) = (rect[0].min(rect[2]), rect[0].max(rect[2]));
-                let (y0, y1) = (rect[1].min(rect[3]), rect[1].max(rect[3]));
-                let inside: Vec<&str> = words
-                    .iter()
-                    .filter(|word| {
-                        let x = (word.bbox[0] + word.bbox[2]) * 0.5;
-                        let y = (word.bbox[1] + word.bbox[3]) * 0.5;
-                        x >= x0 && x <= x1 && y >= y0 && y <= y1
-                    })
-                    .map(|word| word.text.as_str())
-                    .collect();
-                let text = crate::views::tidy_line(&inside.join(" "));
-                match text.char_indices().nth(MAX_UNDER_TEXT) {
-                    Some((at, _)) => format!("{}…", &text[..at]),
-                    None => text,
-                }
-            };
             if let Some(entry) = by_page.get_mut(&page.0) {
-                for link in &mut entry.links {
-                    link.text = under(link.rect);
-                }
-                for comment in &mut entry.comments {
-                    let markup = matches!(
-                        comment.subtype.as_str(),
-                        "Highlight" | "Underline" | "StrikeOut" | "Squiggly"
-                    );
-                    if let (true, Some(rect)) = (markup, comment.rect) {
-                        comment.marked_text = under(rect);
-                    }
-                }
+                attach_text_under(entry, &words);
             }
             ControlFlow::Continue(())
         },

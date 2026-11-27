@@ -52,16 +52,10 @@ pub fn diff_pages(a: &HostPage, b: &HostPage) -> Result<DiffMetrics, DiffError> 
         let ra = &a.pixels[y * a.stride..y * a.stride + row_bytes];
         let rb = &b.pixels[y * b.stride..y * b.stride + row_bytes];
         for (pa, pb) in ra.chunks_exact(bpp).zip(rb.chunks_exact(bpp)) {
-            let mut pixel_changed = false;
-            for (&ca, &cb) in pa.iter().zip(pb) {
-                let d = ca.abs_diff(cb);
-                if d > 0 {
-                    pixel_changed = true;
-                    max_diff = max_diff.max(d);
-                    total_abs += d as u64;
-                }
-            }
-            if pixel_changed {
+            let (pixel_max, pixel_total) = pixel_abs_diff(pa, pb);
+            max_diff = max_diff.max(pixel_max);
+            total_abs += pixel_total;
+            if pixel_total > 0 {
                 changed_pixels += 1;
             }
         }
@@ -75,6 +69,20 @@ pub fn diff_pages(a: &HostPage, b: &HostPage) -> Result<DiffMetrics, DiffError> 
         changed_fraction: changed_pixels as f64 / pixel_count.max(1) as f64,
         identical: max_diff == 0,
     })
+}
+
+/// One pixel's largest channel difference and its summed absolute channel
+/// differences.
+#[inline]
+fn pixel_abs_diff(pa: &[u8], pb: &[u8]) -> (u8, u64) {
+    let mut max = 0u8;
+    let mut total = 0u64;
+    for (&ca, &cb) in pa.iter().zip(pb) {
+        let d = ca.abs_diff(cb);
+        max = max.max(d);
+        total += d as u64;
+    }
+    (max, total)
 }
 
 /// FNV-1a over pixel content (stride-independent): the deterministic page

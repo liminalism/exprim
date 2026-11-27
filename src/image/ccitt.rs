@@ -348,6 +348,103 @@ fn get_run(ins: &[u8], data: &[u8], bitpos: &mut usize, bitsize: usize) -> i32 {
     }
 }
 
+/// A two-dimensional coding mode read from the stream (TABLE 1/T.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum G4Mode {
+    /// Vertical mode: `a1` is `b1` displaced by the delta (V0, VR(n), VL(n)).
+    Vertical(i32),
+    /// Horizontal mode: two run lengths follow.
+    Horizontal,
+    /// Pass mode.
+    Pass,
+    /// An extension code whose skipped bits keep the row going.
+    Extension,
+}
+
+/// Read the next mode code. `None` ends the row: the data ran out inside the
+/// code, or an extension code terminated it. The extension bits are skipped
+/// here exactly as faxmodule.cpp skips them.
+#[inline]
+fn read_g4_mode(data: &[u8], bitpos: &mut usize, bitsize: usize) -> Option<G4Mode> {
+    if next_bit(data, bitpos, bitsize) {
+        return Some(G4Mode::Vertical(0));
+    }
+    if *bitpos >= bitsize {
+        return None;
+    }
+    let bit1 = next_bit(data, bitpos, bitsize);
+    if *bitpos >= bitsize {
+        return None;
+    }
+    let bit2 = next_bit(data, bitpos, bitsize);
+    match (bit1, bit2) {
+        // Vertical VR(1)/VL(1).
+        (true, _) => return Some(G4Mode::Vertical(if bit2 { 1 } else { -1 })),
+        (false, true) => return Some(G4Mode::Horizontal),
+        (false, false) => {}
+    }
+    if *bitpos >= bitsize {
+        return None;
+    }
+    if next_bit(data, bitpos, bitsize) {
+        return Some(G4Mode::Pass);
+    }
+    if *bitpos >= bitsize {
+        return None;
+    }
+    let nb1 = next_bit(data, bitpos, bitsize);
+    if *bitpos >= bitsize {
+        return None;
+    }
+    let nb2 = next_bit(data, bitpos, bitsize);
+    match (nb1, nb2) {
+        // Vertical VR(2)/VL(2).
+        (true, _) => Some(G4Mode::Vertical(if nb2 { 2 } else { -2 })),
+        (false, true) => {
+            if *bitpos >= bitsize {
+                return None;
+            }
+            // Vertical VR(3)/VL(3).
+            Some(G4Mode::Vertical(if next_bit(data, bitpos, bitsize) {
+                3
+            } else {
+                -3
+            }))
+        }
+        (false, false) => {
+            if *bitpos >= bitsize {
+                return None;
+            }
+            // Extension: skip and continue (or end).
+            if next_bit(data, bitpos, bitsize) {
+                *bitpos += 3;
+                return Some(G4Mode::Extension);
+            }
+            *bitpos += 5;
+            None
+        }
+    }
+}
+
+/// Sum a horizontal-mode run of one colour: makeup codes until a terminating
+/// code (< 64). A table miss contributes its `-1` and ends the run.
+#[inline]
+fn read_g4_run(white: bool, data: &[u8], bitpos: &mut usize, bitsize: usize) -> i32 {
+    let table = if white {
+        &WHITE_RUN_INS[..]
+    } else {
+        &BLACK_RUN_INS[..]
+    };
+    let mut run_len = 0i32;
+    loop {
+        let run = get_run(table, data, bitpos, bitsize);
+        run_len += run;
+        if run < 64 {
+            return run_len;
+        }
+    }
+}
+
 /// Decode one 2-D (Group 4 / T.6) coded row into `dest` (which starts all
 /// ones) using the reference line `ref_buf`. Port of `FaxG4GetRow`
 /// (faxmodule.cpp lines 311-473). See TABLE 1/T.6.
@@ -369,34 +466,14 @@ fn g4_get_row(
         let (b1, b2) = find_b1b2(ref_buf, columns, a0, a0color);
         let (b1, b2) = (b1 as i32, b2 as i32);
 
-        let mut v_delta = 0i32;
-        if !next_bit(data, bitpos, bitsize) {
-            if *bitpos >= bitsize {
-                return;
-            }
-            let bit1 = next_bit(data, bitpos, bitsize);
-            if *bitpos >= bitsize {
-                return;
-            }
-            let bit2 = next_bit(data, bitpos, bitsize);
-            if bit1 {
-                // Vertical VR(1)/VL(1).
-                v_delta = if bit2 { 1 } else { -1 };
-            } else if bit2 {
+        let Some(mode) = read_g4_mode(data, bitpos, bitsize) else {
+            return;
+        };
+        let v_delta = match mode {
+            G4Mode::Vertical(delta) => delta,
+            G4Mode::Horizontal => {
                 // Horizontal: two runs.
-                let mut run_len1 = 0i32;
-                loop {
-                    let table = if a0color {
-                        &WHITE_RUN_INS[..]
-                    } else {
-                        &BLACK_RUN_INS[..]
-                    };
-                    let run = get_run(table, data, bitpos, bitsize);
-                    run_len1 += run;
-                    if run < 64 {
-                        break;
-                    }
-                }
+                let mut run_len1 = read_g4_run(a0color, data, bitpos, bitsize);
                 if a0 < 0 {
                     run_len1 += 1;
                 }
@@ -407,19 +484,7 @@ fn g4_get_row(
                 if !a0color {
                     fill_bits(dest, columns, a0, a1);
                 }
-                let mut run_len2 = 0i32;
-                loop {
-                    let table = if a0color {
-                        &BLACK_RUN_INS[..]
-                    } else {
-                        &WHITE_RUN_INS[..]
-                    };
-                    let run = get_run(table, data, bitpos, bitsize);
-                    run_len2 += run;
-                    if run < 64 {
-                        break;
-                    }
-                }
+                let run_len2 = read_g4_run(!a0color, data, bitpos, bitsize);
                 if run_len2 < 0 {
                     return;
                 }
@@ -432,56 +497,19 @@ fn g4_get_row(
                     continue;
                 }
                 return;
-            } else {
-                if *bitpos >= bitsize {
-                    return;
-                }
-                if next_bit(data, bitpos, bitsize) {
-                    // Pass mode.
-                    if !a0color {
-                        fill_bits(dest, columns, a0, b2);
-                    }
-                    if b2 >= cols {
-                        return;
-                    }
-                    a0 = b2;
-                    continue;
-                }
-                if *bitpos >= bitsize {
-                    return;
-                }
-                let nb1 = next_bit(data, bitpos, bitsize);
-                if *bitpos >= bitsize {
-                    return;
-                }
-                let nb2 = next_bit(data, bitpos, bitsize);
-                if nb1 {
-                    // Vertical VR(2)/VL(2).
-                    v_delta = if nb2 { 2 } else { -2 };
-                } else if nb2 {
-                    if *bitpos >= bitsize {
-                        return;
-                    }
-                    // Vertical VR(3)/VL(3).
-                    v_delta = if next_bit(data, bitpos, bitsize) {
-                        3
-                    } else {
-                        -3
-                    };
-                } else {
-                    if *bitpos >= bitsize {
-                        return;
-                    }
-                    // Extension: skip and continue (or end).
-                    if next_bit(data, bitpos, bitsize) {
-                        *bitpos += 3;
-                        continue;
-                    }
-                    *bitpos += 5;
-                    return;
-                }
             }
-        }
+            G4Mode::Pass => {
+                if !a0color {
+                    fill_bits(dest, columns, a0, b2);
+                }
+                if b2 >= cols {
+                    return;
+                }
+                a0 = b2;
+                continue;
+            }
+            G4Mode::Extension => continue,
+        };
         // Vertical mode common tail (V0 falls straight through with v_delta 0).
         let a1 = b1 + v_delta;
         if !a0color {
@@ -519,11 +547,7 @@ fn get_1d_line(data: &[u8], bitsize: usize, bitpos: &mut usize, dest: &mut [u8],
             let run = get_run(table, data, bitpos, bitsize);
             if run < 0 {
                 // Malformed code: skip to the next 1-bit and give up on the row.
-                while *bitpos < bitsize {
-                    if next_bit(data, bitpos, bitsize) {
-                        return;
-                    }
-                }
+                skip_through_next_one(data, bitsize, bitpos);
                 return;
             }
             run_len += run;
@@ -539,6 +563,15 @@ fn get_1d_line(data: &[u8], bitsize: usize, bitpos: &mut usize, dest: &mut [u8],
             break;
         }
         color = !color;
+    }
+}
+
+/// Consume bits up to and including the next 1 bit, or to the end of data.
+fn skip_through_next_one(data: &[u8], bitsize: usize, bitpos: &mut usize) {
+    while *bitpos < bitsize {
+        if next_bit(data, bitpos, bitsize) {
+            return;
+        }
     }
 }
 
@@ -617,18 +650,20 @@ fn decode_ccitt(
         }
         if bitpos < bitsize {
             let before = bitpos;
-            if k < 0 {
-                g4_get_row(data, bitsize, &mut bitpos, &mut cur, &ref_line, columns);
-                ref_line.copy_from_slice(&cur);
-            } else if k == 0 {
+            // /K < 0 is Group 4 (every row 2-D) and /K = 0 Group 3 1-D; for
+            // Group 3 2-D a per-row tag bit selects 1-D (1) or 2-D (0).
+            let one_d = match k {
+                ..0 => false,
+                0 => true,
+                _ => next_bit(data, &mut bitpos, bitsize),
+            };
+            if one_d {
                 get_1d_line(data, bitsize, &mut bitpos, &mut cur, columns);
             } else {
-                // Group 3 2-D: a per-row tag bit selects 1-D (1) or 2-D (0).
-                if next_bit(data, &mut bitpos, bitsize) {
-                    get_1d_line(data, bitsize, &mut bitpos, &mut cur, columns);
-                } else {
-                    g4_get_row(data, bitsize, &mut bitpos, &mut cur, &ref_line, columns);
-                }
+                g4_get_row(data, bitsize, &mut bitpos, &mut cur, &ref_line, columns);
+            }
+            // Only pure 1-D coding never reads a reference line.
+            if k != 0 {
                 ref_line.copy_from_slice(&cur);
             }
             if end_of_line {
@@ -638,18 +673,7 @@ fn decode_ccitt(
             // the skipped padding is all zeros (PDFium turns byte-align off
             // permanently otherwise — some producers set the flag spuriously).
             if byte_align && bitpos < bitsize {
-                let bitpos1 = (bitpos + 7) & !7usize;
-                let mut p = bitpos;
-                while byte_align && p < bitpos1 {
-                    if src_bit(data, p) {
-                        byte_align = false;
-                    } else {
-                        p += 1;
-                    }
-                }
-                if byte_align {
-                    bitpos = bitpos1;
-                }
+                byte_align = align_to_byte(data, &mut bitpos);
             }
             if bitpos > before {
                 rows_decoded += 1;
@@ -672,6 +696,21 @@ fn decode_ccitt(
         ));
     }
     Ok(out)
+}
+
+/// Advance `bitpos` to the next byte boundary if every skipped padding bit
+/// is 0, and report whether it did; a 1 bit leaves `bitpos` where it was.
+fn align_to_byte(data: &[u8], bitpos: &mut usize) -> bool {
+    let bitpos1 = (*bitpos + 7) & !7usize;
+    let mut p = *bitpos;
+    while p < bitpos1 {
+        if src_bit(data, p) {
+            return false;
+        }
+        p += 1;
+    }
+    *bitpos = bitpos1;
+    true
 }
 
 #[allow(
@@ -1070,6 +1109,63 @@ mod tests {
         ]
     }
 
+    /// One point of the encoding-option matrix.
+    #[derive(Clone, Copy)]
+    struct Case {
+        k: i32,
+        cols: usize,
+        rows: usize,
+        byte_align: bool,
+        black_is_1: bool,
+    }
+
+    /// Encode one pattern under `case`, decode it natively, and require the
+    /// bitmap back bit-for-bit.
+    fn assert_roundtrip(case: Case, name: &str, pat: fn(usize, usize) -> bool) {
+        let Case {
+            k,
+            cols,
+            rows,
+            byte_align,
+            black_is_1,
+        } = case;
+        let stream = encode(k, cols, rows, byte_align, pat);
+        let out = native(&stream, cols, rows, k, byte_align, black_is_1);
+        let stride = cols.div_ceil(8);
+        for y in 0..rows {
+            for x in 0..cols {
+                let got = decoded_black(&out, stride, x, y, black_is_1);
+                assert_eq!(
+                    got,
+                    pat(x, y),
+                    "k={k} cols={cols} rows={rows} ba={byte_align} \
+                     b1={black_is_1} pat={name} at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// Round-trip every option and pattern for one geometry; the case count.
+    fn roundtrip_geometry(k: i32, cols: usize, rows: usize) -> usize {
+        let mut cases = 0;
+        for &byte_align in &[false, true] {
+            for &black_is_1 in &[false, true] {
+                for (name, pat) in patterns() {
+                    let case = Case {
+                        k,
+                        cols,
+                        rows,
+                        byte_align,
+                        black_is_1,
+                    };
+                    assert_roundtrip(case, name, pat);
+                    cases += 1;
+                }
+            }
+        }
+        cases
+    }
+
     #[test]
     fn roundtrip_matrix_is_pixel_exact() {
         // encode → native decode → assert the bitmap comes back bit-for-bit.
@@ -1077,31 +1173,33 @@ mod tests {
         for &k in &[-1i32, 0, 4] {
             for &cols in &[8usize, 13, 17, 24, 31] {
                 for &rows in &[1usize, 4, 9] {
-                    for &byte_align in &[false, true] {
-                        for &black_is_1 in &[false, true] {
-                            for (name, pat) in patterns() {
-                                let stream = encode(k, cols, rows, byte_align, pat);
-                                let out = native(&stream, cols, rows, k, byte_align, black_is_1);
-                                let stride = cols.div_ceil(8);
-                                for y in 0..rows {
-                                    for x in 0..cols {
-                                        let got = decoded_black(&out, stride, x, y, black_is_1);
-                                        assert_eq!(
-                                            got,
-                                            pat(x, y),
-                                            "k={k} cols={cols} rows={rows} ba={byte_align} \
-                                             b1={black_is_1} pat={name} at ({x},{y})"
-                                        );
-                                    }
-                                }
-                                cases += 1;
-                            }
-                        }
-                    }
+                    cases += roundtrip_geometry(k, cols, rows);
                 }
             }
         }
         assert!(cases >= 600, "expected a broad matrix, ran {cases}");
+    }
+
+    /// Compare both decoders over every option and pattern for one geometry;
+    /// the case count.
+    fn differential_geometry(k: i32, cols: usize, rows: usize) -> usize {
+        let mut cases = 0;
+        for &byte_align in &[false, true] {
+            for &black_is_1 in &[false, true] {
+                for (name, pat) in patterns() {
+                    let stream = encode(k, cols, rows, byte_align, pat);
+                    let mine = native(&stream, cols, rows, k, byte_align, black_is_1);
+                    let theirs = hayro(&stream, cols, rows, k, byte_align, black_is_1);
+                    assert_eq!(
+                        mine, theirs,
+                        "native vs hayro differ: k={k} cols={cols} rows={rows} \
+                         ba={byte_align} b1={black_is_1} pat={name}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        cases
     }
 
     #[test]
@@ -1111,21 +1209,7 @@ mod tests {
         for &k in &[-1i32, 0, 4] {
             for &cols in &[8usize, 13, 17, 24, 31] {
                 for &rows in &[1usize, 4, 9] {
-                    for &byte_align in &[false, true] {
-                        for &black_is_1 in &[false, true] {
-                            for (name, pat) in patterns() {
-                                let stream = encode(k, cols, rows, byte_align, pat);
-                                let mine = native(&stream, cols, rows, k, byte_align, black_is_1);
-                                let theirs = hayro(&stream, cols, rows, k, byte_align, black_is_1);
-                                assert_eq!(
-                                    mine, theirs,
-                                    "native vs hayro differ: k={k} cols={cols} rows={rows} \
-                                     ba={byte_align} b1={black_is_1} pat={name}"
-                                );
-                                cases += 1;
-                            }
-                        }
-                    }
+                    cases += differential_geometry(k, cols, rows);
                 }
             }
         }

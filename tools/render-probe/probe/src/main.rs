@@ -168,10 +168,38 @@ fn request_for_page(page: Arc<CompiledPage>, scale: f64) -> RenderRequest {
         ),
     };
     let matrix = match page.bounds.rotate {
-        90 => Matrix { a: 0.0, b: scale, c: scale, d: 0.0, e: -crop.y0 * scale, f: -crop.x0 * scale },
-        180 => Matrix { a: -scale, b: 0.0, c: 0.0, d: scale, e: crop.x1 * scale, f: -crop.y0 * scale },
-        270 => Matrix { a: 0.0, b: -scale, c: -scale, d: 0.0, e: crop.y1 * scale, f: crop.x1 * scale },
-        _ => Matrix { a: scale, b: 0.0, c: 0.0, d: -scale, e: -crop.x0 * scale, f: crop.y1 * scale },
+        90 => Matrix {
+            a: 0.0,
+            b: scale,
+            c: scale,
+            d: 0.0,
+            e: -crop.y0 * scale,
+            f: -crop.x0 * scale,
+        },
+        180 => Matrix {
+            a: -scale,
+            b: 0.0,
+            c: 0.0,
+            d: scale,
+            e: crop.x1 * scale,
+            f: -crop.y0 * scale,
+        },
+        270 => Matrix {
+            a: 0.0,
+            b: -scale,
+            c: -scale,
+            d: 0.0,
+            e: crop.y1 * scale,
+            f: crop.x1 * scale,
+        },
+        _ => Matrix {
+            a: scale,
+            b: 0.0,
+            c: 0.0,
+            d: -scale,
+            e: -crop.x0 * scale,
+            f: crop.y1 * scale,
+        },
     };
     RenderRequest {
         page,
@@ -234,7 +262,10 @@ fn do_one(
             }
             #[cfg(not(feature = "profiling"))]
             {
-                Arc::new(comp.compile(snap, PageIndex(page), &mut ctx).expect("compile page"))
+                Arc::new(
+                    comp.compile(snap, PageIndex(page), &mut ctx)
+                        .expect("compile page"),
+                )
             }
         }
     };
@@ -243,7 +274,9 @@ fn do_one(
     let t1 = Instant::now();
     #[cfg(feature = "profiling")]
     let (host, stats) = {
-        let (host, stats, p) = backend.render_profiled_with(&request, worker).expect("render page");
+        let (host, stats, p) = backend
+            .render_profiled_with(&request, worker)
+            .expect("render page");
         profile.merge(&p);
         (host, stats)
     };
@@ -304,6 +337,32 @@ fn hash_host(host: &HostPage) -> u64 {
     h.finish()
 }
 
+/// Print a document-run page's hash (`--hash`) and write its PPM (`--ppm`).
+fn report_doc_page(
+    host: &HostPage,
+    run: usize,
+    page: u32,
+    do_hash: bool,
+    ppm_dir: Option<&String>,
+) {
+    if do_hash {
+        println!(
+            "#dochash run={run} page={} w={} h={} hash={:016x}",
+            page,
+            host.width,
+            host.height,
+            hash_host(host)
+        );
+    }
+    if let Some(dir) = ppm_dir {
+        std::fs::create_dir_all(dir).ok();
+        write_ppm(
+            &std::path::Path::new(dir).join(format!("doc-run{run}-page-{page:03}.ppm")),
+            host,
+        );
+    }
+}
+
 fn write_ppm(path: &std::path::Path, page: &HostPage) {
     let mut f = std::io::BufWriter::new(std::fs::File::create(path).expect("create ppm"));
     write!(f, "P6\n{} {}\n255\n", page.width, page.height).unwrap();
@@ -334,16 +393,28 @@ fn median(mut v: Vec<f64>) -> f64 {
     }
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = v.len();
-    if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
 }
 
 fn run(args: &[String]) {
     let mut a = Args(args.to_vec());
-    let scale: f64 = a.value("--scale").map(|v| v.parse().expect("scale")).unwrap_or(1.0);
+    let scale: f64 = a
+        .value("--scale")
+        .map(|v| v.parse().expect("scale"))
+        .unwrap_or(1.0);
     let pages_spec = a.value("--pages").unwrap_or_else(|| "all".into());
-    let repeat: usize = a.value("--repeat").map(|v| v.parse().expect("repeat")).unwrap_or(1);
-    let measure_from: usize =
-        a.value("--measure-from").map(|v| v.parse().expect("measure-from")).unwrap_or(0);
+    let repeat: usize = a
+        .value("--repeat")
+        .map(|v| v.parse().expect("repeat"))
+        .unwrap_or(1);
+    let measure_from: usize = a
+        .value("--measure-from")
+        .map(|v| v.parse().expect("measure-from"))
+        .unwrap_or(0);
     let system_fonts = a.flag("--system-fonts");
     let render_only = a.flag("--render-only");
     let fresh_backend = a.flag("--fresh-backend");
@@ -401,7 +472,11 @@ fn run(args: &[String]) {
                 backend = CpuBackend::default();
                 worker = CpuWorkerContext::new();
             }
-            let cached = if render_only { compiled_cache.get(&page).cloned() } else { None };
+            let cached = if render_only {
+                compiled_cache.get(&page).cloned()
+            } else {
+                None
+            };
             let (one, compiled) = if seq < measure_from {
                 probe_warmup_render(&snap, &comp, &backend, &mut worker, page, scale, cached)
             } else {
@@ -424,7 +499,11 @@ fn run(args: &[String]) {
                 warm_lower.push(ms(one.stats.lower));
                 warm_exec.push(ms(one.stats.raster));
             }
-            let h = if do_hash { format!("{:016x}", hash_host(&one.host)) } else { "-".into() };
+            let h = if do_hash {
+                format!("{:016x}", hash_host(&one.host))
+            } else {
+                "-".into()
+            };
             if !quiet {
                 println!(
                     "{pass}\t{page}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{h}",
@@ -453,7 +532,10 @@ fn run(args: &[String]) {
                 && let Some(dir) = &ppm_dir
             {
                 std::fs::create_dir_all(dir).ok();
-                write_ppm(&std::path::Path::new(dir).join(format!("page-{page:03}.ppm")), &one.host);
+                write_ppm(
+                    &std::path::Path::new(dir).join(format!("page-{page:03}.ppm")),
+                    &one.host,
+                );
             }
             #[cfg(feature = "profiling")]
             if let Some(w) = prof_writer.as_mut() {
@@ -528,7 +610,10 @@ impl RenderBackend for WholeSurface {
 
 fn doc(args: &[String]) {
     let mut a = Args(args.to_vec());
-    let scale: f64 = a.value("--scale").map(|v| v.parse().expect("scale")).unwrap_or(1.0);
+    let scale: f64 = a
+        .value("--scale")
+        .map(|v| v.parse().expect("scale"))
+        .unwrap_or(1.0);
     let defaults = SchedulerOptions::default();
     let cw: usize = a
         .value("--compile-workers")
@@ -538,14 +623,21 @@ fn doc(args: &[String]) {
         .value("--render-workers")
         .map(|v| v.parse().expect("render workers"))
         .unwrap_or(defaults.render_workers);
-    let runs: usize = a.value("--runs").map(|v| v.parse().expect("runs")).unwrap_or(1);
+    let runs: usize = a
+        .value("--runs")
+        .map(|v| v.parse().expect("runs"))
+        .unwrap_or(1);
     let system_fonts = a.flag("--system-fonts");
     let do_hash = a.flag("--hash");
     let ppm_dir = a.value("--ppm");
-    let pages_end: Option<u32> = a.value("--pages-end").map(|v| v.parse().expect("pages-end"));
+    let pages_end: Option<u32> = a
+        .value("--pages-end")
+        .map(|v| v.parse().expect("pages-end"));
     // The scheduler's memory budget, and (for A/B) whether to budget every
     // job for the whole RGBA surface instead of what the backend reports.
-    let memory_mb: Option<u64> = a.value("--memory-mb").map(|v| v.parse().expect("memory-mb"));
+    let memory_mb: Option<u64> = a
+        .value("--memory-mb")
+        .map(|v| v.parse().expect("memory-mb"));
     let whole_surface = a.flag("--whole-surface-estimate");
     let path = a.positional().to_owned();
 
@@ -571,43 +663,30 @@ fn doc(args: &[String]) {
         };
         let scheduler = RenderScheduler::new(backend, options.clone());
         let provider = provider.clone();
-        let make = move |s: &DocumentSnapshot, page: PageIndex| -> Result<RenderRequest, RenderError> {
-            let mut ctx = ParseContext::new();
-            let compiled = compiler(provider.clone())
-                .compile(s, page, &mut ctx)
-                .map_err(|e| RenderError::Backend(e.to_string()))?;
-            Ok(request_for_page(Arc::new(compiled), scale))
-        };
+        let make =
+            move |s: &DocumentSnapshot, page: PageIndex| -> Result<RenderRequest, RenderError> {
+                let mut ctx = ParseContext::new();
+                let compiled = compiler(provider.clone())
+                    .compile(s, page, &mut ctx)
+                    .map_err(|e| RenderError::Backend(e.to_string()))?;
+                Ok(request_for_page(Arc::new(compiled), scale))
+            };
         let mut ok = 0u32;
         let mut failed = 0u32;
         let mut pixels = 0u64;
         let t = Instant::now();
         let mut first_ms = None;
-        scheduler.render_range(&snap, 0..count, &make, None, &mut |out: PipelineOutput| {
-            match out.result {
+        scheduler.render_range(
+            &snap,
+            0..count,
+            &make,
+            None,
+            &mut |out: PipelineOutput| match out.result {
                 Ok(RenderedPage::Host(host)) => {
                     ok += 1;
                     pixels += u64::from(host.width) * u64::from(host.height);
-                    if first_ms.is_none() {
-                        first_ms = Some(ms(t.elapsed()));
-                    }
-                    if do_hash {
-                        println!(
-                            "#dochash run={run} page={} w={} h={} hash={:016x}",
-                            out.page.0,
-                            host.width,
-                            host.height,
-                            hash_host(&host)
-                        );
-                    }
-                    if let Some(dir) = &ppm_dir {
-                        std::fs::create_dir_all(dir).ok();
-                        write_ppm(
-                            &std::path::Path::new(dir)
-                                .join(format!("doc-run{run}-page-{:03}.ppm", out.page.0)),
-                            &host,
-                        );
-                    }
+                    first_ms.get_or_insert_with(|| ms(t.elapsed()));
+                    report_doc_page(&host, run, out.page.0, do_hash, ppm_dir.as_ref());
                     drop(std::hint::black_box(host));
                 }
                 Ok(_) => failed += 1,
@@ -615,8 +694,8 @@ fn doc(args: &[String]) {
                     failed += 1;
                     eprintln!("page {}: {e}", out.page.0);
                 }
-            }
-        });
+            },
+        );
         let wall = t.elapsed();
         println!(
             "#doc file={path} scale={scale} compile_workers={cw} render_workers={rw} run={run} pages={ok} failed={failed} \
@@ -649,14 +728,45 @@ fn request_for_size(page: Arc<CompiledPage>, w: u32, h: u32) -> RenderRequest {
     let sx = w as f64 / dw.max(f64::EPSILON);
     let sy = h as f64 / dh.max(f64::EPSILON);
     let matrix = match rotation {
-        90 => Matrix { a: 0.0, b: sy, c: sx, d: 0.0, e: -crop.y0 * sx, f: -crop.x0 * sy },
-        180 => Matrix { a: -sx, b: 0.0, c: 0.0, d: sy, e: crop.x1 * sx, f: -crop.y0 * sy },
-        270 => Matrix { a: 0.0, b: -sy, c: -sx, d: 0.0, e: crop.y1 * sx, f: crop.x1 * sy },
-        _ => Matrix { a: sx, b: 0.0, c: 0.0, d: -sy, e: -crop.x0 * sx, f: crop.y1 * sy },
+        90 => Matrix {
+            a: 0.0,
+            b: sy,
+            c: sx,
+            d: 0.0,
+            e: -crop.y0 * sx,
+            f: -crop.x0 * sy,
+        },
+        180 => Matrix {
+            a: -sx,
+            b: 0.0,
+            c: 0.0,
+            d: sy,
+            e: crop.x1 * sx,
+            f: -crop.y0 * sy,
+        },
+        270 => Matrix {
+            a: 0.0,
+            b: -sy,
+            c: -sx,
+            d: 0.0,
+            e: crop.y1 * sx,
+            f: crop.x1 * sy,
+        },
+        _ => Matrix {
+            a: sx,
+            b: 0.0,
+            c: 0.0,
+            d: -sy,
+            e: -crop.x0 * sx,
+            f: crop.y1 * sy,
+        },
     };
     let mut r = request_for_page(page, 1.0);
     r.transform = PageTransform { matrix };
-    r.output_size = DeviceSize { width: w, height: h };
+    r.output_size = DeviceSize {
+        width: w,
+        height: h,
+    };
     r
 }
 
@@ -709,7 +819,10 @@ fn decoded_image_dims(backend: &CpuBackend, req: &RenderRequest) -> Vec<String> 
     };
     let mut out = Vec::new();
     for op in &prepared.ops {
-        let mut p = Prefix { buf: String::new(), cap: 2048 };
+        let mut p = Prefix {
+            buf: String::new(),
+            cap: 2048,
+        };
         let _ = write!(p, "{op:?}");
         if !p.buf.starts_with("Image(") {
             continue;
@@ -720,8 +833,7 @@ fn decoded_image_dims(backend: &CpuBackend, req: &RenderRequest) -> Vec<String> 
         let after_inv = p.buf.find(" inv: ").unwrap_or(0);
         let tail = &p.buf[after_inv..];
         let grab = |key: &str| -> String {
-            tail
-                .find(key)
+            tail.find(key)
                 .map(|i| {
                     tail[i + key.len()..]
                         .chars()
@@ -756,7 +868,10 @@ fn seq(args: &[String]) {
             std::process::exit(2);
         }
     };
-    let page: u32 = a.value("--page").map(|v| v.parse().expect("page")).unwrap_or(0);
+    let page: u32 = a
+        .value("--page")
+        .map(|v| v.parse().expect("page"))
+        .unwrap_or(0);
     let fresh_compare = a.flag("--fresh-compare");
     let show_decode = a.flag("--show-decode");
     let ppm_dir = a.value("--ppm");
@@ -773,7 +888,10 @@ fn seq(args: &[String]) {
     let mut ctx = ParseContext::new();
     // Compiled once and rendered at every step, like lege-pdf-read's
     // RenderSession (compiled-page cache + one CpuBackend per document).
-    let compiled = Arc::new(comp.compile(&snap, PageIndex(page), &mut ctx).expect("compile page"));
+    let compiled = Arc::new(
+        comp.compile(&snap, PageIndex(page), &mut ctx)
+            .expect("compile page"),
+    );
     if let Some(dir) = &ppm_dir {
         std::fs::create_dir_all(dir).ok();
     }
@@ -788,7 +906,11 @@ fn seq(args: &[String]) {
             let (host, stats) = backend.render_with(&req, &mut worker).expect("render page");
             let dt = t.elapsed();
             let h = hash_host(&host);
-            let dims = if show_decode { decoded_image_dims(&backend, &req).join(",") } else { "-".into() };
+            let dims = if show_decode {
+                decoded_image_dims(&backend, &req).join(",")
+            } else {
+                "-".into()
+            };
             println!(
                 "seq\t{i}\t{}\t{page}\t{}\t{}\t{:.3}\t{}\t{dims}\t{h:016x}",
                 step.label(),
@@ -817,7 +939,11 @@ fn seq(args: &[String]) {
             let (host, stats) = backend.render_with(&req, &mut worker).expect("render page");
             let dt = t.elapsed();
             let h = hash_host(&host);
-            let dims = if show_decode { decoded_image_dims(&backend, &req).join(",") } else { "-".into() };
+            let dims = if show_decode {
+                decoded_image_dims(&backend, &req).join(",")
+            } else {
+                "-".into()
+            };
             println!(
                 "fresh\t{i}\t{}\t{page}\t{}\t{}\t{:.3}\t{}\t{dims}\t{h:016x}",
                 step.label(),
@@ -836,7 +962,8 @@ fn seq(args: &[String]) {
             );
             if let Some(dir) = &ppm_dir {
                 write_ppm(
-                    &std::path::Path::new(dir).join(format!("fresh{i}_{}_p{page}.ppm", step.label())),
+                    &std::path::Path::new(dir)
+                        .join(format!("fresh{i}_{}_p{page}.ppm", step.label())),
                     &host,
                 );
             }

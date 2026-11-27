@@ -120,6 +120,15 @@ fn queried_file_preview_plans_without_submitting() {
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
+/// Require each of `keys` in `value` to be a rectangle of four numeric edges.
+fn assert_rects(value: &serde_json::Value, keys: &[&str]) {
+    for key in keys {
+        for edge in ["x0", "y0", "x1", "y1"] {
+            assert!(value[key][edge].is_number(), "{key}.{edge}");
+        }
+    }
+}
+
 #[test]
 fn dry_run_n_up_reports_every_placement() {
     let data = json(&["--dry-run", "--n-up", "2", "--margin-mm", "10"])["data"].clone();
@@ -138,11 +147,7 @@ fn dry_run_n_up_reports_every_placement() {
     assert_eq!(sheet["landscape"], false);
     assert!(sheet["raster"]["width"].as_u64().unwrap() > 0);
     assert_eq!(sheet["raster"]["channels"], 3);
-    for key in ["bounds", "imageable"] {
-        for edge in ["x0", "y0", "x1", "y1"] {
-            assert!(sheet[key][edge].is_number(), "{key}.{edge}");
-        }
-    }
+    assert_rects(sheet, &["bounds", "imageable"]);
     // The imageable area is inset by the greater of the user and hardware
     // margins, so it is strictly inside the sheet.
     assert!(sheet["imageable"]["x0"].as_f64().unwrap() > sheet["bounds"]["x0"].as_f64().unwrap());
@@ -162,11 +167,7 @@ fn dry_run_n_up_reports_every_placement() {
     for key in ["a", "b", "c", "d", "e", "f"] {
         assert!(placement["transform"][key].is_number(), "transform.{key}");
     }
-    for key in ["cell", "content", "painted"] {
-        for edge in ["x0", "y0", "x1", "y1"] {
-            assert!(placement[key][edge].is_number(), "{key}.{edge}");
-        }
-    }
+    assert_rects(placement, &["cell", "content", "painted"]);
     // A shrink-to-fit page never overflows its cell, so nothing is clipped.
     assert_eq!(placement["content"], placement["painted"]);
 }

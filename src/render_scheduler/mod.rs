@@ -216,7 +216,6 @@ impl RenderScheduler {
         use crossbeam_channel::{bounded, unbounded};
 
         let start_seq = pages.start as u64;
-        let cancelled = || cancel.is_some_and(|t| t.is_cancelled());
         #[cfg(feature = "profiling")]
         let pipeline_start = std::time::Instant::now();
 
@@ -259,54 +258,13 @@ impl RenderScheduler {
             // the page the collector is waiting for. Bounding `result_tx`
             // instead can deadlock when later workers fill it before that
             // early page finishes.
-            scope.spawn(move || {
-                let mut pages = pages;
-                let mut admitted = 0_u64;
-                let mut emitted = 0_u64;
-                loop {
-                    let limit = emitted.saturating_add(reorder_window);
-                    while admitted < limit {
-                        let Some(n) = pages.next() else {
-                            return;
-                        };
-                        if page_tx.send(n).is_err() {
-                            return;
-                        }
-                        admitted += 1;
-                    }
-                    match emitted_rx.recv() {
-                        Ok(()) => emitted += 1,
-                        Err(_) => return,
-                    }
-                }
-            });
+            scope.spawn(move || feed_pages(pages, reorder_window, page_tx, emitted_rx));
 
             // Compile workers.
             for _ in 0..compile_workers {
                 let page_rx = page_rx.clone();
                 scope.spawn(move || {
-                    let _live = dispatch.compiler();
-                    while let Ok(n) = page_rx.recv() {
-                        let item = if cancelled() {
-                            Err(RenderError::Cancelled)
-                        } else {
-                            match catch_unwind(AssertUnwindSafe(|| {
-                                make_request(snapshot, PageIndex(n))
-                            })) {
-                                Ok(r) => r,
-                                Err(_) => Err(RenderError::Backend(format!(
-                                    "compile panicked on page {n}"
-                                ))),
-                            }
-                        };
-                        let surface_bytes = match &item {
-                            Ok(request) => output_surface_bytes(request),
-                            Err(_) => 0,
-                        };
-                        if !dispatch.push(n, item, surface_bytes) {
-                            break;
-                        }
-                    }
+                    compile_worker(dispatch, page_rx, snapshot, make_request, cancel)
                 });
             }
             drop(page_rx);
@@ -317,46 +275,15 @@ impl RenderScheduler {
                 let budget = self.budget.clone();
                 let backend = self.backend.clone();
                 scope.spawn(move || {
-                    let _live = dispatch.renderer();
-                    while let Some(ready) = dispatch.take(&cancelled, cancel.is_some()) {
-                        let n = ready.page;
-                        let result = match ready.item {
-                            Err(e) => Err(e),
-                            Ok(request) if cancelled() => {
-                                drop(request);
-                                Err(RenderError::Cancelled)
-                            }
-                            Ok(mut request) => {
-                                // Preserve both cancellation sources through budget
-                                // admission and active backend execution.
-                                if let Some(pipeline) = cancel {
-                                    request.limits.cancellation =
-                                        Some(match &request.limits.cancellation {
-                                            Some(local) => local.linked_with(pipeline),
-                                            None => pipeline.clone(),
-                                        });
-                                }
-                                render_job(backend.as_ref(), &budget, request)
-                            }
-                        };
-                        // A failed page holds no surface while it waits.
-                        let held_bytes = if result.is_ok() {
-                            ready.surface_bytes
-                        } else {
-                            0
-                        };
-                        dispatch.finished(held_bytes);
-                        let sent = result_tx.send(Finished {
-                            page: n,
-                            result,
-                            held_bytes,
-                            #[cfg(feature = "profiling")]
-                            completion_latency: pipeline_start.elapsed(),
-                        });
-                        if sent.is_err() {
-                            break;
-                        }
-                    }
+                    render_worker(
+                        dispatch,
+                        result_tx,
+                        &budget,
+                        backend.as_ref(),
+                        cancel,
+                        #[cfg(feature = "profiling")]
+                        pipeline_start,
+                    )
                 });
             }
             drop(result_tx);
@@ -458,6 +385,144 @@ impl RenderScheduler {
         }
         profile
     }
+}
+
+/// The compiled-page queue between the compile and render workers.
+type RequestDispatch = dispatch::Dispatch<Result<RenderRequest, RenderError>>;
+
+/// Feeder: admit pages into the pipeline as an ordered sliding window of
+/// `reorder_window` pages past the last emitted one, one credit per emitted
+/// page arriving on `emitted_rx`.
+fn feed_pages(
+    mut pages: std::ops::Range<u32>,
+    reorder_window: u64,
+    page_tx: crossbeam_channel::Sender<u32>,
+    emitted_rx: crossbeam_channel::Receiver<()>,
+) {
+    let mut admitted = 0_u64;
+    let mut emitted = 0_u64;
+    loop {
+        let limit = emitted.saturating_add(reorder_window);
+        while admitted < limit {
+            let Some(n) = pages.next() else {
+                return;
+            };
+            if page_tx.send(n).is_err() {
+                return;
+            }
+            admitted += 1;
+        }
+        match emitted_rx.recv() {
+            Ok(()) => emitted += 1,
+            Err(_) => return,
+        }
+    }
+}
+
+/// Compile worker: turn each admitted page into a request and push it to the
+/// dispatch until the queue closes.
+fn compile_worker(
+    dispatch: &RequestDispatch,
+    page_rx: crossbeam_channel::Receiver<u32>,
+    snapshot: &DocumentSnapshot,
+    make_request: &(
+         dyn Fn(&DocumentSnapshot, PageIndex) -> Result<RenderRequest, RenderError> + Sync
+     ),
+    cancel: Option<&CancellationToken>,
+) {
+    let _live = dispatch.compiler();
+    while let Ok(n) = page_rx.recv() {
+        let item = compile_page(snapshot, make_request, n, cancel);
+        let surface_bytes = match &item {
+            Ok(request) => output_surface_bytes(request),
+            Err(_) => 0,
+        };
+        if !dispatch.push(n, item, surface_bytes) {
+            break;
+        }
+    }
+}
+
+/// Build page `n`'s request, unless the pipeline is cancelled; a panic in
+/// `make_request` becomes that page's error.
+fn compile_page(
+    snapshot: &DocumentSnapshot,
+    make_request: &(
+         dyn Fn(&DocumentSnapshot, PageIndex) -> Result<RenderRequest, RenderError> + Sync
+     ),
+    n: u32,
+    cancel: Option<&CancellationToken>,
+) -> Result<RenderRequest, RenderError> {
+    if cancel.is_some_and(|t| t.is_cancelled()) {
+        return Err(RenderError::Cancelled);
+    }
+    match catch_unwind(AssertUnwindSafe(|| make_request(snapshot, PageIndex(n)))) {
+        Ok(r) => r,
+        Err(_) => Err(RenderError::Backend(format!(
+            "compile panicked on page {n}"
+        ))),
+    }
+}
+
+/// Render worker: take compiled pages from the dispatch, render them and send
+/// each result to the collector until the dispatch or the collector stops.
+fn render_worker(
+    dispatch: &RequestDispatch,
+    result_tx: crossbeam_channel::Sender<Finished>,
+    budget: &MemoryBudget,
+    backend: &dyn RenderBackend,
+    cancel: Option<&CancellationToken>,
+    #[cfg(feature = "profiling")] pipeline_start: std::time::Instant,
+) {
+    let cancelled = || cancel.is_some_and(|t| t.is_cancelled());
+    let _live = dispatch.renderer();
+    while let Some(ready) = dispatch.take(&cancelled, cancel.is_some()) {
+        let n = ready.page;
+        let result = match ready.item {
+            Err(e) => Err(e),
+            Ok(request) if cancelled() => {
+                drop(request);
+                Err(RenderError::Cancelled)
+            }
+            Ok(request) => render_linked(backend, budget, request, cancel),
+        };
+        // A failed page holds no surface while it waits.
+        let held_bytes = if result.is_ok() {
+            ready.surface_bytes
+        } else {
+            0
+        };
+        dispatch.finished(held_bytes);
+        let sent = result_tx.send(Finished {
+            page: n,
+            result,
+            held_bytes,
+            #[cfg(feature = "profiling")]
+            completion_latency: pipeline_start.elapsed(),
+        });
+        if sent.is_err() {
+            break;
+        }
+    }
+}
+
+/// Link the pipeline token into the request's own cancellation and run it
+/// through [`render_job`].
+fn render_linked(
+    backend: &dyn RenderBackend,
+    budget: &MemoryBudget,
+    mut request: RenderRequest,
+    cancel: Option<&CancellationToken>,
+) -> Result<RenderedPage, RenderError> {
+    // Preserve both cancellation sources through budget
+    // admission and active backend execution.
+    if let Some(pipeline) = cancel {
+        request.limits.cancellation = Some(match &request.limits.cancellation {
+            Some(local) => local.linked_with(pipeline),
+            None => pipeline.clone(),
+        });
+    }
+    render_job(backend, budget, request)
 }
 
 #[cfg(feature = "profiling")]

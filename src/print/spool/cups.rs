@@ -444,14 +444,14 @@ pub fn parse_lpoptions_entries(text: &str) -> Vec<LpOption> {
         let mut choices = Vec::new();
         let mut current = None;
         for token in right.split_whitespace() {
-            if let Some(starred) = token.strip_prefix('*') {
-                if starred.is_empty() {
-                    continue;
+            match token.strip_prefix('*') {
+                // A lone `*` marks nothing.
+                Some("") => {}
+                Some(starred) => {
+                    current = Some(starred.to_string());
+                    choices.push(starred.to_string());
                 }
-                current = Some(starred.to_string());
-                choices.push(starred.to_string());
-            } else {
-                choices.push(token.to_string());
+                None => choices.push(token.to_string()),
             }
         }
         if choices.is_empty() {

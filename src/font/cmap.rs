@@ -97,9 +97,22 @@ impl CMap {
     pub fn cid(&self, code: u32) -> u32 {
         let mut cur = Some(self);
         while let Some(c) = cur {
-            match &c.records {
-                Records::Range(v) => {
-                    if let Ok(i) = v.binary_search_by(|&(lo, hi, _)| {
+            if let Some(cid) = c.records.lookup(code) {
+                return cid;
+            }
+            cur = c.usecmap.as_deref();
+        }
+        0
+    }
+}
+
+impl Records {
+    /// This link's CID for `code`, or `None` when no record covers it.
+    fn lookup(&self, code: u32) -> Option<u32> {
+        match self {
+            Records::Range(v) => {
+                let i = v
+                    .binary_search_by(|&(lo, hi, _)| {
                         if code < lo {
                             std::cmp::Ordering::Greater
                         } else if code > hi {
@@ -107,20 +120,16 @@ impl CMap {
                         } else {
                             std::cmp::Ordering::Equal
                         }
-                    }) {
-                        let (lo, _, cid) = v[i];
-                        return cid + (code - lo);
-                    }
-                }
-                Records::Single(v) => {
-                    if let Ok(i) = v.binary_search_by(|&(c0, _)| c0.cmp(&code)) {
-                        return v[i].1;
-                    }
-                }
+                    })
+                    .ok()?;
+                let (lo, _, cid) = v[i];
+                Some(cid + (code - lo))
             }
-            cur = c.usecmap.as_deref();
+            Records::Single(v) => {
+                let i = v.binary_search_by(|&(c0, _)| c0.cmp(&code)).ok()?;
+                Some(v[i].1)
+            }
         }
-        0
     }
 }
 
@@ -277,56 +286,9 @@ pub fn parse_embedded_cmap(data: &[u8]) -> Option<CMap> {
                     // `/WMode <n> def`: the number precedes `def`; we captured it
                     // as `last_number` via the Number arm below.
                 }
-                b"begincodespacerange" => {
-                    while let Some(t) = lex.next() {
-                        let Token::Hex(lo) = t else { break }; // endcodespacerange
-                        let Some(Token::Hex(hi)) = lex.next() else {
-                            break;
-                        };
-                        if !lo.is_empty() && lo.len() == hi.len() && lo.len() <= 4 {
-                            let mut l = [0u8; 4];
-                            let mut h = [0xffu8; 4];
-                            l[..lo.len()].copy_from_slice(&lo);
-                            h[..hi.len()].copy_from_slice(&hi);
-                            codespace.push(Codespace {
-                                n: lo.len() as u8,
-                                lo: l,
-                                hi: h,
-                            });
-                        }
-                    }
-                }
-                b"begincidrange" => {
-                    // Triples: <lo> <hi> cid.
-                    loop {
-                        let Some(Token::Hex(lo)) = lex.next() else {
-                            break;
-                        };
-                        let Some(Token::Hex(hi)) = lex.next() else {
-                            break;
-                        };
-                        let Some(Token::Number(cid)) = lex.next() else {
-                            break;
-                        };
-                        if lo.len() <= 4 && hi.len() <= 4 {
-                            ranges.push((be(&lo), be(&hi), cid));
-                        }
-                    }
-                }
-                b"begincidchar" => {
-                    // Pairs: <code> cid.
-                    loop {
-                        let Some(Token::Hex(code)) = lex.next() else {
-                            break;
-                        };
-                        let Some(Token::Number(cid)) = lex.next() else {
-                            break;
-                        };
-                        if code.len() <= 4 {
-                            singles.push((be(&code), cid));
-                        }
-                    }
-                }
+                b"begincodespacerange" => read_codespace_ranges(&mut lex, &mut codespace),
+                b"begincidrange" => read_cid_ranges(&mut lex, &mut ranges),
+                b"begincidchar" => read_cid_chars(&mut lex, &mut singles),
                 _ => {}
             },
             Token::Number(n) => {
@@ -372,6 +334,61 @@ pub fn parse_embedded_cmap(data: &[u8]) -> Option<CMap> {
         records: Records::Range(ranges),
         usecmap,
     })
+}
+
+/// Read `<lo> <hi>` codespace pairs up to the first token that is not one
+/// (`endcodespacerange`), keeping each well-formed range of 1–4 bytes.
+fn read_codespace_ranges(lex: &mut Lexer<'_>, codespace: &mut Vec<Codespace>) {
+    while let Some(t) = lex.next() {
+        let Token::Hex(lo) = t else { break }; // endcodespacerange
+        let Some(Token::Hex(hi)) = lex.next() else {
+            break;
+        };
+        if !lo.is_empty() && lo.len() == hi.len() && lo.len() <= 4 {
+            let mut l = [0u8; 4];
+            let mut h = [0xffu8; 4];
+            l[..lo.len()].copy_from_slice(&lo);
+            h[..hi.len()].copy_from_slice(&hi);
+            codespace.push(Codespace {
+                n: lo.len() as u8,
+                lo: l,
+                hi: h,
+            });
+        }
+    }
+}
+
+/// Read `<lo> <hi> cid` triples up to the first token that breaks the pattern.
+fn read_cid_ranges(lex: &mut Lexer<'_>, ranges: &mut Vec<(u32, u32, u32)>) {
+    loop {
+        let Some(Token::Hex(lo)) = lex.next() else {
+            break;
+        };
+        let Some(Token::Hex(hi)) = lex.next() else {
+            break;
+        };
+        let Some(Token::Number(cid)) = lex.next() else {
+            break;
+        };
+        if lo.len() <= 4 && hi.len() <= 4 {
+            ranges.push((be(&lo), be(&hi), cid));
+        }
+    }
+}
+
+/// Read `<code> cid` pairs up to the first token that breaks the pattern.
+fn read_cid_chars(lex: &mut Lexer<'_>, singles: &mut Vec<(u32, u32)>) {
+    loop {
+        let Some(Token::Hex(code)) = lex.next() else {
+            break;
+        };
+        let Some(Token::Number(cid)) = lex.next() else {
+            break;
+        };
+        if code.len() <= 4 {
+            singles.push((be(&code), cid));
+        }
+    }
 }
 
 /// Minimal token stream for the embedded-CMap syntax.

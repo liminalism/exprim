@@ -143,14 +143,14 @@ impl Query {
                 let (hay, len) = (&folded.chars, needle.len());
                 let mut at = 0;
                 while at + len <= hay.len() {
-                    if hay[at..at + len] == needle[..] {
-                        if !push(at, at + len) {
-                            break;
-                        }
-                        at += len;
-                    } else {
+                    if hay[at..at + len] != needle[..] {
                         at += 1;
+                        continue;
                     }
+                    if !push(at, at + len) {
+                        break;
+                    }
+                    at += len;
                 }
             }
             Matcher::Regex(regex) => {
@@ -211,28 +211,19 @@ impl Folded {
                 }
                 continue;
             }
-            if fold.presentation {
-                let expanded: Option<&str> = match character {
-                    '\u{ad}' => Some(""),
-                    '\u{fb00}' => Some("ff"),
-                    '\u{fb01}' => Some("fi"),
-                    '\u{fb02}' => Some("fl"),
-                    '\u{fb03}' => Some("ffi"),
-                    '\u{fb04}' => Some("ffl"),
-                    '\u{fb05}' | '\u{fb06}' => Some("st"),
-                    '\u{2018}' | '\u{2019}' | '\u{201b}' | '\u{2032}' => Some("'"),
-                    '\u{201c}' | '\u{201d}' | '\u{201f}' | '\u{2033}' => Some("\""),
-                    _ => None,
-                };
-                if let Some(expanded) = expanded {
-                    for part in expanded.chars() {
-                        push(part, index);
-                    }
-                    if !expanded.is_empty() {
-                        in_space = false;
-                    }
-                    continue;
+            let expanded = if fold.presentation {
+                presentation_expansion(character)
+            } else {
+                None
+            };
+            if let Some(expanded) = expanded {
+                for part in expanded.chars() {
+                    push(part, index);
                 }
+                if !expanded.is_empty() {
+                    in_space = false;
+                }
+                continue;
             }
             if fold.hyphens && matches!(character, '-' | '\u{2010}' | '\u{2011}') {
                 continue;
@@ -252,28 +243,48 @@ impl Folded {
     }
 }
 
+/// What a presentation form folds to for matching: a ligature to its
+/// letters, a curly quote or prime to a straight quote, a soft hyphen to
+/// nothing. `None` for any other character.
+fn presentation_expansion(character: char) -> Option<&'static str> {
+    match character {
+        '\u{ad}' => Some(""),
+        '\u{fb00}' => Some("ff"),
+        '\u{fb01}' => Some("fi"),
+        '\u{fb02}' => Some("fl"),
+        '\u{fb03}' => Some("ffi"),
+        '\u{fb04}' => Some("ffl"),
+        '\u{fb05}' | '\u{fb06}' => Some("st"),
+        '\u{2018}' | '\u{2019}' | '\u{201b}' | '\u{2032}' => Some("'"),
+        '\u{201c}' | '\u{201d}' | '\u{201f}' | '\u{2033}' => Some("\""),
+        _ => None,
+    }
+}
+
+/// `slice` as one line: each run of whitespace becomes a single space.
+fn one_line(slice: &[char]) -> String {
+    let mut out = String::with_capacity(slice.len());
+    let mut in_space = false;
+    for &character in slice {
+        if character.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+            }
+            in_space = true;
+        } else {
+            out.push(character);
+            in_space = false;
+        }
+    }
+    out
+}
+
 /// `text[first..first + count]` in characters, with `context` characters on
 /// each side, as one line: runs of whitespace become single spaces, so a
 /// match that crosses a line break reads as the phrase it is.
 pub fn excerpt(chars: &[char], span: Span, context: usize) -> (String, String) {
     let start = span.first_char.min(chars.len());
     let end = (span.first_char + span.char_count).min(chars.len());
-    let one_line = |slice: &[char]| -> String {
-        let mut out = String::with_capacity(slice.len());
-        let mut in_space = false;
-        for &character in slice {
-            if character.is_whitespace() {
-                if !in_space {
-                    out.push(' ');
-                }
-                in_space = true;
-            } else {
-                out.push(character);
-                in_space = false;
-            }
-        }
-        out
-    };
     let matched = one_line(&chars[start..end]);
     let before = start.saturating_sub(context);
     let after = (end + context).min(chars.len());

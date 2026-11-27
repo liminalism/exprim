@@ -501,98 +501,106 @@ fn read_xyz(bytes: &[u8], (off, len): (usize, usize)) -> Option<[f32; 3]> {
 
 /// Read a `curveType` or `parametricCurveType` tag, sampled to 256 points.
 fn read_trc(bytes: &[u8], (off, len): (usize, usize)) -> Option<[f32; 256]> {
-    let kind = bytes.get(off..off + 4)?;
+    match bytes.get(off..off + 4)? {
+        b"curv" => read_curv_trc(bytes, off, len),
+        b"para" => read_para_trc(bytes, off),
+        _ => None,
+    }
+}
+
+/// Sample a `curveType` tag at `off` (identity, a single gamma, or a table
+/// of u16 points) to 256 points.
+fn read_curv_trc(bytes: &[u8], off: usize, len: usize) -> Option<[f32; 256]> {
     let mut out = [0f32; 256];
-    match kind {
-        b"curv" => {
-            if len < 12 {
-                return None;
-            }
-            let count = u32::from_be_bytes(bytes.get(off + 8..off + 12)?.try_into().ok()?) as usize;
-            match count {
-                // Identity.
-                0 => {
-                    for (i, v) in out.iter_mut().enumerate() {
-                        *v = i as f32 / 255.0;
-                    }
-                }
-                // A single u8.8 gamma.
-                1 => {
-                    let g = u16::from_be_bytes(bytes.get(off + 12..off + 14)?.try_into().ok()?)
-                        as f32
-                        / 256.0;
-                    if !(0.1..=10.0).contains(&g) {
-                        return None;
-                    }
-                    for (i, v) in out.iter_mut().enumerate() {
-                        *v = (i as f32 / 255.0).powf(g);
-                    }
-                }
-                // A sampled curve of u16 points, linearly interpolated.
-                _ => {
-                    let table = bytes.get(off + 12..off + 12 + count * 2)?;
-                    let point = |i: usize| -> f32 {
-                        u16::from_be_bytes([table[i * 2], table[i * 2 + 1]]) as f32 / 65535.0
-                    };
-                    for (i, v) in out.iter_mut().enumerate() {
-                        let t = (i as f32 / 255.0) * (count - 1) as f32;
-                        let lo = t.floor() as usize;
-                        let hi = (lo + 1).min(count - 1);
-                        let f = t - lo as f32;
-                        *v = point(lo) * (1.0 - f) + point(hi) * f;
-                    }
-                }
+    if len < 12 {
+        return None;
+    }
+    let count = u32::from_be_bytes(bytes.get(off + 8..off + 12)?.try_into().ok()?) as usize;
+    match count {
+        // Identity.
+        0 => {
+            for (i, v) in out.iter_mut().enumerate() {
+                *v = i as f32 / 255.0;
             }
         }
-        b"para" => {
-            // ICC parametric curves: type 0 is a plain gamma, types 1-4 add the
-            // linear toe sRGB uses. Parameters are s15Fixed16.
-            let ty = u16::from_be_bytes(bytes.get(off + 8..off + 10)?.try_into().ok()?);
-            let p = |i: usize| -> Option<f32> {
-                let o = off + 12 + i * 4;
-                Some(i32::from_be_bytes(bytes.get(o..o + 4)?.try_into().ok()?) as f32 / 65536.0)
-            };
-            let g = p(0)?;
+        // A single u8.8 gamma.
+        1 => {
+            let g =
+                u16::from_be_bytes(bytes.get(off + 12..off + 14)?.try_into().ok()?) as f32 / 256.0;
             if !(0.1..=10.0).contains(&g) {
                 return None;
             }
             for (i, v) in out.iter_mut().enumerate() {
-                let x = i as f32 / 255.0;
-                *v = match ty {
-                    0 => x.powf(g),
-                    1 => {
-                        let (a, b) = (p(1)?, p(2)?);
-                        if x >= -b / a {
-                            (a * x + b).powf(g)
-                        } else {
-                            0.0
-                        }
-                    }
-                    2 => {
-                        let (a, b, c) = (p(1)?, p(2)?, p(3)?);
-                        if x >= -b / a {
-                            (a * x + b).powf(g) + c
-                        } else {
-                            c
-                        }
-                    }
-                    3 => {
-                        let (a, b, c, d) = (p(1)?, p(2)?, p(3)?, p(4)?);
-                        if x >= d { (a * x + b).powf(g) } else { c * x }
-                    }
-                    4 => {
-                        let (a, b, c, d, e, f) = (p(1)?, p(2)?, p(3)?, p(4)?, p(5)?, p(6)?);
-                        if x >= d {
-                            (a * x + b).powf(g) + e
-                        } else {
-                            c * x + f
-                        }
-                    }
-                    _ => return None,
-                };
+                *v = (i as f32 / 255.0).powf(g);
             }
         }
-        _ => return None,
+        // A sampled curve of u16 points, linearly interpolated.
+        _ => {
+            let table = bytes.get(off + 12..off + 12 + count * 2)?;
+            let point = |i: usize| -> f32 {
+                u16::from_be_bytes([table[i * 2], table[i * 2 + 1]]) as f32 / 65535.0
+            };
+            for (i, v) in out.iter_mut().enumerate() {
+                let t = (i as f32 / 255.0) * (count - 1) as f32;
+                let lo = t.floor() as usize;
+                let hi = (lo + 1).min(count - 1);
+                let f = t - lo as f32;
+                *v = point(lo) * (1.0 - f) + point(hi) * f;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Sample a `parametricCurveType` tag at `off` (function types 0-4) to 256
+/// points.
+fn read_para_trc(bytes: &[u8], off: usize) -> Option<[f32; 256]> {
+    let mut out = [0f32; 256];
+    // ICC parametric curves: type 0 is a plain gamma, types 1-4 add the
+    // linear toe sRGB uses. Parameters are s15Fixed16.
+    let ty = u16::from_be_bytes(bytes.get(off + 8..off + 10)?.try_into().ok()?);
+    let p = |i: usize| -> Option<f32> {
+        let o = off + 12 + i * 4;
+        Some(i32::from_be_bytes(bytes.get(o..o + 4)?.try_into().ok()?) as f32 / 65536.0)
+    };
+    let g = p(0)?;
+    if !(0.1..=10.0).contains(&g) {
+        return None;
+    }
+    for (i, v) in out.iter_mut().enumerate() {
+        let x = i as f32 / 255.0;
+        *v = match ty {
+            0 => x.powf(g),
+            1 => {
+                let (a, b) = (p(1)?, p(2)?);
+                if x >= -b / a {
+                    (a * x + b).powf(g)
+                } else {
+                    0.0
+                }
+            }
+            2 => {
+                let (a, b, c) = (p(1)?, p(2)?, p(3)?);
+                if x >= -b / a {
+                    (a * x + b).powf(g) + c
+                } else {
+                    c
+                }
+            }
+            3 => {
+                let (a, b, c, d) = (p(1)?, p(2)?, p(3)?, p(4)?);
+                if x >= d { (a * x + b).powf(g) } else { c * x }
+            }
+            4 => {
+                let (a, b, c, d, e, f) = (p(1)?, p(2)?, p(3)?, p(4)?, p(5)?, p(6)?);
+                if x >= d {
+                    (a * x + b).powf(g) + e
+                } else {
+                    c * x + f
+                }
+            }
+            _ => return None,
+        };
     }
     Some(out)
 }

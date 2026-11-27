@@ -798,6 +798,38 @@ fn a_tiny_byte_limit_drains_with_cancellation_and_failures() {
     assert_eq!(scheduler.budget().in_use(), 0);
 }
 
+/// Render 30 pages through a scheduler whose consumer panics on page 3, and
+/// send whether the panic reached this caller before tearing the scheduler
+/// down.
+fn render_with_a_consumer_that_panics_on_page_3(done_tx: std::sync::mpsc::Sender<bool>) {
+    let snap = snapshot(30);
+    let backend = Arc::new(SizedBackend {
+        slow_width: Some(100),
+        slow: Duration::from_millis(30),
+        fast: Duration::from_millis(1),
+        backlog: Arc::new(Backlog::default()),
+    });
+    let scheduler = RenderScheduler::new(
+        backend,
+        SchedulerOptions {
+            compile_workers: 2,
+            render_workers: 3,
+            compiled_queue_depth: 2,
+            reorder_window_depth: 8,
+            reorder_backlog_bytes: 1,
+            memory_limit_bytes: 1 << 30,
+        },
+    );
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scheduler.render_range(&snap, 0..30, &sized_requester, None, &mut |o| {
+            if o.page.0 == 3 {
+                panic!("consumer failed on page 3");
+            }
+        });
+    }));
+    let _ = done_tx.send(outcome.is_err());
+}
+
 #[test]
 fn a_panicking_consumer_unwinds_out_of_the_pipeline_instead_of_hanging() {
     // Workers may be parked waiting for backlog room or for emission credits
@@ -805,32 +837,7 @@ fn a_panicking_consumer_unwinds_out_of_the_pipeline_instead_of_hanging() {
     // panic reaches the caller.
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let snap = snapshot(30);
-        let backend = Arc::new(SizedBackend {
-            slow_width: Some(100),
-            slow: Duration::from_millis(30),
-            fast: Duration::from_millis(1),
-            backlog: Arc::new(Backlog::default()),
-        });
-        let scheduler = RenderScheduler::new(
-            backend,
-            SchedulerOptions {
-                compile_workers: 2,
-                render_workers: 3,
-                compiled_queue_depth: 2,
-                reorder_window_depth: 8,
-                reorder_backlog_bytes: 1,
-                memory_limit_bytes: 1 << 30,
-            },
-        );
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            scheduler.render_range(&snap, 0..30, &sized_requester, None, &mut |o| {
-                if o.page.0 == 3 {
-                    panic!("consumer failed on page 3");
-                }
-            });
-        }));
-        let _ = done_tx.send(outcome.is_err());
+        render_with_a_consumer_that_panics_on_page_3(done_tx);
     });
     let panicked = done_rx
         .recv_timeout(Duration::from_secs(20))

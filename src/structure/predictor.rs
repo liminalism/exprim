@@ -464,6 +464,18 @@ mod tests {
         Ok(out)
     }
 
+    /// `len` pseudo-random bytes laid out as PNG-predicted rows of
+    /// `row_len` sample bytes, each row led by a tag byte.
+    fn random_png_rows(len: usize, row_len: usize, next: &mut impl FnMut() -> u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| {
+                let b = next();
+                // Tag bytes: mostly the five filters, some unknown.
+                if i % (row_len + 1) == 0 { b % 7 } else { b }
+            })
+            .collect()
+    }
+
     #[test]
     fn in_place_png_matches_the_out_of_place_reference() {
         let mut x: u32 = 0x9e37_79b9;
@@ -487,14 +499,7 @@ mod tests {
                 5 * (row_len + 1),
                 5 * (row_len + 1) + 3,
             ] {
-                let data: Vec<u8> = (0..len)
-                    .enumerate()
-                    .map(|(i, _)| {
-                        let b = next();
-                        // Tag bytes: mostly the five filters, some unknown.
-                        if i % (row_len + 1) == 0 { b % 7 } else { b }
-                    })
-                    .collect();
+                let data = random_png_rows(len, row_len, &mut next);
                 let expected = reference_png(&data, &parms).map_err(|e| format!("{e:?}"));
                 let got = apply_png(data, &parms).map_err(|e| format!("{e:?}"));
                 assert_eq!(

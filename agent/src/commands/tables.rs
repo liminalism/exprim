@@ -72,7 +72,7 @@ pub fn run(args: TablesArgs<'_>) -> Result<i32> {
         |index, page, outcome, mut warnings| {
             let step = || -> Result<ControlFlow<()>> {
                 warnings.splice(0..0, std::mem::take(&mut selection_warnings));
-                match outcome {
+                let data = match outcome {
                     PageOutcome::TimedOut => {
                         exit = 1;
                         crate::commands::timed_out(&document, index, pages.len(), mode, true)?;
@@ -87,45 +87,18 @@ pub fn run(args: TablesArgs<'_>) -> Result<i32> {
                         )
                         .with_warnings(std::mem::take(&mut warnings));
                         emit_failed(&env, mode, true)?;
-                        if args.fail_fast {
-                            return Ok(ControlFlow::Break(()));
-                        }
+                        None
                     }
-                    PageOutcome::Done(data) => {
-                        found += data.tables.len();
-                        match mode {
-                            OutputMode::Human => {
-                                for warning in &warnings {
-                                    eprintln!("warning: {warning}");
-                                }
-                                for (number, table) in data.tables.iter().enumerate() {
-                                    println!(
-                                        "{}\n",
-                                        table_text(
-                                            page.one_based(),
-                                            number + 1,
-                                            table,
-                                            args.format
-                                        )
-                                    );
-                                }
-                            }
-                            // A page without tables is only worth a record
-                            // when it has something to say.
-                            OutputMode::Json | OutputMode::Jsonl => {
-                                if !data.tables.is_empty() || !warnings.is_empty() {
-                                    Envelope::page_ok(
-                                        &document,
-                                        page.one_based(),
-                                        serde_json::to_value(&data)?,
-                                    )
-                                    .with_warnings(std::mem::take(&mut warnings))
-                                    .write_jsonl()?;
-                                }
-                            }
-                        }
-                    }
+                    PageOutcome::Done(data) => Some(data),
+                };
+                if data.is_none() && args.fail_fast {
+                    return Ok(ControlFlow::Break(()));
                 }
+                let Some(data) = data else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+                found += data.tables.len();
+                emit_page_tables(&document, page, &data, &mut warnings, mode, args.format)?;
                 Ok(ControlFlow::Continue(()))
             };
             match step() {
@@ -158,6 +131,41 @@ pub fn run(args: TablesArgs<'_>) -> Result<i32> {
         .write_jsonl()?,
     }
     Ok(exit)
+}
+
+/// Write one page's tables: as text (its warnings to stderr first) in human
+/// mode, else as a record, when the page has tables or warnings.
+fn emit_page_tables(
+    document: &str,
+    page: PageZero,
+    data: &TablesPageData,
+    warnings: &mut Vec<String>,
+    mode: OutputMode,
+    format: TableFormat,
+) -> Result<()> {
+    match mode {
+        OutputMode::Human => {
+            for warning in warnings.iter() {
+                eprintln!("warning: {warning}");
+            }
+            for (number, table) in data.tables.iter().enumerate() {
+                println!(
+                    "{}\n",
+                    table_text(page.one_based(), number + 1, table, format)
+                );
+            }
+        }
+        // A page without tables is only worth a record
+        // when it has something to say.
+        OutputMode::Json | OutputMode::Jsonl => {
+            if !data.tables.is_empty() || !warnings.is_empty() {
+                Envelope::page_ok(document, page.one_based(), serde_json::to_value(data)?)
+                    .with_warnings(std::mem::take(warnings))
+                    .write_jsonl()?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The tables of a page selection as one value, for the services, and
@@ -480,6 +488,16 @@ fn build_table(rows: &[Vec<Segment>], columns: &[(f64, f64)]) -> TableView {
     }
 }
 
+/// A cell as a CSV field: quoted, with quotes doubled, when it holds a
+/// comma, a quote or a line break.
+fn csv_cell(cell: &str) -> String {
+    if cell.contains([',', '"', '\n']) {
+        format!("\"{}\"", cell.replace('"', "\"\""))
+    } else {
+        cell.to_owned()
+    }
+}
+
 /// A table as text, under a line saying where it is.
 pub(crate) fn table_text(
     page: u32,
@@ -513,16 +531,7 @@ pub(crate) fn table_text(
                 }
             }
             TableFormat::Csv => {
-                let line: Vec<String> = row
-                    .iter()
-                    .map(|cell| {
-                        if cell.contains([',', '"', '\n']) {
-                            format!("\"{}\"", cell.replace('"', "\"\""))
-                        } else {
-                            cell.clone()
-                        }
-                    })
-                    .collect();
+                let line: Vec<String> = row.iter().map(|cell| csv_cell(cell)).collect();
                 out.push_str(&line.join(","));
             }
         }

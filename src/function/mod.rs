@@ -552,22 +552,30 @@ fn tokenize(bytes: &[u8]) -> Option<Vec<Sym>> {
             }
             _ => {
                 let start = i;
-                while i < bytes.len() {
-                    let c = bytes[i];
-                    if matches!(
-                        c,
-                        b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0x00 | b'{' | b'}' | b'%'
-                    ) {
-                        break;
-                    }
-                    i += 1;
-                }
+                i = word_end(bytes, start);
                 let word = std::str::from_utf8(&bytes[start..i]).ok()?;
                 out.push(classify(word)?);
             }
         }
     }
     Some(out)
+}
+
+/// The end of the PostScript word starting at `start`: the first
+/// whitespace, brace or `%` byte, or the end of input.
+fn word_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if matches!(
+            c,
+            b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0x00 | b'{' | b'}' | b'%'
+        ) {
+            break;
+        }
+        i += 1;
+    }
+    i
 }
 
 fn classify(word: &str) -> Option<Sym> {
@@ -853,21 +861,7 @@ fn exec_op<'a>(op: Op, s: &mut Vec<Item<'a>>, budget: &mut usize) -> Result<(), 
         Op::Bitshift => {
             let shift = pop_i(s)?;
             let v = pop_i(s)?;
-            let r = if shift >= 0 {
-                if shift >= 64 {
-                    0
-                } else {
-                    v.wrapping_shl(shift as u32)
-                }
-            } else {
-                let s = -shift;
-                if s >= 64 {
-                    if v < 0 { -1 } else { 0 }
-                } else {
-                    v >> s
-                }
-            };
-            s.push(Item::V(PsValue::Int(r)));
+            s.push(Item::V(PsValue::Int(ps_bitshift(v, shift))));
         }
         // --- Relational ---
         Op::Eq => {
@@ -974,6 +968,23 @@ fn exec_op<'a>(op: Op, s: &mut Vec<Item<'a>>, budget: &mut usize) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// PostScript `bitshift`: shift `v` left by a positive `shift`, right
+/// (arithmetically) by a negative one; shifts of 64 or more bits saturate.
+#[inline]
+fn ps_bitshift(v: i64, shift: i64) -> i64 {
+    if shift >= 0 {
+        if shift >= 64 {
+            return 0;
+        }
+        return v.wrapping_shl(shift as u32);
+    }
+    let s = -shift;
+    if s >= 64 {
+        return if v < 0 { -1 } else { 0 };
+    }
+    v >> s
 }
 
 /// Type-preserving binary op: integer path when both operands are integers,

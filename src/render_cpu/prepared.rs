@@ -2084,15 +2084,17 @@ fn decode_unique_payload(
         // footprint); real per-draw reduced decodes carry a distinct key.
         target: None,
     };
-    if seen.insert(key) {
-        if let Some(decoded) = decode_codec_samples(
-            out, kind, data, width, height, bpc, is_mask, want_alpha, true, parms, None, None,
-        ) {
-            out.profile
-                .borrow_mut()
-                .release_bytes(decoded.samples.len() as u64);
-        }
+    if !seen.insert(key) {
+        return;
     }
+    let Some(decoded) = decode_codec_samples(
+        out, kind, data, width, height, bpc, is_mask, want_alpha, true, parms, None, None,
+    ) else {
+        return;
+    };
+    out.profile
+        .borrow_mut()
+        .release_bytes(decoded.samples.len() as u64);
 }
 
 /// Where lowering hands finished ops when it runs in chunks.
@@ -2348,29 +2350,10 @@ fn lower_impl(
     let mut prof_bucket = LowerBucket::State;
     #[cfg(feature = "profiling")]
     out.lower_prof.lap(LowerBucket::State);
-    let mut ctm = base;
-    let mut ctm_stack: Vec<Matrix> = Vec::new();
-    // The clip stack holds active clip ids; `Save`/`Restore` move the CTM,
-    // while `PushClip`/`PopClip` move the clip stack (they are emitted
-    // balanced by IR lowering).
-    let mut clip_stack: Vec<u32> = Vec::new();
-    // Path clips lowered so far, by content, so identical ones share a mask.
-    let mut clip_share = ClipShare::default();
-    // Open groups / soft-mask-content scopes, accumulating device bounds.
-    let mut scope_stack: Vec<ScopeBuilder> = Vec::new();
-    // Active soft masks, and the count captured at each Save so `Restore` can
-    // pop the masks activated within that graphics-state scope (the IR leaves
-    // the pop implicit, like a graphics-state revert).
-    let mut soft_count: u32 = 0;
-    let mut soft_scope: Vec<u32> = Vec::new();
-    let mut soft_mask_content_depth = 0_u32;
-    // Soft-mask depth at each open group's `BeginGroup`, so `EndGroup` can
-    // unwind the §11.6.6 reset from inside the group.
-    let mut soft_at_group_entry: Vec<u32> = Vec::new();
     // Parsed embedded font programs, one parse per font (not per run). A
     // worker rendering the exact same compiled page again hands this map back
     // intact; a different page starts with the original empty local cache.
-    let (mut font_programs, font_page_cache_hit) = match font_cache.as_deref_mut() {
+    let (font_programs, font_page_cache_hit) = match font_cache.as_deref_mut() {
         Some(cache) => cache.take_for_page(page),
         None => (HashMap::new(), false),
     };
@@ -2386,21 +2369,34 @@ fn lower_impl(
     #[cfg(not(feature = "profiling"))]
     let _ = font_page_cache_hit;
 
-    // Phase B glyph-coverage-cache scratch: a rasterizer reused for cache-miss
-    // glyph bitmaps, and a per-font content-identity memo (one 128-bit hash per
-    // font per page, not per run).
-    let mut glyph_raster = crate::render_cpu::raster::RasterKernel::default();
+    let mut lowering = Lowering {
+        page,
+        base,
+        size,
+        shared_fonts,
+        shared_glyphs,
+        split_glyph_draws,
+        ctm: base,
+        ctm_stack: Vec::new(),
+        clip_stack: Vec::new(),
+        clip_share: ClipShare::default(),
+        scope_stack: Vec::new(),
+        soft_count: 0,
+        soft_scope: Vec::new(),
+        soft_mask_content_depth: 0,
+        soft_at_group_entry: Vec::new(),
+        font_programs,
+        // Phase B glyph-coverage-cache scratch: a rasterizer reused for
+        // cache-miss glyph bitmaps, and a per-font content-identity memo (one
+        // 128-bit hash per font per page, not per run).
+        glyph_raster: crate::render_cpu::raster::RasterKernel::default(),
+        glyph_font_ids: HashMap::new(),
+        origin_stack: Vec::new(),
+    };
     #[cfg(feature = "profiling")]
     {
-        glyph_raster.prof.class = crate::render_cpu::raster::RasterClass::Glyph;
+        lowering.glyph_raster.prof.class = crate::render_cpu::raster::RasterClass::Glyph;
     }
-    let mut glyph_font_ids: HashMap<u32, FontProgramKey> = HashMap::new();
-
-    // Diagnostic attribution (see `crate::render_cpu::attribution`): the stack of enclosing
-    // constructs. Painting never reads it; after each operation any ops it
-    // appended are stamped with the innermost origin, which is cheaper and far
-    // less invasive than threading a parameter through every `lower_*`.
-    let mut origin_stack: Vec<crate::page_ir::PaintOrigin> = Vec::new();
 
     // Chunked lowering (see [`LowerSink`]): arena bytes that survive a flush
     // (clip geometry), decoded image bytes among the pending ops, and what
@@ -2425,7 +2421,7 @@ fn lower_impl(
         // bounds and extents are patched into ops already emitted), a backlog
         // past the chunk size is painted and dropped.
         if let Some(sink) = sink.as_deref_mut()
-            && scope_stack.is_empty()
+            && lowering.scope_stack.is_empty()
             && !out.ops.is_empty()
             && (arena_len_bytes(&out).saturating_sub(retained_arena) > sink.chunk_bytes
                 || pending_image_bytes > sink.image_chunk_bytes)
@@ -2441,7 +2437,7 @@ fn lower_impl(
                         as u64,
                 );
             }
-            if !(sink.flush)(&out, &clip_stack) {
+            if !(sink.flush)(&out, &lowering.clip_stack) {
                 stopped_early = true;
                 break;
             }
@@ -2484,660 +2480,32 @@ fn lower_impl(
             };
         }
         let ops_before = out.ops.len();
-        match op {
-            DisplayOp::BeginPaintOrigin(o) => origin_stack.push(*o),
-            DisplayOp::EndPaintOrigin => {
-                origin_stack.pop();
-            }
-            DisplayOp::Save => {
-                ctm_stack.push(ctm);
-                soft_scope.push(soft_count);
-            }
-            DisplayOp::Restore => {
-                if let Some(m) = ctm_stack.pop() {
-                    ctm = m;
-                }
-                let target = soft_scope.pop().unwrap_or(0);
-                while soft_count > target {
-                    out.ops.push(PreparedOp::PopSoftMask);
-                    soft_count -= 1;
-                }
-            }
-            DisplayOp::ConcatTransform(m) => ctm = m.then(ctm),
-            DisplayOp::PushClip { path, rule } => {
-                push_clip(
-                    &mut out,
-                    &mut clip_stack,
-                    &mut clip_share,
-                    &page.paths[path.index()],
-                    ctm,
-                    *rule,
-                );
-            }
-            DisplayOp::PushClipText { runs } => {
-                push_text_clip(
-                    &mut out,
-                    &mut clip_stack,
-                    &mut clip_share,
-                    runs,
-                    page,
-                    ctm,
-                    &mut font_programs,
-                    shared_fonts,
-                );
-            }
-            DisplayOp::PopClip => {
-                clip_stack.pop();
-            }
-            DisplayOp::FillPath {
-                path,
-                paint,
-                rule,
-                alpha,
-                blend,
-            } => {
-                let paint_policy = if soft_mask_content_depth == 0 {
-                    out.color_policy
-                } else {
-                    crate::render_api::RenderColorPolicy::Original
-                };
-                let clip = clip_stack.last().copied();
-                let b = match &page.paints[paint.index()] {
-                    // Solid paint under any blend mode (Normal fast path,
-                    // separable and non-separable via the general compositor).
-                    Paint::Solid(color) => lower_fill(
-                        &mut out,
-                        &page.paths[path.index()],
-                        ctm,
-                        *rule,
-                        recolor(*color, paint_policy),
-                        *alpha,
-                        clip,
-                        *blend,
-                        soft_count > 0,
-                        None,
-                        None,
-                    ),
-                    // Shading pattern: fill the path shape, coloring per pixel
-                    // from the shading ramp. Shading space maps to device via
-                    // the pattern `/Matrix` composed onto the base transform.
-                    Paint::Shading { shading, matrix } => {
-                        match prepare_shading(
-                            &page.shadings[shading.index()],
-                            matrix.then(base),
-                            size,
-                            true,
-                            paint_policy,
-                        ) {
-                            Some(sh) => lower_fill(
-                                &mut out,
-                                &page.paths[path.index()],
-                                ctm,
-                                *rule,
-                                crate::page_ir::Color::BLACK,
-                                *alpha,
-                                clip,
-                                *blend,
-                                soft_count > 0,
-                                Some(Box::new(sh)),
-                                None,
-                            ),
-                            None => None,
-                        }
-                    }
-                    // Tiling pattern: replicate the compiled cell across the
-                    // fill shape.
-                    Paint::Pattern { tiling, matrix } => lower_tiled(
-                        &mut out,
-                        &page.paths[path.index()],
-                        ctm,
-                        *rule,
-                        &page.tilings[tiling.index()],
-                        matrix.then(base),
-                        *alpha,
-                        clip,
-                        *blend,
-                        paint_policy,
-                        None,
-                    ),
-                };
-                accumulate_scope_bounds(&mut scope_stack, b);
-            }
-            DisplayOp::StrokePath {
-                path,
-                paint,
-                style,
-                alpha,
-                blend,
-            } => {
-                let paint_policy = if soft_mask_content_depth == 0 {
-                    out.color_policy
-                } else {
-                    crate::render_api::RenderColorPolicy::Original
-                };
-                // A stroke may carry a pattern the same way a fill does. The
-                // stroke outline is lowered as an ordinary path, so a shading
-                // rides along on the draw command and colours it per pixel —
-                // identical to the fill case above. pdfjs/issue968 draws its
-                // 96 petals as `/Pattern CS /p1 SCN … S`, and dropping
-                // non-solid stroke paint left the page as eight bare centres.
-                // A tiling stroke feeds the same expanded outline through the
-                // ordinary tiling fill machinery as its fill shape.
-                let (color, stroke_shading) = match &page.paints[paint.index()] {
-                    Paint::Solid(color) => (recolor(*color, paint_policy), None),
-                    Paint::Shading { shading, matrix } => {
-                        match prepare_shading(
-                            &page.shadings[shading.index()],
-                            matrix.then(base),
-                            size,
-                            true,
-                            paint_policy,
-                        ) {
-                            Some(sh) => (crate::page_ir::Color::BLACK, Some(Box::new(sh))),
-                            None => continue,
-                        }
-                    }
-                    Paint::Pattern { tiling, matrix } => {
-                        let b = lower_tiled_stroke(
-                            &mut out,
-                            &page.paths[path.index()],
-                            ctm,
-                            &page.stroke_styles[style.index()],
-                            &page.tilings[tiling.index()],
-                            matrix.then(base),
-                            *alpha,
-                            clip_stack.last().copied(),
-                            *blend,
-                            paint_policy,
-                        );
-                        accumulate_scope_bounds(&mut scope_stack, b);
-                        continue;
-                    }
-                };
-                let clip = clip_stack.last().copied();
-                let b = lower_stroke(
-                    &mut out,
-                    &page.paths[path.index()],
-                    ctm,
-                    &page.stroke_styles[style.index()],
-                    color,
-                    *alpha,
-                    clip,
-                    *blend,
-                    stroke_shading,
-                );
-                accumulate_scope_bounds(&mut scope_stack, b);
-            }
-            DisplayOp::DrawGlyphRun {
-                run,
-                paint,
-                alpha,
-                blend,
-                stroke,
-            } => {
-                let paint_policy = if soft_mask_content_depth == 0 {
-                    out.color_policy
-                } else {
-                    crate::render_api::RenderColorPolicy::Original
-                };
-                // Solid text fills paint `color`; a shading-pattern text fill
-                // renders the glyph coverage and colors it per pixel from the
-                // shading (attached after lowering). A tiling-pattern fill
-                // reuses the same glyph outlines as the fill mask for the
-                // ordinary path tiler.
-                let (color, run_shading, run_tiling) = match &page.paints[paint.index()] {
-                    Paint::Solid(color) => (recolor(*color, paint_policy), None, None),
-                    Paint::Shading { shading, matrix } => {
-                        match prepare_shading(
-                            &page.shadings[shading.index()],
-                            matrix.then(base),
-                            size,
-                            true,
-                            paint_policy,
-                        ) {
-                            Some(sh) => (crate::page_ir::Color::BLACK, Some(Box::new(sh)), None),
-                            None => continue,
-                        }
-                    }
-                    Paint::Pattern { tiling, matrix } => (
-                        crate::page_ir::Color::BLACK,
-                        None,
-                        Some((*tiling, matrix.then(base))),
-                    ),
-                };
-                let color = &color;
-                let glyph_op_start = out.ops.len();
-                let gr = &page.glyph_runs[run.index()];
-                // Text render modes (§9.3.1): fill for 0/2/4/6, stroke for
-                // 1/2/5/6, nothing painted for 3 (invisible) and 7 (clip-only).
-                let mode = gr.render_mode;
-                let do_fill = matches!(mode, 0 | 2 | 4 | 6);
-                let do_stroke = matches!(mode, 1 | 2 | 5 | 6) && stroke.is_some();
-                if !do_fill && !do_stroke {
-                    continue;
-                }
-                // Parse (once) the embedded outline program, if any.
-                #[cfg(feature = "profiling")]
-                let font_parse_start = std::time::Instant::now();
-                #[cfg(feature = "profiling")]
-                let font_was_cached = font_programs.contains_key(&gr.font.0);
-                let program = resolve_font_program(&mut font_programs, page, gr.font, shared_fonts);
-                #[cfg(feature = "profiling")]
-                {
-                    let mut profile = out.profile.borrow_mut();
-                    if font_was_cached {
-                        profile.increment("lower.font.program_cache_hits", 1);
-                    } else {
-                        profile.add_duration("lower.font.parse", font_parse_start.elapsed());
-                        profile.increment("lower.font.parses", 1);
-                    }
-                }
-                let clip = clip_stack.last().copied();
-                let synth = GlyphSynthesis::for_font(&page.fonts[gr.font.index()]);
-                let mut bounds: Option<DeviceRect> = None;
-                if do_fill {
-                    let b = if let Some((tiling, pattern_to_device)) = run_tiling {
-                        lower_tiled_glyph_run(
-                            &mut out,
-                            gr,
-                            program.as_ref(),
-                            ctm,
-                            synth,
-                            &page.tilings[tiling.index()],
-                            pattern_to_device,
-                            *alpha,
-                            clip,
-                            *blend,
-                            paint_policy,
-                        )
-                    } else {
-                        match &program {
-                            Some(prog) => {
-                                // Cached path: pure-fill (render mode 0) runs whose glyphs
-                                // are small and axis-aligned blit from the shared glyph
-                                // coverage cache. `None` means the run is ineligible
-                                // (rotated/skewed, oversized, or the cache is off), so it
-                                // falls back to the exact outline fill.
-                                // Synthetic bold/italic bypasses the shared glyph
-                                // cache (its key is font+gid+transform; adding the
-                                // synthesis axes buys nothing for the rare symbolic
-                                // substitutes that need it) and the hinter.
-                                let cached = match shared_glyphs {
-                                    Some(gc) if gr.render_mode == 0 && !synth.is_active() => {
-                                        let font_id =
-                                            *glyph_font_ids.entry(gr.font.0).or_insert_with(|| {
-                                                FontProgramKey::for_resource(
-                                                    &page.fonts[gr.font.index()],
-                                                )
-                                            });
-                                        try_cached_glyph_run(
-                                            &mut out,
-                                            gr,
-                                            prog,
-                                            ctm,
-                                            *color,
-                                            *alpha,
-                                            clip,
-                                            *blend,
-                                            gc,
-                                            font_id,
-                                            &mut glyph_raster,
-                                        )
-                                    }
-                                    _ => None,
-                                };
-                                match cached {
-                                    Some(b) => b,
-                                    None if split_glyph_draws => lower_glyph_outlines_split(
-                                        &mut out, gr, prog, ctm, *color, *alpha, clip, *blend,
-                                        synth,
-                                    ),
-                                    None => lower_glyph_outlines(
-                                        &mut out, gr, prog, ctm, *color, *alpha, clip, *blend,
-                                        synth,
-                                    ),
-                                }
-                            }
-                            None if split_glyph_draws => lower_glyph_boxes_split(
-                                &mut out, gr, ctm, *color, *alpha, clip, *blend,
-                            ),
-                            None => {
-                                lower_glyph_boxes(&mut out, gr, ctm, *color, *alpha, clip, *blend)
-                            }
-                        }
-                    };
-                    // Attach the shading to the fill glyph-run op(s) just emitted
-                    // (the three lowerings share one emitter with no shading param).
-                    if let Some(sh) = &run_shading {
-                        for op in &mut out.ops[glyph_op_start..] {
-                            if let PreparedOp::GlyphRun(g) = op {
-                                g.shading = Some(sh.clone());
-                            }
-                        }
-                    }
-                    bounds = union_rect(bounds, b);
-                }
-                // Stroke the glyph outlines (Tr 1/2/5/6). Only outline fonts can
-                // be stroked; a box-substitute run (no program) is fill-only.
-                if do_stroke && let (Some(prog), Some(gs)) = (&program, stroke) {
-                    let (stroke_color, stroke_shading) = match &page.paints[gs.paint.index()] {
-                        Paint::Solid(c) => (recolor(*c, paint_policy), None),
-                        Paint::Shading { shading, matrix } => {
-                            match prepare_shading(
-                                &page.shadings[shading.index()],
-                                matrix.then(base),
-                                size,
-                                true,
-                                paint_policy,
-                            ) {
-                                Some(sh) => (crate::page_ir::Color::BLACK, Some(Box::new(sh))),
-                                None => (crate::page_ir::Color::BLACK, None),
-                            }
-                        }
-                        _ => (crate::page_ir::Color::BLACK, None),
-                    };
-                    let b = lower_glyph_stroke(
-                        &mut out,
-                        gr,
-                        prog,
-                        ctm,
-                        &page.stroke_styles[gs.style.index()],
-                        stroke_color,
-                        gs.alpha,
-                        clip,
-                        *blend,
-                        synth,
-                        stroke_shading,
-                    );
-                    bounds = union_rect(bounds, b);
-                }
-                accumulate_scope_bounds(&mut scope_stack, bounds);
-            }
-            DisplayOp::BeginTransparencyGroup { group } => {
-                let g = &page.groups[group.index()];
-                let begin_index = out.ops.len();
-                out.ops.push(PreparedOp::BeginGroup {
-                    group: PreparedGroup {
-                        bounds: DeviceRect {
-                            x: 0,
-                            y: 0,
-                            width: 0,
-                            height: 0,
-                        },
-                        opacity: to_u8(g.opacity),
-                        blend: g.blend,
-                        isolated: g.isolated,
-                        knockout: g.knockout,
-                    },
-                    end: 0,
-                });
-                // §11.6.6: the content of a transparency group starts with the
-                // soft mask reset to None. The mask in force at the invocation
-                // applies to the *group's* composite instead (see
-                // `composite_group`), so leaving it active here would apply it
-                // twice. The interpreter already resets alpha and blend for the
-                // same reason; this is the third member of that set.
-                //
-                // Many producers also write `/SMask /None` as the group's first
-                // `gs` — `0041790.pdf` does — which made the omission invisible
-                // until a file relied on the reset being implicit.
-                soft_at_group_entry.push(soft_count);
-                out.ops.push(PreparedOp::PushSoftMaskNone);
-                soft_count += 1;
-                scope_stack.push(ScopeBuilder {
-                    begin_index,
-                    bounds: None,
-                });
-            }
-            DisplayOp::EndTransparencyGroup => {
-                if let Some(gb) = scope_stack.pop() {
-                    // Drop the §11.6.6 reset (plus anything the content pushed
-                    // and did not pop) while still *inside* the group, so the
-                    // executor sees a balanced stack and the mask that was
-                    // active at `BeginGroup` is back on top for the composite.
-                    let target = soft_at_group_entry.pop().unwrap_or(soft_count);
-                    while soft_count > target {
-                        out.ops.push(PreparedOp::PopSoftMask);
-                        soft_count -= 1;
-                    }
-                    let end_index = out.ops.len() as u32;
-                    out.ops.push(PreparedOp::EndGroup);
-                    let bounds = intersect(
-                        gb.bounds.unwrap_or(DeviceRect {
-                            x: 0,
-                            y: 0,
-                            width: 0,
-                            height: 0,
-                        }),
-                        row_window(&out),
-                    );
-                    if let PreparedOp::BeginGroup { group, end } = &mut out.ops[gb.begin_index] {
-                        group.bounds = bounds;
-                        *end = end_index;
-                    }
-                    // A nested group contributes its bounds to its parent.
-                    accumulate_scope_bounds(&mut scope_stack, Some(bounds));
-                }
-            }
-            DisplayOp::BeginSoftMask { kind, transfer } => {
-                soft_mask_content_depth += 1;
-                let begin_index = out.ops.len();
-                out.ops.push(PreparedOp::PushSoftMask {
-                    kind: *kind,
-                    transfer: transfer.clone(),
-                    content_end: 0,
-                    bounds: DeviceRect {
-                        x: 0,
-                        y: 0,
-                        width: 0,
-                        height: 0,
-                    },
-                });
-                scope_stack.push(ScopeBuilder {
-                    begin_index,
-                    bounds: None,
-                });
-            }
-            DisplayOp::EndSoftMask => {
-                soft_mask_content_depth = soft_mask_content_depth.saturating_sub(1);
-                if let Some(sb) = scope_stack.pop() {
-                    let content_end = out.ops.len() as u32;
-                    let bounds = intersect(
-                        sb.bounds.unwrap_or(DeviceRect {
-                            x: 0,
-                            y: 0,
-                            width: 0,
-                            height: 0,
-                        }),
-                        row_window(&out),
-                    );
-                    if let PreparedOp::PushSoftMask {
-                        content_end: ce,
-                        bounds: b,
-                        ..
-                    } = &mut out.ops[sb.begin_index]
-                    {
-                        *ce = content_end;
-                        *b = bounds;
-                    }
-                    // The mask is now active for subsequent painting in scope.
-                    soft_count += 1;
-                }
-            }
-            DisplayOp::ClearSoftMask => {
-                out.ops.push(PreparedOp::PushSoftMaskNone);
-                soft_count += 1;
-            }
-            DisplayOp::DrawShading { shading, .. } => {
-                // `sh` paints the shading across the current clip in current
-                // user space; shading space maps to device via the CTM.
-                let clip = clip_stack.last().copied();
-                let policy = if soft_mask_content_depth == 0 {
-                    out.color_policy
-                } else {
-                    crate::render_api::RenderColorPolicy::Original
-                };
-                let b =
-                    lower_shading_op(&mut out, &page.shadings[shading.index()], ctm, clip, policy);
-                accumulate_scope_bounds(&mut scope_stack, b);
-            }
-            DisplayOp::DrawImage {
-                image,
-                paint,
-                alpha,
-                blend,
-                ..
-            } => {
-                let paint_policy = if soft_mask_content_depth == 0 {
-                    out.color_policy
-                } else {
-                    crate::render_api::RenderColorPolicy::Original
-                };
-                let ir = &page.images[image.index()];
-                let clip = clip_stack.last().copied();
-                // An /ImageMask stencil painted with a tiling pattern (§8.9.6.2:
-                // an image mask is painted with the current fill colour). Fill
-                // the image's unit square with the pattern, masked by the
-                // stencil's coverage — instead of the solid-colour fallback,
-                // which painted the whole stencil black.
-                if ir.is_stencil
-                    && let Paint::Pattern { tiling, matrix } = &page.paints[paint.index()]
-                {
-                    let (tiling, matrix) = (*tiling, *matrix);
-                    if let Some((stencil_img, _)) =
-                        lower_image(&mut out, ir, [255, 255, 255], ctm, *alpha, *blend, None)
-                    {
-                        let unit = unit_square_path();
-                        let b = lower_tiled(
-                            &mut out,
-                            &unit,
-                            ctm,
-                            crate::page_ir::FillRule::NonZero,
-                            &page.tilings[tiling.index()],
-                            matrix.then(base),
-                            *alpha,
-                            clip,
-                            *blend,
-                            paint_policy,
-                            Some(stencil_img),
-                        );
-                        accumulate_scope_bounds(&mut scope_stack, b);
-                    }
-                } else if ir.is_stencil
-                    && let Paint::Shading { shading, matrix } = &page.paints[paint.index()]
-                {
-                    let prepared_shading = prepare_shading(
-                        &page.shadings[shading.index()],
-                        matrix.then(base),
-                        size,
-                        true,
-                        paint_policy,
-                    );
-                    if let (Some(shading), Some((stencil, _))) = (
-                        prepared_shading,
-                        lower_image(
-                            &mut out,
-                            ir,
-                            [255, 255, 255],
-                            ctm,
-                            1.0,
-                            crate::page_ir::BlendMode::Normal,
-                            None,
-                        ),
-                    ) {
-                        let b = lower_fill(
-                            &mut out,
-                            &unit_square_path(),
-                            ctm,
-                            crate::page_ir::FillRule::NonZero,
-                            crate::page_ir::Color::BLACK,
-                            *alpha,
-                            clip,
-                            *blend,
-                            soft_count > 0,
-                            Some(Box::new(shading)),
-                            Some(stencil),
-                        );
-                        accumulate_scope_bounds(&mut scope_stack, b);
-                    }
-                } else {
-                    let stencil_rgb = match &page.paints[paint.index()] {
-                        Paint::Solid(c) => {
-                            let c = recolor(*c, paint_policy);
-                            [to_u8(c.r), to_u8(c.g), to_u8(c.b)]
-                        }
-                        _ => [0, 0, 0],
-                    };
-                    if let Some((img, b)) =
-                        lower_image(&mut out, ir, stencil_rgb, ctm, *alpha, *blend, clip)
-                    {
-                        out.ops.push(PreparedOp::Image(img));
-                        accumulate_scope_bounds(&mut scope_stack, Some(b));
-                    }
-                }
-            }
-            // The deprecated ApplySoftMask op is superseded by BeginSoftMask.
-            DisplayOp::ApplySoftMask { .. } => {}
+        if !lowering.lower_op(&mut out, op) {
+            continue;
         }
         if let Some(extents) = sink
             .as_deref_mut()
             .and_then(|sink| sink.extents.as_deref_mut())
             && !extents.complete
         {
-            // Ops whose bounds are clamped below, not where they were
-            // computed, still carry their full bounds here.
-            for index in ops_before.min(out.ops.len())..out.ops.len() {
-                let bounds = match &out.ops[index] {
-                    PreparedOp::Draw(cmd) => Some(cmd.bounds),
-                    PreparedOp::GlyphRun(gr) => Some(gr.bounds),
-                    PreparedOp::Image(img) => Some(img.bounds),
-                    PreparedOp::TiledFill(t) => Some(t.bounds),
-                    _ => None,
-                };
-                if let Some(bounds) = bounds {
-                    note_extent(&mut out, bounds);
-                }
-            }
-            if extents.rows.len() <= op_index {
-                extents.rows.resize(op_index + 1, (i32::MIN, i32::MAX));
-            }
-            extents.rows[op_index] = out.op_extent.unwrap_or((0, 0));
+            record_op_extent(&mut out, extents, ops_before, op_index);
         }
         if out.rows != (0, u32::MAX) && out.ops.len() > ops_before {
             // Ops whose bounds were not clamped where they were computed
             // (glyph runs, shading fills). A tiling fill keeps its bounds:
             // its cells are lowered relative to their origin.
             let window = row_window(&out);
-            for prepared in &mut out.ops[ops_before..] {
-                match prepared {
-                    PreparedOp::Draw(cmd) => cmd.bounds = intersect(cmd.bounds, window),
-                    PreparedOp::GlyphRun(gr) => gr.bounds = intersect(gr.bounds, window),
-                    PreparedOp::Image(img) => img.bounds = intersect(img.bounds, window),
-                    _ => {}
-                }
-            }
+            clamp_ops_to_window(&mut out.ops[ops_before..], window);
         }
         if sink.is_some() {
-            for prepared in &out.ops[ops_before.min(out.ops.len())..] {
-                if let PreparedOp::Image(img) = prepared {
-                    pending_image_bytes = pending_image_bytes
-                        .saturating_add(img.samples.len())
-                        .saturating_add(img.smask.as_ref().map_or(0, |m| m.samples.len()));
-                }
-            }
+            pending_image_bytes = pending_image_bytes.saturating_add(image_sample_bytes(
+                &out.ops[ops_before.min(out.ops.len())..],
+            ));
         }
-        if let Some(&origin) = origin_stack.last()
+        if let Some(&origin) = lowering.origin_stack.last()
             && out.ops.len() > ops_before
         {
-            for prepared in &mut out.ops[ops_before..] {
-                match prepared {
-                    PreparedOp::Draw(cmd) => cmd.origin = origin,
-                    PreparedOp::GlyphRun(gr) => gr.origin = origin,
-                    PreparedOp::TiledFill(t) => t.origin = origin,
-                    PreparedOp::Image(img) => img.origin = origin,
-                    _ => {}
-                }
-            }
+            stamp_origin(&mut out.ops[ops_before..], origin);
         }
     }
     #[cfg(feature = "profiling")]
@@ -3145,7 +2513,7 @@ fn lower_impl(
         out.lower_prof.lap(prof_bucket);
         let mut profile = out.profile.borrow_mut();
         out.lower_prof.flush_into(&mut profile);
-        glyph_raster.prof.drain_into(&mut profile);
+        lowering.glyph_raster.prof.drain_into(&mut profile);
         profile.add_duration("render.lower.total", lower_start.elapsed());
         profile.increment("render.lower.operations", page.operations.len() as u64);
         // Totals over every chunk; the arena figure is the largest held.
@@ -3181,9 +2549,801 @@ fn lower_impl(
         extents.complete = true;
     }
     if let Some(cache) = font_cache {
-        cache.store_for_page(page, font_programs);
+        cache.store_for_page(page, lowering.font_programs);
     }
     out
+}
+
+/// Record the row extent of the ops IR op `op_index` appended from
+/// `ops_before` on, for the strips after this one.
+fn record_op_extent(
+    out: &mut CpuPreparedPage,
+    extents: &mut OpExtents,
+    ops_before: usize,
+    op_index: usize,
+) {
+    // Ops whose bounds are clamped below, not where they were
+    // computed, still carry their full bounds here.
+    for index in ops_before.min(out.ops.len())..out.ops.len() {
+        let bounds = match &out.ops[index] {
+            PreparedOp::Draw(cmd) => Some(cmd.bounds),
+            PreparedOp::GlyphRun(gr) => Some(gr.bounds),
+            PreparedOp::Image(img) => Some(img.bounds),
+            PreparedOp::TiledFill(t) => Some(t.bounds),
+            _ => None,
+        };
+        if let Some(bounds) = bounds {
+            note_extent(out, bounds);
+        }
+    }
+    if extents.rows.len() <= op_index {
+        extents.rows.resize(op_index + 1, (i32::MIN, i32::MAX));
+    }
+    extents.rows[op_index] = out.op_extent.unwrap_or((0, 0));
+}
+
+/// Cut the bounds of draw, glyph-run and image ops to the row `window`.
+fn clamp_ops_to_window(ops: &mut [PreparedOp], window: DeviceRect) {
+    for prepared in ops {
+        match prepared {
+            PreparedOp::Draw(cmd) => cmd.bounds = intersect(cmd.bounds, window),
+            PreparedOp::GlyphRun(gr) => gr.bounds = intersect(gr.bounds, window),
+            PreparedOp::Image(img) => img.bounds = intersect(img.bounds, window),
+            _ => {}
+        }
+    }
+}
+
+/// Decoded sample bytes (image and soft mask) the image ops in `ops` hold.
+fn image_sample_bytes(ops: &[PreparedOp]) -> usize {
+    let mut bytes = 0usize;
+    for prepared in ops {
+        if let PreparedOp::Image(img) = prepared {
+            bytes = bytes
+                .saturating_add(img.samples.len())
+                .saturating_add(img.smask.as_ref().map_or(0, |m| m.samples.len()));
+        }
+    }
+    bytes
+}
+
+/// Stamp `origin` on every painting op in `ops` (diagnostic attribution).
+fn stamp_origin(ops: &mut [PreparedOp], origin: crate::page_ir::PaintOrigin) {
+    for prepared in ops {
+        match prepared {
+            PreparedOp::Draw(cmd) => cmd.origin = origin,
+            PreparedOp::GlyphRun(gr) => gr.origin = origin,
+            PreparedOp::TiledFill(t) => t.origin = origin,
+            PreparedOp::Image(img) => img.origin = origin,
+            _ => {}
+        }
+    }
+}
+
+/// One page's lowering in progress: what it reads from the compiled page and
+/// the graphics state it carries from one display op to the next.
+struct Lowering<'a> {
+    page: &'a CompiledPage,
+    base: Matrix,
+    size: DeviceSize,
+    shared_fonts: Option<&'a SharedFontProgramCache>,
+    shared_glyphs: Option<&'a SharedGlyphCache>,
+    split_glyph_draws: bool,
+    ctm: Matrix,
+    ctm_stack: Vec<Matrix>,
+    /// Active clip ids. `Save`/`Restore` move the CTM, while
+    /// `PushClip`/`PopClip` move the clip stack (they are emitted balanced by
+    /// IR lowering).
+    clip_stack: Vec<u32>,
+    /// Path clips lowered so far, by content, so identical ones share a mask.
+    clip_share: ClipShare,
+    /// Open groups / soft-mask-content scopes, accumulating device bounds.
+    scope_stack: Vec<ScopeBuilder>,
+    /// Active soft masks, and the count captured at each Save so `Restore`
+    /// can pop the masks activated within that graphics-state scope (the IR
+    /// leaves the pop implicit, like a graphics-state revert).
+    soft_count: u32,
+    soft_scope: Vec<u32>,
+    soft_mask_content_depth: u32,
+    /// Soft-mask depth at each open group's `BeginGroup`, so `EndGroup` can
+    /// unwind the §11.6.6 reset from inside the group.
+    soft_at_group_entry: Vec<u32>,
+    /// Parsed embedded font programs, one parse per font (not per run).
+    font_programs: HashMap<u32, Option<FontProgram>>,
+    /// Rasterizer reused for cache-miss glyph bitmaps.
+    glyph_raster: crate::render_cpu::raster::RasterKernel,
+    /// Per-font content identity for the glyph cache (one 128-bit hash per
+    /// font per page, not per run).
+    glyph_font_ids: HashMap<u32, FontProgramKey>,
+    /// Diagnostic attribution (see `crate::render_cpu::attribution`): the
+    /// stack of enclosing constructs. Painting never reads it; after each
+    /// operation any ops it appended are stamped with the innermost origin,
+    /// which is cheaper and far less invasive than threading a parameter
+    /// through every `lower_*`.
+    origin_stack: Vec<crate::page_ir::PaintOrigin>,
+}
+
+impl Lowering<'_> {
+    /// Lower one display op into `out`. `false` when the op is skipped
+    /// without the per-op bookkeeping (extents, row clamping, attribution)
+    /// that follows a lowered op.
+    fn lower_op(&mut self, out: &mut CpuPreparedPage, op: &DisplayOp) -> bool {
+        match op {
+            DisplayOp::BeginPaintOrigin(o) => self.origin_stack.push(*o),
+            DisplayOp::EndPaintOrigin => {
+                self.origin_stack.pop();
+            }
+            DisplayOp::Save => {
+                self.ctm_stack.push(self.ctm);
+                self.soft_scope.push(self.soft_count);
+            }
+            DisplayOp::Restore => self.restore(out),
+            DisplayOp::ConcatTransform(m) => self.ctm = m.then(self.ctm),
+            DisplayOp::PushClip { path, rule } => {
+                push_clip(
+                    out,
+                    &mut self.clip_stack,
+                    &mut self.clip_share,
+                    &self.page.paths[path.index()],
+                    self.ctm,
+                    *rule,
+                );
+            }
+            DisplayOp::PushClipText { runs } => {
+                push_text_clip(
+                    out,
+                    &mut self.clip_stack,
+                    &mut self.clip_share,
+                    runs,
+                    self.page,
+                    self.ctm,
+                    &mut self.font_programs,
+                    self.shared_fonts,
+                );
+            }
+            DisplayOp::PopClip => {
+                self.clip_stack.pop();
+            }
+            DisplayOp::FillPath {
+                path,
+                paint,
+                rule,
+                alpha,
+                blend,
+            } => self.fill_path(out, *path, *paint, *rule, *alpha, *blend),
+            DisplayOp::StrokePath {
+                path,
+                paint,
+                style,
+                alpha,
+                blend,
+            } => return self.stroke_path(out, *path, *paint, *style, *alpha, *blend),
+            DisplayOp::DrawGlyphRun {
+                run,
+                paint,
+                alpha,
+                blend,
+                stroke,
+            } => return self.glyph_run(out, *run, *paint, *alpha, *blend, *stroke),
+            DisplayOp::BeginTransparencyGroup { group } => self.begin_group(out, *group),
+            DisplayOp::EndTransparencyGroup => self.end_group(out),
+            DisplayOp::BeginSoftMask { kind, transfer } => {
+                self.soft_mask_content_depth += 1;
+                let begin_index = out.ops.len();
+                out.ops.push(PreparedOp::PushSoftMask {
+                    kind: *kind,
+                    transfer: transfer.clone(),
+                    content_end: 0,
+                    bounds: DeviceRect {
+                        x: 0,
+                        y: 0,
+                        width: 0,
+                        height: 0,
+                    },
+                });
+                self.scope_stack.push(ScopeBuilder {
+                    begin_index,
+                    bounds: None,
+                });
+            }
+            DisplayOp::EndSoftMask => self.end_soft_mask(out),
+            DisplayOp::ClearSoftMask => {
+                out.ops.push(PreparedOp::PushSoftMaskNone);
+                self.soft_count += 1;
+            }
+            DisplayOp::DrawShading { shading, .. } => {
+                // `sh` paints the shading across the current clip in current
+                // user space; shading space maps to device via the CTM.
+                let clip = self.clip_stack.last().copied();
+                let policy = self.paint_policy(out);
+                let b = lower_shading_op(
+                    out,
+                    &self.page.shadings[shading.index()],
+                    self.ctm,
+                    clip,
+                    policy,
+                );
+                accumulate_scope_bounds(&mut self.scope_stack, b);
+            }
+            DisplayOp::DrawImage {
+                image,
+                paint,
+                alpha,
+                blend,
+                ..
+            } => self.draw_image(out, *image, *paint, *alpha, *blend),
+            // The deprecated ApplySoftMask op is superseded by BeginSoftMask.
+            DisplayOp::ApplySoftMask { .. } => {}
+        }
+        true
+    }
+
+    /// The colour policy paint is lowered under: the page's, except inside
+    /// soft-mask content, which keeps its original colours.
+    fn paint_policy(&self, out: &CpuPreparedPage) -> crate::render_api::RenderColorPolicy {
+        if self.soft_mask_content_depth == 0 {
+            out.color_policy
+        } else {
+            crate::render_api::RenderColorPolicy::Original
+        }
+    }
+
+    /// A shading paint prepared for device space: shading space maps to
+    /// device via the pattern `/Matrix` composed onto the base transform.
+    fn paint_shading(
+        &self,
+        shading: crate::page_ir::ShadingId,
+        matrix: Matrix,
+        policy: crate::render_api::RenderColorPolicy,
+    ) -> Option<PreparedShading> {
+        prepare_shading(
+            &self.page.shadings[shading.index()],
+            matrix.then(self.base),
+            self.size,
+            true,
+            policy,
+        )
+    }
+
+    /// `Restore`: revert the CTM and pop the soft masks activated within the
+    /// graphics-state scope.
+    fn restore(&mut self, out: &mut CpuPreparedPage) {
+        if let Some(m) = self.ctm_stack.pop() {
+            self.ctm = m;
+        }
+        let target = self.soft_scope.pop().unwrap_or(0);
+        while self.soft_count > target {
+            out.ops.push(PreparedOp::PopSoftMask);
+            self.soft_count -= 1;
+        }
+    }
+
+    /// `FillPath` with a solid, shading or tiling-pattern paint.
+    fn fill_path(
+        &mut self,
+        out: &mut CpuPreparedPage,
+        path: crate::page_ir::PathId,
+        paint: crate::page_ir::PaintId,
+        rule: crate::page_ir::FillRule,
+        alpha: f32,
+        blend: crate::page_ir::BlendMode,
+    ) {
+        let page = self.page;
+        let paint_policy = self.paint_policy(out);
+        let clip = self.clip_stack.last().copied();
+        let b = match &page.paints[paint.index()] {
+            // Solid paint under any blend mode (Normal fast path,
+            // separable and non-separable via the general compositor).
+            Paint::Solid(color) => lower_fill(
+                out,
+                &page.paths[path.index()],
+                self.ctm,
+                rule,
+                recolor(*color, paint_policy),
+                alpha,
+                clip,
+                blend,
+                self.soft_count > 0,
+                None,
+                None,
+            ),
+            // Shading pattern: fill the path shape, coloring per pixel
+            // from the shading ramp. Shading space maps to device via
+            // the pattern `/Matrix` composed onto the base transform.
+            Paint::Shading { shading, matrix } => {
+                match self.paint_shading(*shading, *matrix, paint_policy) {
+                    Some(sh) => lower_fill(
+                        out,
+                        &page.paths[path.index()],
+                        self.ctm,
+                        rule,
+                        crate::page_ir::Color::BLACK,
+                        alpha,
+                        clip,
+                        blend,
+                        self.soft_count > 0,
+                        Some(Box::new(sh)),
+                        None,
+                    ),
+                    None => None,
+                }
+            }
+            // Tiling pattern: replicate the compiled cell across the
+            // fill shape.
+            Paint::Pattern { tiling, matrix } => lower_tiled(
+                out,
+                &page.paths[path.index()],
+                self.ctm,
+                rule,
+                &page.tilings[tiling.index()],
+                matrix.then(self.base),
+                alpha,
+                clip,
+                blend,
+                paint_policy,
+                None,
+            ),
+        };
+        accumulate_scope_bounds(&mut self.scope_stack, b);
+    }
+
+    /// `StrokePath`. `false` when the op skips the per-op bookkeeping: an
+    /// unpreparable shading paint, or a tiling-pattern stroke.
+    fn stroke_path(
+        &mut self,
+        out: &mut CpuPreparedPage,
+        path: crate::page_ir::PathId,
+        paint: crate::page_ir::PaintId,
+        style: crate::page_ir::StrokeStyleId,
+        alpha: f32,
+        blend: crate::page_ir::BlendMode,
+    ) -> bool {
+        let page = self.page;
+        let paint_policy = self.paint_policy(out);
+        // A stroke may carry a pattern the same way a fill does. The
+        // stroke outline is lowered as an ordinary path, so a shading
+        // rides along on the draw command and colours it per pixel —
+        // identical to the fill case above. pdfjs/issue968 draws its
+        // 96 petals as `/Pattern CS /p1 SCN … S`, and dropping
+        // non-solid stroke paint left the page as eight bare centres.
+        // A tiling stroke feeds the same expanded outline through the
+        // ordinary tiling fill machinery as its fill shape.
+        let (color, stroke_shading) = match &page.paints[paint.index()] {
+            Paint::Solid(color) => (recolor(*color, paint_policy), None),
+            Paint::Shading { shading, matrix } => {
+                let Some(sh) = self.paint_shading(*shading, *matrix, paint_policy) else {
+                    return false;
+                };
+                (crate::page_ir::Color::BLACK, Some(Box::new(sh)))
+            }
+            Paint::Pattern { tiling, matrix } => {
+                let b = lower_tiled_stroke(
+                    out,
+                    &page.paths[path.index()],
+                    self.ctm,
+                    &page.stroke_styles[style.index()],
+                    &page.tilings[tiling.index()],
+                    matrix.then(self.base),
+                    alpha,
+                    self.clip_stack.last().copied(),
+                    blend,
+                    paint_policy,
+                );
+                accumulate_scope_bounds(&mut self.scope_stack, b);
+                return false;
+            }
+        };
+        let clip = self.clip_stack.last().copied();
+        let b = lower_stroke(
+            out,
+            &page.paths[path.index()],
+            self.ctm,
+            &page.stroke_styles[style.index()],
+            color,
+            alpha,
+            clip,
+            blend,
+            stroke_shading,
+        );
+        accumulate_scope_bounds(&mut self.scope_stack, b);
+        true
+    }
+
+    /// `DrawGlyphRun`: fill and/or stroke per the text render mode. `false`
+    /// when nothing is painted (an unpreparable shading paint, or an
+    /// invisible / clip-only render mode).
+    fn glyph_run(
+        &mut self,
+        out: &mut CpuPreparedPage,
+        run: crate::page_ir::GlyphRunId,
+        paint: crate::page_ir::PaintId,
+        alpha: f32,
+        blend: crate::page_ir::BlendMode,
+        stroke: Option<crate::page_ir::GlyphStroke>,
+    ) -> bool {
+        let page = self.page;
+        let paint_policy = self.paint_policy(out);
+        // Solid text fills paint `color`; a shading-pattern text fill
+        // renders the glyph coverage and colors it per pixel from the
+        // shading (attached after lowering). A tiling-pattern fill
+        // reuses the same glyph outlines as the fill mask for the
+        // ordinary path tiler.
+        let (color, run_shading, run_tiling) = match &page.paints[paint.index()] {
+            Paint::Solid(color) => (recolor(*color, paint_policy), None, None),
+            Paint::Shading { shading, matrix } => {
+                let Some(sh) = self.paint_shading(*shading, *matrix, paint_policy) else {
+                    return false;
+                };
+                (crate::page_ir::Color::BLACK, Some(Box::new(sh)), None)
+            }
+            Paint::Pattern { tiling, matrix } => (
+                crate::page_ir::Color::BLACK,
+                None,
+                Some((*tiling, matrix.then(self.base))),
+            ),
+        };
+        let glyph_op_start = out.ops.len();
+        let gr = &page.glyph_runs[run.index()];
+        // Text render modes (§9.3.1): fill for 0/2/4/6, stroke for
+        // 1/2/5/6, nothing painted for 3 (invisible) and 7 (clip-only).
+        let mode = gr.render_mode;
+        let do_fill = matches!(mode, 0 | 2 | 4 | 6);
+        let do_stroke = matches!(mode, 1 | 2 | 5 | 6) && stroke.is_some();
+        if !do_fill && !do_stroke {
+            return false;
+        }
+        // Parse (once) the embedded outline program, if any.
+        #[cfg(feature = "profiling")]
+        let font_parse_start = std::time::Instant::now();
+        #[cfg(feature = "profiling")]
+        let font_was_cached = self.font_programs.contains_key(&gr.font.0);
+        let program =
+            resolve_font_program(&mut self.font_programs, page, gr.font, self.shared_fonts);
+        #[cfg(feature = "profiling")]
+        {
+            let mut profile = out.profile.borrow_mut();
+            if font_was_cached {
+                profile.increment("lower.font.program_cache_hits", 1);
+            } else {
+                profile.add_duration("lower.font.parse", font_parse_start.elapsed());
+                profile.increment("lower.font.parses", 1);
+            }
+        }
+        let clip = self.clip_stack.last().copied();
+        let synth = GlyphSynthesis::for_font(&page.fonts[gr.font.index()]);
+        let mut bounds: Option<DeviceRect> = None;
+        if do_fill {
+            let b = match (run_tiling, &program) {
+                (Some((tiling, pattern_to_device)), _) => lower_tiled_glyph_run(
+                    out,
+                    gr,
+                    program.as_ref(),
+                    self.ctm,
+                    synth,
+                    &page.tilings[tiling.index()],
+                    pattern_to_device,
+                    alpha,
+                    clip,
+                    blend,
+                    paint_policy,
+                ),
+                (None, Some(prog)) => {
+                    self.glyph_outline_fill(out, gr, prog, color, alpha, clip, blend, synth)
+                }
+                (None, None) if self.split_glyph_draws => {
+                    lower_glyph_boxes_split(out, gr, self.ctm, color, alpha, clip, blend)
+                }
+                (None, None) => lower_glyph_boxes(out, gr, self.ctm, color, alpha, clip, blend),
+            };
+            // Attach the shading to the fill glyph-run op(s) just emitted
+            // (the three lowerings share one emitter with no shading param).
+            if let Some(sh) = &run_shading {
+                attach_glyph_shading(&mut out.ops[glyph_op_start..], sh);
+            }
+            bounds = union_rect(bounds, b);
+        }
+        // Stroke the glyph outlines (Tr 1/2/5/6). Only outline fonts can
+        // be stroked; a box-substitute run (no program) is fill-only.
+        if do_stroke && let (Some(prog), Some(gs)) = (&program, stroke) {
+            let (stroke_color, stroke_shading) = self.glyph_stroke_paint(gs.paint, paint_policy);
+            let b = lower_glyph_stroke(
+                out,
+                gr,
+                prog,
+                self.ctm,
+                &page.stroke_styles[gs.style.index()],
+                stroke_color,
+                gs.alpha,
+                clip,
+                blend,
+                synth,
+                stroke_shading,
+            );
+            bounds = union_rect(bounds, b);
+        }
+        accumulate_scope_bounds(&mut self.scope_stack, bounds);
+        true
+    }
+
+    /// Fill a glyph run from its outline program: from the shared glyph
+    /// coverage cache when the run is eligible, else as exact outlines.
+    #[allow(clippy::too_many_arguments)]
+    fn glyph_outline_fill(
+        &mut self,
+        out: &mut CpuPreparedPage,
+        gr: &GlyphRun,
+        prog: &FontProgram,
+        color: crate::page_ir::Color,
+        alpha: f32,
+        clip: Option<u32>,
+        blend: crate::page_ir::BlendMode,
+        synth: GlyphSynthesis,
+    ) -> Option<DeviceRect> {
+        let page = self.page;
+        // Cached path: pure-fill (render mode 0) runs whose glyphs
+        // are small and axis-aligned blit from the shared glyph
+        // coverage cache. `None` means the run is ineligible
+        // (rotated/skewed, oversized, or the cache is off), so it
+        // falls back to the exact outline fill.
+        // Synthetic bold/italic bypasses the shared glyph
+        // cache (its key is font+gid+transform; adding the
+        // synthesis axes buys nothing for the rare symbolic
+        // substitutes that need it) and the hinter.
+        let cached = match self.shared_glyphs {
+            Some(gc) if gr.render_mode == 0 && !synth.is_active() => {
+                let font_id = *self
+                    .glyph_font_ids
+                    .entry(gr.font.0)
+                    .or_insert_with(|| FontProgramKey::for_resource(&page.fonts[gr.font.index()]));
+                try_cached_glyph_run(
+                    out,
+                    gr,
+                    prog,
+                    self.ctm,
+                    color,
+                    alpha,
+                    clip,
+                    blend,
+                    gc,
+                    font_id,
+                    &mut self.glyph_raster,
+                )
+            }
+            _ => None,
+        };
+        match cached {
+            Some(b) => b,
+            None if self.split_glyph_draws => lower_glyph_outlines_split(
+                out, gr, prog, self.ctm, color, alpha, clip, blend, synth,
+            ),
+            None => lower_glyph_outlines(out, gr, prog, self.ctm, color, alpha, clip, blend, synth),
+        }
+    }
+
+    /// The colour and optional shading a glyph stroke paints with; anything
+    /// but a solid or a preparable shading paint strokes black.
+    fn glyph_stroke_paint(
+        &self,
+        paint: crate::page_ir::PaintId,
+        policy: crate::render_api::RenderColorPolicy,
+    ) -> (crate::page_ir::Color, Option<Box<PreparedShading>>) {
+        match &self.page.paints[paint.index()] {
+            Paint::Solid(c) => (recolor(*c, policy), None),
+            Paint::Shading { shading, matrix } => (
+                crate::page_ir::Color::BLACK,
+                self.paint_shading(*shading, *matrix, policy).map(Box::new),
+            ),
+            _ => (crate::page_ir::Color::BLACK, None),
+        }
+    }
+
+    /// `BeginTransparencyGroup`: open the group's scope with a placeholder
+    /// bounds and end, patched by [`Self::end_group`].
+    fn begin_group(
+        &mut self,
+        out: &mut CpuPreparedPage,
+        group: crate::page_ir::TransparencyGroupId,
+    ) {
+        let g = &self.page.groups[group.index()];
+        let begin_index = out.ops.len();
+        out.ops.push(PreparedOp::BeginGroup {
+            group: PreparedGroup {
+                bounds: DeviceRect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+                opacity: to_u8(g.opacity),
+                blend: g.blend,
+                isolated: g.isolated,
+                knockout: g.knockout,
+            },
+            end: 0,
+        });
+        // §11.6.6: the content of a transparency group starts with the
+        // soft mask reset to None. The mask in force at the invocation
+        // applies to the *group's* composite instead (see
+        // `composite_group`), so leaving it active here would apply it
+        // twice. The interpreter already resets alpha and blend for the
+        // same reason; this is the third member of that set.
+        //
+        // Many producers also write `/SMask /None` as the group's first
+        // `gs` — `0041790.pdf` does — which made the omission invisible
+        // until a file relied on the reset being implicit.
+        self.soft_at_group_entry.push(self.soft_count);
+        out.ops.push(PreparedOp::PushSoftMaskNone);
+        self.soft_count += 1;
+        self.scope_stack.push(ScopeBuilder {
+            begin_index,
+            bounds: None,
+        });
+    }
+
+    /// `EndTransparencyGroup`: close the innermost scope and patch its
+    /// `BeginGroup` with the content's bounds and the end index.
+    fn end_group(&mut self, out: &mut CpuPreparedPage) {
+        let Some(gb) = self.scope_stack.pop() else {
+            return;
+        };
+        // Drop the §11.6.6 reset (plus anything the content pushed
+        // and did not pop) while still *inside* the group, so the
+        // executor sees a balanced stack and the mask that was
+        // active at `BeginGroup` is back on top for the composite.
+        let target = self.soft_at_group_entry.pop().unwrap_or(self.soft_count);
+        while self.soft_count > target {
+            out.ops.push(PreparedOp::PopSoftMask);
+            self.soft_count -= 1;
+        }
+        let end_index = out.ops.len() as u32;
+        out.ops.push(PreparedOp::EndGroup);
+        let bounds = intersect(
+            gb.bounds.unwrap_or(DeviceRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            }),
+            row_window(out),
+        );
+        if let PreparedOp::BeginGroup { group, end } = &mut out.ops[gb.begin_index] {
+            group.bounds = bounds;
+            *end = end_index;
+        }
+        // A nested group contributes its bounds to its parent.
+        accumulate_scope_bounds(&mut self.scope_stack, Some(bounds));
+    }
+
+    /// `EndSoftMask`: close the mask-content scope, patch its `PushSoftMask`
+    /// and make the mask active.
+    fn end_soft_mask(&mut self, out: &mut CpuPreparedPage) {
+        self.soft_mask_content_depth = self.soft_mask_content_depth.saturating_sub(1);
+        let Some(sb) = self.scope_stack.pop() else {
+            return;
+        };
+        let content_end = out.ops.len() as u32;
+        let bounds = intersect(
+            sb.bounds.unwrap_or(DeviceRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            }),
+            row_window(out),
+        );
+        if let PreparedOp::PushSoftMask {
+            content_end: ce,
+            bounds: b,
+            ..
+        } = &mut out.ops[sb.begin_index]
+        {
+            *ce = content_end;
+            *b = bounds;
+        }
+        // The mask is now active for subsequent painting in scope.
+        self.soft_count += 1;
+    }
+
+    /// `DrawImage`: an `/ImageMask` stencil painted with a pattern or a
+    /// shading, or an ordinary image (a stencil painted with a solid colour).
+    fn draw_image(
+        &mut self,
+        out: &mut CpuPreparedPage,
+        image: crate::page_ir::ImageId,
+        paint: crate::page_ir::PaintId,
+        alpha: f32,
+        blend: crate::page_ir::BlendMode,
+    ) {
+        let page = self.page;
+        let paint_policy = self.paint_policy(out);
+        let ir = &page.images[image.index()];
+        let clip = self.clip_stack.last().copied();
+        match &page.paints[paint.index()] {
+            // An /ImageMask stencil painted with a tiling pattern (§8.9.6.2:
+            // an image mask is painted with the current fill colour). Fill
+            // the image's unit square with the pattern, masked by the
+            // stencil's coverage — instead of the solid-colour fallback,
+            // which painted the whole stencil black.
+            Paint::Pattern { tiling, matrix } if ir.is_stencil => {
+                let Some((stencil_img, _)) =
+                    lower_image(out, ir, [255, 255, 255], self.ctm, alpha, blend, None)
+                else {
+                    return;
+                };
+                let unit = unit_square_path();
+                let b = lower_tiled(
+                    out,
+                    &unit,
+                    self.ctm,
+                    crate::page_ir::FillRule::NonZero,
+                    &page.tilings[tiling.index()],
+                    matrix.then(self.base),
+                    alpha,
+                    clip,
+                    blend,
+                    paint_policy,
+                    Some(stencil_img),
+                );
+                accumulate_scope_bounds(&mut self.scope_stack, b);
+            }
+            Paint::Shading { shading, matrix } if ir.is_stencil => {
+                let prepared_shading = self.paint_shading(*shading, *matrix, paint_policy);
+                let (Some(shading), Some((stencil, _))) = (
+                    prepared_shading,
+                    lower_image(
+                        out,
+                        ir,
+                        [255, 255, 255],
+                        self.ctm,
+                        1.0,
+                        crate::page_ir::BlendMode::Normal,
+                        None,
+                    ),
+                ) else {
+                    return;
+                };
+                let b = lower_fill(
+                    out,
+                    &unit_square_path(),
+                    self.ctm,
+                    crate::page_ir::FillRule::NonZero,
+                    crate::page_ir::Color::BLACK,
+                    alpha,
+                    clip,
+                    blend,
+                    self.soft_count > 0,
+                    Some(Box::new(shading)),
+                    Some(stencil),
+                );
+                accumulate_scope_bounds(&mut self.scope_stack, b);
+            }
+            image_paint => {
+                let stencil_rgb = match image_paint {
+                    Paint::Solid(c) => {
+                        let c = recolor(*c, paint_policy);
+                        [to_u8(c.r), to_u8(c.g), to_u8(c.b)]
+                    }
+                    _ => [0, 0, 0],
+                };
+                let Some((img, b)) =
+                    lower_image(out, ir, stencil_rgb, self.ctm, alpha, blend, clip)
+                else {
+                    return;
+                };
+                out.ops.push(PreparedOp::Image(img));
+                accumulate_scope_bounds(&mut self.scope_stack, Some(b));
+            }
+        }
+    }
+}
+
+/// Attach a shading-pattern text fill's shading to the glyph-run ops in `ops`.
+fn attach_glyph_shading(ops: &mut [PreparedOp], shading: &PreparedShading) {
+    for op in ops {
+        if let PreparedOp::GlyphRun(g) = op {
+            g.shading = Some(Box::new(shading.clone()));
+        }
+    }
 }
 
 /// The unit square `[0,1]²` as a closed path — the fill shape for a stencil
@@ -3339,33 +3499,31 @@ fn lower_image(
                 bounds,
             ));
         }
-        match out.image_cache.as_ref() {
-            Some(cache) => match cache.probe(promo_key) {
-                ImageCacheProbe::Hit(hit) if hit.width > 0 && hit.height > 0 => {
-                    hold_for_later_strips(out, promo_key, &hit);
-                    return Some((
-                        build_prepared_from_promoted(
-                            out,
-                            ir,
-                            hit,
-                            bounds,
-                            clip,
-                            clip_has_mask,
-                            inv,
-                            target_size,
-                            interpolation,
-                            stencil_rgb,
-                            alpha_u8,
-                            blend,
-                        ),
+        match out.image_cache.as_ref().map(|cache| cache.probe(promo_key)) {
+            Some(ImageCacheProbe::Hit(hit)) if hit.width > 0 && hit.height > 0 => {
+                hold_for_later_strips(out, promo_key, &hit);
+                return Some((
+                    build_prepared_from_promoted(
+                        out,
+                        ir,
+                        hit,
                         bounds,
-                    ));
-                }
-                ImageCacheProbe::Hit(_) => {}
-                ImageCacheProbe::Leader(flight) => {
-                    pending_codec_promo = Some((promo_key, Some(flight)));
-                }
-            },
+                        clip,
+                        clip_has_mask,
+                        inv,
+                        target_size,
+                        interpolation,
+                        stencil_rgb,
+                        alpha_u8,
+                        blend,
+                    ),
+                    bounds,
+                ));
+            }
+            Some(ImageCacheProbe::Hit(_)) => {}
+            Some(ImageCacheProbe::Leader(flight)) => {
+                pending_codec_promo = Some((promo_key, Some(flight)));
+            }
             None => {
                 pending_codec_promo = Some((promo_key, None));
             }
@@ -3401,120 +3559,9 @@ fn lower_image(
             };
             // A codec-decode failure is already recorded inside `decode_codec_image`.
             let mut d = decode_codec_image(out, ir, target_size, cache_raw)?;
-            // The codec reports a device format from its own channels (a
-            // 1-component JPEG → Gray). A *reinterpreting* PDF color space —
-            // Indexed, or a `/Separation` tint (`TintLut`) — governs how a
-            // *single* codec component is read; without this a Separation-DCT
-            // scan is misread as DeviceGray and inverts near-white to near-black.
-            let cs = match &ir.color_space {
-                crate::page_ir::ImageColorSpace::Indexed { .. }
-                | crate::page_ir::ImageColorSpace::TintLut { .. } => {
-                    if d.color_space == crate::page_ir::ImageColorSpace::Gray {
-                        // The single codec component is the index / tint.
-                        ir.color_space.clone()
-                    } else {
-                        // The codec produced *multiple* components (Rgb/Cmyk),
-                        // so its stream is not the single-component palette/tint
-                        // stream the /ColorSpace describes — e.g. a JPXDecode
-                        // image whose real colour model is RGB carried under an
-                        // `[/Indexed …]` space with `hival 0` (one lookup
-                        // entry). Painting the raw channels would overwrite real
-                        // content with unintended pixels — a solid near-white JPX
-                        // overlay blanking the cover it sits on. Honouring
-                        // neither space faithfully, drop the draw rather than
-                        // paint garbage, and record it so the drop is never
-                        // silent (the tracking hole R1 exposed: a *successful*
-                        // decode can still blank a page).
-                        out.diagnostics.note_degraded(format!(
-                            "image draw dropped: {} color space over a multi-component {:?} \
-                             codec output (palette/tint expects one component)",
-                            reinterpreting_space_name(&ir.color_space),
-                            d.color_space,
-                        ));
-                        return None;
-                    }
-                }
-                // `/Lab` also reinterprets the codec's channels rather than
-                // describing new ones: a 3-channel DCT stream under `[/Lab …]`
-                // carries L*a*b*, not RGB. The codec has no way to know that —
-                // it reports Rgb from its channel count — so the declared space
-                // has to win. Reading those bytes as RGB renders
-                // custom/image_lab yellow-green (a near-zero b* byte is a
-                // strong blue, but as a blue channel it is black) where PDFium,
-                // hayro and MuPDF all render blue.
-                crate::page_ir::ImageColorSpace::Lab { .. }
-                    if d.color_space == crate::page_ir::ImageColorSpace::Rgb =>
-                {
-                    ir.color_space.clone()
-                }
-                // Same shape for a non-sRGB `/ICCBased` space: the codec reports
-                // `Rgb` from its three channels and has no way to know they are
-                // encoded in some other profile, so the declared space wins.
-                crate::page_ir::ImageColorSpace::IccRgb { .. }
-                    if d.color_space == crate::page_ir::ImageColorSpace::Rgb =>
-                {
-                    ir.color_space.clone()
-                }
-                // A CMYK codec reports only channel arity. Preserve the
-                // declared press-profile transform so sampling does not fall
-                // back to DeviceCMYK's frozen table.
-                crate::page_ir::ImageColorSpace::IccCmyk { .. }
-                    if d.color_space == crate::page_ir::ImageColorSpace::Cmyk =>
-                {
-                    ir.color_space.clone()
-                }
-                // A 2-colorant `/DeviceN` over a two-channel codec output: the
-                // codec reports `Gray` from channel 0 alone, but both channels
-                // are tints the baked table needs.
-                crate::page_ir::ImageColorSpace::TintLut2 { .. }
-                    if matches!(d.format, crate::image::DecodedFormat::Multi2) =>
-                {
-                    ir.color_space.clone()
-                }
-                _ => d.color_space,
-            };
-            // A JPX in-data opacity channel becomes this image's soft mask when
-            // the dict opts in via `/SMaskInData` (and no `/SMask` overrides it).
-            if let Some(opacity) = d.alpha.clone() {
-                match ir.smask_in_data {
-                    1 => {
-                        in_data_smask = Some(std::sync::Arc::new(crate::page_ir::ImageSMask {
-                            width: d.width,
-                            height: d.height,
-                            bits_per_component: 8,
-                            decode: None,
-                            samples: opacity,
-                            codec: None,
-                            codec_data: None,
-                            codec_parms: None,
-                        }));
-                    }
-                    2 => {
-                        let Some(unassociated) =
-                            unpremultiply_in_data_alpha(&d.samples, &opacity, d.format)
-                        else {
-                            out.diagnostics.note_degraded(
-                                "JPX premultiplied in-data alpha has an invalid decoded layout, draw skipped"
-                                    .into(),
-                            );
-                            return None;
-                        };
-                        d.samples = unassociated;
-                        in_data_smask = Some(std::sync::Arc::new(crate::page_ir::ImageSMask {
-                            width: d.width,
-                            height: d.height,
-                            bits_per_component: 8,
-                            decode: None,
-                            samples: opacity,
-                            codec: None,
-                            codec_data: None,
-                            codec_parms: None,
-                        }));
-                    }
-                    // /SMaskInData 0: ignore the alpha, paint the RGB opaque.
-                    _ => {}
-                }
-            }
+            let declared_space = codec_color_space(out, ir, &d)?;
+            in_data_smask = in_data_alpha_smask(out, ir, &mut d)?;
+            let cs = declared_space.unwrap_or(d.color_space);
             (d.samples, d.width, d.height, d.bpc, cs)
         }
     };
@@ -3567,6 +3614,130 @@ fn lower_image(
         None => promote_through_cache(out, prepared, ring_ok),
     };
     Some((prepared, bounds))
+}
+
+/// The declared PDF colour space a codec-decoded image is sampled in when
+/// that space reinterprets the codec's channels; `Some(None)` keeps the
+/// codec's own space. `None` drops the draw (recorded as degraded): a
+/// palette or tint space over multi-component codec output.
+fn codec_color_space(
+    out: &CpuPreparedPage,
+    ir: &crate::page_ir::ImageIr,
+    d: &CodecSamples,
+) -> Option<Option<crate::page_ir::ImageColorSpace>> {
+    // The codec reports a device format from its own channels (a
+    // 1-component JPEG → Gray). A *reinterpreting* PDF color space —
+    // Indexed, or a `/Separation` tint (`TintLut`) — governs how a
+    // *single* codec component is read; without this a Separation-DCT
+    // scan is misread as DeviceGray and inverts near-white to near-black.
+    match &ir.color_space {
+        crate::page_ir::ImageColorSpace::Indexed { .. }
+        | crate::page_ir::ImageColorSpace::TintLut { .. } => {
+            if d.color_space == crate::page_ir::ImageColorSpace::Gray {
+                // The single codec component is the index / tint.
+                Some(Some(ir.color_space.clone()))
+            } else {
+                // The codec produced *multiple* components (Rgb/Cmyk),
+                // so its stream is not the single-component palette/tint
+                // stream the /ColorSpace describes — e.g. a JPXDecode
+                // image whose real colour model is RGB carried under an
+                // `[/Indexed …]` space with `hival 0` (one lookup
+                // entry). Painting the raw channels would overwrite real
+                // content with unintended pixels — a solid near-white JPX
+                // overlay blanking the cover it sits on. Honouring
+                // neither space faithfully, drop the draw rather than
+                // paint garbage, and record it so the drop is never
+                // silent (the tracking hole R1 exposed: a *successful*
+                // decode can still blank a page).
+                out.diagnostics.note_degraded(format!(
+                    "image draw dropped: {} color space over a multi-component {:?} \
+                     codec output (palette/tint expects one component)",
+                    reinterpreting_space_name(&ir.color_space),
+                    d.color_space,
+                ));
+                None
+            }
+        }
+        // `/Lab` also reinterprets the codec's channels rather than
+        // describing new ones: a 3-channel DCT stream under `[/Lab …]`
+        // carries L*a*b*, not RGB. The codec has no way to know that —
+        // it reports Rgb from its channel count — so the declared space
+        // has to win. Reading those bytes as RGB renders
+        // custom/image_lab yellow-green (a near-zero b* byte is a
+        // strong blue, but as a blue channel it is black) where PDFium,
+        // hayro and MuPDF all render blue.
+        crate::page_ir::ImageColorSpace::Lab { .. }
+            if d.color_space == crate::page_ir::ImageColorSpace::Rgb =>
+        {
+            Some(Some(ir.color_space.clone()))
+        }
+        // Same shape for a non-sRGB `/ICCBased` space: the codec reports
+        // `Rgb` from its three channels and has no way to know they are
+        // encoded in some other profile, so the declared space wins.
+        crate::page_ir::ImageColorSpace::IccRgb { .. }
+            if d.color_space == crate::page_ir::ImageColorSpace::Rgb =>
+        {
+            Some(Some(ir.color_space.clone()))
+        }
+        // A CMYK codec reports only channel arity. Preserve the
+        // declared press-profile transform so sampling does not fall
+        // back to DeviceCMYK's frozen table.
+        crate::page_ir::ImageColorSpace::IccCmyk { .. }
+            if d.color_space == crate::page_ir::ImageColorSpace::Cmyk =>
+        {
+            Some(Some(ir.color_space.clone()))
+        }
+        // A 2-colorant `/DeviceN` over a two-channel codec output: the
+        // codec reports `Gray` from channel 0 alone, but both channels
+        // are tints the baked table needs.
+        crate::page_ir::ImageColorSpace::TintLut2 { .. }
+            if matches!(d.format, crate::image::DecodedFormat::Multi2) =>
+        {
+            Some(Some(ir.color_space.clone()))
+        }
+        _ => Some(None),
+    }
+}
+
+/// A JPX in-data opacity channel becomes this image's soft mask when the
+/// dict opts in via `/SMaskInData` (and no `/SMask` overrides it); a
+/// premultiplied one (`2`) is unassociated from `d`'s samples first.
+/// `Some(None)` when there is no such mask; `None` drops the draw (recorded
+/// as degraded).
+fn in_data_alpha_smask(
+    out: &CpuPreparedPage,
+    ir: &crate::page_ir::ImageIr,
+    d: &mut CodecSamples,
+) -> Option<Option<std::sync::Arc<crate::page_ir::ImageSMask>>> {
+    let Some(opacity) = d.alpha.clone() else {
+        return Some(None);
+    };
+    match ir.smask_in_data {
+        1 => {}
+        2 => {
+            let Some(unassociated) = unpremultiply_in_data_alpha(&d.samples, &opacity, d.format)
+            else {
+                out.diagnostics.note_degraded(
+                    "JPX premultiplied in-data alpha has an invalid decoded layout, draw skipped"
+                        .into(),
+                );
+                return None;
+            };
+            d.samples = unassociated;
+        }
+        // /SMaskInData 0: ignore the alpha, paint the RGB opaque.
+        _ => return Some(None),
+    }
+    Some(Some(std::sync::Arc::new(crate::page_ir::ImageSMask {
+        width: d.width,
+        height: d.height,
+        bits_per_component: 8,
+        decode: None,
+        samples: opacity,
+        codec: None,
+        codec_data: None,
+        codec_parms: None,
+    })))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4741,20 +4912,21 @@ impl ClipShare {
             else {
                 continue;
             };
-            if same_clip_geometry(out, subpath_range, shared) {
-                // The new copy is the arena tail and nothing refers to it yet.
-                if let Some(&(tail, _)) = out.subpaths.get(first) {
-                    out.points.truncate(tail);
-                }
-                out.subpaths.truncate(first);
-                return (
-                    ClipKind::Path {
-                        subpath_range: shared,
-                        rule,
-                    },
-                    Some(candidate),
-                );
+            if !same_clip_geometry(out, subpath_range, shared) {
+                continue;
             }
+            // The new copy is the arena tail and nothing refers to it yet.
+            if let Some(&(tail, _)) = out.subpaths.get(first) {
+                out.points.truncate(tail);
+            }
+            out.subpaths.truncate(first);
+            return (
+                ClipKind::Path {
+                    subpath_range: shared,
+                    rule,
+                },
+                Some(candidate),
+            );
         }
         if known.len() < Self::MAX_PER_KEY {
             known.push(cid);
@@ -9178,6 +9350,20 @@ mod image_cache_tests {
     /// byte) and rotated ones. An unmasked opaque image on a fractional
     /// axis-aligned placement keeps the generic body, so its border ring is
     /// unchanged.
+    /// Put `ir`'s own 16-bit samples back on every image op in `ops`.
+    fn restore_original_samples(ops: &mut [PreparedOp], ir: &crate::page_ir::ImageIr) {
+        for op in ops {
+            if let PreparedOp::Image(img) = op {
+                **img = crate::render_cpu::image::PreparedImage {
+                    bpc: 16,
+                    color_space: ir.color_space.clone(),
+                    samples: ir.samples.clone().unwrap(),
+                    ..(**img).clone()
+                };
+            }
+        }
+    }
+
     #[test]
     fn sixteen_bit_device_images_promote_only_where_the_ring_is_unchanged() {
         let whole = Matrix {
@@ -9221,17 +9407,7 @@ mod image_cache_tests {
                 assert_eq!(img.bpc == 8, promoted, "{space:?} {name}");
                 let got = render_pixels(&lowered);
                 // Reference: the same draw with the original 16-bit samples.
-                for op in lowered.ops.iter_mut() {
-                    if let PreparedOp::Image(img) = op {
-                        let ir = &page.images[0];
-                        **img = crate::render_cpu::image::PreparedImage {
-                            bpc: 16,
-                            color_space: ir.color_space.clone(),
-                            samples: ir.samples.clone().unwrap(),
-                            ..(**img).clone()
-                        };
-                    }
-                }
+                restore_original_samples(&mut lowered.ops, &page.images[0]);
                 assert_eq!(prepared_image(&lowered).bpc, 16);
                 assert_eq!(got, render_pixels(&lowered), "{space:?} {name}");
                 if promoted {

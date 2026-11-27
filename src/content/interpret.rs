@@ -670,78 +670,9 @@ impl<'a> Interpreter<'a> {
                 return Err(ContentError::Cancelled);
             }
             let pos_before = lexer.pos();
-            match lexer.next_lexeme() {
+            let lex = match lexer.next_lexeme() {
                 Ok(None) => break,
-                Ok(Some(lex)) => {
-                    lexemes_seen = lexemes_seen.saturating_add(1);
-                    match lex {
-                        Lexeme::Operand(o) => {
-                            if self.operands.len() >= MAX_OPERAND_STACK {
-                                // DoS guard: unbounded operand accumulation. Fatal.
-                                return Err(ContentError::OperandStackOverflow(
-                                    self.operands.len(),
-                                ));
-                            }
-                            self.operands.push(o);
-                        }
-                        Lexeme::Operator(op) => {
-                            self.ops_executed += 1;
-                            if self.ops_executed > self.limits.max_ops {
-                                return Err(ContentError::OperatorBudget(self.ops_executed));
-                            }
-                            let offset = lexer.last_operator_offset();
-                            if self.record_trace {
-                                // `pos` sits just past the keyword: the span
-                                // is exactly the operator token.
-                                self.trace_seq += 1;
-                                self.trace_current = Some(TraceCurrent {
-                                    operator: op.clone(),
-                                    span_start: offset,
-                                    span_end: lexer.pos(),
-                                    seq: self.trace_seq,
-                                });
-                            }
-                            if let Err(e) = self.dispatch(&op, offset) {
-                                if e.is_fatal() {
-                                    return Err(e);
-                                }
-                                // Drop the bad operator and reset the operand stack,
-                                // then continue at the next lexeme.
-                                self.ctx.note_recovery(format!(
-                                    "content operator {} dropped ({e})",
-                                    String::from_utf8_lossy(&op)
-                                ));
-                            }
-                            self.operands.clear();
-                        }
-                        Lexeme::InlineImage { dict, data } => {
-                            // One operation against the page budget, like the
-                            // operator it replaces (B15): otherwise a stream
-                            // of inline images is bounded only by the decode
-                            // budget.
-                            self.ops_executed += 1;
-                            if self.ops_executed > self.limits.max_ops {
-                                return Err(ContentError::OperatorBudget(self.ops_executed));
-                            }
-                            if self.record_trace {
-                                // `pos_before` is the `BI` start; `pos` sits
-                                // just past `EI`: the span is the whole image.
-                                self.trace_seq += 1;
-                                self.trace_current = Some(TraceCurrent {
-                                    operator: b"BI".to_vec(),
-                                    span_start: pos_before,
-                                    span_end: lexer.pos(),
-                                    seq: self.trace_seq,
-                                });
-                            }
-                            // Suppressed inside an OC-hidden span.
-                            if !self.oc_hidden() {
-                                self.inline_image(&dict, data);
-                            }
-                            self.operands.clear();
-                        }
-                    }
-                }
+                Ok(Some(lex)) => lex,
                 Err(e) => {
                     if e.is_fatal() {
                         return Err(e);
@@ -759,6 +690,28 @@ impl<'a> Interpreter<'a> {
                     if lexer.pos() <= pos_before && !lexer.skip_byte() {
                         break; // at end of input: return the partial page
                     }
+                    continue;
+                }
+            };
+            lexemes_seen = lexemes_seen.saturating_add(1);
+            match lex {
+                Lexeme::Operand(o) => {
+                    if self.operands.len() >= MAX_OPERAND_STACK {
+                        // DoS guard: unbounded operand accumulation. Fatal.
+                        return Err(ContentError::OperandStackOverflow(self.operands.len()));
+                    }
+                    self.operands.push(o);
+                }
+                Lexeme::Operator(op) => {
+                    // `pos` sits just past the keyword: the span is exactly
+                    // the operator token.
+                    let span = (lexer.last_operator_offset(), lexer.pos());
+                    self.run_operator(op, span)?;
+                }
+                Lexeme::InlineImage { dict, data } => {
+                    // `pos_before` is the `BI` start; `pos` sits just past
+                    // `EI`: the span is the whole image.
+                    self.run_inline_image(&dict, data, (pos_before, lexer.pos()))?;
                 }
             }
         }
@@ -769,6 +722,73 @@ impl<'a> Interpreter<'a> {
         if self.record_trace {
             self.trace_current = None;
         }
+        Ok(())
+    }
+
+    /// Execute one operator lexeme: charge the operator budget, open its
+    /// trace span, dispatch it, and recover from a non-fatal failure by
+    /// dropping it. `span` is the operator token's byte range.
+    fn run_operator(&mut self, op: Vec<u8>, span: (usize, usize)) -> Result<(), ContentError> {
+        self.ops_executed += 1;
+        if self.ops_executed > self.limits.max_ops {
+            return Err(ContentError::OperatorBudget(self.ops_executed));
+        }
+        let (offset, span_end) = span;
+        if self.record_trace {
+            self.trace_seq += 1;
+            self.trace_current = Some(TraceCurrent {
+                operator: op.clone(),
+                span_start: offset,
+                span_end,
+                seq: self.trace_seq,
+            });
+        }
+        if let Err(e) = self.dispatch(&op, offset) {
+            if e.is_fatal() {
+                return Err(e);
+            }
+            // Drop the bad operator and reset the operand stack,
+            // then continue at the next lexeme.
+            self.ctx.note_recovery(format!(
+                "content operator {} dropped ({e})",
+                String::from_utf8_lossy(&op)
+            ));
+        }
+        self.operands.clear();
+        Ok(())
+    }
+
+    /// Execute one inline-image lexeme: charge it as one operation, open its
+    /// trace span, and paint it unless an optional-content span hides it.
+    /// `span` is the byte range from `BI` to just past `EI`.
+    fn run_inline_image(
+        &mut self,
+        dict: &[(Vec<u8>, Operand)],
+        data: Vec<u8>,
+        span: (usize, usize),
+    ) -> Result<(), ContentError> {
+        // One operation against the page budget, like the
+        // operator it replaces (B15): otherwise a stream
+        // of inline images is bounded only by the decode
+        // budget.
+        self.ops_executed += 1;
+        if self.ops_executed > self.limits.max_ops {
+            return Err(ContentError::OperatorBudget(self.ops_executed));
+        }
+        if self.record_trace {
+            self.trace_seq += 1;
+            self.trace_current = Some(TraceCurrent {
+                operator: b"BI".to_vec(),
+                span_start: span.0,
+                span_end: span.1,
+                seq: self.trace_seq,
+            });
+        }
+        // Suppressed inside an OC-hidden span.
+        if !self.oc_hidden() {
+            self.inline_image(dict, data);
+        }
+        self.operands.clear();
         Ok(())
     }
 
@@ -849,6 +869,89 @@ impl<'a> Interpreter<'a> {
     fn dispatch(&mut self, op: &[u8], offset: usize) -> Result<(), ContentError> {
         match op {
             // --- graphics state ---
+            b"q" | b"Q" | b"cm" | b"w" | b"J" | b"j" | b"M" => self.op_general_state(op),
+            b"d" => self.op_dash(),
+            // Rendering intent and flatness carry no semantic geometry.
+            b"ri" | b"i" => {}
+            b"gs" => self.op_ext_gstate()?,
+
+            // --- color ---
+            b"g" => self.set_device_gray(false),
+            b"G" => self.set_device_gray(true),
+            b"rg" => self.set_device_rgb(false),
+            b"RG" => self.set_device_rgb(true),
+            b"k" => self.set_device_cmyk(false),
+            b"K" => self.set_device_cmyk(true),
+            b"cs" => self.set_color_space(false),
+            b"CS" => self.set_color_space(true),
+            b"sc" | b"scn" => self.set_color(false),
+            b"SC" | b"SCN" => self.set_color(true),
+
+            // --- path construction ---
+            b"m" | b"l" | b"c" | b"v" | b"y" | b"re" | b"h" => self.op_path_construction(op),
+
+            // --- path painting ---
+            b"S" => self.paint(false, None, true),
+            b"s" => self.paint(true, None, true),
+            b"f" | b"F" => self.paint(false, Some(FillRule::NonZero), false),
+            b"f*" => self.paint(false, Some(FillRule::EvenOdd), false),
+            b"B" => self.paint(false, Some(FillRule::NonZero), true),
+            b"B*" => self.paint(false, Some(FillRule::EvenOdd), true),
+            b"b" => self.paint(true, Some(FillRule::NonZero), true),
+            b"b*" => self.paint(true, Some(FillRule::EvenOdd), true),
+            b"n" => self.paint(false, None, false),
+
+            // --- clipping ---
+            b"W" => self.pending_clip = Some(FillRule::NonZero),
+            b"W*" => self.pending_clip = Some(FillRule::EvenOdd),
+
+            // --- text ---
+            b"BT" => {
+                // Recover a repeated BT by committing the previous object's
+                // clipping before starting a new object.
+                self.end_text_object();
+                self.text = TextObjectState::Active(TextObject::default());
+            }
+            b"ET" => self.end_text_object(),
+            b"Tc" | b"Tw" | b"Tz" | b"TL" | b"Tr" | b"Ts" => self.op_text_state(op),
+            b"Tf" => self.op_set_font(),
+            b"Td" | b"TD" | b"Tm" | b"T*" => self.op_text_position(op),
+            b"Tj" | b"'" | b"\"" => self.op_show_string(op),
+            b"TJ" => self.op_show_array(),
+
+            // --- XObjects, shadings, marked content, compatibility ---
+            b"Do" => self.op_do()?,
+            b"sh" => {
+                // Suppressed inside an OC-hidden span (paints nothing).
+                if !self.oc_hidden() {
+                    self.op_shading()?;
+                }
+            }
+
+            // --- Type 3 glyph metrics (ISO 32000-1 §9.6.5) ---
+            // `d0 wx wy` (coloured glyph) and `d1 wx wy llx lly urx ury`
+            // (shape-only glyph) are the first operator of a CharProc. Only
+            // meaningful while executing one; capture `wx` as an advance
+            // fallback, and let `d1` lock colour for the rest of the glyph.
+            b"d0" | b"d1" => self.op_type3_metrics(op),
+
+            // --- marked content (ISO 32000-1 §14.6) ---
+            // Only `/OC` spans affect rendering: content inside a span whose
+            // optional-content group is OFF is suppressed (§8.11.3.2). Other
+            // tags carry no geometry we model.
+            b"BMC" | b"BDC" | b"EMC" => self.op_marked_content(op, offset),
+
+            // Any unknown operator: ignore, having consumed the pending
+            // operands.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Execute a general graphics-state operator (`q`, `Q`, `cm`, `w`,
+    /// `J`, `j`, `M`).
+    fn op_general_state(&mut self, op: &[u8]) {
+        match op {
             b"q" => {
                 self.gs_stack.push(self.gs.clone());
                 self.emit(SemanticOp::Save);
@@ -895,24 +998,14 @@ impl<'a> Interpreter<'a> {
                     self.emit(SemanticOp::SetMiterLimit(v));
                 }
             }
-            b"d" => self.op_dash(),
-            // Rendering intent and flatness carry no semantic geometry.
-            b"ri" | b"i" => {}
-            b"gs" => self.op_ext_gstate()?,
+            _ => {}
+        }
+    }
 
-            // --- color ---
-            b"g" => self.set_device_gray(false),
-            b"G" => self.set_device_gray(true),
-            b"rg" => self.set_device_rgb(false),
-            b"RG" => self.set_device_rgb(true),
-            b"k" => self.set_device_cmyk(false),
-            b"K" => self.set_device_cmyk(true),
-            b"cs" => self.set_color_space(false),
-            b"CS" => self.set_color_space(true),
-            b"sc" | b"scn" => self.set_color(false),
-            b"SC" | b"SCN" => self.set_color(true),
-
-            // --- path construction ---
+    /// Execute a path-construction operator (`m`, `l`, `c`, `v`, `y`, `re`,
+    /// `h`).
+    fn op_path_construction(&mut self, op: &[u8]) {
+        match op {
             b"m" => {
                 if let Some([x, y]) = self.nums() {
                     self.path.move_to(x, y);
@@ -944,30 +1037,13 @@ impl<'a> Interpreter<'a> {
                 }
             }
             b"h" => self.path.close(),
+            _ => {}
+        }
+    }
 
-            // --- path painting ---
-            b"S" => self.paint(false, None, true),
-            b"s" => self.paint(true, None, true),
-            b"f" | b"F" => self.paint(false, Some(FillRule::NonZero), false),
-            b"f*" => self.paint(false, Some(FillRule::EvenOdd), false),
-            b"B" => self.paint(false, Some(FillRule::NonZero), true),
-            b"B*" => self.paint(false, Some(FillRule::EvenOdd), true),
-            b"b" => self.paint(true, Some(FillRule::NonZero), true),
-            b"b*" => self.paint(true, Some(FillRule::EvenOdd), true),
-            b"n" => self.paint(false, None, false),
-
-            // --- clipping ---
-            b"W" => self.pending_clip = Some(FillRule::NonZero),
-            b"W*" => self.pending_clip = Some(FillRule::EvenOdd),
-
-            // --- text ---
-            b"BT" => {
-                // Recover a repeated BT by committing the previous object's
-                // clipping before starting a new object.
-                self.end_text_object();
-                self.text = TextObjectState::Active(TextObject::default());
-            }
-            b"ET" => self.end_text_object(),
+    /// Execute a text-state operator (`Tc`, `Tw`, `Tz`, `TL`, `Tr`, `Ts`).
+    fn op_text_state(&mut self, op: &[u8]) {
+        match op {
             b"Tc" => {
                 if let Some(v) = self.last_num() {
                     self.gs.char_spacing = v;
@@ -988,7 +1064,6 @@ impl<'a> Interpreter<'a> {
                     self.gs.leading = v;
                 }
             }
-            b"Tf" => self.op_set_font(),
             b"Tr" => {
                 if let Some(v) = self.last_num() {
                     self.gs.render_mode = v as u8;
@@ -999,6 +1074,13 @@ impl<'a> Interpreter<'a> {
                     self.gs.rise = v;
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// Execute a text-positioning operator (`Td`, `TD`, `Tm`, `T*`).
+    fn op_text_position(&mut self, op: &[u8]) {
+        match op {
             b"Td" => {
                 if let Some([tx, ty]) = self.nums() {
                     self.text_move(tx, ty);
@@ -1021,13 +1103,19 @@ impl<'a> Interpreter<'a> {
                 let leading = self.gs.leading;
                 self.text_move(0.0, -leading);
             }
+            _ => {}
+        }
+    }
+
+    /// Execute a single-string text-showing operator (`Tj`, `'`, `"`).
+    fn op_show_string(&mut self, op: &[u8]) {
+        match op {
             b"Tj" => {
                 if let Some(bytes) = self.operands.last().and_then(Operand::as_string) {
                     let elements = vec![TextElement::Show(bytes.to_vec())];
                     self.emit_text_run(elements);
                 }
             }
-            b"TJ" => self.op_show_array(),
             b"'" => {
                 let leading = self.gs.leading;
                 self.text_move(0.0, -leading);
@@ -1047,39 +1135,33 @@ impl<'a> Interpreter<'a> {
                     self.emit_text_run(vec![TextElement::Show(bytes.to_vec())]);
                 }
             }
+            _ => {}
+        }
+    }
 
-            // --- XObjects, shadings, marked content, compatibility ---
-            b"Do" => self.op_do()?,
-            b"sh" => {
-                // Suppressed inside an OC-hidden span (paints nothing).
-                if !self.oc_hidden() {
-                    self.op_shading()?;
-                }
-            }
-
-            // --- Type 3 glyph metrics (ISO 32000-1 §9.6.5) ---
-            // `d0 wx wy` (coloured glyph) and `d1 wx wy llx lly urx ury`
-            // (shape-only glyph) are the first operator of a CharProc. Only
-            // meaningful while executing one; capture `wx` as an advance
-            // fallback, and let `d1` lock colour for the rest of the glyph.
+    /// Execute a Type 3 glyph-metrics operator (`d0`, `d1`).
+    fn op_type3_metrics(&mut self, op: &[u8]) {
+        match op {
             b"d0" => {
                 if self.type3_nesting > 0 && self.type3_d_width.is_none() {
                     self.type3_d_width = self.operands.first().and_then(Operand::as_f64);
                 }
             }
-            b"d1" => {
-                if self.type3_nesting > 0 {
-                    if self.type3_d_width.is_none() {
-                        self.type3_d_width = self.operands.first().and_then(Operand::as_f64);
-                    }
-                    self.type3_shape_only = true;
+            b"d1" if self.type3_nesting > 0 => {
+                if self.type3_d_width.is_none() {
+                    self.type3_d_width = self.operands.first().and_then(Operand::as_f64);
                 }
+                self.type3_shape_only = true;
             }
+            // Outside a CharProc, `d0`/`d1` are ignored.
+            _ => {}
+        }
+    }
 
-            // --- marked content (ISO 32000-1 §14.6) ---
-            // Only `/OC` spans affect rendering: content inside a span whose
-            // optional-content group is OFF is suppressed (§8.11.3.2). Other
-            // tags carry no geometry we model.
+    /// Execute a marked-content operator (`BMC`, `BDC`, `EMC`). `offset` is
+    /// the operator keyword's byte offset, for the marked-content inventory.
+    fn op_marked_content(&mut self, op: &[u8], offset: usize) {
+        match op {
             b"BMC" => {
                 self.mc_stack.push(MarkedContentFrame {
                     hidden: false,
@@ -1099,23 +1181,17 @@ impl<'a> Interpreter<'a> {
                 }
                 self.marked_open_bdc(offset);
             }
-            b"EMC" => {
-                // Unbalanced EMC is tolerated (ignored), like unbalanced Q.
-                if self.mc_stack.len() > self.mc_stack_floor {
-                    if let Some(frame) = self.mc_stack.pop()
-                        && frame.hidden
-                    {
-                        self.oc_hidden_count -= 1;
-                    }
-                    self.marked_close(offset);
+            b"EMC" if self.mc_stack.len() > self.mc_stack_floor => {
+                if let Some(frame) = self.mc_stack.pop()
+                    && frame.hidden
+                {
+                    self.oc_hidden_count -= 1;
                 }
+                self.marked_close(offset);
             }
-
-            // Any unknown operator: ignore, having consumed the pending
-            // operands.
+            // Unbalanced EMC is tolerated (ignored), like unbalanced Q.
             _ => {}
         }
-        Ok(())
     }
 
     // --- color operators ---------------------------------------------------
@@ -1527,11 +1603,12 @@ impl<'a> Interpreter<'a> {
             let Some(nid) = self.names.lookup(key) else {
                 return;
             };
-            if let Some(PdfObject::Array(a)) = d.get(nid) {
-                for (slot, item) in out.iter_mut().zip(a.iter()) {
-                    if let Some(v) = item.as_number() {
-                        *slot = v as f32;
-                    }
+            let Some(PdfObject::Array(a)) = d.get(nid) else {
+                return;
+            };
+            for (slot, item) in out.iter_mut().zip(a.iter()) {
+                if let Some(v) = item.as_number() {
+                    *slot = v as f32;
                 }
             }
         };
@@ -2349,20 +2426,7 @@ impl<'a> Interpreter<'a> {
         for e in elements.iter() {
             match e {
                 TextElement::Show(bytes) => {
-                    for dc in metrics.decode(bytes.as_slice()) {
-                        let word = if dc.word_space {
-                            self.gs.word_spacing
-                        } else {
-                            0.0
-                        };
-                        if let Some(vp) = vertical.then(|| metrics.vertical(dc.cid)).flatten() {
-                            let w1 = vp.advance as f64 / 1000.0 * fs;
-                            ty += w1 + self.gs.char_spacing + word;
-                        } else {
-                            let w = dc.advance as f64 / 1000.0 * fs;
-                            tx += (w + self.gs.char_spacing + word) * th;
-                        }
-                    }
+                    self.add_string_displacement(&metrics, bytes, &mut tx, &mut ty);
                 }
                 TextElement::Adjust(n) => {
                     if vertical {
@@ -2374,6 +2438,34 @@ impl<'a> Interpreter<'a> {
             }
         }
         (tx, ty)
+    }
+
+    /// Add one shown string's glyph advances to the running displacement
+    /// `(tx, ty)` of [`Self::text_displacement`], glyph by glyph.
+    fn add_string_displacement(
+        &self,
+        metrics: &crate::font::FontMetrics,
+        bytes: &[u8],
+        tx: &mut f64,
+        ty: &mut f64,
+    ) {
+        let th = self.gs.horizontal_scale / 100.0;
+        let fs = self.gs.font_size;
+        let vertical = metrics.is_vertical();
+        for dc in metrics.decode(bytes) {
+            let word = if dc.word_space {
+                self.gs.word_spacing
+            } else {
+                0.0
+            };
+            if let Some(vp) = vertical.then(|| metrics.vertical(dc.cid)).flatten() {
+                let w1 = vp.advance as f64 / 1000.0 * fs;
+                *ty += w1 + self.gs.char_spacing + word;
+            } else {
+                let w = dc.advance as f64 / 1000.0 * fs;
+                *tx += (w + self.gs.char_spacing + word) * th;
+            }
+        }
     }
 
     /// Show a run of Type 3 text: execute each code's CharProc content stream
@@ -2399,7 +2491,6 @@ impl<'a> Interpreter<'a> {
         // Render modes 3 (invisible) and 7 (clip-only) place no marks but still
         // advance the text position; so does an OC-hidden span.
         let invisible = self.gs.render_mode == 3 || self.gs.render_mode == 7 || self.oc_hidden();
-        let fm = t3.font_matrix;
         let param = Matrix {
             a: tfs * th,
             b: 0.0,
@@ -2407,6 +2498,14 @@ impl<'a> Interpreter<'a> {
             d: tfs,
             e: 0.0,
             f: trise,
+        };
+        let run = Type3Run {
+            tfs,
+            th,
+            tc,
+            tw,
+            invisible,
+            param,
         };
 
         for element in elements {
@@ -2419,46 +2518,53 @@ impl<'a> Interpreter<'a> {
                 }
                 TextElement::Show(bytes) => {
                     for &code in bytes.iter() {
-                        // Glyph space → current user space (CTM applied by the
-                        // enclosing scope): FontMatrix, then the text params,
-                        // then the current text matrix.
-                        let concat = fm.then(param).then(self.text_matrix());
-                        let mut d_width = None;
-                        if !invisible {
-                            if let Some(char_proc) = t3.char_procs[code as usize].clone() {
-                                d_width = self.exec_char_proc(
-                                    char_proc.object,
-                                    &char_proc.stream,
-                                    concat,
-                                    t3.resources.clone(),
-                                );
-                            } else {
-                                self.ctx.note_recovery(format!(
-                                    "Type 3 glyph for code {code} has no CharProc; advancing only"
-                                ));
-                            }
-                        }
-                        // Advance: `/Widths` is authoritative (what viewers
-                        // use); the `d0`/`d1` `wx` is a fallback when it is
-                        // absent. Widths are in glyph space, so the horizontal
-                        // text-space advance is `FontMatrix.a · wx`.
-                        let wx = if t3.has_widths {
-                            t3.widths[code as usize]
-                        } else {
-                            d_width.unwrap_or(0.0)
-                        };
-                        let w0 = fm.a * wx;
-                        let mut adv = w0 * tfs + tc;
-                        // Word spacing applies to the single-byte code 32.
-                        if code == 32 {
-                            adv += tw;
-                        }
-                        adv *= th;
-                        self.advance_text(adv, 0.0);
+                        self.show_type3_code(&t3, code, &run);
                     }
                 }
             }
         }
+    }
+
+    /// Show one Type 3 code: execute its CharProc (unless the run is
+    /// invisible), then advance the text matrix by the glyph's width.
+    fn show_type3_code(&mut self, t3: &Type3Font, code: u8, run: &Type3Run) {
+        let fm = t3.font_matrix;
+        // Glyph space → current user space (CTM applied by the
+        // enclosing scope): FontMatrix, then the text params,
+        // then the current text matrix.
+        let concat = fm.then(run.param).then(self.text_matrix());
+        let mut d_width = None;
+        if !run.invisible {
+            if let Some(char_proc) = t3.char_procs[code as usize].clone() {
+                d_width = self.exec_char_proc(
+                    char_proc.object,
+                    &char_proc.stream,
+                    concat,
+                    t3.resources.clone(),
+                );
+            } else {
+                self.ctx.note_recovery(format!(
+                    "Type 3 glyph for code {code} has no CharProc; advancing only"
+                ));
+            }
+        }
+        // Advance: `/Widths` is authoritative (what viewers
+        // use); the `d0`/`d1` `wx` is a fallback when it is
+        // absent. Widths are in glyph space, so the horizontal
+        // text-space advance is `FontMatrix.a · wx`.
+        let wx = if t3.has_widths {
+            t3.widths[code as usize]
+        } else {
+            d_width.unwrap_or(0.0)
+        };
+        let w0 = fm.a * wx;
+        let mut adv = w0 * run.tfs + run.tc;
+        // Word spacing applies to the single-byte code 32.
+        if code == 32 {
+            adv += run.tw;
+        }
+        adv *= run.th;
+        self.advance_text(adv, 0.0);
     }
 
     /// Execute one Type 3 CharProc content stream inline, bracketed by
@@ -2705,92 +2811,108 @@ impl<'a> Interpreter<'a> {
         }
         // Advance metrics: two-byte Identity CID for Type 0, else simple.
         if sem.subtype == b"Type0" {
-            // The `/Encoding` CMap decodes byte strings into CIDs. Identity-H/V
-            // (the dominant embedded-subset case) keeps the fast two-byte path;
-            // a predefined CJK CMap name or an embedded CMap stream routes
-            // through the CMap machinery (variable-width codes → CID).
-            let widths = self.build_cid_widths(dict);
-            let (cmap, vertical) = self.resolve_cid_encoding(dict);
-            sem.charset = self
-                .descendant_cidfont(dict)
-                .and_then(|font| font.as_dict().cloned())
-                .and_then(|font| self.cid_ordering(&font))
-                .map(|ordering| crate::font::Charset::from_ordering(&ordering))
-                .filter(|charset| charset.is_cjk())
-                .unwrap_or_else(|| crate::font::Charset::from_font_name(&sem.base_font));
-            sem.metrics = Arc::new(if vertical {
-                // Writing mode 1 (`Identity-V` or a `/WMode 1` CMap): decode
-                // as usual, lay out along −y with the `/W2`//`/DW2` metrics.
-                crate::font::FontMetrics::CidVertical {
-                    widths,
-                    vertical: self.build_cid_vertical(dict),
-                    cmap,
-                }
-            } else {
-                match cmap {
-                    Some(cmap) => crate::font::FontMetrics::CidCMap { widths, cmap },
-                    None => crate::font::FontMetrics::CidIdentity(widths),
-                }
-            });
-            let (program, cid_to_gid, face_index) = self.build_cid_program(dict);
-            sem.program = program;
-            sem.face_index = face_index;
-            sem.glyph_map = Arc::new(crate::font::GlyphMap::Cid(cid_to_gid));
+            self.fill_type0_font(dict, &mut sem);
         } else {
-            // Simple font: resolve code→GID through the encoding and a font
-            // program — the embedded one, or a bundled standard face chosen
-            // by substitution (fonts.md Font Phase 3).
-            let embedded = self.embedded_program(dict).and_then(|bytes| {
-                crate::font::FontProgram::parse(bytes.clone()).map(|p| (bytes, p))
-            });
-            let resolved = match embedded {
-                Some((bytes, prog)) => Some((bytes, prog, None, 0)),
-                None => {
-                    let charset = crate::font::Charset::from_font_name(&sem.base_font);
-                    self.substitute_font(dict, &sem.base_font, charset)
-                        .map(|s| {
-                            // A bundled substitute may lack the requested cut
-                            // (Symbol/ZapfDingbats): record what to synthesize.
-                            if !s.system {
-                                sem.synthesis =
-                                    crate::font::synthesis(s.face, s.want_bold, s.want_italic);
-                            }
-                            (s.bytes, s.program, Some(s.face), s.face_index)
-                        })
-                }
-            };
-            let widths = self.build_simple_widths(dict);
-            if let Some((bytes, prog, face, face_index)) = resolved {
-                self.fill_simple_unicode_map(dict, face, &mut unicode_map);
-                let table = self.build_simple_gids(dict, &prog, face);
-                // Last-resort Unicode: reverse the embedded cmap for any
-                // code the encoding left unmapped (a symbolic Latin subset
-                // with no /Encoding and no /ToUnicode —
-                // PLAN-TEXT-EXTRACTION §5.2 step 4).
-                self.fill_program_cmap_unicode(&prog, &table, &mut unicode_map);
-                // A font with no /Widths uses the standard-14 metrics
-                // (§9.6.2.1); the bundled faces are metric-compatible, so
-                // their own advances are those metrics.
-                if !widths.has_widths() && face.is_some() {
-                    sem.metrics = Arc::new(crate::font::FontMetrics::Simple(standard_widths(
-                        &prog, &table,
-                    )));
-                } else {
-                    sem.metrics = Arc::new(crate::font::FontMetrics::Simple(widths));
-                }
-                sem.program = Some(bytes);
-                sem.face_index = face_index;
-                sem.glyph_map = Arc::new(crate::font::GlyphMap::Simple(table));
-            } else {
-                self.fill_simple_unicode_map(dict, None, &mut unicode_map);
-                sem.metrics = Arc::new(crate::font::FontMetrics::Simple(widths));
-            }
+            self.fill_simple_font(dict, &mut sem, &mut unicode_map);
         }
         sem.unicode_map = Arc::new(unicode_map);
         if let (Some(key), Some(slot)) = (cache_key, &slot) {
             self.font_resources.insert(key, slot, &sem);
         }
         sem
+    }
+
+    /// Fill a Type 0 font's metrics, charset, CID program and glyph map.
+    fn fill_type0_font(&mut self, dict: &Dictionary, sem: &mut SemFont) {
+        // The `/Encoding` CMap decodes byte strings into CIDs. Identity-H/V
+        // (the dominant embedded-subset case) keeps the fast two-byte path;
+        // a predefined CJK CMap name or an embedded CMap stream routes
+        // through the CMap machinery (variable-width codes → CID).
+        let widths = self.build_cid_widths(dict);
+        let (cmap, vertical) = self.resolve_cid_encoding(dict);
+        sem.charset = self
+            .descendant_cidfont(dict)
+            .and_then(|font| font.as_dict().cloned())
+            .and_then(|font| self.cid_ordering(&font))
+            .map(|ordering| crate::font::Charset::from_ordering(&ordering))
+            .filter(|charset| charset.is_cjk())
+            .unwrap_or_else(|| crate::font::Charset::from_font_name(&sem.base_font));
+        sem.metrics = Arc::new(if vertical {
+            // Writing mode 1 (`Identity-V` or a `/WMode 1` CMap): decode
+            // as usual, lay out along −y with the `/W2`//`/DW2` metrics.
+            crate::font::FontMetrics::CidVertical {
+                widths,
+                vertical: self.build_cid_vertical(dict),
+                cmap,
+            }
+        } else {
+            match cmap {
+                Some(cmap) => crate::font::FontMetrics::CidCMap { widths, cmap },
+                None => crate::font::FontMetrics::CidIdentity(widths),
+            }
+        });
+        let (program, cid_to_gid, face_index) = self.build_cid_program(dict);
+        sem.program = program;
+        sem.face_index = face_index;
+        sem.glyph_map = Arc::new(crate::font::GlyphMap::Cid(cid_to_gid));
+    }
+
+    /// Fill a simple font's program (embedded or substituted), metrics,
+    /// glyph map and the Unicode entries its encoding and program supply.
+    fn fill_simple_font(
+        &mut self,
+        dict: &Dictionary,
+        sem: &mut SemFont,
+        unicode_map: &mut crate::font::UnicodeMap,
+    ) {
+        // Simple font: resolve code→GID through the encoding and a font
+        // program — the embedded one, or a bundled standard face chosen
+        // by substitution (fonts.md Font Phase 3).
+        let embedded = self
+            .embedded_program(dict)
+            .and_then(|bytes| crate::font::FontProgram::parse(bytes.clone()).map(|p| (bytes, p)));
+        let resolved = match embedded {
+            Some((bytes, prog)) => Some((bytes, prog, None, 0)),
+            None => {
+                let charset = crate::font::Charset::from_font_name(&sem.base_font);
+                self.substitute_font(dict, &sem.base_font, charset)
+                    .map(|s| {
+                        // A bundled substitute may lack the requested cut
+                        // (Symbol/ZapfDingbats): record what to synthesize.
+                        if !s.system {
+                            sem.synthesis =
+                                crate::font::synthesis(s.face, s.want_bold, s.want_italic);
+                        }
+                        (s.bytes, s.program, Some(s.face), s.face_index)
+                    })
+            }
+        };
+        let widths = self.build_simple_widths(dict);
+        let Some((bytes, prog, face, face_index)) = resolved else {
+            self.fill_simple_unicode_map(dict, None, unicode_map);
+            sem.metrics = Arc::new(crate::font::FontMetrics::Simple(widths));
+            return;
+        };
+        self.fill_simple_unicode_map(dict, face, unicode_map);
+        let table = self.build_simple_gids(dict, &prog, face);
+        // Last-resort Unicode: reverse the embedded cmap for any
+        // code the encoding left unmapped (a symbolic Latin subset
+        // with no /Encoding and no /ToUnicode —
+        // PLAN-TEXT-EXTRACTION §5.2 step 4).
+        self.fill_program_cmap_unicode(&prog, &table, unicode_map);
+        // A font with no /Widths uses the standard-14 metrics
+        // (§9.6.2.1); the bundled faces are metric-compatible, so
+        // their own advances are those metrics.
+        if !widths.has_widths() && face.is_some() {
+            sem.metrics = Arc::new(crate::font::FontMetrics::Simple(standard_widths(
+                &prog, &table,
+            )));
+        } else {
+            sem.metrics = Arc::new(crate::font::FontMetrics::Simple(widths));
+        }
+        sem.program = Some(bytes);
+        sem.face_index = face_index;
+        sem.glyph_map = Arc::new(crate::font::GlyphMap::Simple(table));
     }
 
     /// Identity of the system-font provider for the resolved-font cache key: a
@@ -3095,29 +3217,36 @@ impl<'a> Interpreter<'a> {
                     .and_then(PdfObject::as_name)
                     .and_then(|n| crate::font::BaseEncoding::from_name(&self.names.resolve(n)))
                     .unwrap_or(default);
-                if let Some(PdfObject::Array(items)) = ed
-                    .get(self.intern(b"Differences"))
-                    .cloned()
-                    .and_then(|d| self.resolve_obj(&d))
-                    .as_deref()
-                {
-                    let mut code = 0u32;
-                    for item in items.iter() {
-                        match item {
-                            PdfObject::Integer(i) => code = (*i).max(0) as u32,
-                            PdfObject::Name(n) => {
-                                if code < 256 {
-                                    diffs.insert(code as u8, self.names.resolve(*n).to_vec());
-                                }
-                                code += 1;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                self.read_differences(ed, &mut diffs);
                 (base, diffs)
             }
             _ => (default, diffs),
+        }
+    }
+
+    /// Read an encoding dictionary's `/Differences` array into `diffs`: an
+    /// integer sets the next code, each name maps the current code and
+    /// advances it; codes past 255 are dropped.
+    fn read_differences(&mut self, ed: &Dictionary, diffs: &mut HashMap<u8, Vec<u8>>) {
+        let differences = ed
+            .get(self.intern(b"Differences"))
+            .cloned()
+            .and_then(|d| self.resolve_obj(&d));
+        let Some(PdfObject::Array(items)) = differences.as_deref() else {
+            return;
+        };
+        let mut code = 0u32;
+        for item in items.iter() {
+            match item {
+                PdfObject::Integer(i) => code = (*i).max(0) as u32,
+                PdfObject::Name(n) => {
+                    if code < 256 {
+                        diffs.insert(code as u8, self.names.resolve(*n).to_vec());
+                    }
+                    code += 1;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -3864,10 +3993,27 @@ impl<'a> Interpreter<'a> {
         if n_px == 0 || n_px > MAX_PIXELS {
             return None;
         }
-        // Resolve a named resource / indirect reference down to the array.
+        let items = self.special_image_cs_items(cs_obj)?;
+        let head = items.first().and_then(PdfObject::as_name)?;
+        match self.names.resolve(head).as_ref() {
+            // An `/ICCBased` RGB stream whose profile is not sRGB: the samples
+            // are encoded in *that* profile, and reading them as if they were
+            // already sRGB shifts the whole image. Convert once, here. The
+            // common sRGB profile yields no converter and falls through, so the
+            // usual case stays a pass-through.
+            b"ICCBased" => self.convert_iccbased_samples(items.get(1)?, samples, n_px, decode),
+            b"Lab" => self.convert_lab_samples(&items, samples, n_px, decode),
+            b"DeviceN" => self.convert_devicen_samples(&items, samples, n_px, decode),
+            _ => None,
+        }
+    }
+
+    /// Resolve an image `/ColorSpace` (a named resource or an indirect
+    /// reference) down to its array's items, for the special conversions.
+    fn special_image_cs_items(&mut self, cs_obj: &PdfObject) -> Option<Vec<PdfObject>> {
         let resolved = self.resolve_obj(cs_obj)?;
-        let items: Vec<PdfObject> = match &*resolved {
-            PdfObject::Array(a) => a.to_vec(),
+        match &*resolved {
+            PdfObject::Array(a) => Some(a.to_vec()),
             PdfObject::Name(n) => {
                 let nid = *n;
                 let entry = self
@@ -3878,166 +4024,169 @@ impl<'a> Interpreter<'a> {
                 // Found in the page's resources (a device name never is).
                 self.image_cs_resource_relative = true;
                 match &*self.resolve_obj(&entry)? {
-                    PdfObject::Array(a) => a.to_vec(),
-                    _ => return None,
+                    PdfObject::Array(a) => Some(a.to_vec()),
+                    _ => None,
                 }
-            }
-            _ => return None,
-        };
-        let head = items.first().and_then(PdfObject::as_name)?;
-        match self.names.resolve(head).as_ref() {
-            // An `/ICCBased` RGB stream whose profile is not sRGB: the samples
-            // are encoded in *that* profile, and reading them as if they were
-            // already sRGB shifts the whole image. Convert once, here. The
-            // common sRGB profile yields no converter and falls through, so the
-            // usual case stays a pass-through.
-            b"ICCBased" => {
-                let stream = items.get(1)?;
-                // A 3-component matrix/TRC RGB profile (the common non-sRGB case).
-                if let Some(icc) = self.icc_rgb_transform(stream) {
-                    let src = samples.get(..n_px.checked_mul(3)?)?;
-                    let mut out = Vec::with_capacity(n_px * 3);
-                    // `/Decode` is fixed for the whole image; resolve the three
-                    // ranges once instead of walking the array three times per
-                    // pixel.
-                    let ranges: [[f32; 2]; 3] = std::array::from_fn(|c| {
-                        decode.and_then(|d| d.get(c)).copied().unwrap_or([0.0, 1.0])
-                    });
-                    let dec = |c: usize, raw: u8| -> f32 {
-                        let [lo, hi] = ranges[c];
-                        lo + raw as f32 / 255.0 * (hi - lo)
-                    };
-                    for px in src.chunks_exact(3) {
-                        let rgb = icc.to_srgb([dec(0, px[0]), dec(1, px[1]), dec(2, px[2])]);
-                        for c in rgb {
-                            out.push((c.clamp(0.0, 1.0) * 255.0).round() as u8);
-                        }
-                    }
-                    return Some(Arc::from(out));
-                }
-                // A 4-component CMYK press profile: convert each texel through
-                // the lut, matching PDFium's LittleCMS image path. Only fires
-                // for non-codec (Flate/raw) CMYK samples; a CMYK JPEG decodes in
-                // the backend and keeps the frozen-table path. Memoised on the
-                // raw tuple — a one-time compile cost bounded by distinct inks.
-                let prof = self.cmyk_profile_from_stream(stream)?;
-                let src = samples.get(..n_px.checked_mul(4)?)?;
-                let mut memo: HashMap<[u8; 4], [u8; 3]> = HashMap::new();
-                let mut out = Vec::with_capacity(n_px * 3);
-                for px in src.chunks_exact(4) {
-                    let key = [px[0], px[1], px[2], px[3]];
-                    let rgb8 = *memo.entry(key).or_insert_with(|| {
-                        let dec = |c: usize, raw: u8| -> f32 {
-                            let [lo, hi] =
-                                decode.and_then(|d| d.get(c)).copied().unwrap_or([0.0, 1.0]);
-                            lo + raw as f32 / 255.0 * (hi - lo)
-                        };
-                        let rgb = prof.to_srgb([
-                            dec(0, px[0]),
-                            dec(1, px[1]),
-                            dec(2, px[2]),
-                            dec(3, px[3]),
-                        ]);
-                        [
-                            (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-                            (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-                            (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
-                        ]
-                    });
-                    out.extend_from_slice(&rgb8);
-                }
-                Some(Arc::from(out))
-            }
-            b"Lab" => {
-                let mut white_point = [1.0f32, 1.0, 1.0];
-                let mut range = [-100.0f32, 100.0, -100.0, 100.0];
-                if let Some(d) = items
-                    .get(1)
-                    .and_then(|d| self.resolve_obj(d))
-                    .and_then(|d| d.as_dict().cloned())
-                {
-                    for (key, out) in [
-                        (&b"WhitePoint"[..], &mut white_point[..]),
-                        (b"Range", &mut range[..]),
-                    ] {
-                        if let Some(nid) = self.names.lookup(key)
-                            && let Some(PdfObject::Array(a)) = d.get(nid)
-                        {
-                            for (slot, item) in out.iter_mut().zip(a.iter()) {
-                                if let Some(v) = item.as_number() {
-                                    *slot = v as f32;
-                                }
-                            }
-                        }
-                    }
-                }
-                // §8.9.5.2: the Decode default for a Lab image is
-                // [0 100 amin amax bmin bmax].
-                let default_decode: [[f32; 2]; 3] =
-                    [[0.0, 100.0], [range[0], range[1]], [range[2], range[3]]];
-                // Fixed for the whole image: resolve once, not three times
-                // per pixel.
-                let ranges: [[f32; 2]; 3] = std::array::from_fn(|c| {
-                    decode
-                        .and_then(|d| d.get(c))
-                        .copied()
-                        .unwrap_or(default_decode[c])
-                });
-                let dec = |c: usize, raw: u8| -> f32 {
-                    let [lo, hi] = ranges[c];
-                    lo + raw as f32 / 255.0 * (hi - lo)
-                };
-                let src = samples.get(..n_px.checked_mul(3)?)?;
-                let mut out = Vec::with_capacity(n_px * 3);
-                for px in src.chunks_exact(3) {
-                    let [r, g, b] = crate::color::lab_to_rgb(
-                        dec(0, px[0]),
-                        dec(1, px[1]),
-                        dec(2, px[2]),
-                        white_point,
-                        range,
-                    );
-                    let to = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                    out.extend_from_slice(&[to(r), to(g), to(b)]);
-                }
-                Some(Arc::from(out))
-            }
-            b"DeviceN" => {
-                let space = self.build_tint_space_from_array(&items)?;
-                if space.inputs < 2 || space.func.is_none() {
-                    return None; // 1-input takes the TintLut path; no func → arity approx
-                }
-                let n = space.inputs;
-                let src = samples.get(..n_px.checked_mul(n)?)?;
-                let dec = |c: usize, raw: u8| -> f64 {
-                    match decode.and_then(|d| d.get(c)) {
-                        Some([lo, hi]) => (*lo + raw as f32 / 255.0 * (hi - lo)) as f64,
-                        None => raw as f64 / 255.0,
-                    }
-                };
-                // Memoize on the raw tuple: real multi-colorant images carry
-                // few distinct ink combinations.
-                let mut memo: HashMap<Vec<u8>, [u8; 3]> = HashMap::new();
-                let mut out = Vec::with_capacity(n_px * 3);
-                let mut tints = vec![0.0f64; n];
-                for px in src.chunks_exact(n) {
-                    let rgb = match memo.get(px) {
-                        Some(rgb) => *rgb,
-                        None => {
-                            for (c, (t, raw)) in tints.iter_mut().zip(px.iter()).enumerate() {
-                                *t = dec(c, *raw);
-                            }
-                            let rgb = sem_color_to_rgb8(&self.eval_tint(&space, &tints));
-                            memo.insert(px.to_vec(), rgb);
-                            rgb
-                        }
-                    };
-                    out.extend_from_slice(&rgb);
-                }
-                Some(Arc::from(out))
             }
             _ => None,
         }
+    }
+
+    /// Convert 8-bit `/ICCBased` samples to sRGB: through a non-sRGB RGB
+    /// matrix/TRC profile, or else through a CMYK press profile.
+    fn convert_iccbased_samples(
+        &mut self,
+        stream: &PdfObject,
+        samples: &Arc<[u8]>,
+        n_px: usize,
+        decode: Option<&[[f32; 2]]>,
+    ) -> Option<Arc<[u8]>> {
+        // A 3-component matrix/TRC RGB profile (the common non-sRGB case).
+        if let Some(icc) = self.icc_rgb_transform(stream) {
+            let src = samples.get(..n_px.checked_mul(3)?)?;
+            return Some(icc_rgb_samples_to_srgb(&icc, src, n_px, decode));
+        }
+        // A 4-component CMYK press profile: convert each texel through
+        // the lut, matching PDFium's LittleCMS image path. Only fires
+        // for non-codec (Flate/raw) CMYK samples; a CMYK JPEG decodes in
+        // the backend and keeps the frozen-table path. Memoised on the
+        // raw tuple — a one-time compile cost bounded by distinct inks.
+        let prof = self.cmyk_profile_from_stream(stream)?;
+        let src = samples.get(..n_px.checked_mul(4)?)?;
+        let mut memo: HashMap<[u8; 4], [u8; 3]> = HashMap::new();
+        let mut out = Vec::with_capacity(n_px * 3);
+        for px in src.chunks_exact(4) {
+            let key = [px[0], px[1], px[2], px[3]];
+            let rgb8 = *memo.entry(key).or_insert_with(|| {
+                let dec = |c: usize, raw: u8| -> f32 {
+                    let [lo, hi] = decode.and_then(|d| d.get(c)).copied().unwrap_or([0.0, 1.0]);
+                    lo + raw as f32 / 255.0 * (hi - lo)
+                };
+                let rgb =
+                    prof.to_srgb([dec(0, px[0]), dec(1, px[1]), dec(2, px[2]), dec(3, px[3])]);
+                [
+                    (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                ]
+            });
+            out.extend_from_slice(&rgb8);
+        }
+        Some(Arc::from(out))
+    }
+
+    /// Convert 8-bit `/Lab` samples to sRGB with the space's white point,
+    /// range and the image's `/Decode`.
+    fn convert_lab_samples(
+        &mut self,
+        items: &[PdfObject],
+        samples: &Arc<[u8]>,
+        n_px: usize,
+        decode: Option<&[[f32; 2]]>,
+    ) -> Option<Arc<[u8]>> {
+        let (white_point, range) = self.lab_image_params(items);
+        // §8.9.5.2: the Decode default for a Lab image is
+        // [0 100 amin amax bmin bmax].
+        let default_decode: [[f32; 2]; 3] =
+            [[0.0, 100.0], [range[0], range[1]], [range[2], range[3]]];
+        // Fixed for the whole image: resolve once, not three times
+        // per pixel.
+        let ranges: [[f32; 2]; 3] = std::array::from_fn(|c| {
+            decode
+                .and_then(|d| d.get(c))
+                .copied()
+                .unwrap_or(default_decode[c])
+        });
+        let dec = |c: usize, raw: u8| -> f32 {
+            let [lo, hi] = ranges[c];
+            lo + raw as f32 / 255.0 * (hi - lo)
+        };
+        let src = samples.get(..n_px.checked_mul(3)?)?;
+        let mut out = Vec::with_capacity(n_px * 3);
+        for px in src.chunks_exact(3) {
+            let [r, g, b] = crate::color::lab_to_rgb(
+                dec(0, px[0]),
+                dec(1, px[1]),
+                dec(2, px[2]),
+                white_point,
+                range,
+            );
+            let to = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            out.extend_from_slice(&[to(r), to(g), to(b)]);
+        }
+        Some(Arc::from(out))
+    }
+
+    /// A `[/Lab dict]` space's `/WhitePoint` and `/Range`, each defaulting
+    /// (wholly or per missing entry) to the spec values.
+    fn lab_image_params(&mut self, items: &[PdfObject]) -> ([f32; 3], [f32; 4]) {
+        let mut white_point = [1.0f32, 1.0, 1.0];
+        let mut range = [-100.0f32, 100.0, -100.0, 100.0];
+        let Some(d) = items
+            .get(1)
+            .and_then(|d| self.resolve_obj(d))
+            .and_then(|d| d.as_dict().cloned())
+        else {
+            return (white_point, range);
+        };
+        for (key, out) in [
+            (&b"WhitePoint"[..], &mut white_point[..]),
+            (b"Range", &mut range[..]),
+        ] {
+            let Some(nid) = self.names.lookup(key) else {
+                continue;
+            };
+            let Some(PdfObject::Array(a)) = d.get(nid) else {
+                continue;
+            };
+            for (slot, item) in out.iter_mut().zip(a.iter()) {
+                if let Some(v) = item.as_number() {
+                    *slot = v as f32;
+                }
+            }
+        }
+        (white_point, range)
+    }
+
+    /// Convert 8-bit multi-colorant `/DeviceN` samples to sRGB through the
+    /// tint transform, memoised on the raw ink tuple.
+    fn convert_devicen_samples(
+        &mut self,
+        items: &[PdfObject],
+        samples: &Arc<[u8]>,
+        n_px: usize,
+        decode: Option<&[[f32; 2]]>,
+    ) -> Option<Arc<[u8]>> {
+        let space = self.build_tint_space_from_array(items)?;
+        if space.inputs < 2 || space.func.is_none() {
+            return None; // 1-input takes the TintLut path; no func → arity approx
+        }
+        let n = space.inputs;
+        let src = samples.get(..n_px.checked_mul(n)?)?;
+        let dec = |c: usize, raw: u8| -> f64 {
+            match decode.and_then(|d| d.get(c)) {
+                Some([lo, hi]) => (*lo + raw as f32 / 255.0 * (hi - lo)) as f64,
+                None => raw as f64 / 255.0,
+            }
+        };
+        // Memoize on the raw tuple: real multi-colorant images carry
+        // few distinct ink combinations.
+        let mut memo: HashMap<Vec<u8>, [u8; 3]> = HashMap::new();
+        let mut out = Vec::with_capacity(n_px * 3);
+        let mut tints = vec![0.0f64; n];
+        for px in src.chunks_exact(n) {
+            if let Some(rgb) = memo.get(px) {
+                out.extend_from_slice(rgb);
+                continue;
+            }
+            for (c, (t, raw)) in tints.iter_mut().zip(px.iter()).enumerate() {
+                *t = dec(c, *raw);
+            }
+            let rgb = sem_color_to_rgb8(&self.eval_tint(&space, &tints));
+            memo.insert(px.to_vec(), rgb);
+            out.extend_from_slice(&rgb);
+        }
+        Some(Arc::from(out))
     }
 
     /// Read a `/Decode` array into per-component `[min, max]` pairs.
@@ -4151,28 +4300,7 @@ impl<'a> Interpreter<'a> {
             // have to reach the sampler with their `/Range`, so this cannot
             // collapse to `Cs::Rgb` the way `/CalRGB` can.
             b"Lab" => {
-                let mut white_point = [1.0f32, 1.0, 1.0];
-                let mut range = [-100.0f32, 100.0, -100.0, 100.0];
-                let dict = items
-                    .get(1)
-                    .and_then(|d| self.resolve_obj(d))
-                    .and_then(|d| d.as_dict().cloned());
-                if let Some(d) = &dict {
-                    for (key, out) in [
-                        (&b"WhitePoint"[..], &mut white_point[..]),
-                        (&b"Range"[..], &mut range[..]),
-                    ] {
-                        if let Some(nid) = self.names.lookup(key)
-                            && let Some(PdfObject::Array(a)) = d.get(nid)
-                        {
-                            for (slot, item) in out.iter_mut().zip(a.iter()) {
-                                if let Some(v) = item.as_number() {
-                                    *slot = v as f32;
-                                }
-                            }
-                        }
-                    }
-                }
+                let (white_point, range) = self.lab_image_params(items);
                 Some(Cs::Lab { white_point, range })
             }
             b"ICC" => Some(Cs::Rgb),
@@ -4679,13 +4807,14 @@ impl<'a> Interpreter<'a> {
                 if annot.hidden_for_display() {
                     continue;
                 }
-                if let Err(e) = self.render_annotation(annot) {
-                    if e.is_fatal() {
-                        return Err(e);
-                    }
-                    self.ctx
-                        .note_recovery(format!("annotation appearance dropped ({e})"));
+                let Err(e) = self.render_annotation(annot) else {
+                    continue;
+                };
+                if e.is_fatal() {
+                    return Err(e);
                 }
+                self.ctx
+                    .note_recovery(format!("annotation appearance dropped ({e})"));
             }
         }
         Ok(())
@@ -5166,49 +5295,63 @@ impl<'a> Interpreter<'a> {
 
         // /SMask: a soft-mask dictionary, or /None to disable.
         if let Some(smask) = dict.get(self.intern(b"SMask")).cloned() {
-            if matches!(&smask, PdfObject::Name(n) if self.names.resolve(*n).as_ref() == b"None") {
-                self.emit(SemanticOp::ClearSoftMask);
-            } else if let Some(sm) = self.resolve_obj(&smask)
-                && let Some(sm) = sm.as_dict()
-            {
-                let sm = sm.clone();
-                let luminosity = matches!(
-                    sm.get(self.intern(b"S")).and_then(PdfObject::as_name),
-                    Some(s) if self.names.resolve(s).as_ref() == b"Luminosity"
-                );
-                // /BC (luminosity only): explicit backdrop color, converted
-                // to RGB bytes with the device approximation (§11.6.5.2).
-                let kind = if luminosity {
-                    match read_num_array(&sm, self.intern(b"BC")) {
-                        Some(bc) if !bc.is_empty() => {
-                            let comps: Vec<f32> = bc.iter().map(|v| *v as f32).collect();
-                            let rgba = comps_to_rgba(&comps);
-                            MaskKind::LuminosityBc {
-                                backdrop: [
-                                    (rgba[0] * 255.0 + 0.5) as u8,
-                                    (rgba[1] * 255.0 + 0.5) as u8,
-                                    (rgba[2] * 255.0 + 0.5) as u8,
-                                ],
-                            }
-                        }
-                        _ => MaskKind::Luminosity,
-                    }
-                } else {
-                    MaskKind::Alpha
-                };
-                let transfer = self.build_transfer_lut(&sm);
-                if let Some(g) = sm.get(self.intern(b"G")).cloned() {
-                    let group_id = g.as_reference();
-                    if let Some(group) = self.resolve_obj(&g)
-                        && let PdfObject::Stream(stream) = &*group
-                    {
-                        let stream = stream.clone();
-                        self.run_soft_mask(kind, transfer, &stream, group_id)?;
-                    }
-                }
-            }
+            self.ext_gstate_soft_mask(&smask)?;
         }
         Ok(())
+    }
+
+    /// Apply an ExtGState `/SMask` entry: `/None` clears the soft mask; a
+    /// soft-mask dictionary with a `/G` group stream runs that group as the
+    /// new mask. Anything else is ignored.
+    fn ext_gstate_soft_mask(&mut self, smask: &PdfObject) -> Result<(), ContentError> {
+        if matches!(smask, PdfObject::Name(n) if self.names.resolve(*n).as_ref() == b"None") {
+            self.emit(SemanticOp::ClearSoftMask);
+            return Ok(());
+        }
+        let Some(sm) = self.resolve_obj(smask) else {
+            return Ok(());
+        };
+        let Some(sm) = sm.as_dict() else {
+            return Ok(());
+        };
+        let sm = sm.clone();
+        let luminosity = matches!(
+            sm.get(self.intern(b"S")).and_then(PdfObject::as_name),
+            Some(s) if self.names.resolve(s).as_ref() == b"Luminosity"
+        );
+        // /BC (luminosity only): explicit backdrop color, converted
+        // to RGB bytes with the device approximation (§11.6.5.2).
+        let kind = if luminosity {
+            match read_num_array(&sm, self.intern(b"BC")) {
+                Some(bc) if !bc.is_empty() => {
+                    let comps: Vec<f32> = bc.iter().map(|v| *v as f32).collect();
+                    let rgba = comps_to_rgba(&comps);
+                    MaskKind::LuminosityBc {
+                        backdrop: [
+                            (rgba[0] * 255.0 + 0.5) as u8,
+                            (rgba[1] * 255.0 + 0.5) as u8,
+                            (rgba[2] * 255.0 + 0.5) as u8,
+                        ],
+                    }
+                }
+                _ => MaskKind::Luminosity,
+            }
+        } else {
+            MaskKind::Alpha
+        };
+        let transfer = self.build_transfer_lut(&sm);
+        let Some(g) = sm.get(self.intern(b"G")).cloned() else {
+            return Ok(());
+        };
+        let group_id = g.as_reference();
+        let Some(group) = self.resolve_obj(&g) else {
+            return Ok(());
+        };
+        let PdfObject::Stream(stream) = &*group else {
+            return Ok(());
+        };
+        let stream = stream.clone();
+        self.run_soft_mask(kind, transfer, &stream, group_id)
     }
 
     /// Sample the `/SMask` dictionary's `/TR` transfer function into a
@@ -5624,26 +5767,31 @@ impl<'a> Interpreter<'a> {
     /// space that `cs_to_rgba` handles.
     fn resolve_shading_cs(&mut self, obj: &PdfObject) -> Option<ShadingCs> {
         let resolved = self.resolve_obj(obj)?;
-        if let PdfObject::Array(items) = &*resolved {
-            let items = items.clone();
-            if let Some(head) = items.first().and_then(PdfObject::as_name) {
-                match self.names.resolve(head).as_ref() {
-                    b"Separation" | b"DeviceN" => {
-                        if let Some(space) = self.build_tint_space_from_array(&items) {
-                            return Some(ShadingCs::Tint(space));
-                        }
-                    }
-                    b"Lab" | b"CalRGB" | b"CalGray" => {
-                        if let Some(cie) = self.cie_space_from_items(&items) {
-                            return Some(ShadingCs::Cie(cie));
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        if let Some(cs) = self.shading_tint_or_cie_cs(&resolved) {
+            return Some(cs);
         }
         self.resolve_image_colorspace(&resolved)
             .map(ShadingCs::Image)
+    }
+
+    /// A shading colour space that keeps its own colour math: a buildable
+    /// `/Separation`/`/DeviceN` tint space or a CIE space. `None` sends the
+    /// caller to the image-colour-space path.
+    fn shading_tint_or_cie_cs(&mut self, resolved: &PdfObject) -> Option<ShadingCs> {
+        let PdfObject::Array(items) = resolved else {
+            return None;
+        };
+        let items = items.clone();
+        let head = items.first().and_then(PdfObject::as_name)?;
+        match self.names.resolve(head).as_ref() {
+            b"Separation" | b"DeviceN" => self
+                .build_tint_space_from_array(&items)
+                .map(ShadingCs::Tint),
+            b"Lab" | b"CalRGB" | b"CalGray" => {
+                self.cie_space_from_items(&items).map(ShadingCs::Cie)
+            }
+            _ => None,
+        }
     }
 
     /// Type 1 (function-based) shading: sample the 2-in color function on a
@@ -6302,6 +6450,33 @@ fn decode_pdf_text_string(bytes: &[u8]) -> Vec<u16> {
     crate::object::decode_text_string(bytes)
 }
 
+/// Convert 8-bit RGB samples encoded in a non-sRGB ICC RGB profile to sRGB,
+/// applying the image's `/Decode`.
+fn icc_rgb_samples_to_srgb(
+    icc: &crate::color::icc::IccRgb,
+    src: &[u8],
+    n_px: usize,
+    decode: Option<&[[f32; 2]]>,
+) -> Arc<[u8]> {
+    let mut out = Vec::with_capacity(n_px * 3);
+    // `/Decode` is fixed for the whole image; resolve the three
+    // ranges once instead of walking the array three times per
+    // pixel.
+    let ranges: [[f32; 2]; 3] =
+        std::array::from_fn(|c| decode.and_then(|d| d.get(c)).copied().unwrap_or([0.0, 1.0]));
+    let dec = |c: usize, raw: u8| -> f32 {
+        let [lo, hi] = ranges[c];
+        lo + raw as f32 / 255.0 * (hi - lo)
+    };
+    for px in src.chunks_exact(3) {
+        let rgb = icc.to_srgb([dec(0, px[0]), dec(1, px[1]), dec(2, px[2])]);
+        for c in rgb {
+            out.push((c.clamp(0.0, 1.0) * 255.0).round() as u8);
+        }
+    }
+    Arc::from(out)
+}
+
 /// Convert an alternate-space [`SemColor`] (as produced by `eval_tint`) to an
 /// 8-bit sRGB triple, using the same `pdf_color` conversions as the fill path.
 /// Only the device families `eval_tint` yields are handled; anything else
@@ -6391,47 +6566,53 @@ fn inline_codec_parms(op: &Operand) -> Option<crate::page_ir::CodecParms> {
     };
     for d in dicts {
         for (key, value) in d {
-            match key.as_slice() {
-                b"K" => {
-                    if let Some(k) = value.as_int() {
-                        out.k = k as i32;
-                    }
-                }
-                b"Columns" => {
-                    if let Some(c) = value.as_int() {
-                        out.columns = c.max(0) as u32;
-                    }
-                }
-                b"Rows" => {
-                    if let Some(r) = value.as_int() {
-                        out.rows = r.max(0) as u32;
-                    }
-                }
-                b"BlackIs1" => {
-                    if let Operand::Bool(v) = value {
-                        out.black_is_1 = *v;
-                    }
-                }
-                b"EncodedByteAlign" => {
-                    if let Operand::Bool(v) = value {
-                        out.byte_align = *v;
-                    }
-                }
-                b"EndOfLine" => {
-                    if let Operand::Bool(v) = value {
-                        out.end_of_line = *v;
-                    }
-                }
-                b"EndOfBlock" => {
-                    if let Operand::Bool(v) = value {
-                        out.end_of_block = *v;
-                    }
-                }
-                _ => {}
-            }
+            apply_inline_codec_parm(&mut out, key, value);
         }
     }
     Some(out)
+}
+
+/// Apply one inline-image `/DecodeParms` entry to `out`; unknown keys and
+/// mistyped values are ignored.
+fn apply_inline_codec_parm(out: &mut crate::page_ir::CodecParms, key: &[u8], value: &Operand) {
+    match key {
+        b"K" => {
+            if let Some(k) = value.as_int() {
+                out.k = k as i32;
+            }
+        }
+        b"Columns" => {
+            if let Some(c) = value.as_int() {
+                out.columns = c.max(0) as u32;
+            }
+        }
+        b"Rows" => {
+            if let Some(r) = value.as_int() {
+                out.rows = r.max(0) as u32;
+            }
+        }
+        b"BlackIs1" => {
+            if let Operand::Bool(v) = value {
+                out.black_is_1 = *v;
+            }
+        }
+        b"EncodedByteAlign" => {
+            if let Operand::Bool(v) = value {
+                out.byte_align = *v;
+            }
+        }
+        b"EndOfLine" => {
+            if let Operand::Bool(v) = value {
+                out.end_of_line = *v;
+            }
+        }
+        b"EndOfBlock" => {
+            if let Operand::Bool(v) = value {
+                out.end_of_block = *v;
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Build a color-key `/Mask` from an inline image's array operand. Same
@@ -6640,12 +6821,7 @@ fn parse_cid_w(items: &[PdfObject]) -> Vec<(u32, u32, f32)> {
         let Some(next) = items.get(i) else { break };
         match next {
             PdfObject::Array(ws) => {
-                for (j, w) in ws.iter().enumerate() {
-                    if let Some(wn) = w.as_number() {
-                        let cid = (c + j as i64).max(0) as u32;
-                        ranges.push((cid, cid, wn as f32));
-                    }
-                }
+                push_cid_w_list(&mut ranges, c, ws);
                 i += 1;
             }
             _ => {
@@ -6661,6 +6837,18 @@ fn parse_cid_w(items: &[PdfObject]) -> Vec<(u32, u32, f32)> {
     ranges
 }
 
+/// Push the `/W` form `c [w1 … wn]`: one single-CID range per numeric width,
+/// for consecutive CIDs from `c` (a non-numeric entry still uses up its CID).
+fn push_cid_w_list(ranges: &mut Vec<(u32, u32, f32)>, c: i64, ws: &[PdfObject]) {
+    for (j, w) in ws.iter().enumerate() {
+        let Some(wn) = w.as_number() else {
+            continue;
+        };
+        let cid = (c + j as i64).max(0) as u32;
+        ranges.push((cid, cid, wn as f32));
+    }
+}
+
 /// Parse a CIDFont `/W2` array into `(cid_start, cid_end, [w1y, vx, vy])`
 /// ranges (ISO 32000-1 §9.7.4.3, mirroring [`parse_cid_w`]). Two entry forms:
 /// `c [w1y vx vy …]` (triples for consecutive CIDs from `c`) and
@@ -6674,19 +6862,7 @@ fn parse_cid_w2(items: &[PdfObject]) -> Vec<(u32, u32, [f32; 3])> {
         let Some(next) = items.get(i) else { break };
         match next {
             PdfObject::Array(ms) => {
-                for (j, triple) in ms.chunks(3).enumerate() {
-                    if triple.len() < 3 {
-                        break;
-                    }
-                    let nums: Vec<f32> = triple
-                        .iter()
-                        .filter_map(|v| v.as_number().map(|n| n as f32))
-                        .collect();
-                    if nums.len() == 3 {
-                        let cid = (c + j as i64).max(0) as u32;
-                        ranges.push((cid, cid, [nums[0], nums[1], nums[2]]));
-                    }
-                }
+                push_cid_w2_list(&mut ranges, c, ms);
                 i += 1;
             }
             _ => {
@@ -6706,6 +6882,25 @@ fn parse_cid_w2(items: &[PdfObject]) -> Vec<(u32, u32, [f32; 3])> {
         }
     }
     ranges
+}
+
+/// Push the `/W2` form `c [w1y vx vy …]`: one single-CID range per complete,
+/// all-numeric triple, for consecutive CIDs from `c`; a trailing partial
+/// triple ends the list.
+fn push_cid_w2_list(ranges: &mut Vec<(u32, u32, [f32; 3])>, c: i64, ms: &[PdfObject]) {
+    for (j, triple) in ms.chunks(3).enumerate() {
+        if triple.len() < 3 {
+            break;
+        }
+        let nums: Vec<f32> = triple
+            .iter()
+            .filter_map(|v| v.as_number().map(|n| n as f32))
+            .collect();
+        if nums.len() == 3 {
+            let cid = (c + j as i64).max(0) as u32;
+            ranges.push((cid, cid, [nums[0], nums[1], nums[2]]));
+        }
+    }
 }
 
 /// Axis-aligned bounds of a `/BBox` rectangle mapped through `ctm`. All four
@@ -7108,6 +7303,19 @@ fn eval_cie(space: CieSpace, values: &[f64]) -> SemColor {
 struct CharProc {
     object: Option<ObjectId>,
     stream: Arc<PdfStream>,
+}
+
+/// The text-state parameters of one Type 3 show operation, captured once
+/// before its glyphs execute.
+struct Type3Run {
+    tfs: f64,
+    th: f64,
+    tc: f64,
+    tw: f64,
+    /// Render mode 3 or 7, or an OC-hidden span: advance without painting.
+    invisible: bool,
+    /// `[Tfs·Th 0 0 Tfs 0 Ts]`: text space to the scaled text parameters.
+    param: Matrix,
 }
 
 /// A parsed `/Type3` font: everything needed to draw its glyphs, which are

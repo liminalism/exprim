@@ -11,7 +11,8 @@ use std::time::Instant;
 use exprim::content::PageCompiler;
 use exprim::document::{DocumentLimits, DocumentSnapshot, PageIndex, ParseContext};
 use exprim::page_ir::{
-    BlendMode, CompiledPage, DisplayOp, LineCap, LineJoin, Paint, PaintOrigin, PathData, PathVerb,
+    BlendMode, CompiledPage, DisplayOp, GlyphRun, LineCap, LineJoin, Paint, PaintOrigin, PathData,
+    PathVerb, StrokeStyle,
 };
 use exprim::source::{MmapSource, PdfSource};
 
@@ -80,7 +81,12 @@ fn is_rect_like(p: &PathData) -> bool {
             _ => {}
         }
     }
-    lines <= 4 && p.verbs.iter().filter(|v| matches!(v, PathVerb::MoveTo)).count() <= 1
+    lines <= 4
+        && p.verbs
+            .iter()
+            .filter(|v| matches!(v, PathVerb::MoveTo))
+            .count()
+            <= 1
 }
 
 fn font_kind(program: &[u8]) -> &'static str {
@@ -93,6 +99,66 @@ fn font_kind(program: &[u8]) -> &'static str {
     }
 }
 
+/// Stroke-style counts: dashed strokes, and strokes by join, cap and width
+/// band (< 0.5, 0.5..=2, > 2).
+#[derive(Default)]
+struct StrokeTally {
+    dashed: u64,
+    joins: [u64; 3],
+    caps: [u64; 3],
+    widths: [u64; 3],
+}
+
+impl StrokeTally {
+    fn add(&mut self, s: &StrokeStyle) {
+        if !s.dash_pattern.is_empty() {
+            self.dashed += 1;
+        }
+        match s.join {
+            LineJoin::Miter => self.joins[0] += 1,
+            LineJoin::Round => self.joins[1] += 1,
+            LineJoin::Bevel => self.joins[2] += 1,
+        }
+        match s.cap {
+            LineCap::Butt => self.caps[0] += 1,
+            LineCap::Round => self.caps[1] += 1,
+            LineCap::Square => self.caps[2] += 1,
+        }
+        if s.width < 0.5 {
+            self.widths[0] += 1;
+        } else if s.width <= 2.0 {
+            self.widths[1] += 1;
+        } else {
+            self.widths[2] += 1;
+        }
+    }
+}
+
+/// Glyph-run counts: runs by text render mode, glyphs, the largest glyph id,
+/// and runs whose transform is rotated or skewed.
+#[derive(Default)]
+struct RunTally {
+    modes: [u64; 8],
+    glyphs_total: u64,
+    rotated_runs: u64,
+    max_gid: u32,
+}
+
+impl RunTally {
+    fn add(&mut self, r: &GlyphRun) {
+        self.modes[(r.render_mode & 7) as usize] += 1;
+        self.glyphs_total += r.glyphs.len() as u64;
+        for g in r.glyphs.iter() {
+            self.max_gid = self.max_gid.max(g.glyph);
+        }
+        let t = &r.transform;
+        let diag = t.a.abs().max(t.d.abs()).max(1e-12);
+        if t.b.abs() > 1e-4 * diag || t.c.abs() > 1e-4 * diag {
+            self.rotated_runs += 1;
+        }
+    }
+}
+
 fn census_page(path: &str, pages: u32, page: u32, cp: &CompiledPage, compile_ms: f64) -> String {
     let mut fill = Geo::default();
     let mut stroke = Geo::default();
@@ -101,17 +167,12 @@ fn census_page(path: &str, pages: u32, page: u32, cp: &CompiledPage, compile_ms:
 
     let (mut n_fill, mut n_stroke, mut n_clip, mut n_clip_nonrect, mut n_clip_text) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
-    let (mut n_runs, mut n_img, mut n_shade, mut n_group, mut n_smask) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut n_runs, mut n_img, mut n_shade, mut n_group, mut n_smask) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut n_form, mut n_tiling_cell, mut n_t3glyph, mut n_annot) = (0u64, 0u64, 0u64, 0u64);
-    let mut dashed = 0u64;
-    let mut joins = [0u64; 3];
-    let mut caps = [0u64; 3];
-    let mut widths = [0u64; 3];
+    let mut strokes = StrokeTally::default();
     let (mut alpha_lt1, mut blend_non_normal) = (0u64, 0u64);
-    let mut modes = [0u64; 8];
-    let mut glyphs_total = 0u64;
-    let mut rotated_runs = 0u64;
-    let mut max_gid = 0u32;
+    let mut runs = RunTally::default();
     let mut glyph_stroke_runs = 0u64;
     let (mut pat_draws, mut shade_paint_draws) = (0u64, 0u64);
 
@@ -139,72 +200,64 @@ fn census_page(path: &str, pages: u32, page: u32, cp: &CompiledPage, compile_ms:
             }
         }
         match op {
-            DisplayOp::FillPath { path, alpha: a, blend, .. } => {
+            DisplayOp::FillPath {
+                path,
+                alpha: a,
+                blend,
+                ..
+            } => {
                 n_fill += 1;
                 if let Some(p) = cp.paths.get(path.0 as usize) {
                     fill.add(p, &mut max_fill);
                 }
                 alpha(*a, *blend, &mut alpha_lt1, &mut blend_non_normal);
             }
-            DisplayOp::StrokePath { path, style, alpha: a, blend, .. } => {
+            DisplayOp::StrokePath {
+                path,
+                style,
+                alpha: a,
+                blend,
+                ..
+            } => {
                 n_stroke += 1;
                 if let Some(p) = cp.paths.get(path.0 as usize) {
                     stroke.add(p, &mut max_stroke);
                 }
                 if let Some(s) = cp.stroke_styles.get(style.0 as usize) {
-                    if !s.dash_pattern.is_empty() {
-                        dashed += 1;
-                    }
-                    match s.join {
-                        LineJoin::Miter => joins[0] += 1,
-                        LineJoin::Round => joins[1] += 1,
-                        LineJoin::Bevel => joins[2] += 1,
-                    }
-                    match s.cap {
-                        LineCap::Butt => caps[0] += 1,
-                        LineCap::Round => caps[1] += 1,
-                        LineCap::Square => caps[2] += 1,
-                    }
-                    if s.width < 0.5 {
-                        widths[0] += 1;
-                    } else if s.width <= 2.0 {
-                        widths[1] += 1;
-                    } else {
-                        widths[2] += 1;
-                    }
+                    strokes.add(s);
                 }
                 alpha(*a, *blend, &mut alpha_lt1, &mut blend_non_normal);
             }
             DisplayOp::PushClip { path, .. } => {
                 n_clip += 1;
-                if let Some(p) = cp.paths.get(path.0 as usize) {
-                    clip.add(p, &mut max_clip);
-                    if !is_rect_like(p) {
-                        n_clip_nonrect += 1;
-                    }
+                let Some(p) = cp.paths.get(path.0 as usize) else {
+                    continue;
+                };
+                clip.add(p, &mut max_clip);
+                if !is_rect_like(p) {
+                    n_clip_nonrect += 1;
                 }
             }
             DisplayOp::PushClipText { .. } => n_clip_text += 1,
-            DisplayOp::DrawGlyphRun { run, alpha: a, blend, stroke: gs, .. } => {
+            DisplayOp::DrawGlyphRun {
+                run,
+                alpha: a,
+                blend,
+                stroke: gs,
+                ..
+            } => {
                 n_runs += 1;
                 if gs.is_some() {
                     glyph_stroke_runs += 1;
                 }
                 alpha(*a, *blend, &mut alpha_lt1, &mut blend_non_normal);
                 if let Some(r) = cp.glyph_runs.get(run.0 as usize) {
-                    modes[(r.render_mode & 7) as usize] += 1;
-                    glyphs_total += r.glyphs.len() as u64;
-                    for g in r.glyphs.iter() {
-                        max_gid = max_gid.max(g.glyph);
-                    }
-                    let t = &r.transform;
-                    let diag = t.a.abs().max(t.d.abs()).max(1e-12);
-                    if t.b.abs() > 1e-4 * diag || t.c.abs() > 1e-4 * diag {
-                        rotated_runs += 1;
-                    }
+                    runs.add(r);
                 }
             }
-            DisplayOp::DrawImage { alpha: a, blend, .. } => {
+            DisplayOp::DrawImage {
+                alpha: a, blend, ..
+            } => {
                 n_img += 1;
                 alpha(*a, *blend, &mut alpha_lt1, &mut blend_non_normal);
             }
@@ -241,6 +294,18 @@ fn census_page(path: &str, pages: u32, page: u32, cp: &CompiledPage, compile_ms:
         .filter(|f| f.synthetic_shear != 0.0 || f.synthetic_embolden_em != 0.0)
         .count();
 
+    let StrokeTally {
+        dashed,
+        joins,
+        caps,
+        widths,
+    } = strokes;
+    let RunTally {
+        modes,
+        glyphs_total,
+        rotated_runs,
+        max_gid,
+    } = runs;
     let crop = cp.bounds.crop;
     let mut o = String::with_capacity(1500);
     let _ = write!(
@@ -323,8 +388,15 @@ fn census_page(path: &str, pages: u32, page: u32, cp: &CompiledPage, compile_ms:
 
 pub fn census(args: &[String]) {
     let mut a = crate::Args(args.to_vec());
-    let max_pages: usize = a.value("--max-pages").and_then(|v| v.parse().ok()).unwrap_or(6).max(1);
-    let budget_ms: f64 = a.value("--budget-ms").and_then(|v| v.parse().ok()).unwrap_or(3000.0);
+    let max_pages: usize = a
+        .value("--max-pages")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6)
+        .max(1);
+    let budget_ms: f64 = a
+        .value("--budget-ms")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3000.0);
     let path = a.positional().to_owned();
 
     let opened = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -332,7 +404,8 @@ pub fn census(args: &[String]) {
             Ok(s) => Arc::new(s),
             Err(e) => return Err(format!("open source: {e}")),
         };
-        DocumentSnapshot::open(source, DocumentLimits::default()).map_err(|e| format!("open document: {e}"))
+        DocumentSnapshot::open(source, DocumentLimits::default())
+            .map_err(|e| format!("open document: {e}"))
     }));
     let snap = match opened {
         Ok(Ok(s)) => s,

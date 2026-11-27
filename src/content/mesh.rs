@@ -128,6 +128,36 @@ impl Reader<'_, '_> {
         self.bits.byte_align();
         Some((flag, SemMeshVertex { x, y, color }))
     }
+
+    /// Fill each slot with a flagged vertex, in order; `None` at the first
+    /// vertex the stream cannot supply.
+    fn read_vertices<'s>(
+        &mut self,
+        slots: impl Iterator<Item = &'s mut SemMeshVertex>,
+    ) -> Option<()> {
+        for slot in slots {
+            *slot = self.read_vertex(true)?.1;
+        }
+        Some(())
+    }
+
+    /// Fill each slot with a point, in order; `None` at the first point the
+    /// stream cannot supply.
+    fn read_points<'s>(&mut self, slots: impl Iterator<Item = &'s mut [f64; 2]>) -> Option<()> {
+        for slot in slots {
+            *slot = self.read_point()?;
+        }
+        Some(())
+    }
+
+    /// Fill each slot with a colour, in order; `None` at the first colour
+    /// the stream cannot supply.
+    fn read_colors<'s>(&mut self, slots: impl Iterator<Item = &'s mut [f32; 4]>) -> Option<()> {
+        for slot in slots {
+            *slot = self.read_color()?;
+        }
+        Some(())
+    }
 }
 
 /// Type 4: free-form Gouraud triangles. Flag 0 starts a fresh triangle (two
@@ -156,17 +186,7 @@ pub(crate) fn read_free_triangles(
         };
         if flag == 0 {
             tri[0] = vertex;
-            let mut ok = true;
-            for slot in tri.iter_mut().skip(1) {
-                match r.read_vertex(true) {
-                    Some((_, v)) => *slot = v,
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if !ok {
+            if r.read_vertices(tri.iter_mut().skip(1)).is_none() {
                 break;
             }
             have = true;
@@ -352,28 +372,12 @@ pub(crate) fn read_patches(
             colors[1] = c1;
             (4usize, 2usize)
         };
-        let mut ok = true;
-        for slot in coords.iter_mut().take(point_count).skip(start_point) {
-            match r.read_point() {
-                Some(p) => *slot = p,
-                None => {
-                    ok = false;
-                    break;
-                }
-            }
+        if r.read_points(coords.iter_mut().take(point_count).skip(start_point))
+            .is_none()
+        {
+            break;
         }
-        if ok {
-            for slot in colors.iter_mut().skip(start_color) {
-                match r.read_color() {
-                    Some(c) => *slot = c,
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-        }
-        if !ok {
+        if r.read_colors(colors.iter_mut().skip(start_color)).is_none() {
             break;
         }
         have = true;

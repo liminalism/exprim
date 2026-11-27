@@ -200,6 +200,34 @@ fn dnl_height_placeholder_falls_back_to_the_dictionary() {
 
 // --- scaled decode -----------------------------------------------------------
 
+/// Average each `denom`×`denom` square of an RGB raster into a `tw`×`th`
+/// packed RGB raster.
+fn box_filter_rgb(data: &[u8], stride: usize, denom: usize, tw: usize, th: usize) -> Vec<u8> {
+    let mut expect = vec![0u8; tw * th * 3];
+    for y in 0..th {
+        for x in 0..tw {
+            let at = (y * tw + x) * 3;
+            expect[at..at + 3].copy_from_slice(&box_mean_rgb(data, stride, denom, x, y));
+        }
+    }
+    expect
+}
+
+/// The mean of the `denom`×`denom` RGB square whose output pixel is `(x, y)`.
+fn box_mean_rgb(data: &[u8], stride: usize, denom: usize, x: usize, y: usize) -> [u8; 3] {
+    let mut acc = [0u32; 3];
+    for dy in 0..denom {
+        let sy = y * denom + dy;
+        for dx in 0..denom {
+            let sx = x * denom + dx;
+            for (c, sum) in acc.iter_mut().enumerate() {
+                *sum += data[(sy * stride) + sx * 3 + c] as u32;
+            }
+        }
+    }
+    acc.map(|sum| (sum / (denom * denom) as u32) as u8)
+}
+
 /// A minified draw decodes at a reduced DCT size instead of full resolution.
 /// The reduced raster must be a faithful area-average of the full one, not a
 /// point-sampled (aliased) one, so comparing it against a box-filtered full
@@ -224,22 +252,7 @@ fn scaled_decode_matches_a_box_filtered_full_decode() {
         );
 
         // Box-filter the full decode down and compare.
-        let mut expect = vec![0u8; (tw * th) as usize * 3];
-        for y in 0..th as usize {
-            for x in 0..tw as usize {
-                for c in 0..3 {
-                    let mut acc = 0u32;
-                    for dy in 0..denom {
-                        for dx in 0..denom {
-                            let sy = y * denom + dy;
-                            let sx = x * denom + dx;
-                            acc += full.data[(sy * full.stride) + sx * 3 + c] as u32;
-                        }
-                    }
-                    expect[(y * tw as usize + x) * 3 + c] = (acc / (denom * denom) as u32) as u8;
-                }
-            }
-        }
+        let expect = box_filter_rgb(&full.data, full.stride, denom, tw as usize, th as usize);
         let got: Vec<u8> = (0..th as usize)
             .flat_map(|y| small.data[y * small.stride..y * small.stride + tw as usize * 3].to_vec())
             .collect();

@@ -87,28 +87,35 @@ fn fitted_placements_never_leave_the_imageable_area() {
                     n_up,
                     ..PrintOptions::default()
                 };
-                let sheets = impose(&job(document.clone(), options), hardware())
-                    .unwrap_or_else(|e| unreachable!("impose failed: {e}"));
-                for sheet in &sheets {
-                    assert!(
-                        sheet.imageable.contained_by(sheet.bounds, EPS),
-                        "imageable {:?} escaped the sheet {:?}",
-                        sheet.imageable,
-                        sheet.bounds
-                    );
-                    for placement in &sheet.placements {
-                        let page = find(&document, placement.source_page);
-                        let bounds = placement.transformed_bounds(page);
-                        assert!(
-                            bounds.contained_by(sheet.imageable, EPS),
-                            "{n_up:?}/{scaling:?}/{orientation:?}: page {} at {bounds:?} \
-                             escaped imageable {:?}",
-                            page.index,
-                            sheet.imageable
-                        );
-                    }
-                }
+                assert_placements_contained(&document, options);
             }
+        }
+    }
+}
+
+/// Impose `document` under `options` and require every sheet's imageable
+/// area inside the sheet and every placed page inside the imageable area.
+fn assert_placements_contained(document: &[SourcePage], options: PrintOptions) {
+    let (n_up, scaling, orientation) = (options.n_up, options.scaling, options.orientation);
+    let sheets = impose(&job(document.to_vec(), options), hardware())
+        .unwrap_or_else(|e| unreachable!("impose failed: {e}"));
+    for sheet in &sheets {
+        assert!(
+            sheet.imageable.contained_by(sheet.bounds, EPS),
+            "imageable {:?} escaped the sheet {:?}",
+            sheet.imageable,
+            sheet.bounds
+        );
+        for placement in &sheet.placements {
+            let page = find(document, placement.source_page);
+            let bounds = placement.transformed_bounds(page);
+            assert!(
+                bounds.contained_by(sheet.imageable, EPS),
+                "{n_up:?}/{scaling:?}/{orientation:?}: page {} at {bounds:?} \
+                 escaped imageable {:?}",
+                page.index,
+                sheet.imageable
+            );
         }
     }
 }
@@ -198,28 +205,35 @@ fn n_up_placements_on_one_sheet_never_overlap() {
                 scaling: Scaling::FitToPage,
                 ..PrintOptions::default()
             };
-            let sheets = impose(&job(document.clone(), options), hardware())
-                .unwrap_or_else(|e| unreachable!("impose failed: {e}"));
-            for sheet in &sheets {
-                for (i, a) in sheet.placements.iter().enumerate() {
-                    for b in sheet.placements.iter().skip(i + 1) {
-                        assert!(
-                            !a.clip.overlaps(b.clip, EPS),
-                            "{n_up:?}/{order:?}: cells {:?} and {:?} overlap",
-                            a.clip,
-                            b.clip
-                        );
-                        let a_bounds = a.transformed_bounds(find(&document, a.source_page));
-                        let b_bounds = b.transformed_bounds(find(&document, b.source_page));
-                        assert!(
-                            !a_bounds.overlaps(b_bounds, EPS),
-                            "{n_up:?}/{order:?}: pages {} and {} overlap on sheet {}",
-                            a.source_page,
-                            b.source_page,
-                            sheet.index
-                        );
-                    }
-                }
+            assert_no_placements_overlap(&document, options);
+        }
+    }
+}
+
+/// Impose `document` under `options` and require no two cells, and no two
+/// placed pages, on one sheet to overlap.
+fn assert_no_placements_overlap(document: &[SourcePage], options: PrintOptions) {
+    let (n_up, order) = (options.n_up, options.n_up_order);
+    let sheets = impose(&job(document.to_vec(), options), hardware())
+        .unwrap_or_else(|e| unreachable!("impose failed: {e}"));
+    for sheet in &sheets {
+        for (i, a) in sheet.placements.iter().enumerate() {
+            for b in sheet.placements.iter().skip(i + 1) {
+                assert!(
+                    !a.clip.overlaps(b.clip, EPS),
+                    "{n_up:?}/{order:?}: cells {:?} and {:?} overlap",
+                    a.clip,
+                    b.clip
+                );
+                let a_bounds = a.transformed_bounds(find(document, a.source_page));
+                let b_bounds = b.transformed_bounds(find(document, b.source_page));
+                assert!(
+                    !a_bounds.overlaps(b_bounds, EPS),
+                    "{n_up:?}/{order:?}: pages {} and {} overlap on sheet {}",
+                    a.source_page,
+                    b.source_page,
+                    sheet.index
+                );
             }
         }
     }

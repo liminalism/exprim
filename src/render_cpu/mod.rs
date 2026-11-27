@@ -624,6 +624,48 @@ fn batch_gpu_path_commands(
     Some(commands)
 }
 
+/// Whether the page draws an image outside soft-mask content.
+fn has_native_image_draw(ops: &[prepared::PreparedOp]) -> bool {
+    let mut scan = 0;
+    while scan < ops.len() {
+        match &ops[scan] {
+            prepared::PreparedOp::Image(_) => return true,
+            prepared::PreparedOp::PushSoftMask { content_end, .. } => {
+                scan = *content_end as usize;
+            }
+            _ => scan += 1,
+        }
+    }
+    false
+}
+
+/// A path draw's subpaths as closed, simplified `[x0, y0, x1, y1]` edges for
+/// the GPU path rasterizer. Subpaths of fewer than two points are skipped.
+fn gpu_path_edges(
+    prepared: &CpuPreparedPage,
+    command: &prepared::PreparedCommand,
+) -> Vec<[f32; 4]> {
+    let mut edges = Vec::new();
+    for &(start, end) in
+        &prepared.subpaths[command.subpath_range.0 as usize..command.subpath_range.1 as usize]
+    {
+        let points = &prepared.points[start..end];
+        if points.len() < 2 {
+            continue;
+        }
+        let simplified = simplify_closed_gpu_contour(points, GPU_PATH_SIMPLIFY_TOLERANCE);
+        for pair in simplified.windows(2) {
+            edges.push([pair[0][0], pair[0][1], pair[1][0], pair[1][1]]);
+        }
+        let first = simplified[0];
+        let last = simplified[simplified.len() - 1];
+        if first != last {
+            edges.push([last[0], last[1], first[0], first[1]]);
+        }
+    }
+    edges
+}
+
 fn prepare_external_clip(
     page: &CpuPreparedPage,
     clip_masks: &mut [Option<Option<PreparedImageClip>>],
@@ -1633,52 +1675,9 @@ impl CpuBackend {
         let mut clip_masks: Vec<Option<Option<PreparedImageClip>>> =
             vec![None; prepared.clips.len()];
         let mut clip_raster = RasterKernel::default();
-        let has_soft_masks = prepared
-            .ops
-            .iter()
-            .any(|op| matches!(op, prepared::PreparedOp::PushSoftMask { .. }));
-        let mut derived_soft_masks = if has_soft_masks {
-            if let Some(masks) = self.shared_prepared_soft_masks.get(request) {
-                masks
-            } else {
-                let Some(masks) = exec::prepare_soft_masks(&prepared) else {
-                    return Err(RenderError::Cancelled);
-                };
-                let masks = masks
-                    .into_iter()
-                    .map(|mask| {
-                        mask.map(|mask| PreparedImageSoftMask {
-                            bounds: mask.bounds,
-                            samples: Arc::from(mask.data),
-                            outside: mask.outside,
-                        })
-                    })
-                    .collect();
-                self.shared_prepared_soft_masks.insert(request, masks)
-            }
-        } else {
-            std::iter::repeat_with(|| None)
-                .take(prepared.ops.len())
-                .collect()
-        };
+        let mut derived_soft_masks = self.gpu_soft_masks(request, &prepared)?;
         let mut active_soft_masks: Vec<Option<PreparedImageSoftMask>> = Vec::new();
-        let has_native_image_draw = {
-            let mut scan = 0;
-            let mut found = false;
-            while scan < prepared.ops.len() {
-                match &prepared.ops[scan] {
-                    prepared::PreparedOp::Image(_) => {
-                        found = true;
-                        break;
-                    }
-                    prepared::PreparedOp::PushSoftMask { content_end, .. } => {
-                        scan = *content_end as usize;
-                    }
-                    _ => scan += 1,
-                }
-            }
-            found
-        };
+        let has_native_image_draw = has_native_image_draw(&prepared.ops);
 
         let mut op_index = 0;
         while op_index < prepared.ops.len() {
@@ -1693,25 +1692,7 @@ impl CpuBackend {
                     if command.shading.is_some() {
                         return Ok(None);
                     }
-                    let mut edges = Vec::new();
-                    for &(start, end) in &prepared.subpaths
-                        [command.subpath_range.0 as usize..command.subpath_range.1 as usize]
-                    {
-                        let points = &prepared.points[start..end];
-                        if points.len() < 2 {
-                            continue;
-                        }
-                        let simplified =
-                            simplify_closed_gpu_contour(points, GPU_PATH_SIMPLIFY_TOLERANCE);
-                        for pair in simplified.windows(2) {
-                            edges.push([pair[0][0], pair[0][1], pair[1][0], pair[1][1]]);
-                        }
-                        let first = simplified[0];
-                        let last = simplified[simplified.len() - 1];
-                        if first != last {
-                            edges.push([last[0], last[1], first[0], first[1]]);
-                        }
-                    }
+                    let edges = gpu_path_edges(&prepared, command);
                     if edges.is_empty() {
                         op_index += 1;
                         continue;
@@ -1752,34 +1733,10 @@ impl CpuBackend {
                     if automatic_routing && !has_native_image_draw {
                         return Ok(None);
                     }
-                    let patterned = if let Some(cached) = self
-                        .shared_prepared_patterned_stencils
-                        .get(request, op_index)
-                    {
-                        cached
-                    } else {
-                        let pattern_bytes = (tiling.bounds.width as usize)
-                            .checked_mul(tiling.bounds.height as usize)
-                            .and_then(|pixels| pixels.checked_mul(4));
-                        if pattern_bytes
-                            .is_none_or(|bytes| bytes > MAX_PREPARED_PATTERNED_STENCIL_BYTES)
-                        {
-                            return Ok(None);
-                        }
-                        let Some(prepared) = exec::prepare_patterned_stencil(&prepared, tiling)
-                        else {
-                            if request
-                                .limits
-                                .cancellation
-                                .as_ref()
-                                .is_some_and(|token| token.is_cancelled())
-                            {
-                                return Err(RenderError::Cancelled);
-                            }
-                            return Ok(None);
-                        };
-                        self.shared_prepared_patterned_stencils
-                            .insert(request, op_index, prepared)
+                    let Some(patterned) =
+                        self.gpu_patterned_stencil(request, &prepared, tiling, op_index)?
+                    else {
+                        return Ok(None);
                     };
                     let bounds = patterned.bounds;
                     let width = f64::from(bounds.width);
@@ -1872,99 +1829,8 @@ impl CpuBackend {
                 };
                 samples
             };
-            let opacity = if image.is_stencil {
-                let Some(samples) = self.shared_opacity_images.get_or_expand(
-                    &image.samples,
-                    image.width,
-                    image.height,
-                    image.bpc,
-                    image.decode.as_ref(),
-                    true,
-                    request.limits.cancellation.as_ref(),
-                )?
-                else {
-                    return Ok(None);
-                };
-                Some(PreparedImageOpacity {
-                    width: image.width,
-                    height: image.height,
-                    samples,
-                    footprint: image.footprint,
-                    box_filter: true,
-                })
-            } else if let Some(mask) = image.smask.as_ref() {
-                let Some(samples) = self.shared_opacity_images.get_or_expand(
-                    &mask.samples,
-                    mask.width,
-                    mask.height,
-                    mask.bits_per_component,
-                    mask.decode.as_ref(),
-                    false,
-                    request.limits.cancellation.as_ref(),
-                )?
-                else {
-                    return Ok(None);
-                };
-                Some(PreparedImageOpacity {
-                    width: mask.width,
-                    height: mask.height,
-                    samples,
-                    footprint: [
-                        (image.inv.a.abs() + image.inv.c.abs()) * mask.width as f64,
-                        (image.inv.b.abs() + image.inv.d.abs()) * mask.height as f64,
-                    ],
-                    box_filter: true,
-                })
-            } else if let Some(mask) = image.mask.as_ref() {
-                match mask {
-                    ImageMask::ColorKey(ranges) => {
-                        let Some(samples) = self.shared_opacity_images.get_or_expand_color_key(
-                            &image.samples,
-                            image.width,
-                            image.height,
-                            image.bpc,
-                            image.color_space.components(),
-                            ranges,
-                            request.limits.cancellation.as_ref(),
-                        )?
-                        else {
-                            return Ok(None);
-                        };
-                        Some(PreparedImageOpacity {
-                            width: image.width,
-                            height: image.height,
-                            samples,
-                            footprint: image.footprint,
-                            box_filter: false,
-                        })
-                    }
-                    ImageMask::Stencil(mask) => {
-                        let Some(samples) = self.shared_opacity_images.get_or_expand(
-                            &mask.samples,
-                            mask.width,
-                            mask.height,
-                            mask.bits_per_component,
-                            mask.decode.as_ref(),
-                            true,
-                            request.limits.cancellation.as_ref(),
-                        )?
-                        else {
-                            return Ok(None);
-                        };
-                        Some(PreparedImageOpacity {
-                            width: mask.width,
-                            height: mask.height,
-                            samples,
-                            footprint: [
-                                (image.inv.a.abs() + image.inv.c.abs()) * mask.width as f64,
-                                (image.inv.b.abs() + image.inv.d.abs()) * mask.height as f64,
-                            ],
-                            box_filter: false,
-                        })
-                    }
-                }
-            } else {
-                None
+            let Some(opacity) = self.gpu_image_opacity(request, image)? else {
+                return Ok(None);
             };
             let clip = prepare_external_clip(
                 &prepared,
@@ -2035,6 +1901,185 @@ impl CpuBackend {
             automatic_routing,
             prepared,
         )))
+    }
+
+    /// One soft-mask slot per op of `prepared` for the GPU image page, set at
+    /// each `PushSoftMask`: from the shared cache, or derived and cached.
+    fn gpu_soft_masks(
+        &self,
+        request: &RenderRequest,
+        prepared: &CpuPreparedPage,
+    ) -> Result<Vec<Option<PreparedImageSoftMask>>, RenderError> {
+        let has_soft_masks = prepared
+            .ops
+            .iter()
+            .any(|op| matches!(op, prepared::PreparedOp::PushSoftMask { .. }));
+        if !has_soft_masks {
+            return Ok(std::iter::repeat_with(|| None)
+                .take(prepared.ops.len())
+                .collect());
+        }
+        if let Some(masks) = self.shared_prepared_soft_masks.get(request) {
+            return Ok(masks);
+        }
+        let Some(masks) = exec::prepare_soft_masks(prepared) else {
+            return Err(RenderError::Cancelled);
+        };
+        let masks = masks
+            .into_iter()
+            .map(|mask| {
+                mask.map(|mask| PreparedImageSoftMask {
+                    bounds: mask.bounds,
+                    samples: Arc::from(mask.data),
+                    outside: mask.outside,
+                })
+            })
+            .collect();
+        Ok(self.shared_prepared_soft_masks.insert(request, masks))
+    }
+
+    /// The painted brush of the stencil tiling fill at `op_index`: from the
+    /// shared cache, or painted and cached. `Ok(None)` declines the page (the
+    /// brush is over the byte limit or could not be painted).
+    fn gpu_patterned_stencil(
+        &self,
+        request: &RenderRequest,
+        prepared: &CpuPreparedPage,
+        tiling: &prepared::PreparedTiling,
+        op_index: usize,
+    ) -> Result<Option<PreparedPatternedStencil>, RenderError> {
+        if let Some(cached) = self
+            .shared_prepared_patterned_stencils
+            .get(request, op_index)
+        {
+            return Ok(Some(cached));
+        }
+        let pattern_bytes = (tiling.bounds.width as usize)
+            .checked_mul(tiling.bounds.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4));
+        if pattern_bytes.is_none_or(|bytes| bytes > MAX_PREPARED_PATTERNED_STENCIL_BYTES) {
+            return Ok(None);
+        }
+        let Some(patterned) = exec::prepare_patterned_stencil(prepared, tiling) else {
+            if request
+                .limits
+                .cancellation
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                return Err(RenderError::Cancelled);
+            }
+            return Ok(None);
+        };
+        Ok(Some(
+            self.shared_prepared_patterned_stencils
+                .insert(request, op_index, patterned),
+        ))
+    }
+
+    /// The opacity plane of an image draw for the GPU image page: its stencil
+    /// coverage, `/SMask` or explicit `/Mask`. `Ok(Some(None))` when the image
+    /// has none; `Ok(None)` declines the page.
+    fn gpu_image_opacity(
+        &self,
+        request: &RenderRequest,
+        image: &image::PreparedImage,
+    ) -> Result<Option<Option<PreparedImageOpacity>>, RenderError> {
+        if image.is_stencil {
+            let Some(samples) = self.shared_opacity_images.get_or_expand(
+                &image.samples,
+                image.width,
+                image.height,
+                image.bpc,
+                image.decode.as_ref(),
+                true,
+                request.limits.cancellation.as_ref(),
+            )?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(Some(PreparedImageOpacity {
+                width: image.width,
+                height: image.height,
+                samples,
+                footprint: image.footprint,
+                box_filter: true,
+            })));
+        }
+        if let Some(mask) = image.smask.as_ref() {
+            let Some(samples) = self.shared_opacity_images.get_or_expand(
+                &mask.samples,
+                mask.width,
+                mask.height,
+                mask.bits_per_component,
+                mask.decode.as_ref(),
+                false,
+                request.limits.cancellation.as_ref(),
+            )?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(Some(PreparedImageOpacity {
+                width: mask.width,
+                height: mask.height,
+                samples,
+                footprint: [
+                    (image.inv.a.abs() + image.inv.c.abs()) * mask.width as f64,
+                    (image.inv.b.abs() + image.inv.d.abs()) * mask.height as f64,
+                ],
+                box_filter: true,
+            })));
+        }
+        let Some(mask) = image.mask.as_ref() else {
+            return Ok(Some(None));
+        };
+        match mask {
+            ImageMask::ColorKey(ranges) => {
+                let Some(samples) = self.shared_opacity_images.get_or_expand_color_key(
+                    &image.samples,
+                    image.width,
+                    image.height,
+                    image.bpc,
+                    image.color_space.components(),
+                    ranges,
+                    request.limits.cancellation.as_ref(),
+                )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Some(PreparedImageOpacity {
+                    width: image.width,
+                    height: image.height,
+                    samples,
+                    footprint: image.footprint,
+                    box_filter: false,
+                })))
+            }
+            ImageMask::Stencil(mask) => {
+                let Some(samples) = self.shared_opacity_images.get_or_expand(
+                    &mask.samples,
+                    mask.width,
+                    mask.height,
+                    mask.bits_per_component,
+                    mask.decode.as_ref(),
+                    true,
+                    request.limits.cancellation.as_ref(),
+                )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Some(PreparedImageOpacity {
+                    width: mask.width,
+                    height: mask.height,
+                    samples,
+                    footprint: [
+                        (image.inv.a.abs() + image.inv.c.abs()) * mask.width as f64,
+                        (image.inv.b.abs() + image.inv.d.abs()) * mask.height as f64,
+                    ],
+                    box_filter: false,
+                })))
+            }
+        }
     }
 
     /// Render reusing a caller-owned worker context (avoids reallocating the
@@ -2124,6 +2169,28 @@ impl CpuBackend {
             },
             stats,
         ))
+    }
+
+    /// A `width × strip_height` strip surface on `reused`, the buffer the
+    /// previous strip left, else on a pooled buffer when `pool_surface`.
+    fn strip_surface(
+        &self,
+        width: usize,
+        strip_height: usize,
+        background: crate::render_api::Background,
+        reused: Option<Arc<[u8]>>,
+        pool_surface: bool,
+    ) -> Surface {
+        Surface::new_recycled(
+            width,
+            strip_height,
+            background,
+            reused.or_else(|| {
+                pool_surface
+                    .then(|| self.surfaces.take(width, strip_height))
+                    .flatten()
+            }),
+        )
     }
 
     /// For an RGB `target` the `HostPage` carries a three-byte stride under
@@ -2261,22 +2328,18 @@ impl CpuBackend {
         let strip_buffer: std::cell::Cell<Option<Arc<[u8]>>> = std::cell::Cell::new(None);
         for &(first_row, end_row) in &windows {
             let strip_surface = || {
-                if striped {
-                    let mut strip = Surface::new_recycled(
-                        width as usize,
-                        strip_height,
-                        request.background,
-                        strip_buffer.take().or_else(|| {
-                            pool_surface
-                                .then(|| self.surfaces.take(width as usize, strip_height))
-                                .flatten()
-                        }),
-                    );
-                    strip.origin_y = first_row as usize;
-                    strip
-                } else {
-                    new_surface()
+                if !striped {
+                    return new_surface();
                 }
+                let mut strip = self.strip_surface(
+                    width as usize,
+                    strip_height,
+                    request.background,
+                    strip_buffer.take(),
+                    pool_surface,
+                );
+                strip.origin_y = first_row as usize;
+                strip
             };
             let mut surface: Option<Surface> = None;
             let mut exec_state = exec::ExecState::new();

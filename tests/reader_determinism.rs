@@ -175,38 +175,61 @@ fn read_seam_renders_match_cold_renders_whatever_the_thread_rendered_before() {
                 let session =
                     RenderSession::open_with_cache_capacity(bytes.clone(), None, capacity)
                         .expect("open");
-                let cursor = AtomicUsize::new(0);
-                let got: Vec<(u32, u64)> = std::thread::scope(|scope| {
-                    let workers: Vec<_> = (0..threads)
-                        .map(|_| {
-                            scope.spawn(|| {
-                                let mut out = Vec::new();
-                                loop {
-                                    let at = cursor.fetch_add(1, Ordering::Relaxed);
-                                    let Some(&page) = order.get(at) else {
-                                        break out;
-                                    };
-                                    out.push((page, render(&session, page)));
-                                }
-                            })
-                        })
-                        .collect();
-                    workers
-                        .into_iter()
-                        .flat_map(|w| w.join().expect("worker thread"))
-                        .collect()
-                });
+                let got = render_in_order(&session, threads, order);
                 assert_eq!(got.len(), pages as usize);
-                for (page, h) in got {
-                    assert_eq!(
-                        h,
-                        cold[page as usize],
-                        "page {page} (font {}) differs from its cold render \
-                         (capacity {capacity}, {threads} threads, {order_name} order)",
-                        page % 3
-                    );
-                }
+                assert_all_match_cold(&got, &cold, capacity, threads, order_name);
             }
         }
+    }
+}
+
+/// Render `order` on `threads` threads sharing one session, each claiming
+/// the next page in turn; `(page, hash)` pairs, grouped by worker.
+fn render_in_order(session: &RenderSession, threads: usize, order: &[u32]) -> Vec<(u32, u64)> {
+    let cursor = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| scope.spawn(|| render_claimed_pages(session, &cursor, order)))
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().expect("worker thread"))
+            .collect()
+    })
+}
+
+/// One worker: claim the next position of `order` until none remain,
+/// rendering each claimed page.
+fn render_claimed_pages(
+    session: &RenderSession,
+    cursor: &AtomicUsize,
+    order: &[u32],
+) -> Vec<(u32, u64)> {
+    let mut out = Vec::new();
+    loop {
+        let at = cursor.fetch_add(1, Ordering::Relaxed);
+        let Some(&page) = order.get(at) else {
+            break out;
+        };
+        out.push((page, render(session, page)));
+    }
+}
+
+/// Require every rendered page's hash to equal its cold render.
+fn assert_all_match_cold(
+    got: &[(u32, u64)],
+    cold: &[u64],
+    capacity: usize,
+    threads: usize,
+    order_name: &str,
+) {
+    for &(page, h) in got {
+        assert_eq!(
+            h,
+            cold[page as usize],
+            "page {page} (font {}) differs from its cold render \
+             (capacity {capacity}, {threads} threads, {order_name} order)",
+            page % 3
+        );
     }
 }

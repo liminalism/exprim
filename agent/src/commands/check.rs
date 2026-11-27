@@ -272,23 +272,7 @@ pub fn check_document(
                     }
                     // Already reported from the examiner's side.
                     PageOutcome::Failed(_) => {}
-                    PageOutcome::Done(facts) => {
-                        let page = page.one_based();
-                        if facts.unmapped > 0 {
-                            found.pages("warning", "unmapped-text", page);
-                            found.unmapped += facts.unmapped;
-                        }
-                        if facts.outside > 0 {
-                            found.pages("warning", "text-outside-page", page);
-                            found.outside += facts.outside;
-                            if found.outside_sample.len() < 6 {
-                                found.outside_sample.extend(facts.outside_sample);
-                            }
-                        }
-                        if facts.spacing_lost {
-                            found.pages("warning", "word-spacing-lost", page);
-                        }
-                    }
+                    PageOutcome::Done(facts) => found.text_facts(page.one_based(), facts),
                 }
                 ControlFlow::Continue(())
             },
@@ -450,6 +434,25 @@ impl Findings {
         let pages = self.by_code.entry((severity, code)).or_default();
         if pages.last() != Some(&page) {
             pages.push(page);
+        }
+    }
+
+    /// Record one page's text findings: unmapped characters, text outside
+    /// the page (with a few samples) and lost word spacing.
+    fn text_facts(&mut self, page: u32, facts: TextFacts) {
+        if facts.unmapped > 0 {
+            self.pages("warning", "unmapped-text", page);
+            self.unmapped += facts.unmapped;
+        }
+        if facts.outside > 0 {
+            self.pages("warning", "text-outside-page", page);
+            self.outside += facts.outside;
+            if self.outside_sample.len() < 6 {
+                self.outside_sample.extend(facts.outside_sample);
+            }
+        }
+        if facts.spacing_lost {
+            self.pages("warning", "word-spacing-lost", page);
         }
     }
 

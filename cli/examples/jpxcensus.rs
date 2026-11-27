@@ -129,6 +129,201 @@ fn header_markers(cs: &[u8]) -> (Vec<u16>, Vec<u16>) {
     (main, tile)
 }
 
+/// Running totals of the census.
+#[derive(Default)]
+struct Census {
+    tally: BTreeMap<String, u32>,
+    examples: BTreeMap<String, String>,
+    files_done: u32,
+    jpx_total: u32,
+    decoded: u32,
+    // Per watched marker: (streams carrying it, of those how many failed,
+    // first example).
+    marker_streams: BTreeMap<&'static str, (u32, u32, String)>,
+    no_codestream: u32,
+}
+
+/// `<file name> obj<n>`, the label an example stream is reported under.
+fn stream_label(path: &str, n: u32) -> String {
+    format!(
+        "{} obj{n}",
+        std::path::Path::new(path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+    )
+}
+
+/// The decoded bytes of object `n` when it is a `/JPXDecode` stream.
+fn jpx_stream_data(snap: &DocumentSnapshot, n: u32) -> Option<Vec<u8>> {
+    let id = ObjectId::new(n, 0);
+    let mut ctx = ParseContext::new();
+    let obj = snap.objects().resolve(snap, id, &mut ctx).ok()?;
+    let PdfObject::Stream(stream) = obj.as_ref() else {
+        return None;
+    };
+    // Cheap pre-filter: only peel filters for streams that name JPX,
+    // so we do not decode every Flate/CCITT stream in the document.
+    let is_jpx = stream.dict.iter().any(|(_, v)| {
+        match v {
+        PdfObject::Name(nm) => snap.names().resolve(*nm).as_ref() == b"JPXDecode",
+        PdfObject::Array(items) => items.iter().any(|it| {
+            matches!(it, PdfObject::Name(nm) if snap.names().resolve(*nm).as_ref() == b"JPXDecode")
+        }),
+        _ => false,
+    }
+    });
+    if !is_jpx {
+        return None;
+    }
+    let (data, codec) = snap.decode_stream_data_to_codec(stream, &mut ctx).ok()?;
+    if codec.as_deref() != Some("JPXDecode") {
+        return None;
+    }
+    Some(data)
+}
+
+impl Census {
+    /// Open one PDF and census up to `per_file` of its JPX streams. Files
+    /// that cannot be read or opened are skipped without counting.
+    fn scan_file(&mut self, path: &str, per_file: u32) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let source = Arc::new(OwnedBytesSource::new(bytes));
+        let Ok(snap) = DocumentSnapshot::open(source, DocumentLimits::default()) else {
+            return;
+        };
+        self.files_done += 1;
+        let size = snap.structure().xref.size();
+        // Sample up to this many JPX streams per file — enough to catch a
+        // file's codec profile without decoding every image in a 500-page book.
+        let mut jpx_in_file = 0u32;
+        for n in 1..size {
+            if jpx_in_file >= per_file {
+                break;
+            }
+            let Some(data) = jpx_stream_data(&snap, n) else {
+                continue;
+            };
+            jpx_in_file += 1;
+            self.record_stream(path, n, &data);
+        }
+        if self.files_done % 20 == 0 {
+            eprintln!(
+                "... {} files, {} jpx, {} ok",
+                self.files_done, self.jpx_total, self.decoded
+            );
+        }
+    }
+
+    /// Tally one JPX stream: its watched markers and its decode outcome.
+    fn record_stream(&mut self, path: &str, n: u32, data: &[u8]) {
+        self.jpx_total += 1;
+        let carried: Vec<&'static str> = match codestream(data) {
+            Some(cs) => {
+                let (main, tile) = header_markers(cs);
+                WATCHED_MARKERS
+                    .iter()
+                    .filter(|(code, _)| main.contains(code) || tile.contains(code))
+                    .map(|&(_, name)| name)
+                    .collect()
+            }
+            None => {
+                self.no_codestream += 1;
+                Vec::new()
+            }
+        };
+        let outcome = jp2lam::decode_jp2(data);
+        for name in &carried {
+            let entry = self
+                .marker_streams
+                .entry(name)
+                .or_insert_with(|| (0, 0, stream_label(path, n)));
+            entry.0 += 1;
+            entry.1 += u32::from(outcome.is_err());
+        }
+        match outcome {
+            Ok(_) => {
+                self.decoded += 1;
+                dump_decoded(path, n, data);
+            }
+            Err(e) => self.record_failure(path, n, data, &e.to_string()),
+        }
+    }
+
+    /// Tally a failed decode under its normalized signature.
+    fn record_failure(&mut self, path: &str, n: u32, data: &[u8], message: &str) {
+        let sig = normalize(message);
+        // Dump one representative failing stream per signature for
+        // offline inspection (opj_dump).
+        if !self.examples.contains_key(&sig)
+            && let Ok(dir) = std::env::var("JPXDUMPDIR")
+        {
+            let safe: String = sig
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(40)
+                .collect();
+            let _ = std::fs::write(format!("{dir}/failjpx_{safe}.jp2"), data);
+        }
+        *self.tally.entry(sig.clone()).or_default() += 1;
+        self.examples
+            .entry(sig)
+            .or_insert_with(|| stream_label(path, n));
+    }
+
+    /// Print the totals, the watched-marker table and the error signatures.
+    fn report(&self) {
+        let Census {
+            tally,
+            examples,
+            files_done,
+            jpx_total,
+            decoded,
+            marker_streams,
+            no_codestream,
+        } = self;
+        println!(
+            "files={files_done} jpx_streams={jpx_total} decoded={decoded} failed={}",
+            jpx_total - decoded
+        );
+        println!("streams_without_codestream={no_codestream}");
+        println!("--- watched markers (streams carrying / of those failing) ---");
+        for (_, name) in WATCHED_MARKERS {
+            match marker_streams.get(name) {
+                Some((count, failed, example)) => {
+                    println!("{name}: {count} streams, {failed} failed, e.g. {example}")
+                }
+                None => println!("{name}: 0 streams"),
+            }
+        }
+        println!("--- error signatures (count) ---");
+        let mut sorted: Vec<_> = tally.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        for (sig, count) in sorted {
+            println!("{count:>6}  {sig}");
+            if let Some(ex) = examples.get(sig) {
+                println!("        e.g. {ex}");
+            }
+        }
+    }
+}
+
+/// Write a decoded stream to `JPXCENSUS_DUMP_OK`, when set, as
+/// `<pdf stem>_obj<n>.jp2`.
+fn dump_decoded(path: &str, n: u32, data: &[u8]) {
+    let Ok(dir) = std::env::var("JPXCENSUS_DUMP_OK") else {
+        return;
+    };
+    let stem = std::path::Path::new(path)
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+    let _ = std::fs::write(format!("{dir}/{stem}_obj{n}.jp2"), data);
+}
+
 fn main() {
     let list_path = std::env::args()
         .nth(1)
@@ -139,166 +334,17 @@ fn main() {
         .unwrap_or(usize::MAX);
     let list = std::fs::read_to_string(&list_path).expect("read list");
 
-    let mut tally: BTreeMap<String, u32> = BTreeMap::new();
-    let mut examples: BTreeMap<String, String> = BTreeMap::new();
-    let mut files_done = 0u32;
-    let mut jpx_total = 0u32;
-    let mut decoded = 0u32;
     let per_file: u32 = std::env::var("JPXCENSUS_PER_FILE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
-    // Per watched marker: (streams carrying it, of those how many failed,
-    // first example).
-    let mut marker_streams: BTreeMap<&str, (u32, u32, String)> = BTreeMap::new();
-    let mut no_codestream = 0u32;
-
+    let mut census = Census::default();
     for line in list.lines().take(max_files) {
         let path = line.trim();
         if path.is_empty() {
             continue;
         }
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
-        };
-        let source = Arc::new(OwnedBytesSource::new(bytes));
-        let Ok(snap) = DocumentSnapshot::open(source, DocumentLimits::default()) else {
-            continue;
-        };
-        files_done += 1;
-        let size = snap.structure().xref.size();
-        // Sample up to this many JPX streams per file — enough to catch a
-        // file's codec profile without decoding every image in a 500-page book.
-        let mut jpx_in_file = 0u32;
-        for n in 1..size {
-            if jpx_in_file >= per_file {
-                break;
-            }
-            let id = ObjectId::new(n, 0);
-            let mut ctx = ParseContext::new();
-            let Ok(obj) = snap.objects().resolve(&snap, id, &mut ctx) else {
-                continue;
-            };
-            let PdfObject::Stream(stream) = obj.as_ref() else {
-                continue;
-            };
-            // Cheap pre-filter: only peel filters for streams that name JPX,
-            // so we do not decode every Flate/CCITT stream in the document.
-            let is_jpx = stream.dict.iter().any(|(_, v)| match v {
-                PdfObject::Name(nm) => snap.names().resolve(*nm).as_ref() == b"JPXDecode",
-                PdfObject::Array(items) => items.iter().any(|it| {
-                    matches!(it, PdfObject::Name(nm) if snap.names().resolve(*nm).as_ref() == b"JPXDecode")
-                }),
-                _ => false,
-            });
-            if !is_jpx {
-                continue;
-            }
-            let Ok((data, codec)) = snap.decode_stream_data_to_codec(stream, &mut ctx) else {
-                continue;
-            };
-            if codec.as_deref() != Some("JPXDecode") {
-                continue;
-            }
-            jpx_total += 1;
-            jpx_in_file += 1;
-            let carried: Vec<&str> = match codestream(&data) {
-                Some(cs) => {
-                    let (main, tile) = header_markers(cs);
-                    WATCHED_MARKERS
-                        .iter()
-                        .filter(|(code, _)| main.contains(code) || tile.contains(code))
-                        .map(|&(_, name)| name)
-                        .collect()
-                }
-                None => {
-                    no_codestream += 1;
-                    Vec::new()
-                }
-            };
-            let outcome = jp2lam::decode_jp2(&data);
-            for name in &carried {
-                let entry = marker_streams.entry(name).or_insert_with(|| {
-                    (
-                        0,
-                        0,
-                        format!(
-                            "{} obj{n}",
-                            std::path::Path::new(path)
-                                .file_name()
-                                .unwrap()
-                                .to_string_lossy()
-                        ),
-                    )
-                });
-                entry.0 += 1;
-                entry.1 += u32::from(outcome.is_err());
-            }
-            match outcome {
-                Ok(_) => {
-                    decoded += 1;
-                    if let Ok(dir) = std::env::var("JPXCENSUS_DUMP_OK") {
-                        let stem = std::path::Path::new(path)
-                            .file_stem()
-                            .unwrap()
-                            .to_string_lossy()
-                            .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
-                        let _ = std::fs::write(format!("{dir}/{stem}_obj{n}.jp2"), &data);
-                    }
-                }
-                Err(e) => {
-                    let sig = normalize(&e.to_string());
-                    // Dump one representative failing stream per signature for
-                    // offline inspection (opj_dump).
-                    if !examples.contains_key(&sig)
-                        && let Ok(dir) = std::env::var("JPXDUMPDIR")
-                    {
-                        let safe: String = sig
-                            .chars()
-                            .filter(|c| c.is_ascii_alphanumeric())
-                            .take(40)
-                            .collect();
-                        let _ = std::fs::write(format!("{dir}/failjpx_{safe}.jp2"), &data);
-                    }
-                    *tally.entry(sig.clone()).or_default() += 1;
-                    examples.entry(sig).or_insert_with(|| {
-                        format!(
-                            "{} obj{n}",
-                            std::path::Path::new(path)
-                                .file_name()
-                                .unwrap()
-                                .to_string_lossy()
-                        )
-                    });
-                }
-            }
-        }
-        if files_done % 20 == 0 {
-            eprintln!("... {files_done} files, {jpx_total} jpx, {decoded} ok");
-        }
+        census.scan_file(path, per_file);
     }
-
-    println!(
-        "files={files_done} jpx_streams={jpx_total} decoded={decoded} failed={}",
-        jpx_total - decoded
-    );
-    println!("streams_without_codestream={no_codestream}");
-    println!("--- watched markers (streams carrying / of those failing) ---");
-    for (_, name) in WATCHED_MARKERS {
-        match marker_streams.get(name) {
-            Some((count, failed, example)) => {
-                println!("{name}: {count} streams, {failed} failed, e.g. {example}")
-            }
-            None => println!("{name}: 0 streams"),
-        }
-    }
-    println!("--- error signatures (count) ---");
-    let mut sorted: Vec<_> = tally.iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(a.1));
-    for (sig, count) in sorted {
-        println!("{count:>6}  {sig}");
-        if let Some(ex) = examples.get(sig) {
-            println!("        e.g. {ex}");
-        }
-    }
+    census.report();
 }

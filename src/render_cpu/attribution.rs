@@ -9,7 +9,7 @@ use crate::page_ir::{DeviceRect, PaintLeaf, PaintOrigin};
 
 use crate::render_cpu::kernels::mul_div_255;
 use crate::render_cpu::mask::{ClipGeom, ClipMask, build_clip_mask};
-use crate::render_cpu::prepared::{CpuPreparedPage, PreparedOp};
+use crate::render_cpu::prepared::{CpuPreparedPage, GlyphPlacement, PreparedGlyphRun, PreparedOp};
 use crate::render_cpu::raster::RasterKernel;
 
 /// Default minimum geometric coverage accepted as painted, in 8-bit alpha.
@@ -95,38 +95,7 @@ pub fn render_attribution_with_threshold(
                     &mut clips,
                     run.clip.filter(|_| run.clip_has_mask),
                 );
-                for placement in &run.placements {
-                    let bitmap = &placement.bitmap;
-                    for by in 0..bitmap.height as i32 {
-                        let y = placement.dy + by;
-                        if y < run.bounds.y
-                            || y >= run.bounds.y + run.bounds.height as i32
-                            || y < 0
-                            || y >= map.height as i32
-                        {
-                            continue;
-                        }
-                        for bx in 0..bitmap.width as i32 {
-                            let x = placement.dx + bx;
-                            if x < run.bounds.x
-                                || x >= run.bounds.x + run.bounds.width as i32
-                                || x < 0
-                                || x >= map.width as i32
-                            {
-                                continue;
-                            }
-                            let glyph =
-                                bitmap.cov[by as usize * bitmap.width as usize + bx as usize];
-                            let coverage = combined_coverage(
-                                glyph,
-                                clip_at(&clips, run.clip.filter(|_| run.clip_has_mask), x, y),
-                            );
-                            if coverage >= coverage_threshold {
-                                map.stamp(x as u32, y as u32, PaintLeaf::Text, run.origin);
-                            }
-                        }
-                    }
-                }
+                stamp_glyph_run(&mut map, run, &clips);
                 i += 1;
             }
             PreparedOp::Image(image) => {
@@ -136,23 +105,7 @@ pub fn render_attribution_with_threshold(
                     &mut clips,
                     image.clip.filter(|_| image.clip_has_mask),
                 );
-                for_each_pixel(image.bounds, map.width, map.height, |x, y| {
-                    let dx = x as f64 + 0.5;
-                    let dy = y as f64 + 0.5;
-                    let u = image.inv.a * dx + image.inv.c * dy + image.inv.e;
-                    let v = image.inv.b * dx + image.inv.d * dy + image.inv.f;
-                    if (0.0..1.0).contains(&u) && (0.0..1.0).contains(&v) {
-                        let coverage = clip_at(
-                            &clips,
-                            image.clip.filter(|_| image.clip_has_mask),
-                            x as i32,
-                            y as i32,
-                        );
-                        if coverage >= coverage_threshold {
-                            map.stamp(x, y, PaintLeaf::Image, image.origin);
-                        }
-                    }
-                });
+                stamp_image(&mut map, image, &clips);
                 i += 1;
             }
             PreparedOp::PushSoftMask { content_end, .. } => {
@@ -199,38 +152,13 @@ pub fn glyph_stamp_mask(page: &CpuPreparedPage, threshold: u8) -> Vec<bool> {
                     &mut clips,
                     run.clip.filter(|_| run.clip_has_mask),
                 );
-                for placement in &run.placements {
-                    let bitmap = &placement.bitmap;
-                    for by in 0..bitmap.height as i32 {
-                        let y = placement.dy + by;
-                        if y < run.bounds.y
-                            || y >= run.bounds.y + run.bounds.height as i32
-                            || y < 0
-                            || y >= page.size.height as i32
-                        {
-                            continue;
-                        }
-                        for bx in 0..bitmap.width as i32 {
-                            let x = placement.dx + bx;
-                            if x < run.bounds.x
-                                || x >= run.bounds.x + run.bounds.width as i32
-                                || x < 0
-                                || x >= page.size.width as i32
-                            {
-                                continue;
-                            }
-                            let glyph =
-                                bitmap.cov[by as usize * bitmap.width as usize + bx as usize];
-                            let coverage = combined_coverage(
-                                glyph,
-                                clip_at(&clips, run.clip.filter(|_| run.clip_has_mask), x, y),
-                            );
-                            if coverage >= threshold {
-                                mask[y as usize * width + x as usize] = true;
-                            }
-                        }
-                    }
-                }
+                let reach = GlyphReach {
+                    clips: &clips,
+                    width: page.size.width as i32,
+                    height: page.size.height as i32,
+                    threshold,
+                };
+                mark_glyph_run(&mut mask, width, run, reach);
                 i += 1;
             }
             PreparedOp::PushSoftMask { content_end, .. } => {
@@ -241,6 +169,111 @@ pub fn glyph_stamp_mask(page: &CpuPreparedPage, threshold: u8) -> Vec<bool> {
         }
     }
     mask
+}
+
+/// Where a glyph run's coverage counts as painted: its clip masks, the
+/// `width × height` device, and the coverage threshold.
+#[derive(Clone, Copy)]
+struct GlyphReach<'a> {
+    clips: &'a [Option<ClipMask>],
+    width: i32,
+    height: i32,
+    threshold: u8,
+}
+
+/// Visit, in row-major order, every device pixel of one glyph placement
+/// inside the run's bounds and the device whose glyph coverage, combined
+/// with the run's clip coverage there, reaches the threshold.
+fn for_each_glyph_pixel(
+    run: &PreparedGlyphRun,
+    placement: &GlyphPlacement,
+    reach: GlyphReach<'_>,
+    f: &mut impl FnMut(i32, i32),
+) {
+    let bitmap = &placement.bitmap;
+    for by in 0..bitmap.height as i32 {
+        let y = placement.dy + by;
+        if y < run.bounds.y
+            || y >= run.bounds.y + run.bounds.height as i32
+            || y < 0
+            || y >= reach.height
+        {
+            continue;
+        }
+        for bx in 0..bitmap.width as i32 {
+            let x = placement.dx + bx;
+            if x < run.bounds.x
+                || x >= run.bounds.x + run.bounds.width as i32
+                || x < 0
+                || x >= reach.width
+            {
+                continue;
+            }
+            let glyph = bitmap.cov[by as usize * bitmap.width as usize + bx as usize];
+            let coverage = combined_coverage(
+                glyph,
+                clip_at(reach.clips, run.clip.filter(|_| run.clip_has_mask), x, y),
+            );
+            if coverage >= reach.threshold {
+                f(x, y);
+            }
+        }
+    }
+}
+
+/// Stamp `Text` on every pixel a glyph run's placements cover at the map's
+/// threshold.
+fn stamp_glyph_run(map: &mut AttributionMap, run: &PreparedGlyphRun, clips: &[Option<ClipMask>]) {
+    let reach = GlyphReach {
+        clips,
+        width: map.width as i32,
+        height: map.height as i32,
+        threshold: map.coverage_threshold,
+    };
+    for placement in &run.placements {
+        for_each_glyph_pixel(run, placement, reach, &mut |x, y| {
+            map.stamp(x as u32, y as u32, PaintLeaf::Text, run.origin)
+        });
+    }
+}
+
+/// Set the flag of every pixel a glyph run's placements cover at
+/// `reach.threshold` in the row-major `mask`, `width` flags per row.
+fn mark_glyph_run(mask: &mut [bool], width: usize, run: &PreparedGlyphRun, reach: GlyphReach<'_>) {
+    for placement in &run.placements {
+        for_each_glyph_pixel(run, placement, reach, &mut |x, y| {
+            mask[y as usize * width + x as usize] = true
+        });
+    }
+}
+
+/// Stamp every device pixel whose centre maps into an image's unit square
+/// and whose clip coverage reaches the map's threshold.
+fn stamp_image(
+    map: &mut AttributionMap,
+    image: &crate::render_cpu::image::PreparedImage,
+    clips: &[Option<ClipMask>],
+) {
+    let threshold = map.coverage_threshold;
+    let (width, height) = (map.width, map.height);
+    for_each_pixel(image.bounds, width, height, |x, y| {
+        let dx = x as f64 + 0.5;
+        let dy = y as f64 + 0.5;
+        let u = image.inv.a * dx + image.inv.c * dy + image.inv.e;
+        let v = image.inv.b * dx + image.inv.d * dy + image.inv.f;
+        if !((0.0..1.0).contains(&u) && (0.0..1.0).contains(&v)) {
+            return;
+        }
+        let coverage = clip_at(
+            clips,
+            image.clip.filter(|_| image.clip_has_mask),
+            x as i32,
+            y as i32,
+        );
+        if coverage >= threshold {
+            map.stamp(x, y, PaintLeaf::Image, image.origin);
+        }
+    });
 }
 
 impl AttributionMap {

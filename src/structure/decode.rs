@@ -679,23 +679,22 @@ fn inflate_with(
         budget.charge(produced)?;
         match status {
             Ok(flate2::Status::StreamEnd) => return Ok(out),
-            Ok(_) => {
-                let consumed = decompress.total_in() - before_in;
-                if consumed == 0 && produced == 0 {
-                    // No forward progress: truncated stream. Tolerate if we
-                    // produced output (salvage), else corrupt.
-                    if out.is_empty() {
-                        return Err(DecodeError::Corrupt("flate stream truncated"));
-                    }
-                    return Ok(out);
-                }
-            }
+            Ok(_) => {}
             Err(e) => {
                 if out.is_empty() {
                     return Err(e);
                 }
                 return Ok(out);
             }
+        }
+        let consumed = decompress.total_in() - before_in;
+        if consumed == 0 && produced == 0 {
+            // No forward progress: truncated stream. Tolerate if we
+            // produced output (salvage), else corrupt.
+            if out.is_empty() {
+                return Err(DecodeError::Corrupt("flate stream truncated"));
+            }
+            return Ok(out);
         }
     }
 }
@@ -1237,29 +1236,29 @@ mod tests {
             wc.push(b);
             if dict.contains_key(&wc) {
                 w = wc;
-            } else {
-                bw.write(dict[&w], width);
-                // Freeze the table when full rather than emitting a CLEAR: this
-                // mirrors the decoder's `next < MAX` freeze, so the round trip
-                // exercises the shared 9→12-bit width-step logic without also
-                // depending on encoder/decoder agreement on the CLEAR-reset
-                // boundary. (Real Adobe streams do emit CLEAR at table-full;
-                // the decoder's handling of that is validated against PDFium on
-                // real corpus files, not by this self-round-trip.)
-                if next < MAX {
-                    dict.insert(wc, next);
-                    next += 1;
-                    // One entry LATER than the decoder's `>=` bump: the decoder
-                    // builds its table one entry behind the encoder (it needs
-                    // the next code to complete an entry), so to emit each code
-                    // at the width the decoder will read it, the encoder must
-                    // defer its width step by exactly one assigned code.
-                    if width < 12 && next + early > (1 << width) {
-                        width += 1;
-                    }
-                }
-                w = vec![b];
+                continue;
             }
+            bw.write(dict[&w], width);
+            // Freeze the table when full rather than emitting a CLEAR: this
+            // mirrors the decoder's `next < MAX` freeze, so the round trip
+            // exercises the shared 9→12-bit width-step logic without also
+            // depending on encoder/decoder agreement on the CLEAR-reset
+            // boundary. (Real Adobe streams do emit CLEAR at table-full;
+            // the decoder's handling of that is validated against PDFium on
+            // real corpus files, not by this self-round-trip.)
+            if next < MAX {
+                dict.insert(wc, next);
+                next += 1;
+                // One entry LATER than the decoder's `>=` bump: the decoder
+                // builds its table one entry behind the encoder (it needs
+                // the next code to complete an entry), so to emit each code
+                // at the width the decoder will read it, the encoder must
+                // defer its width step by exactly one assigned code.
+                if width < 12 && next + early > (1 << width) {
+                    width += 1;
+                }
+            }
+            w = vec![b];
         }
         if !w.is_empty() {
             bw.write(dict[&w], width);

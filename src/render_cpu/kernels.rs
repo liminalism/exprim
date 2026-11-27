@@ -296,11 +296,7 @@ unsafe fn blend_mask_rect_avx2_body(
                 let v = u64::from_le_bytes(w) >> (8 * (at + 8 - cov_len));
                 _mm_cvtsi64_si128(v as i64)
             } else {
-                let mut v = 0u64;
-                for k in 0..rem {
-                    v |= (cov[at + k] as u64) << (8 * k);
-                }
-                _mm_cvtsi64_si128(v as i64)
+                _mm_cvtsi64_si128(le_bytes_u64(cov, at, rem) as i64)
             };
             // SAFETY: lanes `0..rem` address pixels `full..width` of this row,
             // inside `dst` (precondition); masked-off lanes are neither read
@@ -315,6 +311,18 @@ unsafe fn blend_mask_rect_avx2_body(
         covered += row_covered as u64;
     }
     covered
+}
+
+/// The `n <= 8` bytes of `bytes` at `at`, little-endian in the low bytes of a
+/// `u64`: the remainder coverage of a bitmap shorter than eight bytes.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn le_bytes_u64(bytes: &[u8], at: usize, n: usize) -> u64 {
+    let mut v = 0u64;
+    for k in 0..n {
+        v |= (bytes[at + k] as u64) << (8 * k);
+    }
+    v
 }
 
 /// [`blend_mask`] with the body vectorized eight pixels at a time (AVX2) and
@@ -823,6 +831,29 @@ mod tests {
         fn byte(&mut self) -> u8 {
             (self.next() >> 24) as u8
         }
+
+        /// An alpha that is 255 a quarter of the time, 0 a quarter, else random.
+        fn alpha(&mut self) -> u8 {
+            match self.next() % 4 {
+                0 => 255,
+                1 => 0,
+                _ => self.byte(),
+            }
+        }
+
+        /// `len` premultiplied-looking bytes: every alpha byte and about half
+        /// the others opaque, the rest random.
+        fn opaque_biased(&mut self, len: usize) -> Vec<u8> {
+            (0..len)
+                .map(|k| {
+                    if k % 4 == 3 || self.next() & 1 == 0 {
+                        255
+                    } else {
+                        self.byte()
+                    }
+                })
+                .collect()
+        }
     }
 
     /// The AVX2 mask blend must be byte-for-byte identical to the scalar
@@ -850,22 +881,10 @@ mod tests {
         // the opaque-destination backdrop text normally composites onto.
         for len in 0..=41usize {
             for _ in 0..40 {
-                let alpha = match rng.next() % 4 {
-                    0 => 255,
-                    1 => 0,
-                    _ => rng.byte(),
-                };
+                let alpha = rng.alpha();
                 let cov: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
                 let rgb = [rng.byte(), rng.byte(), rng.byte()];
-                let mut dst: Vec<u8> = (0..len * 4)
-                    .map(|k| {
-                        if k % 4 == 3 || rng.next() & 1 == 0 {
-                            255
-                        } else {
-                            rng.byte()
-                        }
-                    })
-                    .collect();
+                let mut dst: Vec<u8> = rng.opaque_biased(len * 4);
                 let mut reference = dst.clone();
                 blend_mask(&mut reference, &cov, rgb, alpha);
                 blend_mask_avx2(&mut dst, &cov, rgb, alpha);
@@ -887,79 +906,72 @@ mod tests {
         for width in 0..=41usize {
             for height in [0usize, 1, 2, 3, 5, 9] {
                 for _ in 0..12 {
-                    let alpha = match rng.next() % 4 {
-                        0 => 255,
-                        1 => 0,
-                        _ => rng.byte(),
-                    };
-                    let rgb = [rng.byte(), rng.byte(), rng.byte()];
-                    let cov_stride = width + (rng.next() % 3) as usize * (rng.next() % 9) as usize;
-                    let dst_stride = width * 4 + 4 * (rng.next() % 6) as usize;
-                    let cov_len = if height == 0 {
-                        (rng.next() % 4) as usize
-                    } else {
-                        (height - 1) * cov_stride + width + (rng.next() % 2) as usize * 5
-                    };
-                    let cov: Vec<u8> = (0..cov_len)
-                        .map(|_| match rng.next() % 3 {
-                            0 => 0,
-                            1 => 255,
-                            _ => rng.byte(),
-                        })
-                        .collect();
-                    let dst_len = height * dst_stride + 12;
-                    let dst0: Vec<u8> = (0..dst_len)
-                        .map(|k| {
-                            if k % 4 == 3 || rng.next() & 1 == 0 {
-                                255
-                            } else {
-                                rng.byte()
-                            }
-                        })
-                        .collect();
-
-                    // Per-row reference, exactly as the blit did it before.
-                    let mut reference = dst0.clone();
-                    let mut ref_count = 0u64;
-                    for r in 0..height {
-                        let src = &cov[r * cov_stride..r * cov_stride + width];
-                        blend_mask(
-                            &mut reference[r * dst_stride..r * dst_stride + width * 4],
-                            src,
-                            rgb,
-                            alpha,
-                        );
-                        ref_count += src.iter().filter(|&&c| c != 0).count() as u64;
-                    }
-
-                    let mut scalar = dst0.clone();
-                    let n = blend_mask_rect(
-                        &mut scalar,
-                        dst_stride,
-                        &cov,
-                        cov_stride,
-                        width,
-                        height,
-                        rgb,
-                        alpha,
-                    );
-                    assert_eq!(scalar, reference, "scalar w{width} h{height} a{alpha}");
-                    assert_eq!(n, ref_count, "scalar count w{width} h{height}");
-
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        let mut simd = dst0.clone();
-                        let n = blend_mask_rect_avx2(
-                            &mut simd, dst_stride, &cov, cov_stride, width, height, rgb, alpha,
-                        );
-                        assert_eq!(
-                            simd, reference,
-                            "avx2 w{width} h{height} a{alpha} cs{cov_stride} ds{dst_stride}"
-                        );
-                        assert_eq!(n, ref_count, "avx2 count w{width} h{height}");
-                    }
+                    check_blend_mask_rect_case(&mut rng, width, height);
                 }
             }
+        }
+    }
+
+    /// One random case of [`blend_mask_rect_avx2_matches_scalar_bit_exact`].
+    fn check_blend_mask_rect_case(rng: &mut Rng, width: usize, height: usize) {
+        let alpha = rng.alpha();
+        let rgb = [rng.byte(), rng.byte(), rng.byte()];
+        let cov_stride = width + (rng.next() % 3) as usize * (rng.next() % 9) as usize;
+        let dst_stride = width * 4 + 4 * (rng.next() % 6) as usize;
+        let cov_len = if height == 0 {
+            (rng.next() % 4) as usize
+        } else {
+            (height - 1) * cov_stride + width + (rng.next() % 2) as usize * 5
+        };
+        let cov: Vec<u8> = (0..cov_len)
+            .map(|_| match rng.next() % 3 {
+                0 => 0,
+                1 => 255,
+                _ => rng.byte(),
+            })
+            .collect();
+        let dst_len = height * dst_stride + 12;
+        let dst0: Vec<u8> = rng.opaque_biased(dst_len);
+
+        // Per-row reference, exactly as the blit did it before.
+        let mut reference = dst0.clone();
+        let mut ref_count = 0u64;
+        for r in 0..height {
+            let src = &cov[r * cov_stride..r * cov_stride + width];
+            blend_mask(
+                &mut reference[r * dst_stride..r * dst_stride + width * 4],
+                src,
+                rgb,
+                alpha,
+            );
+            ref_count += src.iter().filter(|&&c| c != 0).count() as u64;
+        }
+
+        let mut scalar = dst0.clone();
+        let n = blend_mask_rect(
+            &mut scalar,
+            dst_stride,
+            &cov,
+            cov_stride,
+            width,
+            height,
+            rgb,
+            alpha,
+        );
+        assert_eq!(scalar, reference, "scalar w{width} h{height} a{alpha}");
+        assert_eq!(n, ref_count, "scalar count w{width} h{height}");
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut simd = dst0.clone();
+            let n = blend_mask_rect_avx2(
+                &mut simd, dst_stride, &cov, cov_stride, width, height, rgb, alpha,
+            );
+            assert_eq!(
+                simd, reference,
+                "avx2 w{width} h{height} a{alpha} cs{cov_stride} ds{dst_stride}"
+            );
+            assert_eq!(n, ref_count, "avx2 count w{width} h{height}");
         }
     }
 
