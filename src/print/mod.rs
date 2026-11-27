@@ -328,8 +328,9 @@ impl NUp {
         }
     }
 
-    /// Cell grid `(columns, rows)` for the *portrait* orientation of the
-    /// sheet. Callers swap the pair when the sheet is landscape.
+    /// Cell grid `(columns, rows)`, read in the sheet's own frame whichever
+    /// way the sheet is turned: a landscape sheet is not swapped. A booklet is
+    /// always two cells side by side (see `layout::cell_grid`).
     #[must_use]
     pub const fn grid(self) -> (u32, u32) {
         match self {
