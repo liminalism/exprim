@@ -143,6 +143,19 @@ fn checked_dimensions(width: usize, height: usize) -> Result<usize, String> {
         .ok_or_else(|| "bitmap dimensions overflow".to_string())
 }
 
+/// Packs up to 32 one-byte pixels into a row word, MSB first, setting the
+/// bits `is_black` accepts.
+#[inline(always)]
+fn pack_pixel_word(pixels: &[u8], is_black: &impl Fn(u8) -> bool) -> u32 {
+    let mut packed = 0u32;
+    for (i, &value) in pixels.iter().enumerate() {
+        if is_black(value) {
+            packed |= 0x8000_0000 >> i;
+        }
+    }
+    packed
+}
+
 impl BitImage {
     pub const MAX_DIMENSION: usize = 1 << 24; // 16M pixels
     pub const MIN_DIMENSION: usize = 1;
@@ -372,13 +385,7 @@ impl BitImage {
             let start = y * stride;
             let row = &data[start..start + width];
             for (word, pixels) in dst.iter_mut().zip(row.chunks(32)) {
-                let mut packed = 0u32;
-                for (i, &value) in pixels.iter().enumerate() {
-                    if is_black(value) {
-                        packed |= 0x8000_0000 >> i;
-                    }
-                }
-                *word = packed;
+                *word = pack_pixel_word(pixels, &is_black);
             }
         }
         Ok(image)
@@ -1032,6 +1039,92 @@ mod tests {
         image
     }
 
+    /// Checks `crop` against `from_sub_image` and against the source pixels.
+    fn assert_crop_matches(source: &BitImage, rect: &Rect) {
+        let cropped = source.crop(rect).unwrap();
+        assert_eq!(cropped, BitImage::from_sub_image(source, rect).unwrap());
+        let (rect_x, rect_y) = (rect.x as usize, rect.y as usize);
+        for y in 0..rect.height as usize {
+            for x in 0..rect.width as usize {
+                assert_eq!(
+                    cropped.get_usize(x, y),
+                    source.get_usize(rect_x + x, rect_y + y)
+                );
+            }
+        }
+    }
+
+    /// ORs the source block into a random target at a random position and
+    /// checks it against a per-pixel OR.
+    fn check_or_block(next: &mut impl FnMut() -> u64, source: &BitImage, rect: &Rect) {
+        let (rect_x, rect_y) = (rect.x as usize, rect.y as usize);
+        let (rect_w, rect_h) = (rect.width as usize, rect.height as usize);
+        let target_w = rect_w + (next() as usize) % 70;
+        let target_h = rect_h + (next() as usize) % 5;
+        let mut target = random_bitmap(next, target_w, target_h);
+        let mut expected = target.clone();
+        let at_x = (next() as usize) % (target_w - rect_w + 1);
+        let at_y = (next() as usize) % (target_h - rect_h + 1);
+        target.or_block_from(source, rect, at_x, at_y);
+        for y in 0..rect_h {
+            for x in 0..rect_w {
+                if source.get_usize(rect_x + x, rect_y + y) {
+                    expected.set_usize(at_x + x, at_y + y, true);
+                }
+            }
+        }
+        assert_eq!(target, expected);
+    }
+
+    /// Sets a random span of row `y` and checks it pixel by pixel.
+    #[cfg(feature = "symboldict")]
+    fn check_set_span(next: &mut impl FnMut() -> u64, width: usize, height: usize, y: usize) {
+        let start = (next() as usize) % width;
+        let end = start + (next() as usize) % (width - start);
+        let mut spans = BitImage::new(width as u32, height as u32).unwrap();
+        let mut expected = spans.clone();
+        spans.set_span(y, start, end);
+        for x in start..=end {
+            expected.set_usize(x, y, true);
+        }
+        assert_eq!(spans, expected);
+    }
+
+    /// Checks `trim` and `first_black_pixel` against the black pixels found
+    /// one by one.
+    fn assert_trim_matches(source: &BitImage) {
+        let (trim_rect, trimmed) = source.trim();
+        let mut black = Vec::new();
+        for y in 0..source.height {
+            for x in 0..source.width {
+                if source.get_usize(x, y) {
+                    black.push((x, y));
+                }
+            }
+        }
+        if black.is_empty() {
+            assert_eq!((trimmed.width, trimmed.height), (1, 1));
+            return;
+        }
+        let min_x = black.iter().map(|p| p.0).min().unwrap();
+        let max_x = black.iter().map(|p| p.0).max().unwrap();
+        let min_y = black.iter().map(|p| p.1).min().unwrap();
+        let max_y = black.iter().map(|p| p.1).max().unwrap();
+        assert_eq!(
+            (trim_rect.x, trim_rect.y, trim_rect.width, trim_rect.height),
+            (
+                min_x as u32,
+                min_y as u32,
+                (max_x - min_x + 1) as u32,
+                (max_y - min_y + 1) as u32
+            )
+        );
+        assert_eq!(
+            crate::jbig2enc::first_black_pixel(source),
+            black.first().copied()
+        );
+    }
+
     #[test]
     fn word_level_block_operations_match_per_pixel_reference() {
         let mut state = 0x2545_f491_4f6c_dd1du64;
@@ -1055,76 +1148,11 @@ mod tests {
                 width: rect_w as u32,
                 height: rect_h as u32,
             };
-            let cropped = source.crop(&rect).unwrap();
-            assert_eq!(cropped, BitImage::from_sub_image(&source, &rect).unwrap());
-            for y in 0..rect_h {
-                for x in 0..rect_w {
-                    assert_eq!(
-                        cropped.get_usize(x, y),
-                        source.get_usize(rect_x + x, rect_y + y)
-                    );
-                }
-            }
-
-            let target_w = rect_w + (next() as usize) % 70;
-            let target_h = rect_h + (next() as usize) % 5;
-            let mut target = random_bitmap(&mut next, target_w, target_h);
-            let mut expected = target.clone();
-            let at_x = (next() as usize) % (target_w - rect_w + 1);
-            let at_y = (next() as usize) % (target_h - rect_h + 1);
-            target.or_block_from(&source, &rect, at_x, at_y);
-            for y in 0..rect_h {
-                for x in 0..rect_w {
-                    if source.get_usize(rect_x + x, rect_y + y) {
-                        expected.set_usize(at_x + x, at_y + y, true);
-                    }
-                }
-            }
-            assert_eq!(target, expected);
-
+            assert_crop_matches(&source, &rect);
+            check_or_block(&mut next, &source, &rect);
             #[cfg(feature = "symboldict")]
-            {
-                let start = (next() as usize) % width;
-                let end = start + (next() as usize) % (width - start);
-                let mut spans = BitImage::new(width as u32, height as u32).unwrap();
-                let mut expected = spans.clone();
-                spans.set_span(rect_y, start, end);
-                for x in start..=end {
-                    expected.set_usize(x, rect_y, true);
-                }
-                assert_eq!(spans, expected);
-            }
-
-            let (trim_rect, trimmed) = source.trim();
-            let mut black = Vec::new();
-            for y in 0..height {
-                for x in 0..width {
-                    if source.get_usize(x, y) {
-                        black.push((x, y));
-                    }
-                }
-            }
-            if black.is_empty() {
-                assert_eq!((trimmed.width, trimmed.height), (1, 1));
-            } else {
-                let min_x = black.iter().map(|p| p.0).min().unwrap();
-                let max_x = black.iter().map(|p| p.0).max().unwrap();
-                let min_y = black.iter().map(|p| p.1).min().unwrap();
-                let max_y = black.iter().map(|p| p.1).max().unwrap();
-                assert_eq!(
-                    (trim_rect.x, trim_rect.y, trim_rect.width, trim_rect.height),
-                    (
-                        min_x as u32,
-                        min_y as u32,
-                        (max_x - min_x + 1) as u32,
-                        (max_y - min_y + 1) as u32
-                    )
-                );
-                assert_eq!(
-                    crate::jbig2enc::first_black_pixel(&source),
-                    black.first().copied()
-                );
-            }
+            check_set_span(&mut next, width, height, rect_y);
+            assert_trim_matches(&source);
         }
     }
 
@@ -1157,13 +1185,14 @@ pub fn first_black_pixel_in_packed(
             }
 
             let word = packed[row_start + word_idx];
-            if word != 0 {
-                // Find the first set bit in this word
-                let bit_pos = word.leading_zeros() as usize;
-                let x = word_idx * 32 + bit_pos;
-                if x < width {
-                    return Some((x, y));
-                }
+            if word == 0 {
+                continue;
+            }
+            // Find the first set bit in this word
+            let bit_pos = word.leading_zeros() as usize;
+            let x = word_idx * 32 + bit_pos;
+            if x < width {
+                return Some((x, y));
             }
         }
     }

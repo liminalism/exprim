@@ -1,14 +1,177 @@
-use super::super::{HashKey, Jbig2Encoder, PageData, hash_key};
+use super::super::{HashKey, Jbig2Encoder, PageData, dimension_bucket_keys, hash_key};
 use super::types::{RefinementPlan, encoder_diagnostics_enabled};
 use crate::jbig2classify::SymbolSignature;
 use crate::jbig2comparator::Comparator;
 use crate::jbig2context::build_symbol_context_model;
 use crate::jbig2cost::symbol_dictionary_entries_bytes;
-use crate::jbig2structs::LossySymbolMode;
+use crate::jbig2structs::{Jbig2Config, LossySymbolMode};
 use crate::jbig2sym::BitImage;
 use crate::jbig2unify::{SymbolUnifyInputs, UnifiedClass};
 use anyhow::Result;
 use rustc_hash::{FxHashMap, FxHashSet};
+
+/// A local symbol's chosen global alias: the global symbol, the compare
+/// error, the offset, and whether instances must be refined.
+type GlobalAlias = (usize, u32, i32, i32, bool);
+
+/// The encoder state the local-to-global alias search reads.
+struct GlobalAliasSearch<'s> {
+    config: &'s Jbig2Config,
+    global_symbols: &'s [BitImage],
+    symbol_signatures: &'s [SymbolSignature],
+    symbol_pixel_counts: &'s [usize],
+    global_bucket_map: &'s FxHashMap<HashKey, Vec<usize>>,
+}
+
+impl GlobalAliasSearch<'_> {
+    /// Searches the global symbols in the dimension buckets around a local
+    /// symbol for an acceptable alias; the last accepted one wins unless an
+    /// exact match ends the search.
+    fn best_match(
+        &self,
+        local_symbol_index: usize,
+        comparator: &mut Comparator,
+    ) -> Option<GlobalAlias> {
+        let local_symbol = &self.global_symbols[local_symbol_index];
+        let area = (local_symbol.width * local_symbol.height) as u32;
+        let max_err = if self.config.text_refine {
+            (area / self.config.match_tolerance.max(1)).max(3)
+        } else {
+            ((area as f32 * 0.05) as u32).max(2)
+        };
+        let dim_range: u64 = if self.config.text_refine || self.config.refine {
+            2
+        } else {
+            0
+        };
+
+        let mut best_match: Option<GlobalAlias> = None;
+        let h = local_symbol.height as u64;
+        let w = local_symbol.width as u64;
+        for bucket_key in dimension_bucket_keys(h, w, dim_range) {
+            let Some(bucket) = self.global_bucket_map.get(&bucket_key) else {
+                continue;
+            };
+            for &global_symbol_index in bucket {
+                let Some((err, dx, dy, needs_refinement)) = self.alias_candidate(
+                    local_symbol_index,
+                    global_symbol_index,
+                    max_err,
+                    comparator,
+                ) else {
+                    continue;
+                };
+                best_match = Some((global_symbol_index, err, dx, dy, needs_refinement));
+                if err == 0 && dx == 0 && dy == 0 {
+                    return best_match;
+                }
+            }
+        }
+        best_match
+    }
+
+    /// Screens a global symbol by ink count and signature, compares it with
+    /// the local symbol, and returns the error, offset and refinement need
+    /// when it is an acceptable alias.
+    fn alias_candidate(
+        &self,
+        local_symbol_index: usize,
+        global_symbol_index: usize,
+        max_err: u32,
+        comparator: &mut Comparator,
+    ) -> Option<(u32, i32, i32, bool)> {
+        let text_refine = self.config.text_refine;
+        let local_symbol = &self.global_symbols[local_symbol_index];
+        let local_sig = self.symbol_signatures[local_symbol_index];
+        let pixel_count = self.symbol_pixel_counts[local_symbol_index];
+        if self.symbol_pixel_counts[global_symbol_index].abs_diff(pixel_count)
+            > max_err as usize + if self.config.text_refine { 8 } else { 6 }
+        {
+            return None;
+        }
+        let stored = self.symbol_signatures[global_symbol_index];
+        let black_tol = if text_refine { 12 } else { 8 };
+        let pos_tol = 2;
+        let centroid_tol = if text_refine { 96 } else { 64 };
+        if local_sig.black.abs_diff(stored.black) > black_tol
+            || local_sig.left_col.abs_diff(stored.left_col) > pos_tol
+            || local_sig.right_col.abs_diff(stored.right_col) > pos_tol
+            || local_sig.top_row.abs_diff(stored.top_row) > pos_tol
+            || local_sig.bottom_row.abs_diff(stored.bottom_row) > pos_tol
+            || local_sig.cx_times_256.abs_diff(stored.cx_times_256) > centroid_tol
+            || local_sig.cy_times_256.abs_diff(stored.cy_times_256) > centroid_tol
+        {
+            return None;
+        }
+        let max_dx = if text_refine { 1 } else { 1 };
+        let max_dy = if text_refine { 1 } else { 0 };
+        let result = comparator.compare_for_refine_family(
+            local_symbol,
+            &self.global_symbols[global_symbol_index],
+            max_err,
+            max_dx,
+            max_dy,
+        )?;
+        let err = result.total_err;
+        let dx = result.dx;
+        let dy = result.dy;
+        let exact_dims = local_symbol.width == self.global_symbols[global_symbol_index].width
+            && local_symbol.height == self.global_symbols[global_symbol_index].height;
+        let needs_refinement = self.alias_refinement(err, dx, dy, exact_dims, max_err)?;
+        Some((err, dx, dy, needs_refinement))
+    }
+
+    /// Whether a compared alias is accepted and, if so, whether its
+    /// instances must be refined.
+    fn alias_refinement(
+        &self,
+        err: u32,
+        dx: i32,
+        dy: i32,
+        exact_dims: bool,
+        max_err: u32,
+    ) -> Option<bool> {
+        if err == 0 && dx == 0 && dy == 0 && exact_dims {
+            return Some(false);
+        }
+        if self.config.text_refine {
+            return (dx.abs() <= 1 && dy.abs() <= 1 && err <= (max_err / 2).max(2)).then_some(true);
+        }
+        if dx.abs() <= 1 && dy == 0 {
+            // Non-exact: alias onto the global prototype but
+            // refine per-instance so the original bitmap is
+            // reconstructed losslessly (no substitution). In an
+            // explicitly lossy mode (sym-unify) substitution is
+            // intended, so refinement is not forced there.
+            return Some(self.config.lossy_symbol_mode == LossySymbolMode::Off);
+        }
+        None
+    }
+}
+
+/// Recodes a page's instances of a local symbol as its global alias and
+/// returns how many were changed.
+fn alias_page_instances(
+    page: &mut PageData,
+    local_symbol_index: usize,
+    global_symbol_index: usize,
+    dx: i32,
+    dy: i32,
+    needs_refinement: bool,
+) -> usize {
+    let mut remapped = 0;
+    for instance in &mut page.symbol_instances {
+        if instance.symbol_index != local_symbol_index {
+            continue;
+        }
+        instance.symbol_index = global_symbol_index;
+        instance.needs_refinement = needs_refinement;
+        instance.refinement_dx = if needs_refinement { dx } else { 0 };
+        instance.refinement_dy = if needs_refinement { dy } else { 0 };
+        remapped += 1;
+    }
+    remapped
+}
 
 impl<'a> Jbig2Encoder<'a> {
     pub(crate) fn estimate_local_symbol_gain(&self, page: &PageData, symbol_index: usize) -> i64 {
@@ -270,7 +433,6 @@ impl<'a> Jbig2Encoder<'a> {
         if self.pages.len() <= 1 || self.global_symbols.is_empty() {
             return Ok(());
         }
-        let text_refine = self.config.text_refine;
         let global_indices: Vec<usize> = self
             .global_symbols
             .iter()
@@ -296,6 +458,13 @@ impl<'a> Jbig2Encoder<'a> {
         let mut aliased_symbols = 0usize;
         let mut aliased_instances = 0usize;
         let mut alias_samples = Vec::new();
+        let search = GlobalAliasSearch {
+            config: &self.config,
+            global_symbols: &self.global_symbols,
+            symbol_signatures: &self.symbol_signatures,
+            symbol_pixel_counts: &self.symbol_pixel_counts,
+            global_bucket_map: &global_bucket_map,
+        };
         for page in &mut self.pages {
             let mut page_local_symbols: FxHashSet<usize> =
                 FxHashSet::with_capacity_and_hasher(256, Default::default());
@@ -306,123 +475,22 @@ impl<'a> Jbig2Encoder<'a> {
             }
 
             for local_symbol_index in page_local_symbols {
-                let local_symbol = &self.global_symbols[local_symbol_index];
-                let local_sig = self.symbol_signatures[local_symbol_index];
-                let pixel_count = self.symbol_pixel_counts[local_symbol_index];
-                let area = (local_symbol.width * local_symbol.height) as u32;
-                let max_err = if self.config.text_refine {
-                    (area / self.config.match_tolerance.max(1)).max(3)
-                } else {
-                    ((area as f32 * 0.05) as u32).max(2)
-                };
-                let dim_range: u64 = if self.config.text_refine || self.config.refine {
-                    2
-                } else {
-                    0
-                };
-
-                let mut best_match: Option<(usize, u32, i32, i32, bool)> = None;
-                let h = local_symbol.height as u64;
-                let w = local_symbol.width as u64;
-                'bucket_search: for dh_off in 0..=(dim_range * 2) {
-                    let dh = h.wrapping_add(dh_off).wrapping_sub(dim_range);
-                    if dh >= 10_000 {
-                        continue;
-                    }
-                    for dw_off in 0..=(dim_range * 2) {
-                        let dw = w.wrapping_add(dw_off).wrapping_sub(dim_range);
-                        if dw >= 10_000 {
-                            continue;
-                        }
-                        let bucket_key = HashKey(dh * 10_000 + dw);
-                        let Some(bucket) = global_bucket_map.get(&bucket_key) else {
-                            continue;
-                        };
-                        for &global_symbol_index in bucket {
-                            if self.symbol_pixel_counts[global_symbol_index].abs_diff(pixel_count)
-                                > max_err as usize + if self.config.text_refine { 8 } else { 6 }
-                            {
-                                continue;
-                            }
-                            let stored = self.symbol_signatures[global_symbol_index];
-                            let black_tol = if text_refine { 12 } else { 8 };
-                            let pos_tol = 2;
-                            let centroid_tol = if text_refine { 96 } else { 64 };
-                            if local_sig.black.abs_diff(stored.black) > black_tol
-                                || local_sig.left_col.abs_diff(stored.left_col) > pos_tol
-                                || local_sig.right_col.abs_diff(stored.right_col) > pos_tol
-                                || local_sig.top_row.abs_diff(stored.top_row) > pos_tol
-                                || local_sig.bottom_row.abs_diff(stored.bottom_row) > pos_tol
-                                || local_sig.cx_times_256.abs_diff(stored.cx_times_256)
-                                    > centroid_tol
-                                || local_sig.cy_times_256.abs_diff(stored.cy_times_256)
-                                    > centroid_tol
-                            {
-                                continue;
-                            }
-                            let max_dx = if text_refine { 1 } else { 1 };
-                            let max_dy = if text_refine { 1 } else { 0 };
-                            let Some(result) = comparator.compare_for_refine_family(
-                                local_symbol,
-                                &self.global_symbols[global_symbol_index],
-                                max_err,
-                                max_dx,
-                                max_dy,
-                            ) else {
-                                continue;
-                            };
-                            let err = result.total_err;
-                            let dx = result.dx;
-                            let dy = result.dy;
-                            let exact_dims = local_symbol.width
-                                == self.global_symbols[global_symbol_index].width
-                                && local_symbol.height
-                                    == self.global_symbols[global_symbol_index].height;
-                            let (accept, needs_refinement) =
-                                if err == 0 && dx == 0 && dy == 0 && exact_dims {
-                                    (true, false)
-                                } else if text_refine {
-                                    (
-                                        dx.abs() <= 1
-                                            && dy.abs() <= 1
-                                            && err <= (max_err / 2).max(2),
-                                        true,
-                                    )
-                                } else if dx.abs() <= 1 && dy == 0 {
-                                    // Non-exact: alias onto the global prototype but
-                                    // refine per-instance so the original bitmap is
-                                    // reconstructed losslessly (no substitution). In an
-                                    // explicitly lossy mode (sym-unify) substitution is
-                                    // intended, so refinement is not forced there.
-                                    (true, self.config.lossy_symbol_mode == LossySymbolMode::Off)
-                                } else {
-                                    (false, false)
-                                };
-                            if !accept {
-                                continue;
-                            }
-                            best_match = Some((global_symbol_index, err, dx, dy, needs_refinement));
-                            if err == 0 && dx == 0 && dy == 0 {
-                                break 'bucket_search;
-                            }
-                        }
-                    }
-                }
-
-                let Some((global_symbol_index, _err, dx, dy, needs_refinement)) = best_match else {
+                let Some((global_symbol_index, _err, dx, dy, needs_refinement)) =
+                    search.best_match(local_symbol_index, &mut comparator)
+                else {
                     continue;
                 };
                 aliased_symbols += 1;
-                for instance in &mut page.symbol_instances {
-                    if instance.symbol_index == local_symbol_index {
-                        instance.symbol_index = global_symbol_index;
-                        instance.needs_refinement = needs_refinement;
-                        instance.refinement_dx = if needs_refinement { dx } else { 0 };
-                        instance.refinement_dy = if needs_refinement { dy } else { 0 };
-                        changed = true;
-                        aliased_instances += 1;
-                    }
-                }
+                let remapped = alias_page_instances(
+                    page,
+                    local_symbol_index,
+                    global_symbol_index,
+                    dx,
+                    dy,
+                    needs_refinement,
+                );
+                changed |= remapped > 0;
+                aliased_instances += remapped;
                 if alias_samples.len() < 64 {
                     alias_samples.push(format!(
                         "alias local->global: local={} global={} dx={} dy={} refine={}",

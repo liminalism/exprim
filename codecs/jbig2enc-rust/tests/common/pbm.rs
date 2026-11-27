@@ -60,12 +60,11 @@ impl Pbm {
                 while *i < b.len() && b[*i].is_ascii_whitespace() {
                     *i += 1;
                 }
-                if *i < b.len() && b[*i] == b'#' {
-                    while *i < b.len() && b[*i] != b'\n' {
-                        *i += 1;
-                    }
-                } else {
+                if *i >= b.len() || b[*i] != b'#' {
                     break;
+                }
+                while *i < b.len() && b[*i] != b'\n' {
+                    *i += 1;
                 }
             }
         }

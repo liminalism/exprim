@@ -145,6 +145,67 @@ impl Choice {
     }
 }
 
+/// The dictionary policies every proposal is measured under, in order.
+const TRIAL_POLICIES: [PdfDictionaryPolicy; 3] = [
+    PdfDictionaryPolicy::AllGlobal,
+    PdfDictionaryPolicy::SharedGlobal,
+    PdfDictionaryPolicy::SharedGlobalWithLocal,
+];
+
+/// A family's shared `(reference, substitution)`.
+type FamilyKey = (usize, bool);
+
+/// A family's members: each target with its score and choice.
+type FamilyMembers = Vec<(usize, u32, Choice)>;
+
+/// Symbols that share a reference and representation.
+type CandidateFamily = (FamilyKey, FamilyMembers);
+
+/// Groups the near candidates by reference and representation, keeping
+/// the groups of two or more members.
+fn candidate_families(near_candidates: &[Vec<(u32, Choice)>]) -> Vec<CandidateFamily> {
+    let mut families: std::collections::BTreeMap<FamilyKey, FamilyMembers> = Default::default();
+    for (target, candidates) in near_candidates.iter().enumerate() {
+        for &(score, choice) in candidates {
+            let Some(reference) = choice.reference(target) else {
+                continue;
+            };
+            families
+                .entry((reference, matches!(choice, Choice::Substitution { .. })))
+                .or_default()
+                .push((target, score, choice));
+        }
+    }
+    families
+        .into_iter()
+        .filter(|(_, members)| members.len() >= 2)
+        .collect()
+}
+
+/// The state of the measured search: the current choice per symbol, the
+/// best complete trial so far, the report and the cost calibration.
+struct TrialSearch {
+    choices: Vec<Choice>,
+    best: Trial,
+    report: SymbolOptimizationMetrics,
+    calibration: CostCalibration,
+}
+
+/// A coordinated change of a family's members to one reference.
+struct FamilyProposal {
+    reference: usize,
+    kind: &'static str,
+    choices: Vec<Choice>,
+    estimate: i64,
+}
+
+/// A change of one target's representation, with its rough gain estimate.
+struct TargetProposal {
+    target: usize,
+    choice: Choice,
+    estimate: Option<i64>,
+}
+
 impl<'a> Jbig2Encoder<'a> {
     fn encode_exact_trial(
         &mut self,
@@ -375,10 +436,10 @@ impl<'a> Jbig2Encoder<'a> {
         {
             segment.write_into(&mut count)?;
         }
-        if !self.state.pdf_mode {
-            if let Some(eof) = &document.eof_segment {
-                eof.write_into(&mut count)?;
-            }
+        if !self.state.pdf_mode
+            && let Some(eof) = &document.eof_segment
+        {
+            eof.write_into(&mut count)?;
         }
         let resources = super::super::DocumentResourceMetrics::from_plan(&document)?;
         let feasible = self
@@ -414,32 +475,9 @@ impl<'a> Jbig2Encoder<'a> {
             .validate_exact_symbol_mode()
             .map_err(anyhow::Error::msg)?;
         let started = Instant::now();
-        let policies = [
-            PdfDictionaryPolicy::AllGlobal,
-            PdfDictionaryPolicy::SharedGlobal,
-            PdfDictionaryPolicy::SharedGlobalWithLocal,
-        ];
         let mut report = SymbolOptimizationMetrics::default();
-        let mut calibration = CostCalibration::default();
-        let mut choices = vec![Choice::Dictionary; self.global_symbols.len()];
-        let mut best: Option<Trial> = None;
-        for policy in policies {
-            let trial = self.encode_exact_trial(&choices, policy, include_header)?;
-            report.trials.push(SymbolCostTrial {
-                symbol: None,
-                representation: "dictionary control",
-                policy,
-                estimated_gain_bytes: None,
-                raw_estimated_gain_bytes: None,
-                measured_gain_bytes: None,
-                encoded_bytes: trial.bytes,
-                meets_resource_limits: trial.feasible,
-            });
-            if best.as_ref().is_none_or(|best| trial.preferable_to(best)) {
-                best = Some(trial);
-            }
-        }
-        let mut best = best.expect("three dictionary control trials");
+        let choices = vec![Choice::Dictionary; self.global_symbols.len()];
+        let best = self.run_dictionary_controls(&choices, include_header, &mut report)?;
         report.baseline_bytes = report
             .trials
             .iter()
@@ -447,22 +485,7 @@ impl<'a> Jbig2Encoder<'a> {
             .min()
             .unwrap();
 
-        // Bucket indices in usage order so candidate budgets are spent on the
-        // most reusable anchors first. Large components remain eligible for
-        // generic coding but do not trigger expensive fuzzy comparisons.
-        let mut by_usage: Vec<_> = (0..self.global_symbols.len()).collect();
-        by_usage.sort_by_key(|&index| (std::cmp::Reverse(self.symbol_usage[index]), index));
-        let mut buckets: FxHashMap<FamilyBucketKey, Vec<usize>> = FxHashMap::default();
-        let mut keys = vec![None; self.global_symbols.len()];
-        for &index in &by_usage {
-            let symbol = &self.global_symbols[index];
-            if symbol.width <= 256 && symbol.height <= 256 && self.symbol_pixel_counts[index] > 1 {
-                let signature = compute_symbol_signature(symbol);
-                let key = family_bucket_key_for_symbol(symbol, &signature);
-                keys[index] = Some(key);
-                buckets.entry(key).or_default().push(index);
-            }
-        }
+        let (buckets, keys) = self.candidate_family_buckets();
         let mut targets: Vec<_> = (0..self.global_symbols.len()).collect();
         targets.sort_by_key(|&index| {
             (
@@ -480,268 +503,47 @@ impl<'a> Jbig2Encoder<'a> {
             if limit == 4 {
                 break;
             }
-            let mut candidates = Vec::new();
-            let mut visited = FxHashSet::default();
-            if let Some(key) = keys[target] {
-                'neighbors: for neighbor in family_bucket_neighbors(key) {
-                    let Some(bucket) = buckets.get(&neighbor) else {
-                        continue;
-                    };
-                    for &reference in bucket {
-                        if reference == target || !visited.insert(reference) {
-                            continue;
-                        }
-                        if visited.len() > self.config.symbol_candidate_limit {
-                            break 'neighbors;
-                        }
-                        if choices[reference] != Choice::Dictionary
-                            || (self.symbol_usage[reference], std::cmp::Reverse(reference))
-                                < (self.symbol_usage[target], std::cmp::Reverse(target))
-                        {
-                            continue;
-                        }
-                        let symbol = &self.global_symbols[target];
-                        let max_error = (symbol.width * symbol.height
-                            / self.config.match_tolerance.max(1) as usize)
-                            .max(2) as u32;
-                        report.candidate_comparisons += 1;
-                        if let Some(result) = comparator.compare_for_refine_family(
-                            symbol,
-                            &self.global_symbols[reference],
-                            max_error,
-                            2,
-                            1,
-                        ) {
-                            candidates.push((
-                                result.total_err
-                                    + (result.dx.unsigned_abs() + result.dy.unsigned_abs()) * 3,
-                                Choice::Refinement {
-                                    reference,
-                                    dx: result.dx,
-                                    dy: result.dy,
-                                },
-                            ));
-                        }
-                    }
-                }
-            }
+            let mut candidates = match keys[target] {
+                Some(key) => self.refinement_candidates(
+                    target,
+                    key,
+                    &buckets,
+                    &choices,
+                    &mut comparator,
+                    &mut report,
+                ),
+                None => Vec::new(),
+            };
             candidates.sort_by_key(|candidate| candidate.0);
             candidates.truncate(2);
             if self.config.optimize_lossy_symbols {
-                let substitutions = candidates
-                    .iter()
-                    .filter_map(|&(score, choice)| {
-                        let Choice::Refinement {
-                            reference,
-                            dx: 0,
-                            dy: 0,
-                        } = choice
-                        else {
-                            return None;
-                        };
-                        let source = &self.global_symbols[target];
-                        let prototype = &self.global_symbols[reference];
-                        if (source.width, source.height) != (prototype.width, prototype.height) {
-                            return None;
-                        }
-                        let errors: u32 = source
-                            .packed_words()
-                            .iter()
-                            .zip(prototype.packed_words())
-                            .map(|(left, right)| (left ^ right).count_ones())
-                            .sum();
-                        (errors <= self.config.symbol_substitution_error_limit
-                            && super::topology::substitution_preserves_topology(source, prototype))
-                        .then_some((score, Choice::Substitution { reference }))
-                    })
-                    .collect::<Vec<_>>();
+                let substitutions = self.lossless_substitutions(target, &candidates);
                 candidates.extend(substitutions);
             }
             near_candidates[target] = candidates;
         }
 
-        // Refinement has a fixed text-region signaling cost. A family can win
-        // jointly even when moving any one member alone loses. Measure these
-        // coordinated proposals before greedy per-symbol changes.
-        let mut families: std::collections::BTreeMap<(usize, bool), Vec<(usize, u32, Choice)>> =
-            Default::default();
-        for (target, candidates) in near_candidates.iter().enumerate() {
-            for &(score, choice) in candidates {
-                if let Some(reference) = choice.reference(target) {
-                    families
-                        .entry((reference, matches!(choice, Choice::Substitution { .. })))
-                        .or_default()
-                        .push((target, score, choice));
-                }
-            }
-        }
-        let mut families: Vec<_> = families
-            .into_iter()
-            .filter(|(_, members)| members.len() >= 2)
-            .collect();
-        let family_budget = report.trials.len() + ((limit - 4) / 2).min(18);
-        while !families.is_empty() && report.trials.len() < family_budget {
-            let referenced = referenced_symbols(&choices);
-            families.retain(|((reference, _), members)| {
-                choices[*reference] == Choice::Dictionary
-                    && members
-                        .iter()
-                        .filter(|&&(target, _, choice)| {
-                            choices[target] != choice && !referenced.contains(&target)
-                        })
-                        .take(2)
-                        .count()
-                        == 2
-            });
-            if families.is_empty() {
-                break;
-            }
-            let selected = families
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, ((reference, substitution), members))| {
-                    let raw = members
-                        .iter()
-                        .map(|&(target, score, _)| {
-                            self.global_symbols[target]
-                                .width
-                                .saturating_mul(self.global_symbols[target].height)
-                                .div_ceil(8) as i64
-                                - score as i64
-                        })
-                        .sum::<i64>();
-                    let predicted = policies
-                        .iter()
-                        .map(|&policy| calibration.predict(family_kind(*substitution), policy, raw))
-                        .max()
-                        .unwrap();
-                    (
-                        predicted,
-                        std::cmp::Reverse(*reference),
-                        std::cmp::Reverse(*substitution),
-                    )
-                })
-                .unwrap()
-                .0;
-            let ((reference, substitution), members) = families.swap_remove(selected);
-            if choices[reference] != Choice::Dictionary {
-                continue;
-            }
-            let mut proposal = choices.clone();
-            let mut estimate = 0;
-            let mut changed = 0;
-            for (target, score, choice) in members {
-                if choices[target] == choice || referenced.contains(&target) {
-                    continue;
-                }
-                proposal[target] = choice;
-                estimate += self.global_symbols[target]
-                    .width
-                    .saturating_mul(self.global_symbols[target].height)
-                    .div_ceil(8) as i64
-                    - score as i64;
-                changed += 1;
-            }
-            if changed < 2 {
-                continue;
-            }
-            for policy in policies {
-                if report.trials.len() >= family_budget {
-                    break;
-                }
-                let kind = family_kind(substitution);
-                let prediction = calibration.predict(kind, policy, estimate);
-                let trial = self.encode_exact_trial(&proposal, policy, include_header)?;
-                let measured = best.bytes as i64 - trial.bytes as i64;
-                calibration.observe(kind, policy, estimate, measured);
-                report.trials.push(SymbolCostTrial {
-                    symbol: Some(reference),
-                    representation: kind,
-                    policy,
-                    estimated_gain_bytes: Some(prediction),
-                    raw_estimated_gain_bytes: Some(estimate),
-                    measured_gain_bytes: Some(measured),
-                    encoded_bytes: trial.bytes,
-                    meets_resource_limits: trial.feasible,
-                });
-                if trial.preferable_to(&best) {
-                    best = trial;
-                    choices = proposal.clone();
-                }
-            }
-        }
+        let mut search = TrialSearch {
+            choices,
+            best,
+            report,
+            calibration: CostCalibration::default(),
+        };
+        self.run_family_trials(&mut search, &near_candidates, limit, include_header)?;
+        self.run_target_trials(
+            &mut search,
+            targets,
+            &near_candidates,
+            limit,
+            include_header,
+        )?;
+        let TrialSearch {
+            choices,
+            mut best,
+            mut report,
+            calibration,
+        } = search;
 
-        for target in targets {
-            if report.trials.len() >= limit - 1 {
-                break;
-            }
-            // A chosen reference remains stored; changing it underneath already
-            // accepted refinements would invalidate their dictionary mapping.
-            if referenced_symbols(&choices).contains(&target) {
-                continue;
-            }
-            // A deliberately rough shortlist estimate. Every accepted change is
-            // measured with dictionaries, placements, residuals and headers in
-            // the contexts in which they will actually be emitted.
-            let bitmap_bytes = self.global_symbols[target]
-                .width
-                .saturating_mul(self.global_symbols[target].height)
-                .div_ceil(8) as i64;
-            let proposals = near_candidates[target].iter().copied().filter(|&(_, choice)| {
-                matches!(choice, Choice::Refinement { reference, .. } | Choice::Substitution { reference } if choices[reference] == Choice::Dictionary)
-            }).map(|(score, choice)| (choice, Some(bitmap_bytes - score as i64))).collect::<Vec<_>>();
-            let mut proposals: Vec<_> = proposals
-                .into_iter()
-                .chain(std::iter::once((Choice::Generic, None)))
-                .collect();
-            proposals.sort_by_key(|&(choice, raw)| {
-                std::cmp::Reverse(
-                    raw.map(|raw| {
-                        policies
-                            .iter()
-                            .map(|&policy| calibration.predict(choice_kind(choice), policy, raw))
-                            .max()
-                            .unwrap()
-                    })
-                    .unwrap_or(0),
-                )
-            });
-            for (proposal, estimate) in proposals {
-                if choices[target] == proposal {
-                    continue;
-                }
-                for policy in policies {
-                    if report.trials.len() >= limit - 1 {
-                        break;
-                    }
-                    let previous = choices[target];
-                    choices[target] = proposal;
-                    let trial = self.encode_exact_trial(&choices, policy, include_header)?;
-                    let representation = choice_kind(proposal);
-                    let prediction =
-                        estimate.map(|raw| calibration.predict(representation, policy, raw));
-                    let measured = best.bytes as i64 - trial.bytes as i64;
-                    if let Some(raw) = estimate {
-                        calibration.observe(representation, policy, raw, measured);
-                    }
-                    report.trials.push(SymbolCostTrial {
-                        symbol: Some(target),
-                        representation,
-                        policy,
-                        estimated_gain_bytes: prediction,
-                        raw_estimated_gain_bytes: estimate,
-                        measured_gain_bytes: Some(measured),
-                        encoded_bytes: trial.bytes,
-                        meets_resource_limits: trial.feasible,
-                    });
-                    if trial.preferable_to(&best) {
-                        best = trial;
-                    } else {
-                        choices[target] = previous;
-                    }
-                }
-            }
-        }
         let generic = self.encode_exact_trial(
             &vec![Choice::Generic; choices.len()],
             PdfDictionaryPolicy::AllGlobal,
@@ -779,5 +581,413 @@ impl<'a> Jbig2Encoder<'a> {
         self.metrics.symbol_mode.planning += started.elapsed();
         self.metrics.optimization = report;
         Ok(best.document)
+    }
+
+    /// Measures the all-dictionary choice under every policy and returns the
+    /// preferable trial.
+    fn run_dictionary_controls(
+        &mut self,
+        choices: &[Choice],
+        include_header: bool,
+        report: &mut SymbolOptimizationMetrics,
+    ) -> Result<Trial> {
+        let mut best: Option<Trial> = None;
+        for policy in TRIAL_POLICIES {
+            let trial = self.encode_exact_trial(choices, policy, include_header)?;
+            report.trials.push(SymbolCostTrial {
+                symbol: None,
+                representation: "dictionary control",
+                policy,
+                estimated_gain_bytes: None,
+                raw_estimated_gain_bytes: None,
+                measured_gain_bytes: None,
+                encoded_bytes: trial.bytes,
+                meets_resource_limits: trial.feasible,
+            });
+            if best.as_ref().is_none_or(|best| trial.preferable_to(best)) {
+                best = Some(trial);
+            }
+        }
+        Ok(best.expect("three dictionary control trials"))
+    }
+
+    /// Buckets the symbols eligible for fuzzy comparison by family key, and
+    /// returns the key of each symbol.
+    fn candidate_family_buckets(
+        &self,
+    ) -> (
+        FxHashMap<FamilyBucketKey, Vec<usize>>,
+        Vec<Option<FamilyBucketKey>>,
+    ) {
+        // Bucket indices in usage order so candidate budgets are spent on the
+        // most reusable anchors first. Large components remain eligible for
+        // generic coding but do not trigger expensive fuzzy comparisons.
+        let mut by_usage: Vec<_> = (0..self.global_symbols.len()).collect();
+        by_usage.sort_by_key(|&index| (std::cmp::Reverse(self.symbol_usage[index]), index));
+        let mut buckets: FxHashMap<FamilyBucketKey, Vec<usize>> = FxHashMap::default();
+        let mut keys = vec![None; self.global_symbols.len()];
+        for &index in &by_usage {
+            let symbol = &self.global_symbols[index];
+            if symbol.width > 256 || symbol.height > 256 || self.symbol_pixel_counts[index] <= 1 {
+                continue;
+            }
+            let signature = compute_symbol_signature(symbol);
+            let key = family_bucket_key_for_symbol(symbol, &signature);
+            keys[index] = Some(key);
+            buckets.entry(key).or_default().push(index);
+        }
+        (buckets, keys)
+    }
+
+    /// Compares the target with the more-used dictionary symbols near its
+    /// family bucket, within the candidate budget, and returns each match as
+    /// a scored refinement proposal.
+    fn refinement_candidates(
+        &self,
+        target: usize,
+        key: FamilyBucketKey,
+        buckets: &FxHashMap<FamilyBucketKey, Vec<usize>>,
+        choices: &[Choice],
+        comparator: &mut Comparator,
+        report: &mut SymbolOptimizationMetrics,
+    ) -> Vec<(u32, Choice)> {
+        let mut candidates = Vec::new();
+        let mut visited = FxHashSet::default();
+        for neighbor in family_bucket_neighbors(key) {
+            let Some(bucket) = buckets.get(&neighbor) else {
+                continue;
+            };
+            for &reference in bucket {
+                if reference == target || !visited.insert(reference) {
+                    continue;
+                }
+                if visited.len() > self.config.symbol_candidate_limit {
+                    return candidates;
+                }
+                if choices[reference] != Choice::Dictionary
+                    || (self.symbol_usage[reference], std::cmp::Reverse(reference))
+                        < (self.symbol_usage[target], std::cmp::Reverse(target))
+                {
+                    continue;
+                }
+                let symbol = &self.global_symbols[target];
+                let max_error = (symbol.width * symbol.height
+                    / self.config.match_tolerance.max(1) as usize)
+                    .max(2) as u32;
+                report.candidate_comparisons += 1;
+                let Some(result) = comparator.compare_for_refine_family(
+                    symbol,
+                    &self.global_symbols[reference],
+                    max_error,
+                    2,
+                    1,
+                ) else {
+                    continue;
+                };
+                candidates.push((
+                    result.total_err + (result.dx.unsigned_abs() + result.dy.unsigned_abs()) * 3,
+                    Choice::Refinement {
+                        reference,
+                        dx: result.dx,
+                        dy: result.dy,
+                    },
+                ));
+            }
+        }
+        candidates
+    }
+
+    /// The unshifted refinement candidates that may instead substitute the
+    /// reference outright: same size, within the error limit and preserving
+    /// topology.
+    fn lossless_substitutions(
+        &self,
+        target: usize,
+        candidates: &[(u32, Choice)],
+    ) -> Vec<(u32, Choice)> {
+        candidates
+            .iter()
+            .filter_map(|&(score, choice)| {
+                let Choice::Refinement {
+                    reference,
+                    dx: 0,
+                    dy: 0,
+                } = choice
+                else {
+                    return None;
+                };
+                let source = &self.global_symbols[target];
+                let prototype = &self.global_symbols[reference];
+                if (source.width, source.height) != (prototype.width, prototype.height) {
+                    return None;
+                }
+                let errors: u32 = source
+                    .packed_words()
+                    .iter()
+                    .zip(prototype.packed_words())
+                    .map(|(left, right)| (left ^ right).count_ones())
+                    .sum();
+                (errors <= self.config.symbol_substitution_error_limit
+                    && super::topology::substitution_preserves_topology(source, prototype))
+                .then_some((score, Choice::Substitution { reference }))
+            })
+            .collect()
+    }
+
+    /// Measures coordinated family proposals: a family can win jointly even
+    /// when moving any one member alone loses.
+    fn run_family_trials(
+        &mut self,
+        search: &mut TrialSearch,
+        near_candidates: &[Vec<(u32, Choice)>],
+        limit: usize,
+        include_header: bool,
+    ) -> Result<()> {
+        // Refinement has a fixed text-region signaling cost. A family can win
+        // jointly even when moving any one member alone loses. Measure these
+        // coordinated proposals before greedy per-symbol changes.
+        let mut families = candidate_families(near_candidates);
+        let family_budget = search.report.trials.len() + ((limit - 4) / 2).min(18);
+        while !families.is_empty() && search.report.trials.len() < family_budget {
+            let referenced = referenced_symbols(&search.choices);
+            families.retain(|((reference, _), members)| {
+                search.choices[*reference] == Choice::Dictionary
+                    && members
+                        .iter()
+                        .filter(|&&(target, _, choice)| {
+                            search.choices[target] != choice && !referenced.contains(&target)
+                        })
+                        .take(2)
+                        .count()
+                        == 2
+            });
+            if families.is_empty() {
+                break;
+            }
+            let selected = self.most_promising_family(&families, &search.calibration);
+            let ((reference, substitution), members) = families.swap_remove(selected);
+            if search.choices[reference] != Choice::Dictionary {
+                continue;
+            }
+            let mut proposal = search.choices.clone();
+            let mut estimate = 0;
+            let mut changed = 0;
+            for (target, score, choice) in members {
+                if search.choices[target] == choice || referenced.contains(&target) {
+                    continue;
+                }
+                proposal[target] = choice;
+                estimate += self.global_symbols[target]
+                    .width
+                    .saturating_mul(self.global_symbols[target].height)
+                    .div_ceil(8) as i64
+                    - score as i64;
+                changed += 1;
+            }
+            if changed < 2 {
+                continue;
+            }
+            let family = FamilyProposal {
+                reference,
+                kind: family_kind(substitution),
+                choices: proposal,
+                estimate,
+            };
+            self.measure_family_proposal(search, &family, family_budget, include_header)?;
+        }
+        Ok(())
+    }
+
+    /// The index of the family with the highest calibrated gain over all
+    /// policies, ties broken towards the lower reference and refinement.
+    fn most_promising_family(
+        &self,
+        families: &[CandidateFamily],
+        calibration: &CostCalibration,
+    ) -> usize {
+        families
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, ((reference, substitution), members))| {
+                let raw = members
+                    .iter()
+                    .map(|&(target, score, _)| {
+                        self.global_symbols[target]
+                            .width
+                            .saturating_mul(self.global_symbols[target].height)
+                            .div_ceil(8) as i64
+                            - score as i64
+                    })
+                    .sum::<i64>();
+                let predicted = TRIAL_POLICIES
+                    .iter()
+                    .map(|&policy| calibration.predict(family_kind(*substitution), policy, raw))
+                    .max()
+                    .unwrap();
+                (
+                    predicted,
+                    std::cmp::Reverse(*reference),
+                    std::cmp::Reverse(*substitution),
+                )
+            })
+            .unwrap()
+            .0
+    }
+
+    /// Encodes a family proposal under each policy while the family budget
+    /// lasts, adopting it whenever it beats the best trial.
+    fn measure_family_proposal(
+        &mut self,
+        search: &mut TrialSearch,
+        family: &FamilyProposal,
+        family_budget: usize,
+        include_header: bool,
+    ) -> Result<()> {
+        for policy in TRIAL_POLICIES {
+            if search.report.trials.len() >= family_budget {
+                break;
+            }
+            let kind = family.kind;
+            let prediction = search.calibration.predict(kind, policy, family.estimate);
+            let trial = self.encode_exact_trial(&family.choices, policy, include_header)?;
+            let measured = search.best.bytes as i64 - trial.bytes as i64;
+            search
+                .calibration
+                .observe(kind, policy, family.estimate, measured);
+            search.report.trials.push(SymbolCostTrial {
+                symbol: Some(family.reference),
+                representation: kind,
+                policy,
+                estimated_gain_bytes: Some(prediction),
+                raw_estimated_gain_bytes: Some(family.estimate),
+                measured_gain_bytes: Some(measured),
+                encoded_bytes: trial.bytes,
+                meets_resource_limits: trial.feasible,
+            });
+            if trial.preferable_to(&search.best) {
+                search.best = trial;
+                search.choices = family.choices.clone();
+            }
+        }
+        Ok(())
+    }
+
+    /// Tries each target's own proposals, best calibrated estimate first,
+    /// keeping a change only when the measured stream improves.
+    fn run_target_trials(
+        &mut self,
+        search: &mut TrialSearch,
+        targets: Vec<usize>,
+        near_candidates: &[Vec<(u32, Choice)>],
+        limit: usize,
+        include_header: bool,
+    ) -> Result<()> {
+        for target in targets {
+            if search.report.trials.len() >= limit - 1 {
+                break;
+            }
+            // A chosen reference remains stored; changing it underneath already
+            // accepted refinements would invalidate their dictionary mapping.
+            if referenced_symbols(&search.choices).contains(&target) {
+                continue;
+            }
+            let proposals = self.target_proposals(search, target, &near_candidates[target]);
+            for (proposal, estimate) in proposals {
+                if search.choices[target] == proposal {
+                    continue;
+                }
+                let change = TargetProposal {
+                    target,
+                    choice: proposal,
+                    estimate,
+                };
+                self.measure_target_proposal(search, &change, limit, include_header)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The target's proposals whose reference is still a dictionary symbol,
+    /// plus generic coding, ordered by best calibrated gain first.
+    fn target_proposals(
+        &self,
+        search: &TrialSearch,
+        target: usize,
+        near_candidates: &[(u32, Choice)],
+    ) -> Vec<(Choice, Option<i64>)> {
+        let choices = &search.choices;
+        // A deliberately rough shortlist estimate. Every accepted change is
+        // measured with dictionaries, placements, residuals and headers in
+        // the contexts in which they will actually be emitted.
+        let bitmap_bytes = self.global_symbols[target]
+            .width
+            .saturating_mul(self.global_symbols[target].height)
+            .div_ceil(8) as i64;
+        let proposals = near_candidates.iter().copied().filter(|&(_, choice)| {
+            matches!(choice, Choice::Refinement { reference, .. } | Choice::Substitution { reference } if choices[reference] == Choice::Dictionary)
+        }).map(|(score, choice)| (choice, Some(bitmap_bytes - score as i64))).collect::<Vec<_>>();
+        let mut proposals: Vec<_> = proposals
+            .into_iter()
+            .chain(std::iter::once((Choice::Generic, None)))
+            .collect();
+        proposals.sort_by_key(|&(choice, raw)| {
+            std::cmp::Reverse(
+                raw.map(|raw| {
+                    TRIAL_POLICIES
+                        .iter()
+                        .map(|&policy| search.calibration.predict(choice_kind(choice), policy, raw))
+                        .max()
+                        .unwrap()
+                })
+                .unwrap_or(0),
+            )
+        });
+        proposals
+    }
+
+    /// Encodes one target change under each policy while the trial budget
+    /// lasts, keeping it only when it beats the best trial.
+    fn measure_target_proposal(
+        &mut self,
+        search: &mut TrialSearch,
+        change: &TargetProposal,
+        limit: usize,
+        include_header: bool,
+    ) -> Result<()> {
+        let target = change.target;
+        for policy in TRIAL_POLICIES {
+            if search.report.trials.len() >= limit - 1 {
+                break;
+            }
+            let previous = search.choices[target];
+            search.choices[target] = change.choice;
+            let trial = self.encode_exact_trial(&search.choices, policy, include_header)?;
+            let representation = choice_kind(change.choice);
+            let prediction = change
+                .estimate
+                .map(|raw| search.calibration.predict(representation, policy, raw));
+            let measured = search.best.bytes as i64 - trial.bytes as i64;
+            if let Some(raw) = change.estimate {
+                search
+                    .calibration
+                    .observe(representation, policy, raw, measured);
+            }
+            search.report.trials.push(SymbolCostTrial {
+                symbol: Some(target),
+                representation,
+                policy,
+                estimated_gain_bytes: prediction,
+                raw_estimated_gain_bytes: change.estimate,
+                measured_gain_bytes: Some(measured),
+                encoded_bytes: trial.bytes,
+                meets_resource_limits: trial.feasible,
+            });
+            if trial.preferable_to(&search.best) {
+                search.best = trial;
+            } else {
+                search.choices[target] = previous;
+            }
+        }
+        Ok(())
     }
 }

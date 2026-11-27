@@ -51,16 +51,7 @@ fn refagg_refined_symbols() {
     let mut expected = TestBitmap::new(w, h);
     for &(sym, s) in &placements {
         let g = &targets[sym];
-        for gy in 0..g.height {
-            for gx in 0..g.width {
-                if g.get(gx, gy) {
-                    let px = s + gx as i32;
-                    if px >= 0 && (px as u32) < w {
-                        expected.set(px as u32, gy, true);
-                    }
-                }
-            }
-        }
+        expected.or_glyph(g, s, 0);
     }
 
     let opts = DecodeOptions::default();
@@ -115,16 +106,7 @@ fn refagg_aggregate_symbol() {
     // Expected page: the aggregate placed at each S.
     let mut expected = TestBitmap::new(w, h);
     for &(_, s) in &placements {
-        for gy in 0..agg.height {
-            for gx in 0..agg.width {
-                if agg.get(gx, gy) {
-                    let px = s + gx as i32;
-                    if px >= 0 && (px as u32) < w {
-                        expected.set(px as u32, gy, true);
-                    }
-                }
-            }
-        }
+        expected.or_glyph(&agg, s, 0);
     }
 
     let opts = DecodeOptions::default();

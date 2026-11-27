@@ -6,39 +6,44 @@ fn make_bitimage_from_bits(width: usize, height: usize, bits: &[u8]) -> BitImage
     // `bits` is the contiguous (unpadded) MSB-first packing.
     BitImage::from_bits(width, height, bits).unwrap()
 }
+/// The differing pixels of `a` and `b` shifted by `(dx, dy)` over their
+/// overlap, counted until they reach `best_err`.
+fn shifted_error(a: &BitImage, b: &BitImage, dx: i32, dy: i32, best_err: u32) -> u32 {
+    let w = a.width as i32;
+    let h = a.height as i32;
+    let mut err = 0_u32;
+
+    // overlap rectangle after shifting (dx,dy)
+    let x0 = 0.max(-dx);
+    let y0 = 0.max(-dy);
+    let x1 = w.min(w - dx);
+    let y1 = h.min(h - dy);
+
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if a.get(x as u32, y as u32) == b.get((x + dx) as u32, (y + dy) as u32) {
+                continue;
+            }
+            err += 1;
+            if err >= best_err {
+                return err;
+            }
+        }
+    }
+    err
+}
+
 /// Brute-force, byte-per-pixel reference implementation that
 /// mimics the algorithm used by `Comparator::distance`.
 fn slow_distance(a: &BitImage, b: &BitImage, search_radius: i32, max_err: u32) -> u32 {
     assert_eq!(a.width, b.width);
     assert_eq!(a.height, b.height);
 
-    let w = a.width as i32;
-    let h = a.height as i32;
     let mut best_err = max_err;
 
     for dy in -search_radius..=search_radius {
         for dx in -search_radius..=search_radius {
-            let mut err = 0_u32;
-
-            // overlap rectangle after shifting (dx,dy)
-            let x0 = 0.max(-dx);
-            let y0 = 0.max(-dy);
-            let x1 = w.min(w - dx);
-            let y1 = h.min(h - dy);
-
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    if a.get(x as u32, y as u32) != b.get((x + dx) as u32, (y + dy) as u32) {
-                        err += 1;
-                        if err >= best_err {
-                            break;
-                        }
-                    }
-                }
-                if err >= best_err {
-                    break;
-                }
-            }
+            let err = shifted_error(a, b, dx, dy, best_err);
             best_err = best_err.min(err);
         }
     }

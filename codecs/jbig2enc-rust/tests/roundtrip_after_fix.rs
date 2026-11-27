@@ -263,6 +263,17 @@ fn array2_from_pixels(w: u32, h: u32, pixels: &[u8]) -> Array2<u8> {
     Array2::from_shape_vec((h as usize, w as usize), pixels.to_vec()).expect("shape")
 }
 
+/// Sets the glyph's pixels at `(ox, oy)`, clipped to the `w` x `h` page.
+fn stamp_glyph(pixels: &mut [u8], (w, h): (u32, u32), glyph: &[(u32, u32)], (ox, oy): (u32, u32)) {
+    for &(gx, gy) in glyph {
+        let x = ox + gx;
+        let y = oy + gy;
+        if x < w && y < h {
+            pixels[(y * w + x) as usize] = 1;
+        }
+    }
+}
+
 /// A page containing a repeated "letter-like" glyph so the symbol-mode planner
 /// sees multiple identical instances and exercises the symbol-dict /
 /// text-region encoding paths affected by fixes #2 and #4–#5.
@@ -283,13 +294,7 @@ fn page_with_repeated_glyph(
             if ox + glyph_w > w || oy + glyph_h > h {
                 continue;
             }
-            for &(gx, gy) in glyph {
-                let x = ox + gx;
-                let y = oy + gy;
-                if x < w && y < h {
-                    pixels[(y * w + x) as usize] = 1;
-                }
-            }
+            stamp_glyph(&mut pixels, (w, h), glyph, (ox, oy));
         }
     }
     pixels

@@ -41,16 +41,7 @@ fn expected_page(
     let mut page = TestBitmap::new(w, h);
     for &(sym, s) in placements {
         let g = &symbols[sym];
-        for gy in 0..g.height {
-            for gx in 0..g.width {
-                if g.get(gx, gy) {
-                    let px = s + gx as i32;
-                    if px >= 0 && (px as u32) < w && gy < h {
-                        page.set(px as u32, gy, true);
-                    }
-                }
-            }
-        }
+        page.or_glyph(g, s, 0);
     }
     page
 }
@@ -139,17 +130,7 @@ fn transposed_vertical_text() {
     // Expected: each glyph's top-left at (0, s).
     let mut expected = TestBitmap::new(w, h);
     for &(sym, s) in &placements {
-        let g = &symbols[sym];
-        for gy in 0..g.height {
-            for gx in 0..g.width {
-                if g.get(gx, gy) {
-                    let py = s + gy as i32;
-                    if py >= 0 && (py as u32) < h {
-                        expected.set(gx, py as u32, true);
-                    }
-                }
-            }
-        }
+        expected.or_glyph(&symbols[sym], 0, s);
     }
 
     let got = decode_embedded(None, &stream, &opts())

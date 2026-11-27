@@ -54,16 +54,7 @@ fn huffman_text_with_refinement() {
     // Expected: each refined target at (s, 0).
     let mut expected = TestBitmap::new(w, h);
     for (_, s, target) in &instances {
-        for gy in 0..target.height {
-            for gx in 0..target.width {
-                if target.get(gx, gy) {
-                    let px = s + gx as i32;
-                    if px >= 0 && (px as u32) < w {
-                        expected.set(px as u32, gy, true);
-                    }
-                }
-            }
-        }
+        expected.or_glyph(target, *s, 0);
     }
 
     let opts = DecodeOptions::default();

@@ -2,6 +2,37 @@
 use jbig2enc_rust::jbig2sym::BitImage;
 use jbig2enc_rust::{CCImage, analyze_page};
 
+/// The 8-connected black pixels reachable from the visited pixel `(x, y)`,
+/// marking each as visited.
+fn flood_black(image: &BitImage, visited: &mut [bool], x: usize, y: usize) -> Vec<(usize, usize)> {
+    let mut pending = vec![(x, y)];
+    let mut pixels = Vec::new();
+    while let Some((x, y)) = pending.pop() {
+        pixels.push((x, y));
+        push_black_neighbors(image, visited, &mut pending, x, y);
+    }
+    pixels
+}
+
+/// Marks and queues the unvisited black 8-neighbours of `(x, y)`.
+fn push_black_neighbors(
+    image: &BitImage,
+    visited: &mut [bool],
+    pending: &mut Vec<(usize, usize)>,
+    x: usize,
+    y: usize,
+) {
+    for ny in y.saturating_sub(1)..=(y + 1).min(image.height - 1) {
+        for nx in x.saturating_sub(1)..=(x + 1).min(image.width - 1) {
+            let offset = ny * image.width + nx;
+            if !visited[offset] && image.get_usize(nx, ny) {
+                visited[offset] = true;
+                pending.push((nx, ny));
+            }
+        }
+    }
+}
+
 fn pixel_components(image: &BitImage) -> Vec<Vec<(usize, usize)>> {
     let mut visited = vec![false; image.width * image.height];
     let mut groups = Vec::new();
@@ -10,21 +41,8 @@ fn pixel_components(image: &BitImage) -> Vec<Vec<(usize, usize)>> {
             if visited[y * image.width + x] || !image.get_usize(x, y) {
                 continue;
             }
-            let mut pending = vec![(x, y)];
             visited[y * image.width + x] = true;
-            let mut pixels = Vec::new();
-            while let Some((x, y)) = pending.pop() {
-                pixels.push((x, y));
-                for ny in y.saturating_sub(1)..=(y + 1).min(image.height - 1) {
-                    for nx in x.saturating_sub(1)..=(x + 1).min(image.width - 1) {
-                        let offset = ny * image.width + nx;
-                        if !visited[offset] && image.get_usize(nx, ny) {
-                            visited[offset] = true;
-                            pending.push((nx, ny));
-                        }
-                    }
-                }
-            }
+            let mut pixels = flood_black(image, &mut visited, x, y);
             pixels.sort_unstable();
             groups.push(pixels);
         }
@@ -33,18 +51,25 @@ fn pixel_components(image: &BitImage) -> Vec<Vec<(usize, usize)>> {
     groups
 }
 
+/// The black pixels of `bitmap`, offset by `(left, top)`.
+fn black_pixels_at(bitmap: &BitImage, left: usize, top: usize) -> Vec<(usize, usize)> {
+    let mut pixels = Vec::new();
+    for y in 0..bitmap.height {
+        for x in 0..bitmap.width {
+            if bitmap.get_usize(x, y) {
+                pixels.push((x + left, y + top));
+            }
+        }
+    }
+    pixels
+}
+
 fn extracted_pixels(components: &CCImage) -> Vec<Vec<(usize, usize)>> {
     let mut groups = Vec::new();
     for shape in components.extract_shape_refs() {
         let bitmap = components.get_bitmap_for_cc(shape.ccid).unwrap();
-        let mut pixels = Vec::new();
-        for y in 0..bitmap.height {
-            for x in 0..bitmap.width {
-                if bitmap.get_usize(x, y) {
-                    pixels.push((x + shape.bbox.xmin as usize, y + shape.bbox.ymin as usize));
-                }
-            }
-        }
+        let mut pixels =
+            black_pixels_at(&bitmap, shape.bbox.xmin as usize, shape.bbox.ymin as usize);
         assert_eq!(pixels.len(), shape.black_pixels);
         pixels.sort_unstable();
         groups.push(pixels);
@@ -53,18 +78,25 @@ fn extracted_pixels(components: &CCImage) -> Vec<Vec<(usize, usize)>> {
     groups
 }
 
+/// A `width` x 29 page of seeded pseudo-random noise whose density grows
+/// with `seed % 8`.
+fn random_image(width: u32, seed: u32) -> BitImage {
+    let mut image = BitImage::new(width, 29).unwrap();
+    let mut state = 0x8514_2973_u32 ^ seed;
+    for y in 0..image.height {
+        for x in 0..image.width {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            image.set_usize(x, y, state >> 28 < 4 + seed % 8);
+        }
+    }
+    image
+}
+
 #[test]
 fn span_components_equal_pixel_graph_on_odd_widths_and_random_patterns() {
     for width in [1, 2, 7, 8, 31, 32, 33, 65, 129] {
         for seed in 0..24 {
-            let mut image = BitImage::new(width, 29).unwrap();
-            let mut state = 0x8514_2973_u32 ^ seed;
-            for y in 0..image.height {
-                for x in 0..image.width {
-                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                    image.set_usize(x, y, state >> 28 < 4 + seed % 8);
-                }
-            }
+            let image = random_image(width, seed);
             let expected = pixel_components(&image);
             let actual = analyze_page(&image, 300, 0);
             assert_eq!(

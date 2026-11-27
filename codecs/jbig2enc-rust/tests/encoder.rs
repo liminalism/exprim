@@ -116,34 +116,39 @@ fn debug_print_image(img: &BitImage, name: &str) {
     println!("================");
 }
 
+/// The first black pixel of `img` in row-major order, read from its packed
+/// MSB-first rows.
+#[cfg(debug_assertions)]
+fn first_black_pixel(img: &BitImage) -> Option<(usize, usize)> {
+    let bytes_per_row = img.width.div_ceil(8);
+    let rows = img.to_jbig2_format();
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let byte_idx = y * bytes_per_row + (x / 8);
+            let bit = (rows[byte_idx] >> (7 - (x % 8))) & 1;
+            if bit == 1 {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+/// Prints the first black pixel of `img`, naming it `what`.
+#[cfg(debug_assertions)]
+fn print_first_black_pixel(img: &BitImage, what: &str) {
+    if let Some((col, row)) = first_black_pixel(img) {
+        println!("first black pixel in {}: ({}, {})", what, col, row);
+    } else {
+        println!("first black pixel in {}: none", what);
+    }
+}
+
 fn encode_and_decode(img: &BitImage, temp_dir: &TempDir) -> Result<(), Box<dyn Error>> {
     // Debug print input image
     debug_print_image(img, "Input Image");
     #[cfg(debug_assertions)]
-    {
-        // Compute first black pixel in input BitImage
-        let mut first_input_pixel = None;
-        let bytes_per_row = (img.width as usize + 7) / 8;
-        let img_rows = img.to_jbig2_format();
-        for y in 0..img.height as usize {
-            for x in 0..img.width as usize {
-                let byte_idx = y * bytes_per_row + (x / 8);
-                let bit = (img_rows[byte_idx] >> (7 - (x % 8))) & 1;
-                if bit == 1 {
-                    first_input_pixel = Some((x, y));
-                    break;
-                }
-            }
-            if first_input_pixel.is_some() {
-                break;
-            }
-        }
-        if let Some((col, row)) = first_input_pixel {
-            println!("first black pixel in input image: ({}, {})", col, row);
-        } else {
-            println!("first black pixel in input image: none");
-        }
-    }
+    print_first_black_pixel(img, "input image");
 
     let mut cfg = Jbig2Config::default();
     cfg.want_full_headers = true;
@@ -220,30 +225,7 @@ fn encode_and_decode(img: &BitImage, temp_dir: &TempDir) -> Result<(), Box<dyn E
 
     let decoded = read_pbm(&temp_dir.path().join("out.pbm"));
     #[cfg(debug_assertions)]
-    {
-        // Compute first black pixel in decoded image
-        let mut first_decoded_pixel = None;
-        let bytes_per_row_dec = (decoded.width as usize + 7) / 8;
-        let decoded_rows = decoded.to_jbig2_format();
-        for y in 0..decoded.height as usize {
-            for x in 0..decoded.width as usize {
-                let byte_idx = y * bytes_per_row_dec + (x / 8);
-                let bit = (decoded_rows[byte_idx] >> (7 - (x % 8))) & 1;
-                if bit == 1 {
-                    first_decoded_pixel = Some((x, y));
-                    break;
-                }
-            }
-            if first_decoded_pixel.is_some() {
-                break;
-            }
-        }
-        if let Some((col, row)) = first_decoded_pixel {
-            println!("first black pixel in decoded PBM: ({}, {})", col, row);
-        } else {
-            println!("first black pixel in decoded PBM: none");
-        }
-    }
+    print_first_black_pixel(&decoded, "decoded PBM");
 
     if img.width != decoded.width || img.height != decoded.height {
         return Err(Box::new(TestError::DecodeError(format!(
@@ -437,6 +419,17 @@ fn test_encode_symbol_dict_single() {
     println!("Test test_encode_symbol_dict_single took: {:?}", duration);
 }
 
+/// The bitmap as one byte per pixel, 255 for black.
+fn byte_array(img: &BitImage) -> Array2<u8> {
+    let mut array = Array2::zeros((img.height, img.width));
+    for y in 0..img.height {
+        for x in 0..img.width {
+            array[[y, x]] = if img.get(x as u32, y as u32) { 255 } else { 0 };
+        }
+    }
+    array
+}
+
 #[test]
 fn test_encode_page_with_symbol_dictionary() -> Result<(), Box<dyn Error>> {
     let start = Instant::now();
@@ -455,12 +448,7 @@ fn test_encode_page_with_symbol_dictionary() -> Result<(), Box<dyn Error>> {
 
     // Test with a single symbol
     let mut encoder = Jbig2Encoder::new(&cfg);
-    let mut array = Array2::zeros((img.height as usize, img.width as usize));
-    for y in 0..img.height as usize {
-        for x in 0..img.width as usize {
-            array[[y, x]] = if img.get(x as u32, y as u32) { 255 } else { 0 };
-        }
-    }
+    let array = byte_array(&img);
     encoder.add_page(&array).unwrap();
     let result = encoder.flush();
     assert!(result.is_ok(), "Failed to encode page with single symbol");
@@ -469,12 +457,7 @@ fn test_encode_page_with_symbol_dictionary() -> Result<(), Box<dyn Error>> {
     let mut encoder = Jbig2Encoder::new(&cfg);
     for _ in 0..3 {
         // Convert the same image multiple times to test multiple pages
-        let mut array = Array2::zeros((img.height as usize, img.width as usize));
-        for y in 0..img.height as usize {
-            for x in 0..img.width as usize {
-                array[[y, x]] = if img.get(x as u32, y as u32) { 255 } else { 0 };
-            }
-        }
+        let array = byte_array(&img);
         encoder.add_page(&array).unwrap();
     }
     let result = encoder.flush();

@@ -2,10 +2,10 @@ akr-lock 0.1
 project exprim
 
 build {
-    tool "akr 0.8.0"
+    tool "akr 0.8.1"
     grammar "0.1"
     vocabulary "0.3"
-    source_graph "sha256:bdb7913fd69690845f1ae032a7d711da549944a3047ed8c5f66a857e3da7d2b3"
+    source_graph "sha256:fdd85858917e0dcbfaee14e958510a79484a241688d0647024417c7d3e9f7200"
 }
 
 source ".akr/project.akr" {
@@ -24,8 +24,8 @@ source ".akr/records/exprim/evidence.akr" {
 }
 
 source ".akr/records/exprim/observations.akr" {
-    hash "sha256:4d0c939276ce477d4343ecee6befc476d74769b679add28653b53c82585138d3"
-    records 14
+    hash "sha256:98eb34747998867db36aad4b231a284dee0a327d98175c62595942a5b0d311a0"
+    records 15
 }
 
 source ".akr/records/exprim/papercuts.akr" {
@@ -44,8 +44,8 @@ source ".akr/records/exprim/questions.akr" {
 }
 
 source ".akr/records/exprim/work.akr" {
-    hash "sha256:73802b5760d0c312f939aeddcd304ada6a30aefb42997a5eae0cc908503ce8dc"
-    records 10
+    hash "sha256:2e538ecec40905b8c475546df169a2bcda4babad853aeb9f3e8133b10e1d4f46"
+    records 11
 }
 
 resolution @exprim.jbig2.ffi-facade/1 {
@@ -192,6 +192,12 @@ resolution @exprim.memory.wrapper-groups-direct/1 {
     hash "sha256:4c25aabf26fa5536f806c88795f864d9a0d385065ff30fe8c85936eda08d5472"
 }
 
+resolution @exprim.observation.defects-seen-in-flat-control-flow-review/1 {
+    slot derived_from
+    to @exprim.work.flat-control-flow-review/1
+    hash "sha256:8dab85cce0a9b3ee116ef4f4832d8c02bc5f1dee5022f91485383a04a60cef9e"
+}
+
 resolution @exprim.renderer.g1-exact-speedups/1 {
     slot supported_by
     to @exprim.renderer.attribution-20261110/3
@@ -281,6 +287,11 @@ seal @exprim.memory.peak-audit-20261120/1 {
 seal @exprim.memory.real-documents-20261120/1 {
     state verified
     hash "sha256:b4d542de1e00a215f67d053ffcdac369285602aa22790e94e6fc24b0ef612641"
+}
+
+seal @exprim.observation.defects-seen-in-flat-control-flow-review/1 {
+    state verified
+    hash "sha256:1ab1a987ed9bc2bcbebafbd930f10fd0384d4e840273e1de0001f9f040512800"
 }
 
 seal @exprim.observation.xref-rebuild-touches-whole-mmap/1 {

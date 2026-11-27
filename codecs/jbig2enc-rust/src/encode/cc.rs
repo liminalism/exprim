@@ -67,6 +67,60 @@ pub struct CCImage {
     pub tinysize: i32,
 }
 
+/// Joins the components of every pair of touching spans in two
+/// consecutive rows, walking both sorted rows in one merge-like pass.
+fn link_touching_spans(
+    runs: &[Run],
+    parent: &mut [u32],
+    previous: std::ops::Range<usize>,
+    current: std::ops::Range<usize>,
+) {
+    let (mut above, mut below) = (previous.start, current.start);
+    while above < previous.end && below < current.end {
+        let (upper, lower) = (&runs[above], &runs[below]);
+        if upper.x2 >= lower.x1 - 1 && upper.x1 <= lower.x2 + 1 {
+            let upper_root = span_root(parent, above as u32);
+            let lower_root = span_root(parent, below as u32);
+            let (keep, merge) = if upper_root < lower_root {
+                (upper_root, lower_root)
+            } else {
+                (lower_root, upper_root)
+            };
+            parent[merge as usize] = keep;
+        }
+        if runs[above].x2 < runs[below].x2 {
+            above += 1;
+        } else {
+            below += 1;
+        }
+    }
+}
+
+/// Clips a run of a large component at grid cell columns, grouping each
+/// piece under its cell.
+fn push_clipped_run(
+    groups: &mut BTreeMap<(u8, i32, i32, i32), Vec<Run>>,
+    run: &Run,
+    cell: i32,
+    index: i32,
+) {
+    let mut left = run.x1;
+    while left <= run.x2 {
+        let column = left.div_euclid(cell);
+        let right = run.x2.min((column + 1).saturating_mul(cell) - 1);
+        groups
+            .entry((2, run.y.div_euclid(cell), column, index))
+            .or_default()
+            .push(Run {
+                y: run.y,
+                x1: left,
+                x2: right,
+                ccid: 0,
+            });
+        left = right + 1;
+    }
+}
+
 impl CCImage {
     pub fn new(width: i32, height: i32, dpi: i32) -> Self {
         let resolution = dpi.clamp(200, 900);
@@ -161,25 +215,7 @@ impl CCImage {
                 end += 1;
             }
             if previous.start < previous.end && self.runs[previous.start].y == y - 1 {
-                let (mut above, mut below) = (previous.start, start);
-                while above < previous.end && below < end {
-                    let (upper, lower) = (&self.runs[above], &self.runs[below]);
-                    if upper.x2 >= lower.x1 - 1 && upper.x1 <= lower.x2 + 1 {
-                        let upper_root = span_root(&mut parent, above as u32);
-                        let lower_root = span_root(&mut parent, below as u32);
-                        let (keep, merge) = if upper_root < lower_root {
-                            (upper_root, lower_root)
-                        } else {
-                            (lower_root, upper_root)
-                        };
-                        parent[merge as usize] = keep;
-                    }
-                    if self.runs[above].x2 < self.runs[below].x2 {
-                        above += 1;
-                    } else {
-                        below += 1;
-                    }
-                }
+                link_touching_spans(&self.runs, &mut parent, previous, start..end);
             }
             previous = start..end;
             start = end;
@@ -273,19 +309,20 @@ impl CCImage {
 
     pub fn erase_tiny_ccs(&mut self) {
         for (index, component) in self.ccs.iter_mut().enumerate() {
-            if component.npix <= self.tinysize {
-                let start = component.frun.max(0) as usize;
-                let end = start
-                    .saturating_add(component.nrun.max(0) as usize)
-                    .min(self.runs.len());
-                for run in &mut self.runs[start.min(end)..end] {
-                    if run.ccid == index as i32 {
-                        run.ccid = -1;
-                    }
-                }
-                component.npix = 0;
-                component.nrun = 0;
+            if component.npix > self.tinysize {
+                continue;
             }
+            let start = component.frun.max(0) as usize;
+            let end = start
+                .saturating_add(component.nrun.max(0) as usize)
+                .min(self.runs.len());
+            for run in &mut self.runs[start.min(end)..end] {
+                if run.ccid == index as i32 {
+                    run.ccid = -1;
+                }
+            }
+            component.npix = 0;
+            component.nrun = 0;
         }
     }
 
@@ -313,21 +350,7 @@ impl CCImage {
                         .or_default()
                         .push(run.clone());
                 } else if component.bb.width() >= cell || component.bb.height() >= cell {
-                    let mut left = run.x1;
-                    while left <= run.x2 {
-                        let column = left.div_euclid(cell);
-                        let right = run.x2.min((column + 1).saturating_mul(cell) - 1);
-                        groups
-                            .entry((2, run.y.div_euclid(cell), column, index as i32))
-                            .or_default()
-                            .push(Run {
-                                y: run.y,
-                                x1: left,
-                                x2: right,
-                                ccid: 0,
-                            });
-                        left = right + 1;
-                    }
+                    push_clipped_run(&mut groups, run, cell, index as i32);
                 } else {
                     groups
                         .entry((0, index as i32, 0, 0))
@@ -485,8 +508,6 @@ mod tests {
     /// Labels from a depth-first traversal seeded in span order, over an
     /// explicit quadratic adjacency test: the numbering the sweep must match.
     fn traversal_labels(runs: &[Run]) -> Vec<i32> {
-        let touches =
-            |a: &Run, b: &Run| (a.y - b.y).abs() == 1 && a.x2 >= b.x1 - 1 && a.x1 <= b.x2 + 1;
         let mut labels = vec![-1; runs.len()];
         let mut next = 0;
         for seed in 0..runs.len() {
@@ -494,18 +515,48 @@ mod tests {
                 continue;
             }
             labels[seed] = next;
-            let mut pending = vec![seed];
-            while let Some(index) = pending.pop() {
-                for other in 0..runs.len() {
-                    if labels[other] < 0 && touches(&runs[index], &runs[other]) {
-                        labels[other] = next;
-                        pending.push(other);
-                    }
-                }
-            }
+            flood_label(runs, &mut labels, seed, next);
             next += 1;
         }
         labels
+    }
+
+    /// Gives `label` to every unlabelled span reachable from `seed`.
+    fn flood_label(runs: &[Run], labels: &mut [i32], seed: usize, label: i32) {
+        let touches =
+            |a: &Run, b: &Run| (a.y - b.y).abs() == 1 && a.x2 >= b.x1 - 1 && a.x1 <= b.x2 + 1;
+        let mut pending = vec![seed];
+        while let Some(index) = pending.pop() {
+            for other in 0..runs.len() {
+                if labels[other] < 0 && touches(&runs[index], &runs[other]) {
+                    labels[other] = label;
+                    pending.push(other);
+                }
+            }
+        }
+    }
+
+    /// A random bitmap with about `density` percent black pixels, where
+    /// about one row in seven is left blank.
+    fn random_bitmap_with_blank_rows(
+        next: &mut impl FnMut() -> u64,
+        width: usize,
+        height: usize,
+        density: u64,
+    ) -> BitImage {
+        let mut bitmap = BitImage::new(width as u32, height as u32).unwrap();
+        for y in 0..height {
+            // Skip some rows entirely so non-adjacent rows are exercised.
+            if next().is_multiple_of(7) {
+                continue;
+            }
+            for x in 0..width {
+                if next() % 100 < density {
+                    bitmap.set_usize(x, y, true);
+                }
+            }
+        }
+        bitmap
     }
 
     #[test]
@@ -521,18 +572,7 @@ mod tests {
             let width = 1 + (next() % 90) as usize;
             let height = 1 + (next() % 40) as usize;
             let density = next() % 100;
-            let mut bitmap = BitImage::new(width as u32, height as u32).unwrap();
-            for y in 0..height {
-                // Skip some rows entirely so non-adjacent rows are exercised.
-                if next() % 7 == 0 {
-                    continue;
-                }
-                for x in 0..width {
-                    if next() % 100 < density {
-                        bitmap.set_usize(x, y, true);
-                    }
-                }
-            }
+            let bitmap = random_bitmap_with_blank_rows(&mut next, width, height, density);
             let mut image = CCImage::new(width as i32, height as i32, 300);
             image.add_bitmap_runs(&bitmap);
             image.make_ccids_by_analysis();

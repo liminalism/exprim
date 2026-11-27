@@ -535,6 +535,19 @@ fn decode_symbol_dictionary_huffman_refagg(
     let mut new_symbols: Vec<Arc<MonoBitmap>> = Vec::with_capacity(num_new.min(4096));
     let mut hc_height: i64 = 0;
     let mut total_pixels: u64 = 0;
+    let refagg = RefAggTables {
+        sym_table: &sym_table,
+        b1: &b1,
+        b6: &b6,
+        b8: &b8,
+        b11: &b11,
+        b15: &b15,
+        imported,
+        sdrtemplate,
+        sdrat,
+        sdrat2,
+        limits,
+    };
 
     while new_symbols.len() < num_new {
         let hcdh = match dh_table.get().decode(&mut r)? {
@@ -576,29 +589,7 @@ fn decode_symbol_dictionary_huffman_refagg(
                     reason: "more symbols coded than SDNUMNEWSYMS",
                 });
             }
-            let px =
-                (sym_width as u64)
-                    .checked_mul(hc_height as u64)
-                    .ok_or(DecodeError::Overflow {
-                        operation: "symbol pixel count",
-                    })?;
-            if px > limits.max_symbol_pixels {
-                return Err(DecodeError::limit(LimitError::Pixels {
-                    what: "symbol",
-                    value: px,
-                    limit: limits.max_symbol_pixels,
-                }));
-            }
-            total_pixels = total_pixels.checked_add(px).ok_or(DecodeError::Overflow {
-                operation: "dictionary pixel total",
-            })?;
-            if total_pixels > limits.max_total_dictionary_pixels {
-                return Err(DecodeError::limit(LimitError::Pixels {
-                    what: "dictionary",
-                    value: total_pixels,
-                    limit: limits.max_total_dictionary_pixels,
-                }));
-            }
+            check_new_symbol_pixels(sym_width, hc_height, &mut total_pixels, limits)?;
 
             // §6.5.8.2.1 number of instances in the aggregation.
             let refagg_ninst = match agg_table.get().decode(&mut r)? {
@@ -610,115 +601,21 @@ fn decode_symbol_dictionary_huffman_refagg(
                 }
             };
 
-            let bitmap = if refagg_ninst == 1 {
-                // §6.5.8.2.2 with SBHUFF=1: symbol id, RDX/RDY (B.15), BMSIZE
-                // (B.1), byte-align, arithmetic refinement block, byte-align.
-                let id = match sym_table.decode(&mut r)? {
-                    HuffmanValue::Value(v) => v as usize,
-                    HuffmanValue::Oob => {
-                        return Err(DecodeError::Malformed {
-                            reason: "OOB decoding refinement symbol id",
-                        });
-                    }
-                };
-                let rdx = match b15.decode(&mut r)? {
-                    HuffmanValue::Value(v) => v,
-                    HuffmanValue::Oob => {
-                        return Err(DecodeError::Malformed {
-                            reason: "OOB for RDX",
-                        });
-                    }
-                };
-                let rdy = match b15.decode(&mut r)? {
-                    HuffmanValue::Value(v) => v,
-                    HuffmanValue::Oob => {
-                        return Err(DecodeError::Malformed {
-                            reason: "OOB for RDY",
-                        });
-                    }
-                };
-                let bmsize = match b1.decode(&mut r)? {
-                    HuffmanValue::Value(v) if v >= 0 => v as usize,
-                    _ => {
-                        return Err(DecodeError::Malformed {
-                            reason: "invalid refinement bitmap size",
-                        });
-                    }
-                };
-                r.align_to_byte();
-                let reference = if id < imported.len() {
-                    &imported[id]
-                } else if id - imported.len() < new_symbols.len() {
-                    &new_symbols[id - imported.len()]
-                } else {
-                    return Err(DecodeError::Malformed {
-                        reason: "refinement symbol id out of range",
-                    });
-                };
-                for c in refine_ctx.iter_mut() {
-                    *c = MqContext(0);
-                }
-                let refine_bytes = r.remaining_from_byte();
-                let block = if bmsize > 0 && bmsize <= refine_bytes.len() {
-                    &refine_bytes[..bmsize]
-                } else {
-                    refine_bytes
-                };
-                let mut rdec = ArithmeticDecoder::new(block);
-                let refined = decode_refinement_region_templated(
-                    &mut rdec,
-                    reference,
-                    sym_width as u32,
-                    hc_height as u32,
-                    rdx,
-                    rdy,
-                    sdrtemplate,
-                    false,
-                    sdrat,
-                    sdrat2,
+            let size = (sym_width as u32, hc_height as u32);
+            let bitmap = match refagg_ninst {
+                1 => refagg.decode_refined_symbol(&mut r, &new_symbols, size, refine_ctx)?,
+                n if n > 1 => refagg.decode_aggregate_symbol(
+                    &mut r,
+                    &new_symbols,
+                    size,
+                    n as u32,
                     refine_ctx,
-                    limits,
-                )?;
-                r.skip_bytes(bmsize);
-                r.align_to_byte();
-                refined
-            } else if refagg_ninst > 1 {
-                // §6.5.8.2 step 2 / Table 17: an internal Huffman text region.
-                let mut combined: Vec<Arc<MonoBitmap>> =
-                    Vec::with_capacity(imported.len() + new_symbols.len());
-                combined.extend(imported.iter().cloned());
-                combined.extend(new_symbols.iter().cloned());
-                let tables = HuffTextTables {
-                    sym: &sym_table,
-                    fs: &b6,
-                    ds: &b8,
-                    dt: &b11,
-                    rdw: &b15,
-                    rdh: &b15,
-                    rdx: &b15,
-                    rdy: &b15,
-                    rsize: &b1,
-                };
-                let params = HuffTextParams {
-                    width: sym_width as u32,
-                    height: hc_height as u32,
-                    num_instances: refagg_ninst as u32,
-                    log_strips: 0,
-                    ref_corner: 1, // TOPLEFT
-                    transposed: false,
-                    sb_comb_op: 0, // OR
-                    sb_def_pixel: false,
-                    sb_ds_offset: 0,
-                    sbrefine: true,
-                    sb_rtemplate: sdrtemplate,
-                    grat: sdrat,
-                    grat2: sdrat2,
-                };
-                decode_huffman_text_core(&mut r, &tables, &params, &combined, refine_ctx, limits)?
-            } else {
-                return Err(DecodeError::Malformed {
-                    reason: "REFAGGNINST is zero",
-                });
+                )?,
+                _ => {
+                    return Err(DecodeError::Malformed {
+                        reason: "REFAGGNINST is zero",
+                    });
+                }
             };
             new_symbols.push(Arc::new(bitmap));
         }
@@ -730,6 +627,172 @@ fn decode_symbol_dictionary_huffman_refagg(
     Ok(SymbolDictionary {
         exported_symbols: exported.into_boxed_slice(),
     })
+}
+
+/// Checks a new symbol's pixel count against the symbol limit, and the
+/// dictionary's running total against the dictionary limit.
+fn check_new_symbol_pixels(
+    sym_width: i64,
+    hc_height: i64,
+    total_pixels: &mut u64,
+    limits: &DecodeLimits,
+) -> Result<(), DecodeError> {
+    let px = (sym_width as u64)
+        .checked_mul(hc_height as u64)
+        .ok_or(DecodeError::Overflow {
+            operation: "symbol pixel count",
+        })?;
+    if px > limits.max_symbol_pixels {
+        return Err(DecodeError::limit(LimitError::Pixels {
+            what: "symbol",
+            value: px,
+            limit: limits.max_symbol_pixels,
+        }));
+    }
+    *total_pixels = total_pixels.checked_add(px).ok_or(DecodeError::Overflow {
+        operation: "dictionary pixel total",
+    })?;
+    if *total_pixels > limits.max_total_dictionary_pixels {
+        return Err(DecodeError::limit(LimitError::Pixels {
+            what: "dictionary",
+            value: *total_pixels,
+            limit: limits.max_total_dictionary_pixels,
+        }));
+    }
+    Ok(())
+}
+
+/// The tables and parameters every refinement/aggregate symbol of a
+/// Huffman dictionary is decoded with: the symbol ID code, the standard
+/// tables of §6.5.8.2.2 and Table 17, the imported symbols, and the
+/// refinement template.
+struct RefAggTables<'t> {
+    sym_table: &'t HuffmanTable,
+    b1: &'t HuffmanTable,
+    b6: &'t HuffmanTable,
+    b8: &'t HuffmanTable,
+    b11: &'t HuffmanTable,
+    b15: &'t HuffmanTable,
+    imported: &'t [Arc<MonoBitmap>],
+    sdrtemplate: u8,
+    sdrat: (i8, i8),
+    sdrat2: (i8, i8),
+    limits: &'t DecodeLimits,
+}
+
+/// The value of a Huffman code where OOB is malformed.
+fn huffman_value(value: HuffmanValue, oob_reason: &'static str) -> Result<i32, DecodeError> {
+    match value {
+        HuffmanValue::Value(v) => Ok(v),
+        HuffmanValue::Oob => Err(DecodeError::Malformed { reason: oob_reason }),
+    }
+}
+
+impl RefAggTables<'_> {
+    /// §6.5.8.2.2 with SBHUFF=1: symbol id, RDX/RDY (B.15), BMSIZE
+    /// (B.1), byte-align, arithmetic refinement block, byte-align.
+    fn decode_refined_symbol(
+        &self,
+        r: &mut BitReader<'_>,
+        new_symbols: &[Arc<MonoBitmap>],
+        (sym_width, hc_height): (u32, u32),
+        refine_ctx: &mut [MqContext],
+    ) -> Result<MonoBitmap, DecodeError> {
+        let imported = self.imported;
+        let id = huffman_value(
+            self.sym_table.decode(r)?,
+            "OOB decoding refinement symbol id",
+        )? as usize;
+        let rdx = huffman_value(self.b15.decode(r)?, "OOB for RDX")?;
+        let rdy = huffman_value(self.b15.decode(r)?, "OOB for RDY")?;
+        let bmsize = match self.b1.decode(r)? {
+            HuffmanValue::Value(v) if v >= 0 => v as usize,
+            _ => {
+                return Err(DecodeError::Malformed {
+                    reason: "invalid refinement bitmap size",
+                });
+            }
+        };
+        r.align_to_byte();
+        let reference = if id < imported.len() {
+            &imported[id]
+        } else if id - imported.len() < new_symbols.len() {
+            &new_symbols[id - imported.len()]
+        } else {
+            return Err(DecodeError::Malformed {
+                reason: "refinement symbol id out of range",
+            });
+        };
+        for c in refine_ctx.iter_mut() {
+            *c = MqContext(0);
+        }
+        let refine_bytes = r.remaining_from_byte();
+        let block = if bmsize > 0 && bmsize <= refine_bytes.len() {
+            &refine_bytes[..bmsize]
+        } else {
+            refine_bytes
+        };
+        let mut rdec = ArithmeticDecoder::new(block);
+        let refined = decode_refinement_region_templated(
+            &mut rdec,
+            reference,
+            sym_width,
+            hc_height,
+            rdx,
+            rdy,
+            self.sdrtemplate,
+            false,
+            self.sdrat,
+            self.sdrat2,
+            refine_ctx,
+            self.limits,
+        )?;
+        r.skip_bytes(bmsize);
+        r.align_to_byte();
+        Ok(refined)
+    }
+
+    /// §6.5.8.2 step 2 / Table 17: an internal Huffman text region.
+    fn decode_aggregate_symbol(
+        &self,
+        r: &mut BitReader<'_>,
+        new_symbols: &[Arc<MonoBitmap>],
+        (sym_width, hc_height): (u32, u32),
+        num_instances: u32,
+        refine_ctx: &mut [MqContext],
+    ) -> Result<MonoBitmap, DecodeError> {
+        let mut combined: Vec<Arc<MonoBitmap>> =
+            Vec::with_capacity(self.imported.len() + new_symbols.len());
+        combined.extend(self.imported.iter().cloned());
+        combined.extend(new_symbols.iter().cloned());
+        let tables = HuffTextTables {
+            sym: self.sym_table,
+            fs: self.b6,
+            ds: self.b8,
+            dt: self.b11,
+            rdw: self.b15,
+            rdh: self.b15,
+            rdx: self.b15,
+            rdy: self.b15,
+            rsize: self.b1,
+        };
+        let params = HuffTextParams {
+            width: sym_width,
+            height: hc_height,
+            num_instances,
+            log_strips: 0,
+            ref_corner: 1, // TOPLEFT
+            transposed: false,
+            sb_comb_op: 0, // OR
+            sb_def_pixel: false,
+            sb_ds_offset: 0,
+            sbrefine: true,
+            sb_rtemplate: self.sdrtemplate,
+            grat: self.sdrat,
+            grat2: self.sdrat2,
+        };
+        decode_huffman_text_core(r, &tables, &params, &combined, refine_ctx, self.limits)
+    }
 }
 
 /// Decode a Huffman-coded symbol dictionary (SDHUFF=1, SDREFAGG=0; T.88 §6.5
@@ -959,6 +1022,24 @@ fn extract_columns(
     Ok(bm)
 }
 
+/// Appends the symbols of an exported run of the combined symbol space
+/// (`imported` followed by `new_symbols`).
+fn push_exported_run(
+    exported: &mut Vec<Arc<MonoBitmap>>,
+    imported: &[Arc<MonoBitmap>],
+    new_symbols: &[Arc<MonoBitmap>],
+    run: std::ops::Range<usize>,
+) {
+    for j in run {
+        let sym = if j < imported.len() {
+            imported[j].clone()
+        } else {
+            new_symbols[j - imported.len()].clone()
+        };
+        exported.push(sym);
+    }
+}
+
 /// §6.5.10 export flags for the Huffman path: run lengths decoded with Table
 /// B.1 over the Huffman bit reader; otherwise identical to the arithmetic path.
 fn export_symbols_huffman(
@@ -996,14 +1077,7 @@ fn export_symbols_huffman(
             });
         }
         if ex_flag {
-            for j in index..index + run {
-                let sym = if j < imported.len() {
-                    imported[j].clone()
-                } else {
-                    new_symbols[j - imported.len()].clone()
-                };
-                exported.push(sym);
-            }
+            push_exported_run(&mut exported, imported, new_symbols, index..index + run);
         }
         index += run;
         ex_flag = !ex_flag;
@@ -1063,14 +1137,7 @@ fn decode_export_flags(
             });
         }
         if ex_flag {
-            for j in index..index + run {
-                let sym = if j < imported.len() {
-                    imported[j].clone()
-                } else {
-                    new_symbols[j - imported.len()].clone()
-                };
-                exported.push(sym);
-            }
+            push_exported_run(&mut exported, imported, new_symbols, index..index + run);
         }
         index += run;
         ex_flag = !ex_flag;

@@ -67,6 +67,30 @@ fn halftone_config(dict_mmr: bool, gray_mmr: bool, lossless: bool) -> Jbig2Confi
     cfg
 }
 
+/// Encodes the image in one halftone mode and checks the native decode
+/// against jbig2dec.
+fn check_halftone_mode(
+    img: &BitImage,
+    opts: &DecodeOptions,
+    (dict_mmr, gray_mmr, lossless): (bool, bool, bool),
+) {
+    let (w, h) = (img.width as u32, img.height as u32);
+    let cfg = halftone_config(dict_mmr, gray_mmr, lossless);
+    let region = GenericRegionParams::new(w, h, 300);
+    let stream = encode_halftone_document_auto(img, &cfg, &region, 0, Some(1)).unwrap();
+    let label = format!("halftone dict_mmr={dict_mmr} gray_mmr={gray_mmr} lossless={lossless}");
+
+    let doc = decode_file(&stream, opts).unwrap_or_else(|e| panic!("{label} native: {e}"));
+    let native = mono_to_pbm(doc.first_page().expect("a page"));
+    assert_eq!(native.width, w);
+    assert_eq!(native.height, h);
+
+    if let Some(res) = oracle::decode_standalone(&stream) {
+        let jd = res.unwrap_or_else(|e| panic!("{label} jbig2dec: {e}"));
+        assert_pixels_eq(&native, &jd, &format!("{label} native vs jbig2dec"));
+    }
+}
+
 /// Every halftone mode combination: native decode must equal jbig2dec exactly.
 #[test]
 fn halftone_modes_standalone_vs_jbig2dec() {
@@ -77,23 +101,7 @@ fn halftone_modes_standalone_vs_jbig2dec() {
     for &dict_mmr in &[false, true] {
         for &gray_mmr in &[false, true] {
             for &lossless in &[false, true] {
-                let cfg = halftone_config(dict_mmr, gray_mmr, lossless);
-                let region = GenericRegionParams::new(w, h, 300);
-                let stream =
-                    encode_halftone_document_auto(&img, &cfg, &region, 0, Some(1)).unwrap();
-                let label =
-                    format!("halftone dict_mmr={dict_mmr} gray_mmr={gray_mmr} lossless={lossless}");
-
-                let doc =
-                    decode_file(&stream, &opts).unwrap_or_else(|e| panic!("{label} native: {e}"));
-                let native = mono_to_pbm(doc.first_page().expect("a page"));
-                assert_eq!(native.width, w);
-                assert_eq!(native.height, h);
-
-                if let Some(res) = oracle::decode_standalone(&stream) {
-                    let jd = res.unwrap_or_else(|e| panic!("{label} jbig2dec: {e}"));
-                    assert_pixels_eq(&native, &jd, &format!("{label} native vs jbig2dec"));
-                }
+                check_halftone_mode(&img, &opts, (dict_mmr, gray_mmr, lossless));
             }
         }
     }

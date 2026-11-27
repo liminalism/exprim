@@ -10,17 +10,23 @@ fn sample(words: &[u32], width: usize, height: usize, x: isize, y: isize) -> boo
             != 0
 }
 
+/// The 16-pixel template-0 context of pixel `(x, y)` with nominal AT
+/// pixels, read pixel by pixel.
+fn template0_context(words: &[u32], width: usize, height: usize, x: isize, y: isize) -> usize {
+    let mut context = 0usize;
+    for (dy, offsets) in [(-2, -2..=2), (-1, -3..=3), (0, -4..=-1)] {
+        for dx in offsets {
+            context = (context << 1) | usize::from(sample(words, width, height, x + dx, y + dy));
+        }
+    }
+    context
+}
+
 fn scalar(words: &[u32], width: usize, height: usize) -> Vec<u8> {
     let mut coder = Jbig2ArithCoder::new();
     for y in 0..height as isize {
         for x in 0..width as isize {
-            let mut context = 0usize;
-            for (dy, offsets) in [(-2, -2..=2), (-1, -3..=3), (0, -4..=-1)] {
-                for dx in offsets {
-                    context =
-                        (context << 1) | usize::from(sample(words, width, height, x + dx, y + dy));
-                }
-            }
+            let context = template0_context(words, width, height, x, y);
             coder.encode_bit(context, sample(words, width, height, x, y));
         }
     }
@@ -28,49 +34,63 @@ fn scalar(words: &[u32], width: usize, height: usize) -> Vec<u8> {
     coder.as_bytes().to_vec()
 }
 
+/// A packed `width` x `height` page: blank, solid, checkerboard or
+/// pseudo-random by `pattern`.
+fn pattern_words(width: usize, height: usize, pattern: u32) -> Vec<u32> {
+    let stride = width.div_ceil(32);
+    let mut words = vec![0u32; stride * height];
+    let mut random = 0x192a_73ef_u32;
+    for y in 0..height {
+        for x in 0..width {
+            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+            if pattern == 1
+                || (pattern == 2 && (x + y) % 2 == 0)
+                || (pattern == 3 && random >> 29 < 3)
+            {
+                words[y * stride + x / 32] |= 1 << (31 - x % 32);
+            }
+        }
+    }
+    words
+}
+
+/// Encodes one pattern with the packed-word encoder, with clean and then
+/// dirty tail padding, and checks both against the scalar encoder.
+fn check_pattern_against_scalar(width: usize, height: usize, pattern: u32) {
+    let stride = width.div_ceil(32);
+    let mut words = pattern_words(width, height, pattern);
+    let expected = scalar(&words, width, height);
+    for dirty in [false, true] {
+        if dirty && !width.is_multiple_of(32) {
+            for row in words.chunks_exact_mut(stride) {
+                *row.last_mut().unwrap() |= u32::MAX >> (width % 32);
+            }
+        }
+        let mut actual = Jbig2ArithCoder::new();
+        actual
+            .encode_generic_region_inner(
+                &words,
+                width,
+                height,
+                0,
+                &[(3, -1), (-3, -1), (2, -2), (-2, -2)],
+            )
+            .unwrap();
+        actual.flush(true);
+        assert_eq!(
+            actual.as_bytes(),
+            expected,
+            "{width}x{height}, pattern={pattern}, dirty={dirty}"
+        );
+    }
+}
+
 #[test]
 fn packed_word_windows_match_scalar_template_zero_even_with_dirty_tail_padding() {
     for width in [0usize, 1, 2, 7, 8, 15, 31, 32, 33, 63, 64, 65, 97] {
         for height in [0usize, 1, 2, 3, 9] {
             for pattern in 0..4 {
-                let stride = width.div_ceil(32);
-                let mut words = vec![0u32; stride * height];
-                let mut random = 0x192a_73ef_u32;
-                for y in 0..height {
-                    for x in 0..width {
-                        random = random.wrapping_mul(1664525).wrapping_add(1013904223);
-                        if pattern == 1
-                            || (pattern == 2 && (x + y) % 2 == 0)
-                            || (pattern == 3 && random >> 29 < 3)
-                        {
-                            words[y * stride + x / 32] |= 1 << (31 - x % 32);
-                        }
-                    }
-                }
-                let expected = scalar(&words, width, height);
-                for dirty in [false, true] {
-                    if dirty && width % 32 != 0 {
-                        for row in words.chunks_exact_mut(stride) {
-                            *row.last_mut().unwrap() |= u32::MAX >> (width % 32);
-                        }
-                    }
-                    let mut actual = Jbig2ArithCoder::new();
-                    actual
-                        .encode_generic_region_inner(
-                            &words,
-                            width,
-                            height,
-                            0,
-                            &[(3, -1), (-3, -1), (2, -2), (-2, -2)],
-                        )
-                        .unwrap();
-                    actual.flush(true);
-                    assert_eq!(
-                        actual.as_bytes(),
-                        expected,
-                        "{width}x{height}, pattern={pattern}, dirty={dirty}"
-                    );
-                }
+                check_pattern_against_scalar(width, height, pattern);
             }
         }
     }

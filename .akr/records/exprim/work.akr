@@ -450,3 +450,33 @@ record exprim.work.compile-without-reading-image-bytes/1 : work {
     derived_from [ @exprim.observation.xref-rebuild-touches-whole-mmap ]
     author "dk"
 }
+
+record exprim.work.flat-control-flow-review/1 : work {
+    title "Flatten control flow and cut cognitive complexity across exprim and its codecs"
+    state proposed
+    scope [
+        path "agent/**",
+        path "cli/**",
+        path "clippy.toml",
+        path "codecs/**",
+        path "fuzz/**",
+        path "src/**",
+        path "tests/**",
+        path "tools/**",
+        path "tools/check-control-flow.py"
+    ]
+    intent """
+        Most of exprim and its three codecs predates the flat-control-flow rule: more than three levels of control-flow nesting is a design defect, the successful path sits at the lowest indentation, and helpers are cut around coherent responsibilities. Bring every Rust file in line without changing behaviour, output bytes, public API or versions, and leave a gate that holds the rule afterwards, with exceptions that are local and carry a checkable reason.
+        """
+    trace [
+        "Lege gated on one excessive_nesting threshold; it counts mod, impl and fn blocks, so free functions kept a fourth level. Here a script judges each function at its own item depth.",
+        "Survey on the starting commit: 1515 raw hits at threshold 4 in 204 files, 552 at threshold 5, 23 functions over cognitive complexity 25; jbig2enc-rust and render_cpu carry most.",
+        "Exceptions use allow with a reason, not expect: the exact gate is stricter than plain Clippy for free functions, so an expect could go unfulfilled.",
+        "Five file-disjoint partitions, one worker each in its own worktree at a shared config commit, so a half-edited file never breaks another worker's cargo check.",
+        "Workers had no tool to start Sonnet subagents, so each Opus worker did its whole partition alone; partitions were sized by lint hits, not lines.",
+        "Orchestration was split around real stages; 18 exceptions remain, all function-level on spec-shaped kernels: Tier-1 passes, IW44 lifting, JBIG2 generic and refinement decode, JPEG MCU loop.",
+        "Tests alone cannot show byte identity for symbol planning, so outputs were hashed against the starting commit: pages, text, and every codec preset.",
+        "Split into one commit per published crate plus the gate, at the owner's request: unlike a format commit, a restructuring can regress, and bisect should narrow to a crate."
+    ]
+    author "Claude"
+}

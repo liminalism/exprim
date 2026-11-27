@@ -1,11 +1,41 @@
 use super::super::Jbig2Encoder;
-use super::types::{PlannedDocument, SymbolInstance};
+use super::types::{PlannedDocument, PlannedPage, SymbolInstance};
 use crate::jbig2arith::Jbig2ArithCoder;
 use crate::jbig2structs::{GenericRegionConfig, GenericRegionParams, SegmentType};
 use crate::jbig2sym::{BitImage, Rect};
 use anyhow::{Result, anyhow};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+
+/// Serializes one page's segments and counts the bytes of its local
+/// dictionaries, text regions and generic regions.
+fn serialize_planned_page(page: &PlannedPage) -> Result<(Vec<u8>, usize, usize, usize)> {
+    let mut page_out = Vec::new();
+    let mut local_dict_bytes = 0usize;
+    let mut text_region_bytes = 0usize;
+    let mut generic_region_bytes = 0usize;
+    for seg in &page.segments {
+        let start_len = page_out.len();
+        seg.write_into(&mut page_out)?;
+        let seg_len = page_out.len().saturating_sub(start_len);
+        match seg.seg_type {
+            SegmentType::SymbolDictionary => local_dict_bytes += seg_len,
+            SegmentType::ImmediateTextRegion | SegmentType::ImmediateLosslessTextRegion => {
+                text_region_bytes += seg_len
+            }
+            SegmentType::ImmediateGenericRegion | SegmentType::ImmediateLosslessGenericRegion => {
+                generic_region_bytes += seg_len
+            }
+            _ => {}
+        }
+    }
+    Ok((
+        page_out,
+        local_dict_bytes,
+        text_region_bytes,
+        generic_region_bytes,
+    ))
+}
 
 impl<'a> Jbig2Encoder<'a> {
     pub(crate) fn serialize_full_document(&self, plan: &PlannedDocument) -> Result<Vec<u8>> {
@@ -51,33 +81,7 @@ impl<'a> Jbig2Encoder<'a> {
         let page_streams = plan
             .pages
             .par_iter()
-            .map(|page| {
-                let mut page_out = Vec::new();
-                let mut local_dict_bytes = 0usize;
-                let mut text_region_bytes = 0usize;
-                let mut generic_region_bytes = 0usize;
-                for seg in &page.segments {
-                    let start_len = page_out.len();
-                    seg.write_into(&mut page_out)?;
-                    let seg_len = page_out.len().saturating_sub(start_len);
-                    match seg.seg_type {
-                        SegmentType::SymbolDictionary => local_dict_bytes += seg_len,
-                        SegmentType::ImmediateTextRegion
-                        | SegmentType::ImmediateLosslessTextRegion => text_region_bytes += seg_len,
-                        SegmentType::ImmediateGenericRegion
-                        | SegmentType::ImmediateLosslessGenericRegion => {
-                            generic_region_bytes += seg_len
-                        }
-                        _ => {}
-                    }
-                }
-                Ok((
-                    page_out,
-                    local_dict_bytes,
-                    text_region_bytes,
-                    generic_region_bytes,
-                ))
-            })
+            .map(serialize_planned_page)
             .collect::<Vec<Result<(Vec<u8>, usize, usize, usize)>>>()
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
@@ -86,31 +90,7 @@ impl<'a> Jbig2Encoder<'a> {
         let page_streams = {
             let mut page_streams = Vec::with_capacity(plan.pages.len());
             for page in &plan.pages {
-                let mut page_out = Vec::new();
-                let mut local_dict_bytes = 0usize;
-                let mut text_region_bytes = 0usize;
-                let mut generic_region_bytes = 0usize;
-                for seg in &page.segments {
-                    let start_len = page_out.len();
-                    seg.write_into(&mut page_out)?;
-                    let seg_len = page_out.len().saturating_sub(start_len);
-                    match seg.seg_type {
-                        SegmentType::SymbolDictionary => local_dict_bytes += seg_len,
-                        SegmentType::ImmediateTextRegion
-                        | SegmentType::ImmediateLosslessTextRegion => text_region_bytes += seg_len,
-                        SegmentType::ImmediateGenericRegion
-                        | SegmentType::ImmediateLosslessGenericRegion => {
-                            generic_region_bytes += seg_len
-                        }
-                        _ => {}
-                    }
-                }
-                page_streams.push((
-                    page_out,
-                    local_dict_bytes,
-                    text_region_bytes,
-                    generic_region_bytes,
-                ));
+                page_streams.push(serialize_planned_page(page)?);
             }
             page_streams
         };

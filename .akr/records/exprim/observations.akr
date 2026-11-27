@@ -319,6 +319,26 @@ record exprim.memory.real-documents-20261120/1 : observation {
     author "dk"
 }
 
+record exprim.observation.defects-seen-in-flat-control-flow-review/1 : observation {
+    title "Pre-existing defects seen during the flat-control-flow review, kept as they were"
+    state verified
+    statement """
+        The review kept behaviour frozen, so these were left as found. exprim: (1) src/print/mod.rs PageRange::resolve walks start..=end even when end is far past the page count, so an end of u32::MAX costs about four billion iterations. (2) src/render_cpu/stroke.rs dash_polyline would not terminate on a NaN dash entry, if the parser can let one through. (3) src/render_cpu/prepared.rs: the tiling-pattern arm of stroke lowering skips the per-op bookkeeping (extent, row clamp, origin stamp), which may drop such a stroke in later strips; not verified. (4) Unchecked arithmetic on hostile values in src/content/interpret.rs (Differences code increment, CID width list index), src/function/mod.rs (bitshift of i64::MIN) and src/color/icc.rs (curv table offset). jbig2enc-rust: (5) planning's global_symbol_indices is a clone of multi_page_candidates, so two diagnostics are always empty. (6) unify_apply's should_keep_text_local_symbol always returns false, so the local-rescue paths in planning are dead, and alias_candidate has an if with identical branches. (7) tests/roundtrip_after_fix.rs panics when jbig2dec is absent instead of skipping. (8) examples/generic_decode_timing.rs lacks required-features and breaks --all-targets builds without decode.
+        """
+    observed_at git:658a75edfa9926a48cf9551fab1c11e219f0d965
+    method manual
+    watches [
+        "src/print/mod.rs",
+        "src/render_cpu/stroke.rs",
+        "src/render_cpu/prepared.rs",
+        "codecs/jbig2enc-rust/src/encode/document/symbol/planning.rs",
+        "codecs/jbig2enc-rust/src/encode/document/symbol/unify_apply.rs"
+    ]
+    confidence medium
+    derived_from [ @exprim.work.flat-control-flow-review ]
+    author "Claude"
+}
+
 record exprim.observation.xref-rebuild-touches-whole-mmap/1 : observation {
     title "Xref rebuild over an MmapSource pulls the whole file into the process working set"
     state superseded

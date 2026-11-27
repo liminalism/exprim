@@ -7,6 +7,59 @@ use anyhow::Result;
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 
+/// Offers each pair of a bucket, sorted by ink count, whose ink counts
+/// differ by at most `pixel_window`, lower symbol index first.
+fn compare_within_bucket(
+    bucket: &[(usize, usize)],
+    pixel_window: usize,
+    compare_pair: &mut impl FnMut(usize, usize),
+) {
+    for (ci, &(a_pixels, a_idx)) in bucket.iter().enumerate() {
+        for &(b_pixels, b_idx) in &bucket[ci + 1..] {
+            if b_pixels - a_pixels > pixel_window {
+                break;
+            }
+            compare_pair(a_idx.min(b_idx), a_idx.max(b_idx));
+        }
+    }
+}
+
+/// Offers each pair across two buckets whose ink counts differ by at most
+/// `pixel_window`, the smaller bucket's symbol first.
+fn compare_across_buckets(
+    bucket: &[(usize, usize)],
+    neighbor_bucket: &[(usize, usize)],
+    pixel_window: usize,
+    compare_pair: &mut impl FnMut(usize, usize),
+) {
+    for &(a_pixels, a_idx) in bucket {
+        let start =
+            neighbor_bucket.partition_point(|&(b_pixels, _)| b_pixels + pixel_window < a_pixels);
+        for &(b_pixels, b_idx) in &neighbor_bucket[start..] {
+            if b_pixels > a_pixels + pixel_window {
+                break;
+            }
+            compare_pair(a_idx, b_idx);
+        }
+    }
+}
+
+/// The (height, width) buckets one pixel or less away from `(bh, bw)` that
+/// sort after it, in row-major offset order.
+fn larger_adjacent_buckets(bh: usize, bw: usize) -> impl Iterator<Item = (usize, usize)> {
+    (-1i32..=1)
+        .flat_map(|dh| (-1i32..=1).map(move |dw| (dh, dw)))
+        .filter_map(move |(dh, dw)| {
+            let nh = bh as i32 + dh;
+            let nw = bw as i32 + dw;
+            if nh < 0 || nw < 0 {
+                return None;
+            }
+            let neighbor_key = (nh as usize, nw as usize);
+            (neighbor_key > (bh, bw)).then_some(neighbor_key)
+        })
+}
+
 impl<'a> Jbig2Encoder<'a> {
     /// Cluster similar symbols into groups and select prototypes.
     ///
@@ -114,40 +167,18 @@ impl<'a> Jbig2Encoder<'a> {
 
         for &(bh, bw) in &bucket_keys {
             let current_bucket = &sorted_buckets[&(bh, bw)];
-            for (ci, &(a_pixels, a_idx)) in current_bucket.iter().enumerate() {
-                for &(b_pixels, b_idx) in &current_bucket[ci + 1..] {
-                    if b_pixels - a_pixels > pixel_window {
-                        break;
-                    }
-                    compare_pair(a_idx.min(b_idx), a_idx.max(b_idx));
-                }
-            }
+            compare_within_bucket(current_bucket, pixel_window, &mut compare_pair);
 
-            for dh in -1i32..=1 {
-                for dw in -1i32..=1 {
-                    let nh = bh as i32 + dh;
-                    let nw = bw as i32 + dw;
-                    if nh < 0 || nw < 0 {
-                        continue;
-                    }
-                    let neighbor_key = (nh as usize, nw as usize);
-                    if neighbor_key <= (bh, bw) {
-                        continue;
-                    }
-                    if let Some(neighbor_bucket) = sorted_buckets.get(&neighbor_key) {
-                        for &(a_pixels, a_idx) in current_bucket {
-                            let start = neighbor_bucket.partition_point(|&(b_pixels, _)| {
-                                b_pixels + pixel_window < a_pixels
-                            });
-                            for &(b_pixels, b_idx) in &neighbor_bucket[start..] {
-                                if b_pixels > a_pixels + pixel_window {
-                                    break;
-                                }
-                                compare_pair(a_idx, b_idx);
-                            }
-                        }
-                    }
-                }
+            for neighbor_key in larger_adjacent_buckets(bh, bw) {
+                let Some(neighbor_bucket) = sorted_buckets.get(&neighbor_key) else {
+                    continue;
+                };
+                compare_across_buckets(
+                    current_bucket,
+                    neighbor_bucket,
+                    pixel_window,
+                    &mut compare_pair,
+                );
             }
         }
 
@@ -197,24 +228,25 @@ impl<'a> Jbig2Encoder<'a> {
                 let old_idx = inst.symbol_index;
                 let new_idx = old_to_new[old_idx];
                 let proto = old_to_prototype[old_idx];
+                inst.symbol_index = new_idx;
 
                 // If this instance's original symbol was NOT the prototype,
                 // it needs refinement encoding to preserve quality
-                if old_idx != proto {
-                    inst.needs_refinement = true;
-                    // Compute alignment offset between instance and prototype.
-                    // Use a generous error limit (not u32::MAX which overflows in Comparator).
-                    let (_, trimmed_inst) = inst.instance_bitmap.trim();
-                    let max_ref_err = (trimmed_inst.width * trimmed_inst.height) as u32;
-                    if let Some((_, dx, dy)) =
-                        comparator.distance(&trimmed_inst, &new_symbols[new_idx], max_ref_err)
-                    {
-                        inst.refinement_dx = dx;
-                        inst.refinement_dy = dy;
-                    }
+                if old_idx == proto {
+                    continue;
                 }
-
-                inst.symbol_index = new_idx;
+                inst.needs_refinement = true;
+                // Compute alignment offset between instance and prototype.
+                // Use a generous error limit (not u32::MAX which overflows in Comparator).
+                let (_, trimmed_inst) = inst.instance_bitmap.trim();
+                let max_ref_err = (trimmed_inst.width * trimmed_inst.height) as u32;
+                let Some((_, dx, dy)) =
+                    comparator.distance(&trimmed_inst, &new_symbols[new_idx], max_ref_err)
+                else {
+                    continue;
+                };
+                inst.refinement_dx = dx;
+                inst.refinement_dy = dy;
             }
         }
 

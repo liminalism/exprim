@@ -335,24 +335,41 @@ fn connected_components_for_members(
         if !seen.insert(*start) {
             continue;
         }
-        let mut stack = vec![*start];
-        let mut component = vec![*start];
-        while let Some(node) = stack.pop() {
-            if let Some(neighbors) = close_edges.get(&node) {
-                for &neighbor in neighbors {
-                    if !member_set.contains(&neighbor) || !seen.insert(neighbor) {
-                        continue;
-                    }
-                    component.push(neighbor);
-                    stack.push(neighbor);
-                }
-            }
-        }
-        components.push(component);
+        components.push(close_component_from(
+            *start,
+            close_edges,
+            &member_set,
+            &mut seen,
+        ));
     }
 
     components.sort_by(|lhs, rhs| rhs.len().cmp(&lhs.len()).then_with(|| lhs[0].cmp(&rhs[0])));
     components
+}
+
+/// The members reachable from `start` over close edges, in discovery
+/// order, marking each as seen.
+fn close_component_from(
+    start: usize,
+    close_edges: &FxHashMap<usize, Vec<usize>>,
+    member_set: &FxHashSet<usize>,
+    seen: &mut FxHashSet<usize>,
+) -> Vec<usize> {
+    let mut stack = vec![start];
+    let mut component = vec![start];
+    while let Some(node) = stack.pop() {
+        let Some(neighbors) = close_edges.get(&node) else {
+            continue;
+        };
+        for &neighbor in neighbors {
+            if !member_set.contains(&neighbor) || !seen.insert(neighbor) {
+                continue;
+            }
+            component.push(neighbor);
+            stack.push(neighbor);
+        }
+    }
+    component
 }
 
 fn dense_core_component(
@@ -815,6 +832,473 @@ fn select_dense_representative(
     best.map(|stats| (stats.index, stats.total_score))
 }
 
+/// The class limits derived once from the configuration.
+#[derive(Clone, Copy)]
+struct ClassLimits {
+    class_max_err: u32,
+    class_max_dx: i32,
+    class_max_dy: i32,
+    class_accept_limit: u32,
+    close_threshold: u32,
+    border_accept_limit: u32,
+}
+
+/// The accepted-edge graph over all symbols: union-find components, the
+/// accepted neighbours of each symbol, and the reject counts by reason.
+struct EdgeGraph {
+    parent: Vec<usize>,
+    rank: Vec<u8>,
+    accepted_edges: FxHashMap<usize, Vec<usize>>,
+    reject_reason_counts: FxHashMap<&'static str, usize>,
+    accepted_edge_count: usize,
+}
+
+impl EdgeGraph {
+    /// Records an accepted edge: joins the two components and links the
+    /// symbols both ways.
+    fn accept(&mut self, symbol_index: usize, other_index: usize) {
+        self.accepted_edge_count += 1;
+        union(&mut self.parent, &mut self.rank, symbol_index, other_index);
+        self.accepted_edges
+            .entry(symbol_index)
+            .or_default()
+            .push(other_index);
+        self.accepted_edges
+            .entry(other_index)
+            .or_default()
+            .push(symbol_index);
+    }
+}
+
+/// What became of one connected component of the edge graph.
+enum ClassOutcome {
+    Built(UnifiedClass),
+    /// Too small, too little used, or without a representative.
+    Ineligible,
+    /// Its dense core is too small or nothing remaps onto the representative.
+    WeakCore,
+    /// Its estimated gain is below the configured minimum.
+    LowGain,
+}
+
+/// The state every class-building stage shares: the inputs, the pair
+/// observation cache, the comparator and the class limits.
+struct ClassBuilder<'b, 'i> {
+    inputs: &'b SymbolUnifyInputs<'i>,
+    pair_cache: PairCache,
+    comparator: Comparator,
+    limits: ClassLimits,
+}
+
+impl ClassBuilder<'_, '_> {
+    /// The cached observation of a pair under the class limits.
+    fn pair(&mut self, lhs: usize, rhs: usize) -> Option<PairObservation> {
+        get_or_compute_pair(
+            &mut self.pair_cache,
+            &mut self.comparator,
+            self.inputs.global_symbols,
+            self.inputs.symbol_signatures,
+            self.inputs.symbol_pixel_counts,
+            lhs,
+            rhs,
+            self.limits.class_max_err,
+            self.limits.class_max_dx,
+            self.limits.class_max_dy,
+        )
+    }
+
+    /// Offers the symbol's pairs with each higher-indexed symbol of a
+    /// neighbouring bucket to the edge graph.
+    fn offer_edges(&mut self, symbol_index: usize, bucket: &[usize], graph: &mut EdgeGraph) {
+        for &other_index in bucket {
+            if other_index <= symbol_index {
+                continue;
+            }
+            match self.edge_verdict(symbol_index, other_index) {
+                Ok(()) => graph.accept(symbol_index, other_index),
+                Err(reason) => *graph.reject_reason_counts.entry(reason).or_insert(0) += 1,
+            }
+        }
+    }
+
+    /// Whether two symbols are joined by an edge, or the reason they are not.
+    fn edge_verdict(
+        &mut self,
+        symbol_index: usize,
+        other_index: usize,
+    ) -> Result<(), &'static str> {
+        // The bitmap screens settle most pairs from cached ink
+        // profiles; the context similarity walks six token maps per
+        // pair. Run the cheap rejection first: an edge needs both
+        // verdicts, so the accepted set is the same in either order
+        // and only the diagnostic attribution of double rejections
+        // moves from "context" to "compare".
+        let Some(obs) = self.pair(symbol_index, other_index) else {
+            return Err("compare");
+        };
+        let context_decision = self
+            .inputs
+            .context_model
+            .map(|model| {
+                model.merge_decision(
+                    symbol_index,
+                    other_index,
+                    self.inputs.config.sym_unify_context_mode,
+                )
+            })
+            .unwrap_or(ContextDecision::Unknown);
+        if context_decision == ContextDecision::Reject {
+            return Err("context");
+        }
+
+        let class_accept_limit = self.limits.class_accept_limit;
+        let accept = if context_decision == ContextDecision::Unknown {
+            obs.class_score <= class_accept_limit.saturating_sub(2)
+                && obs.result.outside_ink_err == 0
+        } else {
+            obs.class_score <= class_accept_limit
+        };
+        if !accept {
+            return Err("score");
+        }
+        Ok(())
+    }
+
+    /// Each member's accepted neighbours within the class whose assignment
+    /// score is within the close threshold.
+    fn close_edges(
+        &mut self,
+        members: &[usize],
+        accepted_edges: &FxHashMap<usize, Vec<usize>>,
+    ) -> FxHashMap<usize, Vec<usize>> {
+        let member_set: FxHashSet<usize> = members.iter().copied().collect();
+        let close_threshold = self.limits.close_threshold;
+        members
+            .iter()
+            .copied()
+            .map(|member| {
+                let neighbors = accepted_edges
+                    .get(&member)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|neighbor| member_set.contains(neighbor))
+                    .filter(|neighbor| {
+                        self.pair(member, *neighbor)
+                            .is_some_and(|obs| obs.assignment_score <= close_threshold)
+                    })
+                    .collect();
+                (member, neighbors)
+            })
+            .collect()
+    }
+
+    /// The dense-core members that remap onto the representative within the
+    /// class limits, with their offsets and scores.
+    fn core_members(
+        &mut self,
+        dense_core: &[usize],
+        representative_index: usize,
+    ) -> Vec<UnifiedClassMember> {
+        let mut core_members = Vec::new();
+        for &member in dense_core {
+            if member == representative_index {
+                continue;
+            }
+            let Some(obs) = self.pair(member, representative_index) else {
+                continue;
+            };
+            if obs.assignment_score > self.limits.class_accept_limit
+                || obs.result.outside_ink_err > 0
+                || obs.result.dx.abs() > self.limits.class_max_dx
+                || obs.result.dy.abs() > self.limits.class_max_dy
+            {
+                continue;
+            }
+            core_members.push(UnifiedClassMember {
+                member_index: member,
+                dx: obs.result.dx,
+                dy: obs.result.dy,
+                score: obs.assignment_score,
+            });
+        }
+        core_members
+    }
+
+    /// Builds the refinement subcluster of each recurring border component,
+    /// and counts the border members left unrepresented.
+    fn refinement_subclusters(
+        &self,
+        recurring_components: &[Vec<usize>],
+    ) -> (Vec<UnifiedRefinementSubcluster>, usize) {
+        let inputs = self.inputs;
+        let mut refinement_subclusters = Vec::new();
+        let mut retained_border_members = 0usize;
+        for component in recurring_components {
+            let (maybe_subcluster, leftover_members) = build_refinement_subcluster(
+                component,
+                inputs.global_symbols,
+                inputs.symbol_signatures,
+                inputs.symbol_pixel_counts,
+                inputs.symbol_usage,
+                inputs.symbol_page_count,
+                inputs.config,
+            );
+            if let Some(subcluster) = maybe_subcluster {
+                refinement_subclusters.push(subcluster);
+                retained_border_members += leftover_members;
+            } else {
+                retained_border_members += component.len();
+            }
+        }
+        (refinement_subclusters, retained_border_members)
+    }
+
+    /// Turns one connected component into a unified class: checks its size
+    /// and usage, finds its dense core and representative, remaps the core,
+    /// triages the rest into border, refined and retained members, and
+    /// keeps the class only if its estimated gain is high enough.
+    fn build_class(
+        &mut self,
+        members: Vec<usize>,
+        accepted_edges: &FxHashMap<usize, Vec<usize>>,
+        diagnostics: &mut UnifyBuildDiagnostics,
+    ) -> ClassOutcome {
+        let inputs = self.inputs;
+        let limits = self.limits;
+        let class_size = members.len();
+        let non_fragile_members = members;
+
+        if non_fragile_members.len() < inputs.config.sym_unify_min_class_size.max(2) {
+            return ClassOutcome::Ineligible;
+        }
+        let class_usage: usize = non_fragile_members
+            .iter()
+            .map(|&index| inputs.symbol_usage[index])
+            .sum();
+        let class_page_span = non_fragile_members
+            .iter()
+            .map(|&index| inputs.symbol_page_count[index])
+            .max()
+            .unwrap_or(0);
+        if class_usage < inputs.config.sym_unify_min_class_usage
+            || class_page_span < inputs.config.sym_unify_min_page_span
+        {
+            return ClassOutcome::Ineligible;
+        }
+
+        let close_edges = self.close_edges(&non_fragile_members, accepted_edges);
+
+        let (dense_core, core_subcluster_count) =
+            dense_core_component(&non_fragile_members, &close_edges);
+        let core_ratio_permille =
+            ((dense_core.len() * 1000) / non_fragile_members.len().max(1)) as u16;
+        if dense_core.len() < 2
+            || core_ratio_permille < inputs.config.sym_unify_min_core_ratio_permille
+        {
+            if inputs.collect_diagnostics {
+                diagnostics.lines.push(format!(
+                    "sym_unify skip weak-core: class_size={} non_fragile={} core_size={} core_ratio_permille={} sample={:?}",
+                    class_size,
+                    non_fragile_members.len(),
+                    dense_core.len(),
+                    core_ratio_permille,
+                    &non_fragile_members[..non_fragile_members.len().min(8)]
+                ));
+            }
+            return ClassOutcome::WeakCore;
+        }
+
+        let Some((representative_index, representative_score)) = select_dense_representative(
+            &dense_core,
+            &mut self.pair_cache,
+            &mut self.comparator,
+            inputs.global_symbols,
+            inputs.symbol_signatures,
+            inputs.symbol_pixel_counts,
+            inputs.symbol_usage,
+            inputs.symbol_page_count,
+            limits.class_max_err,
+            limits.class_max_dx,
+            limits.class_max_dy,
+            limits.close_threshold,
+        ) else {
+            return ClassOutcome::Ineligible;
+        };
+
+        let core_members = self.core_members(&dense_core, representative_index);
+        if core_members.is_empty() {
+            if inputs.collect_diagnostics {
+                diagnostics.lines.push(format!(
+                    "sym_unify skip empty-remap: class_size={} core_size={} representative={}",
+                    non_fragile_members.len(),
+                    dense_core.len(),
+                    representative_index
+                ));
+            }
+            return ClassOutcome::WeakCore;
+        }
+
+        let core_member_set: FxHashSet<usize> = dense_core.iter().copied().collect();
+        let non_core_members: Vec<usize> = non_fragile_members
+            .iter()
+            .copied()
+            .filter(|index| !core_member_set.contains(index) && *index != representative_index)
+            .collect();
+        let triage = triage_non_core_members(
+            &non_core_members,
+            &close_edges,
+            representative_index,
+            inputs.symbol_usage[representative_index],
+            inputs.symbol_page_count[representative_index],
+            &mut self.pair_cache,
+            &mut self.comparator,
+            inputs.global_symbols,
+            inputs.symbol_signatures,
+            inputs.symbol_pixel_counts,
+            inputs.symbol_usage,
+            inputs.symbol_page_count,
+            inputs.context_model,
+            inputs.config.sym_unify_context_mode,
+            limits.class_max_err,
+            limits.class_max_dx,
+            limits.class_max_dy,
+            limits.border_accept_limit,
+            inputs.config.sym_unify_max_border_outside_ink,
+            inputs.config.sym_unify_min_class_usage,
+            inputs.config.sym_unify_min_page_span,
+        );
+        let (refinement_subclusters, retained_border_members) =
+            self.refinement_subclusters(&triage.recurring_components);
+        let retained_outlier_members: usize = triage.outlier_components.iter().map(Vec::len).sum();
+        let candidate_subclusters = core_subcluster_count + triage.recurring_components.len();
+        let total_usage: usize = non_fragile_members
+            .iter()
+            .map(|&index| inputs.symbol_usage[index])
+            .sum();
+        let page_span = non_fragile_members
+            .iter()
+            .map(|&index| inputs.symbol_page_count[index])
+            .max()
+            .unwrap_or(1);
+        let gain = estimate_class_gain(
+            inputs.global_symbols,
+            inputs.symbol_usage,
+            inputs.symbol_page_count,
+            representative_index,
+            &core_members,
+            &triage.border_members,
+            &refinement_subclusters,
+            retained_border_members,
+            retained_outlier_members,
+            representative_score,
+        );
+        let class = UnifiedClass {
+            representative_index,
+            core_members,
+            border_members: triage.border_members,
+            refinement_subclusters,
+            class_size: non_fragile_members.len(),
+            dense_core_size: dense_core.len(),
+            total_usage,
+            page_span,
+            representative_score,
+            retained_border_members,
+            retained_outlier_members,
+            candidate_subclusters,
+            estimated_gain: gain.net_gain,
+        };
+        if gain.net_gain < inputs.config.sym_unify_min_estimated_gain {
+            if inputs.collect_diagnostics {
+                push_low_gain_line(diagnostics, &class, &gain);
+            }
+            return ClassOutcome::LowGain;
+        }
+
+        if inputs.collect_diagnostics {
+            push_class_lines(diagnostics, inputs, &class, &gain);
+        }
+        ClassOutcome::Built(class)
+    }
+}
+
+/// Logs a class skipped for its low estimated gain.
+fn push_low_gain_line(
+    diagnostics: &mut UnifyBuildDiagnostics,
+    class: &UnifiedClass,
+    gain: &GainBreakdown,
+) {
+    diagnostics.lines.push(format!(
+        "sym_unify skip low-gain: representative={} class_size={} core_size={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} border_unified={} refined_subclusters={} refined_members={} retained_border={} retained_outliers={}",
+        class.representative_index,
+        class.class_size,
+        class.dense_core_size,
+        gain.net_gain,
+        gain.bitmap_savings,
+        gain.id_savings,
+        gain.representative_penalty,
+        gain.retained_penalty,
+        class.border_members.len(),
+        class.refinement_subclusters.len(),
+        class
+            .refinement_subclusters
+            .iter()
+            .map(|subcluster| subcluster.refined_members.len())
+            .sum::<usize>(),
+        class.retained_border_members,
+        class.retained_outlier_members
+    ));
+}
+
+/// Logs a built class and a sample of its refinement subclusters.
+fn push_class_lines(
+    diagnostics: &mut UnifyBuildDiagnostics,
+    inputs: &SymbolUnifyInputs<'_>,
+    class: &UnifiedClass,
+    gain: &GainBreakdown,
+) {
+    let representative_index = class.representative_index;
+    for subcluster in class.refinement_subclusters.iter().take(8) {
+        diagnostics.lines.push(format!(
+            "  sym_unify refine-subcluster: representative={} prototype={} refined_members={} usage={} page_span={} prototype_score={} gain={}",
+            representative_index,
+            subcluster.prototype_index,
+            subcluster.refined_members.len(),
+            subcluster.total_usage,
+            subcluster.page_span,
+            subcluster.prototype_score,
+            subcluster.estimated_gain
+        ));
+    }
+    diagnostics.lines.push(format!(
+        "sym_unify class: representative={} class_size={} core_size={} unified={} border_unified={} refined_subclusters={} refined_members={} retained_border={} retained_outliers={} total_usage={} page_span={} rep_usage={} rep_pages={} rep_score={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} subclusters={}",
+        representative_index,
+        class.class_size,
+        class.dense_core_size,
+        class.core_members.len(),
+        class.border_members.len(),
+        class.refinement_subclusters.len(),
+        class
+            .refinement_subclusters
+            .iter()
+            .map(|subcluster| subcluster.refined_members.len())
+            .sum::<usize>(),
+        class.retained_border_members,
+        class.retained_outlier_members,
+        class.total_usage,
+        class.page_span,
+        inputs.symbol_usage[representative_index],
+        inputs.symbol_page_count[representative_index],
+        class.representative_score,
+        gain.net_gain,
+        gain.bitmap_savings,
+        gain.id_savings,
+        gain.representative_penalty,
+        gain.retained_penalty,
+        class.candidate_subclusters
+    ));
+}
+
 pub fn build_symbol_unify_classes(
     inputs: SymbolUnifyInputs<'_>,
 ) -> (Vec<UnifiedClass>, UnifyBuildDiagnostics) {
@@ -849,13 +1333,26 @@ pub fn build_symbol_unify_classes(
         bucket_map.entry(key).or_default().push(index);
     }
 
-    let mut comparator = Comparator::default();
-    let mut pair_cache = PairCache::new(inputs.global_symbols);
-    let mut parent: Vec<usize> = (0..inputs.global_symbols.len()).collect();
-    let mut rank = vec![0u8; inputs.global_symbols.len()];
-    let mut accepted_edges: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
-    let mut reject_reason_counts: FxHashMap<&'static str, usize> = FxHashMap::default();
-    let mut accepted_edge_count = 0usize;
+    let mut builder = ClassBuilder {
+        inputs: &inputs,
+        pair_cache: PairCache::new(inputs.global_symbols),
+        comparator: Comparator::default(),
+        limits: ClassLimits {
+            class_max_err,
+            class_max_dx,
+            class_max_dy,
+            class_accept_limit,
+            close_threshold,
+            border_accept_limit,
+        },
+    };
+    let mut graph = EdgeGraph {
+        parent: (0..inputs.global_symbols.len()).collect(),
+        rank: vec![0u8; inputs.global_symbols.len()],
+        accepted_edges: FxHashMap::default(),
+        reject_reason_counts: FxHashMap::default(),
+        accepted_edge_count: 0,
+    };
 
     for symbol_index in 0..inputs.global_symbols.len() {
         let key = bucket_keys[symbol_index];
@@ -863,84 +1360,24 @@ pub fn build_symbol_unify_classes(
             let Some(bucket) = bucket_map.get(&neighbor) else {
                 return;
             };
-            for &other_index in bucket {
-                if other_index <= symbol_index {
-                    continue;
-                }
-                // The bitmap screens settle most pairs from cached ink
-                // profiles; the context similarity walks six token maps per
-                // pair. Run the cheap rejection first: an edge needs both
-                // verdicts, so the accepted set is the same in either order
-                // and only the diagnostic attribution of double rejections
-                // moves from "context" to "compare".
-                let Some(obs) = get_or_compute_pair(
-                    &mut pair_cache,
-                    &mut comparator,
-                    inputs.global_symbols,
-                    inputs.symbol_signatures,
-                    inputs.symbol_pixel_counts,
-                    symbol_index,
-                    other_index,
-                    class_max_err,
-                    class_max_dx,
-                    class_max_dy,
-                ) else {
-                    *reject_reason_counts.entry("compare").or_insert(0) += 1;
-                    continue;
-                };
-                let context_decision = inputs
-                    .context_model
-                    .map(|model| {
-                        model.merge_decision(
-                            symbol_index,
-                            other_index,
-                            inputs.config.sym_unify_context_mode,
-                        )
-                    })
-                    .unwrap_or(ContextDecision::Unknown);
-                if context_decision == ContextDecision::Reject {
-                    *reject_reason_counts.entry("context").or_insert(0) += 1;
-                    continue;
-                }
-
-                let accept = if context_decision == ContextDecision::Unknown {
-                    obs.class_score <= class_accept_limit.saturating_sub(2)
-                        && obs.result.outside_ink_err == 0
-                } else {
-                    obs.class_score <= class_accept_limit
-                };
-                if !accept {
-                    *reject_reason_counts.entry("score").or_insert(0) += 1;
-                    continue;
-                }
-
-                accepted_edge_count += 1;
-                union(&mut parent, &mut rank, symbol_index, other_index);
-                accepted_edges
-                    .entry(symbol_index)
-                    .or_default()
-                    .push(other_index);
-                accepted_edges
-                    .entry(other_index)
-                    .or_default()
-                    .push(symbol_index);
-            }
+            builder.offer_edges(symbol_index, bucket, &mut graph);
         });
     }
 
     let mut class_map: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     for index in 0..inputs.global_symbols.len() {
-        let root = find_root(&mut parent, index);
+        let root = find_root(&mut graph.parent, index);
         class_map.entry(root).or_default().push(index);
     }
 
     let mut classes = Vec::new();
     let mut diagnostics = UnifyBuildDiagnostics::default();
     if inputs.collect_diagnostics {
+        let reject_reason_counts = &graph.reject_reason_counts;
         diagnostics.lines.push(format!(
             "sym_unify class build: symbols={} accepted_edges={} compare_rejects={} score_rejects={} context_rejects={}",
             inputs.global_symbols.len(),
-            accepted_edge_count,
+            graph.accepted_edge_count,
             reject_reason_counts.get("compare").copied().unwrap_or(0),
             reject_reason_counts.get("score").copied().unwrap_or(0),
             reject_reason_counts.get("context").copied().unwrap_or(0),
@@ -954,296 +1391,12 @@ pub fn build_symbol_unify_classes(
     let mut rejected_low_gain = 0usize;
 
     for members in grouped {
-        let class_size = members.len();
-        let non_fragile_members = members;
-
-        if non_fragile_members.len() < inputs.config.sym_unify_min_class_size.max(2) {
-            continue;
+        match builder.build_class(members, &graph.accepted_edges, &mut diagnostics) {
+            ClassOutcome::Built(class) => classes.push(class),
+            ClassOutcome::Ineligible => {}
+            ClassOutcome::WeakCore => rejected_weak_core += 1,
+            ClassOutcome::LowGain => rejected_low_gain += 1,
         }
-        let class_usage: usize = non_fragile_members
-            .iter()
-            .map(|&index| inputs.symbol_usage[index])
-            .sum();
-        let class_page_span = non_fragile_members
-            .iter()
-            .map(|&index| inputs.symbol_page_count[index])
-            .max()
-            .unwrap_or(0);
-        if class_usage < inputs.config.sym_unify_min_class_usage
-            || class_page_span < inputs.config.sym_unify_min_page_span
-        {
-            continue;
-        }
-
-        let member_set: FxHashSet<usize> = non_fragile_members.iter().copied().collect();
-        let close_edges: FxHashMap<usize, Vec<usize>> = non_fragile_members
-            .iter()
-            .copied()
-            .map(|member| {
-                let neighbors = accepted_edges
-                    .get(&member)
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .filter(|neighbor| member_set.contains(neighbor))
-                    .filter(|neighbor| {
-                        get_or_compute_pair(
-                            &mut pair_cache,
-                            &mut comparator,
-                            inputs.global_symbols,
-                            inputs.symbol_signatures,
-                            inputs.symbol_pixel_counts,
-                            member,
-                            *neighbor,
-                            class_max_err,
-                            class_max_dx,
-                            class_max_dy,
-                        )
-                        .is_some_and(|obs| obs.assignment_score <= close_threshold)
-                    })
-                    .collect();
-                (member, neighbors)
-            })
-            .collect();
-
-        let (dense_core, core_subcluster_count) =
-            dense_core_component(&non_fragile_members, &close_edges);
-        let core_ratio_permille =
-            ((dense_core.len() * 1000) / non_fragile_members.len().max(1)) as u16;
-        if dense_core.len() < 2
-            || core_ratio_permille < inputs.config.sym_unify_min_core_ratio_permille
-        {
-            rejected_weak_core += 1;
-            if inputs.collect_diagnostics {
-                diagnostics.lines.push(format!(
-                    "sym_unify skip weak-core: class_size={} non_fragile={} core_size={} core_ratio_permille={} sample={:?}",
-                    class_size,
-                    non_fragile_members.len(),
-                    dense_core.len(),
-                    core_ratio_permille,
-                    &non_fragile_members[..non_fragile_members.len().min(8)]
-                ));
-            }
-            continue;
-        }
-
-        let Some((representative_index, representative_score)) = select_dense_representative(
-            &dense_core,
-            &mut pair_cache,
-            &mut comparator,
-            inputs.global_symbols,
-            inputs.symbol_signatures,
-            inputs.symbol_pixel_counts,
-            inputs.symbol_usage,
-            inputs.symbol_page_count,
-            class_max_err,
-            class_max_dx,
-            class_max_dy,
-            close_threshold,
-        ) else {
-            continue;
-        };
-
-        let mut core_members = Vec::new();
-        for &member in &dense_core {
-            if member == representative_index {
-                continue;
-            }
-            let Some(obs) = get_or_compute_pair(
-                &mut pair_cache,
-                &mut comparator,
-                inputs.global_symbols,
-                inputs.symbol_signatures,
-                inputs.symbol_pixel_counts,
-                member,
-                representative_index,
-                class_max_err,
-                class_max_dx,
-                class_max_dy,
-            ) else {
-                continue;
-            };
-            if obs.assignment_score > class_accept_limit
-                || obs.result.outside_ink_err > 0
-                || obs.result.dx.abs() > class_max_dx
-                || obs.result.dy.abs() > class_max_dy
-            {
-                continue;
-            }
-            core_members.push(UnifiedClassMember {
-                member_index: member,
-                dx: obs.result.dx,
-                dy: obs.result.dy,
-                score: obs.assignment_score,
-            });
-        }
-
-        if core_members.is_empty() {
-            rejected_weak_core += 1;
-            if inputs.collect_diagnostics {
-                diagnostics.lines.push(format!(
-                    "sym_unify skip empty-remap: class_size={} core_size={} representative={}",
-                    non_fragile_members.len(),
-                    dense_core.len(),
-                    representative_index
-                ));
-            }
-            continue;
-        }
-
-        let core_member_set: FxHashSet<usize> = dense_core.iter().copied().collect();
-        let non_core_members: Vec<usize> = non_fragile_members
-            .iter()
-            .copied()
-            .filter(|index| !core_member_set.contains(index) && *index != representative_index)
-            .collect();
-        let triage = triage_non_core_members(
-            &non_core_members,
-            &close_edges,
-            representative_index,
-            inputs.symbol_usage[representative_index],
-            inputs.symbol_page_count[representative_index],
-            &mut pair_cache,
-            &mut comparator,
-            inputs.global_symbols,
-            inputs.symbol_signatures,
-            inputs.symbol_pixel_counts,
-            inputs.symbol_usage,
-            inputs.symbol_page_count,
-            inputs.context_model,
-            inputs.config.sym_unify_context_mode,
-            class_max_err,
-            class_max_dx,
-            class_max_dy,
-            border_accept_limit,
-            inputs.config.sym_unify_max_border_outside_ink,
-            inputs.config.sym_unify_min_class_usage,
-            inputs.config.sym_unify_min_page_span,
-        );
-        let mut refinement_subclusters = Vec::new();
-        let mut retained_border_members = 0usize;
-        for component in &triage.recurring_components {
-            let (maybe_subcluster, leftover_members) = build_refinement_subcluster(
-                component,
-                inputs.global_symbols,
-                inputs.symbol_signatures,
-                inputs.symbol_pixel_counts,
-                inputs.symbol_usage,
-                inputs.symbol_page_count,
-                inputs.config,
-            );
-            if let Some(subcluster) = maybe_subcluster {
-                refinement_subclusters.push(subcluster);
-                retained_border_members += leftover_members;
-            } else {
-                retained_border_members += component.len();
-            }
-        }
-        let retained_outlier_members: usize = triage.outlier_components.iter().map(Vec::len).sum();
-        let candidate_subclusters = core_subcluster_count + triage.recurring_components.len();
-        let total_usage: usize = non_fragile_members
-            .iter()
-            .map(|&index| inputs.symbol_usage[index])
-            .sum();
-        let page_span = non_fragile_members
-            .iter()
-            .map(|&index| inputs.symbol_page_count[index])
-            .max()
-            .unwrap_or(1);
-        let gain = estimate_class_gain(
-            inputs.global_symbols,
-            inputs.symbol_usage,
-            inputs.symbol_page_count,
-            representative_index,
-            &core_members,
-            &triage.border_members,
-            &refinement_subclusters,
-            retained_border_members,
-            retained_outlier_members,
-            representative_score,
-        );
-        if gain.net_gain < inputs.config.sym_unify_min_estimated_gain {
-            rejected_low_gain += 1;
-            if inputs.collect_diagnostics {
-                diagnostics.lines.push(format!(
-                    "sym_unify skip low-gain: representative={} class_size={} core_size={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} border_unified={} refined_subclusters={} refined_members={} retained_border={} retained_outliers={}",
-                    representative_index,
-                    non_fragile_members.len(),
-                    dense_core.len(),
-                    gain.net_gain,
-                    gain.bitmap_savings,
-                    gain.id_savings,
-                    gain.representative_penalty,
-                    gain.retained_penalty,
-                    triage.border_members.len(),
-                    refinement_subclusters.len(),
-                    refinement_subclusters
-                        .iter()
-                        .map(|subcluster| subcluster.refined_members.len())
-                        .sum::<usize>(),
-                    retained_border_members,
-                    retained_outlier_members
-                ));
-            }
-            continue;
-        }
-
-        if inputs.collect_diagnostics {
-            for subcluster in refinement_subclusters.iter().take(8) {
-                diagnostics.lines.push(format!(
-                    "  sym_unify refine-subcluster: representative={} prototype={} refined_members={} usage={} page_span={} prototype_score={} gain={}",
-                    representative_index,
-                    subcluster.prototype_index,
-                    subcluster.refined_members.len(),
-                    subcluster.total_usage,
-                    subcluster.page_span,
-                    subcluster.prototype_score,
-                    subcluster.estimated_gain
-                ));
-            }
-            diagnostics.lines.push(format!(
-                "sym_unify class: representative={} class_size={} core_size={} unified={} border_unified={} refined_subclusters={} refined_members={} retained_border={} retained_outliers={} total_usage={} page_span={} rep_usage={} rep_pages={} rep_score={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} subclusters={}",
-                representative_index,
-                non_fragile_members.len(),
-                dense_core.len(),
-                core_members.len(),
-                triage.border_members.len(),
-                refinement_subclusters.len(),
-                refinement_subclusters
-                    .iter()
-                    .map(|subcluster| subcluster.refined_members.len())
-                    .sum::<usize>(),
-                retained_border_members,
-                retained_outlier_members,
-                total_usage,
-                page_span,
-                inputs.symbol_usage[representative_index],
-                inputs.symbol_page_count[representative_index],
-                representative_score,
-                gain.net_gain,
-                gain.bitmap_savings,
-                gain.id_savings,
-                gain.representative_penalty,
-                gain.retained_penalty,
-                candidate_subclusters
-            ));
-        }
-
-        classes.push(UnifiedClass {
-            representative_index,
-            core_members,
-            border_members: triage.border_members,
-            refinement_subclusters,
-            class_size: non_fragile_members.len(),
-            dense_core_size: dense_core.len(),
-            total_usage,
-            page_span,
-            representative_score,
-            retained_border_members,
-            retained_outlier_members,
-            candidate_subclusters,
-            estimated_gain: gain.net_gain,
-        });
     }
 
     let unified_members: usize = classes.iter().map(|class| class.core_members.len()).sum();
@@ -1280,6 +1433,38 @@ pub fn build_symbol_unify_classes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checks one pair under every error and offset limit, and counts the
+    /// limits the profile screen skips and the prescreen accepts.
+    fn check_prescreens(
+        cache: &PairCache,
+        comparator: &mut Comparator,
+        symbols: &[BitImage],
+        black: &[usize],
+        lhs: usize,
+        rhs: usize,
+    ) -> (usize, usize) {
+        let (mut skipped, mut accepted) = (0usize, 0usize);
+        for max_err in [4, 8, 12] {
+            for (max_dx, max_dy) in [(0, 0), (1, 1), (1, 0)] {
+                let possible = cache.prescreen_possible(symbols, lhs, rhs, max_err, max_dx, max_dy);
+                let prescreen = prescreen_pair(
+                    comparator,
+                    &symbols[lhs],
+                    &symbols[rhs],
+                    black[lhs],
+                    black[rhs],
+                    max_err,
+                    max_dx,
+                    max_dy,
+                );
+                assert!(possible || !prescreen, "pair {lhs}/{rhs} err={max_err}");
+                skipped += usize::from(!possible);
+                accepted += usize::from(prescreen);
+            }
+        }
+        (skipped, accepted)
+    }
 
     #[test]
     fn ink_count_prescreen_never_rejects_an_accepted_pair() {
@@ -1323,25 +1508,10 @@ mod tests {
                 if rhs >= symbols.len() {
                     continue;
                 }
-                for max_err in [4, 8, 12] {
-                    for (max_dx, max_dy) in [(0, 0), (1, 1), (1, 0)] {
-                        let possible =
-                            cache.prescreen_possible(&symbols, lhs, rhs, max_err, max_dx, max_dy);
-                        let prescreen = prescreen_pair(
-                            &mut comparator,
-                            &symbols[lhs],
-                            &symbols[rhs],
-                            black[lhs],
-                            black[rhs],
-                            max_err,
-                            max_dx,
-                            max_dy,
-                        );
-                        assert!(possible || !prescreen, "pair {lhs}/{rhs} err={max_err}");
-                        skipped += usize::from(!possible);
-                        accepted += usize::from(prescreen);
-                    }
-                }
+                let (pair_skipped, pair_accepted) =
+                    check_prescreens(&cache, &mut comparator, &symbols, &black, lhs, rhs);
+                skipped += pair_skipped;
+                accepted += pair_accepted;
             }
         }
         assert!(skipped > 0 && accepted > 0);

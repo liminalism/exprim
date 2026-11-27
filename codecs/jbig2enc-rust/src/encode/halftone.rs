@@ -371,18 +371,7 @@ fn quantized_from_grayscale_input(
     let mut filtered = Array2::<f32>::zeros((h, w));
     for y in 0..h {
         for x in 0..w {
-            let mut sum = 0.0f32;
-            let mut cnt = 0.0f32;
-            let y0 = y.saturating_sub(1);
-            let y1 = (y + 1).min(h - 1);
-            let x0 = x.saturating_sub(1);
-            let x1 = (x + 1).min(w - 1);
-            for yy in y0..=y1 {
-                for xx in x0..=x1 {
-                    sum += src[[yy, xx]];
-                    cnt += 1.0;
-                }
-            }
+            let (sum, cnt) = box_sum_3x3(&src, y, x);
             filtered[[y, x]] = if cnt > 0.0 { sum / cnt } else { src[[y, x]] };
         }
     }
@@ -558,6 +547,24 @@ pub fn encode_halftone_document_auto(
     Ok(document)
 }
 
+/// Copies the `cell` x `cell` pattern to `(x0, y0)` of `out`, clipped to
+/// its edges.
+fn tile_pattern(out: &mut BitImage, pattern: &BitImage, x0: usize, y0: usize, cell: usize) {
+    for py in 0..cell {
+        for px in 0..cell {
+            let ox = x0 + px;
+            let oy = y0 + py;
+            if ox < out.width && oy < out.height {
+                out.set(
+                    usize_to_u32(ox),
+                    usize_to_u32(oy),
+                    pattern.get_usize(px, py),
+                );
+            }
+        }
+    }
+}
+
 /// Runs the JBIG2 halftone pipeline and reconstructs a bilevel image by tiling
 /// generated dictionary patterns according to quantized gray levels.
 pub fn halftone_bilevel_preview(image: &BitImage, config: &Jbig2Config) -> Result<BitImage> {
@@ -588,19 +595,7 @@ pub fn halftone_bilevel_preview(image: &BitImage, config: &Jbig2Config) -> Resul
             let pattern = pattern_dictionary
                 .get(level)
                 .ok_or_else(|| anyhow!("Quantized level {} out of pattern range", level))?;
-            for py in 0..cell {
-                for px in 0..cell {
-                    let ox = gx * cell + px;
-                    let oy = gy * cell + py;
-                    if ox < image.width && oy < image.height {
-                        out.set(
-                            usize_to_u32(ox),
-                            usize_to_u32(oy),
-                            pattern.get_usize(px, py),
-                        );
-                    }
-                }
-            }
+            tile_pattern(&mut out, pattern, gx * cell, gy * cell, cell);
         }
     }
 
@@ -622,6 +617,22 @@ fn prefilter(image: &BitImage) -> Array2<f32> {
     out
 }
 
+/// The sum of the `m` x `m` cell at cell `(y, x)`, replicating the last row
+/// and column past the image edge, added row by row.
+#[inline]
+fn cell_sum(gray_image: &Array2<f32>, y: usize, x: usize, m: usize) -> f32 {
+    let (h, w) = gray_image.dim();
+    let mut sum = 0.0f32;
+    for dy in 0..m {
+        for dx in 0..m {
+            let sy = (y * m + dy).min(h - 1);
+            let sx = (x * m + dx).min(w - 1);
+            sum += gray_image[[sy, sx]];
+        }
+    }
+    sum
+}
+
 /// Step 2: Decimates (downsamples) the grayscale image by summing M x M blocks.
 ///
 /// Cells that hang over the right/bottom edge are completed by edge replication
@@ -638,18 +649,83 @@ fn decimate(gray_image: &Array2<f32>, m: usize) -> Array2<f32> {
 
     for y in 0..out_h {
         for x in 0..out_w {
-            let mut sum = 0.0f32;
-            for dy in 0..m {
-                for dx in 0..m {
-                    let sy = (y * m + dy).min(h - 1);
-                    let sx = (x * m + dx).min(w - 1);
-                    sum += gray_image[[sy, sx]];
-                }
-            }
-            out[[y, x]] = sum;
+            out[[y, x]] = cell_sum(gray_image, y, x, m);
         }
     }
     out
+}
+
+/// The sum and count of the samples in the 3x3 box around `(y, x)`,
+/// clipped to the image, added row by row.
+#[inline]
+fn box_sum_3x3(image: &Array2<f32>, y: usize, x: usize) -> (f32, f32) {
+    let (h, w) = image.dim();
+    let (y0, y1) = (y.saturating_sub(1), (y + 1).min(h - 1));
+    let (x0, x1) = (x.saturating_sub(1), (x + 1).min(w - 1));
+    let mut sum = 0.0f32;
+    let mut cnt = 0.0f32;
+    for yy in y0..=y1 {
+        for xx in x0..=x1 {
+            sum += image[[yy, xx]];
+            cnt += 1.0;
+        }
+    }
+    (sum, cnt)
+}
+
+/// The first level whose pattern coverage is nearest to `pixel_val`.
+#[inline]
+fn nearest_level(populations: &[f32], pixel_val: f32) -> usize {
+    let mut level = 0usize;
+    let mut best = f32::INFINITY;
+    for (i, &cov) in populations.iter().enumerate() {
+        let d = (pixel_val - cov).abs();
+        if d < best {
+            best = d;
+            level = i;
+        }
+    }
+    level
+}
+
+/// Spreads a quantization error over the unvisited Floyd-Steinberg
+/// neighbours, mirrored on right-to-left rows.
+#[inline]
+fn diffuse_error(
+    temp_image: &mut Array2<f32>,
+    y: usize,
+    x: usize,
+    error: f32,
+    left_to_right: bool,
+) {
+    let (h, w) = temp_image.dim();
+    if left_to_right {
+        if x + 1 < w {
+            temp_image[[y, x + 1]] += error * 7.0 / 16.0;
+        }
+        if y + 1 < h {
+            if x > 0 {
+                temp_image[[y + 1, x - 1]] += error * 3.0 / 16.0;
+            }
+            temp_image[[y + 1, x]] += error * 5.0 / 16.0;
+            if x + 1 < w {
+                temp_image[[y + 1, x + 1]] += error * 1.0 / 16.0;
+            }
+        }
+    } else {
+        if x > 0 {
+            temp_image[[y, x - 1]] += error * 7.0 / 16.0;
+        }
+        if y + 1 < h {
+            if x + 1 < w {
+                temp_image[[y + 1, x + 1]] += error * 3.0 / 16.0;
+            }
+            temp_image[[y + 1, x]] += error * 5.0 / 16.0;
+            if x > 0 {
+                temp_image[[y + 1, x - 1]] += error * 1.0 / 16.0;
+            }
+        }
+    }
 }
 
 /// Step 3: Quantizes to the dictionary levels using a serpentine
@@ -680,16 +756,7 @@ fn quantize_with_error_diffusion(
         // Unsharp mask against a 3x3 box blur of the decimated image.
         for y in 0..h {
             for x in 0..w {
-                let (y0, y1) = (y.saturating_sub(1), (y + 1).min(h - 1));
-                let (x0, x1) = (x.saturating_sub(1), (x + 1).min(w - 1));
-                let mut sum = 0.0f32;
-                let mut cnt = 0.0f32;
-                for yy in y0..=y1 {
-                    for xx in x0..=x1 {
-                        sum += decimated_image[[yy, xx]];
-                        cnt += 1.0;
-                    }
-                }
+                let (sum, cnt) = box_sum_3x3(decimated_image, y, x);
                 let blur = sum / cnt;
                 let v = decimated_image[[y, x]];
                 temp_image[[y, x]] = (v + l * (v - blur)).clamp(0.0, (m * m) as f32);
@@ -708,46 +775,11 @@ fn quantize_with_error_diffusion(
         for x in xs {
             let pixel_val = temp_image[[y, x]];
             // Nearest actual pattern coverage (populations are monotone).
-            let mut level = 0usize;
-            let mut best = f32::INFINITY;
-            for (i, &cov) in populations.iter().enumerate() {
-                let d = (pixel_val - cov).abs();
-                if d < best {
-                    best = d;
-                    level = i;
-                }
-            }
+            let level = nearest_level(&populations, pixel_val);
             out[[y, x]] = level as u8;
 
             let error = pixel_val - populations[level];
-
-            if left_to_right {
-                if x + 1 < w {
-                    temp_image[[y, x + 1]] += error * 7.0 / 16.0;
-                }
-                if y + 1 < h {
-                    if x > 0 {
-                        temp_image[[y + 1, x - 1]] += error * 3.0 / 16.0;
-                    }
-                    temp_image[[y + 1, x]] += error * 5.0 / 16.0;
-                    if x + 1 < w {
-                        temp_image[[y + 1, x + 1]] += error * 1.0 / 16.0;
-                    }
-                }
-            } else {
-                if x > 0 {
-                    temp_image[[y, x - 1]] += error * 7.0 / 16.0;
-                }
-                if y + 1 < h {
-                    if x + 1 < w {
-                        temp_image[[y + 1, x + 1]] += error * 3.0 / 16.0;
-                    }
-                    temp_image[[y + 1, x]] += error * 5.0 / 16.0;
-                    if x > 0 {
-                        temp_image[[y + 1, x - 1]] += error * 1.0 / 16.0;
-                    }
-                }
-            }
+            diffuse_error(&mut temp_image, y, x, error, left_to_right);
         }
     }
     out
@@ -813,6 +845,24 @@ fn clustered_fill_order(m: usize) -> Vec<(usize, usize)> {
     coords.into_iter().map(|(x, y, _, _)| (x, y)).collect()
 }
 
+/// Sets the black pixels of the `p_w` x `p_h` top-left area of `pattern`
+/// in `collective_bitmap`, shifted right by `x_offset`.
+fn set_pattern_pixels(
+    collective_bitmap: &mut BitImage,
+    pattern: &BitImage,
+    x_offset: usize,
+    p_w: usize,
+    p_h: usize,
+) {
+    for y in 0..p_h {
+        for x in 0..p_w {
+            if pattern.get_usize(x, y) {
+                collective_bitmap.set(usize_to_u32(x_offset + x), usize_to_u32(y), true);
+            }
+        }
+    }
+}
+
 /// Encodes the pattern dictionary by concatenating all patterns into a single
 /// large bitmap and using the generic region encoder.
 fn encode_pattern_dictionary_payload(
@@ -834,14 +884,7 @@ fn encode_pattern_dictionary_payload(
         BitImage::new(usize_to_u32(total_width), usize_to_u32(p_h)).map_err(|e| anyhow!(e))?;
 
     for (i, pattern) in patterns.iter().enumerate() {
-        let x_offset = i * p_w;
-        for y in 0..p_h {
-            for x in 0..p_w {
-                if pattern.get_usize(x, y) {
-                    collective_bitmap.set(usize_to_u32(x_offset + x), usize_to_u32(y), true);
-                }
-            }
-        }
+        set_pattern_pixels(&mut collective_bitmap, pattern, i * p_w, p_w, p_h);
     }
 
     let params = PatternDictionaryParams {
@@ -941,6 +984,16 @@ fn encode_bitmap_mmr(image: &BitImage) -> Result<Vec<u8>> {
     Ok(writer.finish())
 }
 
+/// Sets pixel `(x, y)` in plane `b` for every set bit `b` of `val`.
+#[inline]
+fn set_value_bits(raw_bitplanes: &mut [BitImage], x: usize, y: usize, val: u8) {
+    for (b, plane) in raw_bitplanes.iter_mut().enumerate() {
+        if (val >> b) & 1 == 1 {
+            plane.set(usize_to_u32(x), usize_to_u32(y), true);
+        }
+    }
+}
+
 /// `HBPP = ceil(log2(HNUMPATS))` (T.88 6.6.5 step 3, Annex C.5).
 ///
 /// The plane count must come from the pattern dictionary size, not from the
@@ -961,12 +1014,7 @@ fn gray_coded_bitplanes(gray_image: &Array2<u8>, num_patterns: usize) -> Vec<Bit
 
     for y in 0..h {
         for x in 0..w {
-            let val = gray_image[[y, x]];
-            for b in 0..num_bits {
-                if (val >> b) & 1 == 1 {
-                    raw_bitplanes[b].set(usize_to_u32(x), usize_to_u32(y), true);
-                }
-            }
+            set_value_bits(&mut raw_bitplanes, x, y, gray_image[[y, x]]);
         }
     }
 

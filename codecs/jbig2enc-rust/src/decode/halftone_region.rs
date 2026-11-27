@@ -154,6 +154,169 @@ fn compute_skip(
     Ok(skip)
 }
 
+/// Decodes the gray-scale planes as separate byte-aligned, EOFB-terminated
+/// MMR blocks, MSB first.
+fn decode_mmr_gray_planes(
+    region: &HalftoneRegion<'_>,
+    hbpp: usize,
+    limits: &DecodeLimits,
+) -> Result<Vec<MonoBitmap>, DecodeError> {
+    let (hgw, hgh) = (region.grid_width, region.grid_height);
+    let mut planes: Vec<MonoBitmap> = Vec::with_capacity(hbpp);
+    // Each plane is a separate byte-aligned EOFB-terminated MMR block.
+    let mut off = 0usize;
+    for _ in 0..hbpp {
+        let (plane, consumed) = decode_mmr_plane(&region.data[off..], hgw, hgh, limits)?;
+        planes.push(plane);
+        off = off.checked_add(consumed).ok_or(DecodeError::Overflow {
+            operation: "MMR gray-plane offset",
+        })?;
+        if off > region.data.len() {
+            return Err(DecodeError::Malformed {
+                reason: "MMR gray-plane offset past end of data",
+            });
+        }
+    }
+    Ok(planes)
+}
+
+/// Decodes the gray-scale planes as generic regions sharing one arithmetic
+/// stream and freshly reset context bank, MSB first, skipping the cells
+/// outside the region when `skip` is given.
+fn decode_arith_gray_planes(
+    region: &HalftoneRegion<'_>,
+    hbpp: usize,
+    skip: Option<&MonoBitmap>,
+    generic_ctx: &mut [MqContext],
+    limits: &DecodeLimits,
+    scratch: &mut GenericScratch,
+) -> Result<Vec<MonoBitmap>, DecodeError> {
+    let (hgw, hgh) = (region.grid_width, region.grid_height);
+    let mut planes: Vec<MonoBitmap> = Vec::with_capacity(hbpp);
+    if generic_ctx.len() < (1usize << 16) {
+        return Err(DecodeError::Overflow {
+            operation: "halftone region context array too small",
+        });
+    }
+    for c in generic_ctx.iter_mut() {
+        *c = MqContext::default();
+    }
+    // Table C.4 gray-plane AT pixels (template 0/1 share AT1 = (3, -1),
+    // matching this crate's template-0 generic decoder).
+    let at = match region.template {
+        0 | 1 => [(3i8, -1i8), (-3, -1), (2, -2), (-2, -2)],
+        _ => [(2i8, -1i8), (-3, -1), (2, -2), (-2, -2)],
+    };
+    // All planes share one continuous arithmetic stream and context bank
+    // (the encoder codes them with a single coder, contexts carried across).
+    let mut dec = ArithmeticDecoder::new(region.data);
+    for _ in 0..hbpp {
+        let plane = match skip {
+            Some(s) => crate::decode::generic::decode_generic_bitmap_skip(
+                &mut dec,
+                hgw,
+                hgh,
+                region.template,
+                at,
+                generic_ctx,
+                limits,
+                s,
+                scratch,
+            )?,
+            None => decode_generic_bitmap(
+                &mut dec,
+                hgw,
+                hgh,
+                region.template,
+                at,
+                generic_ctx,
+                limits,
+                scratch,
+            )?,
+        };
+        planes.push(plane);
+    }
+    Ok(planes)
+}
+
+/// §6.6.5.2: renders each grid cell's pattern onto the region. Converts
+/// each 32-cell word of the Gray-coded bitplanes to binary in parallel with
+/// word-wise XORs instead of probing every plane per cell.
+fn render_gray_cells(
+    htreg: &mut MonoBitmap,
+    region: &HalftoneRegion<'_>,
+    patterns: &PatternDictionary,
+    planes: &[MonoBitmap],
+    hbpp: usize,
+) {
+    let (hgw, hgh) = (region.grid_width, region.grid_height);
+    let op = combination_operator(region.halftone_comb_operator);
+    let hgx = region.grid_x as i64;
+    let hgy = region.grid_y as i64;
+    let hrx = region.grid_vector_x as i64;
+    let hry = region.grid_vector_y as i64;
+    let last_index = patterns.len() - 1;
+    let plane_stride = hgw.div_ceil(32) as usize;
+    // HBPP = ceil(log2(num_patterns)) <= 32, so a fixed stack array avoids a
+    // heap allocation per halftone region.
+    let mut bin_words = [0u32; 32];
+    let bin_slice = &mut bin_words[..hbpp.min(32)];
+
+    for mg in 0..hgh {
+        let mg_i = mg as i64;
+        let mut x_fp = hgx + mg_i * hry;
+        let mut y_fp = hgy + mg_i * hrx;
+        for w_idx in 0..plane_stride {
+            gray_words_to_binary(bin_slice, planes, mg, w_idx);
+            let cells = (hgw - (w_idx as u32) * 32).min(32);
+            for _ in 0..cells {
+                let value = next_cell_value(bin_slice);
+                let idx = (value as usize).min(last_index);
+                let pattern = &patterns.patterns[idx];
+
+                let x = x_fp >> 8;
+                let y = y_fp >> 8;
+                x_fp += hrx;
+                y_fp -= hry;
+                let (xi, yi) = match (i32::try_from(x), i32::try_from(y)) {
+                    (Ok(xi), Ok(yi)) => (xi, yi),
+                    // Out of the i32 grid entirely: `combine` would clip it away.
+                    _ => continue,
+                };
+                htreg.combine(pattern, xi, yi, op);
+            }
+        }
+    }
+}
+
+/// Converts word `w_idx` of row `mg` of the Gray-coded planes to binary
+/// planes: each bit is the XOR of its own and every higher Gray bit.
+#[inline(always)]
+fn gray_words_to_binary(bin_slice: &mut [u32], planes: &[MonoBitmap], mg: u32, w_idx: usize) {
+    if bin_slice.is_empty() {
+        return;
+    }
+    let top = bin_slice.len() - 1;
+    let mut acc = planes[top].row(mg)[w_idx];
+    bin_slice[top] = acc;
+    for j in (0..top).rev() {
+        acc ^= planes[j].row(mg)[w_idx];
+        bin_slice[j] = acc;
+    }
+}
+
+/// Takes the next cell's binary gray value from the top bits of the binary
+/// plane words and shifts them on.
+#[inline(always)]
+fn next_cell_value(bin_slice: &mut [u32]) -> u32 {
+    let mut value: u32 = 0;
+    for (j, bw) in bin_slice.iter_mut().enumerate() {
+        value |= (*bw >> 31) << j;
+        *bw <<= 1;
+    }
+    value
+}
+
 pub fn decode_halftone_region(
     region: &HalftoneRegion<'_>,
     patterns: &PatternDictionary,
@@ -195,125 +358,22 @@ pub fn decode_halftone_region(
     // §6.6.5 step 4 + Annex C.5: decode HBPP Gray-coded planes, MSB first.
     // `planes[j]` holds the coded (still Gray-coded) plane for bit position j.
     let hbpp_usize = hbpp as usize;
-    let mut planes: Vec<MonoBitmap> = Vec::with_capacity(hbpp_usize);
-
-    if region.mmr {
-        // Each plane is a separate byte-aligned EOFB-terminated MMR block.
-        let mut off = 0usize;
-        for _ in 0..hbpp_usize {
-            let (plane, consumed) = decode_mmr_plane(&region.data[off..], hgw, hgh, limits)?;
-            planes.push(plane);
-            off = off.checked_add(consumed).ok_or(DecodeError::Overflow {
-                operation: "MMR gray-plane offset",
-            })?;
-            if off > region.data.len() {
-                return Err(DecodeError::Malformed {
-                    reason: "MMR gray-plane offset past end of data",
-                });
-            }
-        }
-        // Decoded MSB-first; reverse so `planes[j]` corresponds to bit `j`.
-        planes.reverse();
+    let mut planes = if region.mmr {
+        decode_mmr_gray_planes(region, hbpp_usize, limits)?
     } else {
-        if generic_ctx.len() < (1usize << 16) {
-            return Err(DecodeError::Overflow {
-                operation: "halftone region context array too small",
-            });
-        }
-        for c in generic_ctx.iter_mut() {
-            *c = MqContext::default();
-        }
-        // Table C.4 gray-plane AT pixels (template 0/1 share AT1 = (3, -1),
-        // matching this crate's template-0 generic decoder).
-        let at = match region.template {
-            0 | 1 => [(3i8, -1i8), (-3, -1), (2, -2), (-2, -2)],
-            _ => [(2i8, -1i8), (-3, -1), (2, -2), (-2, -2)],
-        };
-        // All planes share one continuous arithmetic stream and context bank
-        // (the encoder codes them with a single coder, contexts carried across).
-        let mut dec = ArithmeticDecoder::new(region.data);
-        for _ in 0..hbpp_usize {
-            let plane = match &skip {
-                Some(s) => crate::decode::generic::decode_generic_bitmap_skip(
-                    &mut dec,
-                    hgw,
-                    hgh,
-                    region.template,
-                    at,
-                    generic_ctx,
-                    limits,
-                    s,
-                    scratch,
-                )?,
-                None => decode_generic_bitmap(
-                    &mut dec,
-                    hgw,
-                    hgh,
-                    region.template,
-                    at,
-                    generic_ctx,
-                    limits,
-                    scratch,
-                )?,
-            };
-            planes.push(plane);
-        }
-        // Decoded MSB-first; reverse so `planes[j]` corresponds to bit `j`.
-        planes.reverse();
-    }
+        decode_arith_gray_planes(
+            region,
+            hbpp_usize,
+            skip.as_ref(),
+            generic_ctx,
+            limits,
+            scratch,
+        )?
+    };
+    // Decoded MSB-first; reverse so `planes[j]` corresponds to bit `j`.
+    planes.reverse();
 
-    // §6.6.5.2: render patterns. Convert each 32-cell word of the Gray-coded
-    // bitplanes to binary in parallel with word-wise XORs instead of probing
-    // every plane per cell.
-    let op = combination_operator(region.halftone_comb_operator);
-    let hgx = region.grid_x as i64;
-    let hgy = region.grid_y as i64;
-    let hrx = region.grid_vector_x as i64;
-    let hry = region.grid_vector_y as i64;
-    let last_index = num_patterns - 1;
-    let plane_stride = hgw.div_ceil(32) as usize;
-    // HBPP = ceil(log2(num_patterns)) <= 32, so a fixed stack array avoids a
-    // heap allocation per halftone region.
-    let mut bin_words = [0u32; 32];
-    let bin_slice = &mut bin_words[..hbpp_usize.min(32)];
-
-    for mg in 0..hgh {
-        let mg_i = mg as i64;
-        let mut x_fp = hgx + mg_i * hry;
-        let mut y_fp = hgy + mg_i * hrx;
-        for w_idx in 0..plane_stride {
-            if !bin_slice.is_empty() {
-                let top = bin_slice.len() - 1;
-                let mut acc = planes[top].row(mg)[w_idx];
-                bin_slice[top] = acc;
-                for j in (0..top).rev() {
-                    acc ^= planes[j].row(mg)[w_idx];
-                    bin_slice[j] = acc;
-                }
-            }
-            let cells = (hgw - (w_idx as u32) * 32).min(32);
-            for _ in 0..cells {
-                let mut value: u32 = 0;
-                for (j, bw) in bin_slice.iter_mut().enumerate() {
-                    value |= (*bw >> 31) << j;
-                    *bw <<= 1;
-                }
-                let idx = (value as usize).min(last_index);
-                let pattern = &patterns.patterns[idx];
-
-                let x = x_fp >> 8;
-                let y = y_fp >> 8;
-                x_fp += hrx;
-                y_fp -= hry;
-                let (xi, yi) = match (i32::try_from(x), i32::try_from(y)) {
-                    (Ok(xi), Ok(yi)) => (xi, yi),
-                    // Out of the i32 grid entirely: `combine` would clip it away.
-                    _ => continue,
-                };
-                htreg.combine(pattern, xi, yi, op);
-            }
-        }
-    }
+    render_gray_cells(&mut htreg, region, patterns, &planes, hbpp_usize);
 
     Ok(htreg)
 }

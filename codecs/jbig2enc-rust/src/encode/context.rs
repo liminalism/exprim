@@ -69,6 +69,77 @@ impl LineGroup {
     }
 }
 
+/// Groups a page's symbol instances, in (y, x) order, into text lines:
+/// each joins the first line that accepts it or starts a new one.
+fn group_into_lines(page: &PageData) -> Vec<LineGroup> {
+    let mut lines: Vec<LineGroup> = Vec::new();
+    let mut instances: Vec<LineInstance> = page
+        .symbol_instances
+        .iter()
+        .map(|instance| line_instance(instance.symbol_index, instance.position))
+        .collect();
+    instances.sort_unstable_by_key(|instance| (instance.y, instance.x));
+
+    for instance in instances {
+        if let Some(line) = lines.iter_mut().find(|line| line.can_accept(instance)) {
+            line.push(instance);
+        } else {
+            lines.push(LineGroup {
+                min_y: instance.y,
+                max_y: instance.y + instance.height,
+                instances: vec![instance],
+            });
+        }
+    }
+    lines
+}
+
+/// Records, for every instance of a line sorted by x, its occurrence, its
+/// left and right neighbour tokens, and whether it starts or ends a word.
+fn record_line_contexts(
+    line: &LineGroup,
+    bucket_keys: &[FamilyBucketKey],
+    symbol_contexts: &mut [SymbolContextStats],
+) {
+    for (idx, instance) in line.instances.iter().enumerate() {
+        let stats = &mut symbol_contexts[instance.symbol_index];
+        stats.occurrences += 1;
+
+        let left_gap = idx
+            .checked_sub(1)
+            .and_then(|i| line.instances.get(i))
+            .map(|left| {
+                bump_token(
+                    &mut stats.left_tokens,
+                    context_token(
+                        true,
+                        bucket_keys[left.symbol_index],
+                        spacing_bin(*instance, *left, true),
+                    ),
+                );
+                instance.x - (left.x + left.width)
+            });
+        let right_gap = line.instances.get(idx + 1).map(|right| {
+            bump_token(
+                &mut stats.right_tokens,
+                context_token(
+                    false,
+                    bucket_keys[right.symbol_index],
+                    spacing_bin(*instance, *right, false),
+                ),
+            );
+            right.x - (instance.x + instance.width)
+        });
+
+        if left_gap.is_none_or(|gap| gap >= word_gap_threshold(*instance)) {
+            stats.start_like += 1;
+        }
+        if right_gap.is_none_or(|gap| gap >= word_gap_threshold(*instance)) {
+            stats.end_like += 1;
+        }
+    }
+}
+
 pub fn build_symbol_context_model(
     pages: &[PageData],
     symbols: &[crate::jbig2sym::BitImage],
@@ -82,65 +153,10 @@ pub fn build_symbol_context_model(
     let mut symbol_contexts = vec![SymbolContextStats::default(); symbols.len()];
 
     for page in pages {
-        let mut lines: Vec<LineGroup> = Vec::new();
-        let mut instances: Vec<LineInstance> = page
-            .symbol_instances
-            .iter()
-            .map(|instance| line_instance(instance.symbol_index, instance.position))
-            .collect();
-        instances.sort_unstable_by_key(|instance| (instance.y, instance.x));
-
-        for instance in instances {
-            if let Some(line) = lines.iter_mut().find(|line| line.can_accept(instance)) {
-                line.push(instance);
-            } else {
-                lines.push(LineGroup {
-                    min_y: instance.y,
-                    max_y: instance.y + instance.height,
-                    instances: vec![instance],
-                });
-            }
-        }
-
+        let mut lines = group_into_lines(page);
         for line in &mut lines {
             line.instances.sort_unstable_by_key(|instance| instance.x);
-            for (idx, instance) in line.instances.iter().enumerate() {
-                let stats = &mut symbol_contexts[instance.symbol_index];
-                stats.occurrences += 1;
-
-                let left_gap = idx
-                    .checked_sub(1)
-                    .and_then(|i| line.instances.get(i))
-                    .map(|left| {
-                        bump_token(
-                            &mut stats.left_tokens,
-                            context_token(
-                                true,
-                                bucket_keys[left.symbol_index],
-                                spacing_bin(*instance, *left, true),
-                            ),
-                        );
-                        instance.x - (left.x + left.width)
-                    });
-                let right_gap = line.instances.get(idx + 1).map(|right| {
-                    bump_token(
-                        &mut stats.right_tokens,
-                        context_token(
-                            false,
-                            bucket_keys[right.symbol_index],
-                            spacing_bin(*instance, *right, false),
-                        ),
-                    );
-                    right.x - (instance.x + instance.width)
-                });
-
-                if left_gap.is_none_or(|gap| gap >= word_gap_threshold(*instance)) {
-                    stats.start_like += 1;
-                }
-                if right_gap.is_none_or(|gap| gap >= word_gap_threshold(*instance)) {
-                    stats.end_like += 1;
-                }
-            }
+            record_line_contexts(line, &bucket_keys, &mut symbol_contexts);
         }
     }
 

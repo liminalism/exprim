@@ -218,6 +218,27 @@ pub enum HuffmanValue {
     Oob,
 }
 
+/// Points every lookup-table slot whose leading bits are the code
+/// `cur_code` of length `cur_len` at sorted line `sorted_idx`.
+fn fill_lut_entries(
+    lut: &mut [u16; HUFF_LUT_SIZE],
+    cur_len: usize,
+    cur_code: u64,
+    sorted_idx: usize,
+) {
+    let shift = HUFF_LUT_BITS - cur_len;
+    let base = (cur_code as usize) << shift;
+    let fill = 1usize << shift;
+    let entry = ((cur_len as u16) << 8) | (sorted_idx as u16);
+    for slot in &mut lut[base..base + fill] {
+        // First matching code wins (matching the prior
+        // linear scan if a malformed table repeats codes).
+        if *slot == 0 {
+            *slot = entry;
+        }
+    }
+}
+
 impl HuffmanTable {
     /// Build a table from its lines, assigning canonical prefix codes (B.3).
     fn build(lines: Vec<RawLine>) -> Result<Self, DecodeError> {
@@ -241,39 +262,28 @@ impl HuffmanTable {
         let mut lut = [0u16; HUFF_LUT_SIZE];
         let mut codes = vec![0u32; lines.len()];
 
-        if len_max >= 1 {
-            // B.3 step 2/3: canonical first-code per length, populating both
-            // `codes` (in original line order) and `sorted_lines` (grouped by
-            // length for O(1)/O(L) decode).
-            for cur_len in 1..=len_max {
-                first_code[cur_len] =
-                    (first_code[cur_len - 1] + len_count[cur_len - 1] as u64) << 1;
-                len_offset[cur_len] = sorted_lines.len();
-                let mut cur_code = first_code[cur_len];
-                for (i, l) in lines.iter().enumerate() {
-                    if l.pref_len as usize == cur_len {
-                        let sorted_idx = sorted_lines.len();
-                        codes[i] = cur_code as u32;
-                        sorted_lines.push(*l);
-                        if cur_len <= HUFF_LUT_BITS
-                            && sorted_idx < HUFF_LUT_SIZE
-                            && cur_code < (1u64 << cur_len)
-                        {
-                            let shift = HUFF_LUT_BITS - cur_len;
-                            let base = (cur_code as usize) << shift;
-                            let fill = 1usize << shift;
-                            let entry = ((cur_len as u16) << 8) | (sorted_idx as u16);
-                            for slot in &mut lut[base..base + fill] {
-                                // First matching code wins (matching the prior
-                                // linear scan if a malformed table repeats codes).
-                                if *slot == 0 {
-                                    *slot = entry;
-                                }
-                            }
-                        }
-                        cur_code += 1;
-                    }
+        // B.3 step 2/3: canonical first-code per length, populating both
+        // `codes` (in original line order) and `sorted_lines` (grouped by
+        // length for O(1)/O(L) decode). With no prefix lengths there is
+        // nothing to assign.
+        for cur_len in 1..=len_max {
+            first_code[cur_len] = (first_code[cur_len - 1] + len_count[cur_len - 1] as u64) << 1;
+            len_offset[cur_len] = sorted_lines.len();
+            let mut cur_code = first_code[cur_len];
+            for (i, l) in lines.iter().enumerate() {
+                if l.pref_len as usize != cur_len {
+                    continue;
                 }
+                let sorted_idx = sorted_lines.len();
+                codes[i] = cur_code as u32;
+                sorted_lines.push(*l);
+                if cur_len <= HUFF_LUT_BITS
+                    && sorted_idx < HUFF_LUT_SIZE
+                    && cur_code < (1u64 << cur_len)
+                {
+                    fill_lut_entries(&mut lut, cur_len, cur_code, sorted_idx);
+                }
+                cur_code += 1;
             }
         }
         let has_oob = lines.iter().any(|l| l.kind == LineKind::Oob);
@@ -771,6 +781,23 @@ mod tests {
         assert_eq!(t.decode(&mut r).unwrap(), HuffmanValue::Oob);
     }
 
+    /// Asserts that code `a` of table B.`i` is not a prefix of any other.
+    fn assert_not_a_prefix(t: &HuffmanTable, i: u8, a: usize, la: &RawLine) {
+        for (b, lb) in t.lines.iter().enumerate() {
+            if a == b || lb.pref_len == 0 || la.pref_len > lb.pref_len {
+                continue;
+            }
+            // Is code[a] a prefix of code[b]?
+            let shift = lb.pref_len - la.pref_len;
+            if t.codes[b] >> shift == t.codes[a] && la.pref_len <= lb.pref_len {
+                assert!(
+                    !(la.pref_len < lb.pref_len || a == b),
+                    "table B.{i}: code {a} is a prefix of {b}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn all_standard_tables_build() {
         for i in 1u8..=15 {
@@ -780,19 +807,7 @@ mod tests {
                 if la.pref_len == 0 {
                     continue;
                 }
-                for (b, lb) in t.lines.iter().enumerate() {
-                    if a == b || lb.pref_len == 0 || la.pref_len > lb.pref_len {
-                        continue;
-                    }
-                    // Is code[a] a prefix of code[b]?
-                    let shift = lb.pref_len - la.pref_len;
-                    if t.codes[b] >> shift == t.codes[a] && la.pref_len <= lb.pref_len {
-                        assert!(
-                            !(la.pref_len < lb.pref_len || a == b),
-                            "table B.{i}: code {a} is a prefix of {b}"
-                        );
-                    }
-                }
+                assert_not_a_prefix(&t, i, a, la);
             }
         }
     }

@@ -183,6 +183,78 @@ fn bitimage_to_binary(img: &BitImage) -> Vec<u8> {
     binary
 }
 
+/// Writes an encoded stream to `output_file` and, when that works, decodes
+/// it with jbig2dec into `decoded_file`, reporting each step for `kind`
+/// (lower-case and title-case names).
+fn save_and_decode(kind: (&str, &str), output_file: &str, decoded_file: &str, data: &[u8]) {
+    let (lower, title) = kind;
+    if let Err(e) = std::fs::write(output_file, data) {
+        println!("⚠️  Warning: Could not save {} output: {}", lower, e);
+        return;
+    }
+    println!(
+        "📁 Saved {} output to: {} ({} bytes)",
+        lower,
+        output_file,
+        data.len()
+    );
+
+    // Test decoding with jbig2dec (standalone JBIG2 files)
+    let mut cmd = jbig2dec_command();
+    match cmd.args(["-o", decoded_file, output_file]).output() {
+        Ok(output) if output.status.success() => {
+            println!("✅ {} JBIG2 successfully decoded with jbig2dec", title);
+        }
+        Ok(output) => {
+            println!(
+                "❌ {} JBIG2 decode failed: {}",
+                title,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Err(e) => {
+            println!("⚠️  Could not run jbig2dec: {}", e);
+        }
+    }
+}
+
+/// DEBUG-ONLY PROBE: PDF mode fragments are NOT a valid standalone JBIG2
+/// file. Prints their sizes and, when `SAVE_PDF_PROBE` is set, saves their
+/// concatenation.
+fn probe_pdf_fragments(input: &[u8], width: u32, height: u32) {
+    let pdf_result = match encode_single_image(input, width, height, true) {
+        Ok(pdf_result) => pdf_result,
+        Err(e) => {
+            println!("🔧 PDF mode failed: {}", e);
+            return;
+        }
+    };
+    let page_len = pdf_result.page_data.len();
+    let Some(ref dict) = pdf_result.global_data else {
+        return;
+    };
+    println!(
+        "🔧 PDF mode: global_data = {} bytes, page_data = {} bytes",
+        dict.len(),
+        page_len
+    );
+
+    if std::env::var("SAVE_PDF_PROBE").is_err() {
+        return;
+    }
+    let mut combined_pdf = dict.clone();
+    combined_pdf.extend_from_slice(&pdf_result.page_data);
+    let test_file = "test_output_pdf_combined.jb2";
+    match std::fs::write(test_file, &combined_pdf) {
+        Ok(_) => println!(
+            "📁 Saved debug-only PDF probe: {} ({} bytes)",
+            test_file,
+            combined_pdf.len()
+        ),
+        Err(e) => println!("⚠️  Could not save PDF probe: {}", e),
+    }
+}
+
 /// Test lossless mode encoding
 fn test_lossless_mode(input: &[u8], width: u32, height: u32) -> EncodingStats {
     let mut stats = EncodingStats::new("Lossless Mode".to_string(), input.len());
@@ -198,36 +270,12 @@ fn test_lossless_mode(input: &[u8], width: u32, height: u32) -> EncodingStats {
             // Save the JBIG2 output to file for decoding verification
             let output_file = "test_output_lossless.jb2";
             let page_data = result.page_data.clone();
-            if let Err(e) = std::fs::write(output_file, &page_data) {
-                println!("⚠️  Warning: Could not save lossless output: {}", e);
-            } else {
-                println!(
-                    "📁 Saved lossless output to: {} ({} bytes)",
-                    output_file,
-                    page_data.len()
-                );
-
-                // Test decoding with jbig2dec (standalone JBIG2 files)
-                let mut cmd = jbig2dec_command();
-                match cmd
-                    .args(&["-o", "decoded_lossless.pbm", output_file])
-                    .output()
-                {
-                    Ok(output) => {
-                        if output.status.success() {
-                            println!("✅ Lossless JBIG2 successfully decoded with jbig2dec");
-                        } else {
-                            println!(
-                                "❌ Lossless JBIG2 decode failed: {}",
-                                String::from_utf8_lossy(&output.stderr)
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        println!("⚠️  Could not run jbig2dec: {}", e);
-                    }
-                }
-            }
+            save_and_decode(
+                ("lossless", "Lossless"),
+                output_file,
+                "decoded_lossless.pbm",
+                &page_data,
+            );
         }
         Err(e) => {
             let elapsed = start.elapsed().as_millis();
@@ -248,33 +296,7 @@ fn test_symbol_mode(input: &[u8], width: u32, height: u32) -> EncodingStats {
     // DEBUG-ONLY PROBE: PDF mode fragments are NOT a valid standalone JBIG2 file.
     // We inspect sizes; optional concatenation guarded by SAVE_PDF_PROBE env var.
     println!("🔧 DEBUG: Inspecting PDF-mode fragment sizes (not a standalone file)");
-    match encode_single_image(input, width, height, true) {
-        Ok(pdf_result) => {
-            let page_len = pdf_result.page_data.len();
-            if let Some(ref dict) = pdf_result.global_data {
-                println!(
-                    "🔧 PDF mode: global_data = {} bytes, page_data = {} bytes",
-                    dict.len(),
-                    page_len
-                );
-
-                if std::env::var("SAVE_PDF_PROBE").is_ok() {
-                    let mut combined_pdf = dict.clone();
-                    combined_pdf.extend_from_slice(&pdf_result.page_data);
-                    let test_file = "test_output_pdf_combined.jb2";
-                    match std::fs::write(test_file, &combined_pdf) {
-                        Ok(_) => println!(
-                            "📁 Saved debug-only PDF probe: {} ({} bytes)",
-                            test_file,
-                            combined_pdf.len()
-                        ),
-                        Err(e) => println!("⚠️  Could not save PDF probe: {}", e),
-                    }
-                }
-            }
-        }
-        Err(e) => println!("🔧 PDF mode failed: {}", e),
-    }
+    probe_pdf_fragments(input, width, height);
 
     // Now test standalone mode
     match encode_single_image(input, width, height, false) {
@@ -308,36 +330,12 @@ fn test_symbol_mode(input: &[u8], width: u32, height: u32) -> EncodingStats {
                 page_data
             };
 
-            if let Err(e) = std::fs::write(output_file, &complete_data) {
-                println!("⚠️  Warning: Could not save symbol output: {}", e);
-            } else {
-                println!(
-                    "📁 Saved symbol output to: {} ({} bytes)",
-                    output_file,
-                    complete_data.len()
-                );
-
-                // Test decoding with jbig2dec (standalone JBIG2 files)
-                let mut cmd = jbig2dec_command();
-                match cmd
-                    .args(&["-o", "decoded_symbol.pbm", output_file])
-                    .output()
-                {
-                    Ok(output) => {
-                        if output.status.success() {
-                            println!("✅ Symbol JBIG2 successfully decoded with jbig2dec");
-                        } else {
-                            println!(
-                                "❌ Symbol JBIG2 decode failed: {}",
-                                String::from_utf8_lossy(&output.stderr)
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        println!("⚠️  Could not run jbig2dec: {}", e);
-                    }
-                }
-            }
+            save_and_decode(
+                ("symbol", "Symbol"),
+                output_file,
+                "decoded_symbol.pbm",
+                &complete_data,
+            );
         }
         Err(e) => {
             let elapsed = start.elapsed().as_millis();
@@ -433,23 +431,26 @@ fn create_text_pattern() -> BitImage {
     // Repeat this pattern across the image
     for repeat_x in 0..6 {
         for repeat_y in 0..4 {
-            let base_x = repeat_x * 10;
-            let base_y = repeat_y * 8;
-
-            for (row, &pattern) in letter_pattern.iter().enumerate() {
-                for bit in 0..5 {
-                    let x = base_x + bit;
-                    let y = base_y + row;
-                    if x < 64 && y < 32 {
-                        let pixel = (pattern >> (4 - bit)) & 1 == 1;
-                        img.set(x as u32, y as u32, pixel);
-                    }
-                }
-            }
+            stamp_letter(&mut img, &letter_pattern, repeat_x * 10, repeat_y * 8);
         }
     }
 
     img
+}
+
+/// Draws the 5-pixel-wide letter rows at `(base_x, base_y)`, clipped to the
+/// 64x32 image.
+fn stamp_letter(img: &mut BitImage, letter_pattern: &[u32], base_x: usize, base_y: usize) {
+    for (row, &pattern) in letter_pattern.iter().enumerate() {
+        for bit in 0..5 {
+            let x = base_x + bit;
+            let y = base_y + row;
+            if x < 64 && y < 32 {
+                let pixel = (pattern >> (4 - bit)) & 1 == 1;
+                img.set(x as u32, y as u32, pixel);
+            }
+        }
+    }
 }
 
 /// Create a half black, half white image (minimal compression potential)
@@ -536,6 +537,114 @@ fn test_real_images() {
     }
 }
 
+/// Prints both modes' sizes, ratios and times and which is smaller and
+/// faster, or which mode failed.
+fn print_specified_summary(results: &ComparisonResults) {
+    let (Some(lossless), Some(symbol)) = (&results.lossless, &results.symbol) else {
+        return;
+    };
+    if !(lossless.success && symbol.success) {
+        println!("❌ One or both encoding modes failed!");
+        if !lossless.success {
+            println!("   Lossless error: {:?}", lossless.error_message);
+        }
+        if !symbol.success {
+            println!("   Symbol error: {:?}", symbol.error_message);
+        }
+        return;
+    }
+    println!("✅ Both encoding modes completed successfully!");
+    println!();
+    println!("📈 KEY METRICS:");
+    println!(
+        "   Lossless mode:  {} bytes, {:.2}x compression, {} ms",
+        lossless.total_output_size, lossless.compression_ratio, lossless.encoding_time_ms
+    );
+    println!(
+        "   Symbol mode:    {} bytes, {:.2}x compression, {} ms",
+        symbol.total_output_size, symbol.compression_ratio, symbol.encoding_time_ms
+    );
+
+    let size_savings = lossless.total_output_size as i64 - symbol.total_output_size as i64;
+    let size_percent = (size_savings as f64 / lossless.total_output_size as f64) * 100.0;
+
+    println!();
+    if size_savings > 0 {
+        println!(
+            "🏆 Symbol mode is BETTER: {} bytes smaller ({:.1}% reduction)",
+            size_savings, size_percent
+        );
+    } else if size_savings < 0 {
+        println!(
+            "🏆 Lossless mode is BETTER: {} bytes smaller ({:.1}% reduction)",
+            -size_savings, -size_percent
+        );
+    } else {
+        println!("🤝 Both modes produced identical output sizes");
+    }
+
+    if symbol.encoding_time_ms < lossless.encoding_time_ms {
+        println!(
+            "⚡ Symbol mode is FASTER by {} ms",
+            lossless.encoding_time_ms - symbol.encoding_time_ms
+        );
+    } else if symbol.encoding_time_ms > lossless.encoding_time_ms {
+        println!(
+            "⚡ Lossless mode is FASTER by {} ms",
+            symbol.encoding_time_ms - lossless.encoding_time_ms
+        );
+    } else {
+        println!("⚡ Both modes have identical encoding times");
+    }
+}
+
+/// Lists the PBM files in the current directory.
+fn list_pbm_files() {
+    let Ok(entries) = std::fs::read_dir(".") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.path().extension().is_some_and(|ext| ext == "pbm") {
+            println!("     Found: {}", entry.path().display());
+        }
+    }
+}
+
+/// Prints which mode produced the smaller output and which was faster.
+fn print_winners(results: &ComparisonResults) {
+    let (Some(lossless), Some(symbol)) = (&results.lossless, &results.symbol) else {
+        return;
+    };
+    if !(lossless.success && symbol.success) {
+        println!("  Status: One or both modes failed");
+        return;
+    }
+    let size_winner = if symbol.total_output_size < lossless.total_output_size {
+        "Symbol"
+    } else if symbol.total_output_size > lossless.total_output_size {
+        "Lossless"
+    } else {
+        "Tie"
+    };
+
+    let speed_winner = if symbol.encoding_time_ms < lossless.encoding_time_ms {
+        "Symbol"
+    } else if symbol.encoding_time_ms > lossless.encoding_time_ms {
+        "Lossless"
+    } else {
+        "Tie"
+    };
+
+    println!(
+        "  Size winner:  {} ({} vs {} bytes)",
+        size_winner, symbol.total_output_size, lossless.total_output_size
+    );
+    println!(
+        "  Speed winner: {} ({} vs {} ms)",
+        speed_winner, symbol.encoding_time_ms, lossless.encoding_time_ms
+    );
+}
+
 #[test]
 fn test_specified_image_only() {
     println!("\n🎯 FOCUSED TEST: USER-SPECIFIED IMAGE ONLY");
@@ -556,80 +665,14 @@ fn test_specified_image_only() {
         println!("\n📊 FINAL SUMMARY FOR SPECIFIED IMAGE");
         println!("=====================================");
 
-        if let (Some(lossless), Some(symbol)) = (&results.lossless, &results.symbol) {
-            if lossless.success && symbol.success {
-                println!("✅ Both encoding modes completed successfully!");
-                println!();
-                println!("📈 KEY METRICS:");
-                println!(
-                    "   Lossless mode:  {} bytes, {:.2}x compression, {} ms",
-                    lossless.total_output_size,
-                    lossless.compression_ratio,
-                    lossless.encoding_time_ms
-                );
-                println!(
-                    "   Symbol mode:    {} bytes, {:.2}x compression, {} ms",
-                    symbol.total_output_size, symbol.compression_ratio, symbol.encoding_time_ms
-                );
-
-                let size_savings =
-                    lossless.total_output_size as i64 - symbol.total_output_size as i64;
-                let size_percent =
-                    (size_savings as f64 / lossless.total_output_size as f64) * 100.0;
-
-                println!();
-                if size_savings > 0 {
-                    println!(
-                        "🏆 Symbol mode is BETTER: {} bytes smaller ({:.1}% reduction)",
-                        size_savings, size_percent
-                    );
-                } else if size_savings < 0 {
-                    println!(
-                        "🏆 Lossless mode is BETTER: {} bytes smaller ({:.1}% reduction)",
-                        -size_savings, -size_percent
-                    );
-                } else {
-                    println!("🤝 Both modes produced identical output sizes");
-                }
-
-                if symbol.encoding_time_ms < lossless.encoding_time_ms {
-                    println!(
-                        "⚡ Symbol mode is FASTER by {} ms",
-                        lossless.encoding_time_ms - symbol.encoding_time_ms
-                    );
-                } else if symbol.encoding_time_ms > lossless.encoding_time_ms {
-                    println!(
-                        "⚡ Lossless mode is FASTER by {} ms",
-                        symbol.encoding_time_ms - lossless.encoding_time_ms
-                    );
-                } else {
-                    println!("⚡ Both modes have identical encoding times");
-                }
-            } else {
-                println!("❌ One or both encoding modes failed!");
-                if !lossless.success {
-                    println!("   Lossless error: {:?}", lossless.error_message);
-                }
-                if !symbol.success {
-                    println!("   Symbol error: {:?}", symbol.error_message);
-                }
-            }
-        }
+        print_specified_summary(&results);
     } else {
         println!(
             "❌ ERROR: Specified test image not found - {}",
             test_image2_path
         );
         println!("   Current directory contents:");
-        if let Ok(entries) = std::fs::read_dir(".") {
-            for entry in entries.flatten() {
-                if let Some(ext) = entry.path().extension() {
-                    if ext == "pbm" {
-                        println!("     Found: {}", entry.path().display());
-                    }
-                }
-            }
-        }
+        list_pbm_files();
     }
 }
 
@@ -691,36 +734,7 @@ fn test_comprehensive_comparison() {
 
     for (name, results) in all_results.iter() {
         println!("\n{}", name);
-        if let (Some(lossless), Some(symbol)) = (&results.lossless, &results.symbol) {
-            if lossless.success && symbol.success {
-                let size_winner = if symbol.total_output_size < lossless.total_output_size {
-                    "Symbol"
-                } else if symbol.total_output_size > lossless.total_output_size {
-                    "Lossless"
-                } else {
-                    "Tie"
-                };
-
-                let speed_winner = if symbol.encoding_time_ms < lossless.encoding_time_ms {
-                    "Symbol"
-                } else if symbol.encoding_time_ms > lossless.encoding_time_ms {
-                    "Lossless"
-                } else {
-                    "Tie"
-                };
-
-                println!(
-                    "  Size winner:  {} ({} vs {} bytes)",
-                    size_winner, symbol.total_output_size, lossless.total_output_size
-                );
-                println!(
-                    "  Speed winner: {} ({} vs {} ms)",
-                    speed_winner, symbol.encoding_time_ms, lossless.encoding_time_ms
-                );
-            } else {
-                println!("  Status: One or both modes failed");
-            }
-        }
+        print_winners(results);
     }
 
     println!("{}", "=".repeat(80));

@@ -30,7 +30,9 @@ pub use symbol::types::SymbolInstance;
 use crate::jbig2arith::Jbig2ArithCoder;
 use crate::jbig2classify::SymbolSignature;
 #[cfg(feature = "symboldict")]
-use crate::jbig2classify::{family_bucket_key_for_symbol, family_bucket_neighbors};
+use crate::jbig2classify::{
+    FamilyBucketKey, family_bucket_key_for_symbol, family_bucket_neighbors,
+};
 #[cfg(feature = "symboldict")]
 use crate::jbig2comparator::Comparator;
 // Symbol extraction using CC analysis
@@ -246,6 +248,113 @@ pub struct Jbig2Encoder<'a> {
     trial_memo: Option<std::sync::Mutex<symbol::memo::TrialMemo>>,
 }
 
+/// Per-page state of symbol ingest: matching scratch, debug switches and
+/// log, the component count, the unification anchor map and counters.
+#[cfg(feature = "symboldict")]
+struct PageIngest {
+    page_num: usize,
+    comparator: Comparator,
+    debug_matching: bool,
+    no_reuse: bool,
+    debug_lines: Vec<String>,
+    cc_index: usize,
+    sym_unify_anchor_map: Option<FxHashMap<FamilyBucketKey, Vec<usize>>>,
+    initial_anchor_count: usize,
+    initial_anchor_bytes: usize,
+    counters: SymUnifyIngestCounters,
+}
+
+/// How a page's components were coded under symbol unification, and why
+/// anchors rejected them.
+#[cfg(feature = "symboldict")]
+#[derive(Default)]
+struct SymUnifyIngestCounters {
+    recent_hits: usize,
+    anchor_hits: usize,
+    bucket_hits: usize,
+    new_symbols: usize,
+    anchor_score_rejects: usize,
+    anchor_outside_rejects: usize,
+    anchor_compare_rejects: usize,
+    anchor_overlap_rejects: usize,
+}
+
+/// The symbols used on the current text line, most recent first, with a
+/// scratch copy to iterate while matching and the line's last y.
+#[cfg(feature = "symboldict")]
+struct RecentSymbols {
+    cache: RecentSymbolCache,
+    candidates: [usize; RECENT_SYMBOL_CACHE_CAP],
+    last_y: u32,
+}
+
+/// One connected component prepared for matching: its bitmap, trimmed
+/// bitmap and offset, signature, ink, page position and match tolerance.
+#[cfg(feature = "symboldict")]
+struct PageComponent {
+    symbol: BitImage,
+    trimmed: BitImage,
+    trim_offset: Rect,
+    signature: SymbolSignature,
+    pixel_count: usize,
+    rect: Rect,
+    max_err: u32,
+}
+
+/// Which search found a component's match.
+#[cfg(feature = "symboldict")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatchSource {
+    Recent,
+    Anchor,
+    Bucket,
+}
+
+/// A known symbol a component is coded as: the compare error (the
+/// assignment score for an anchor), the offset and the refinement need.
+#[cfg(feature = "symboldict")]
+struct ComponentMatch {
+    symbol_index: usize,
+    source: MatchSource,
+    err_or_score: u32,
+    dx: i32,
+    dy: i32,
+    needs_refinement: bool,
+}
+
+/// Writes the page 0 matching log to `jbig2_debug_page0.log`, ignoring
+/// I/O failures.
+#[cfg(feature = "symboldict")]
+fn write_matching_log(debug_lines: &[String]) {
+    let log_path = std::path::Path::new("jbig2_debug_page0.log");
+    let Ok(mut f) = std::fs::File::create(log_path) else {
+        return;
+    };
+    use std::io::Write;
+    for line in debug_lines {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
+/// The `hash_key` dimension buckets within `dim_range` of `(h, w)`,
+/// height-major; offsets that wrap below zero land far out of range and are
+/// skipped.
+pub(crate) fn dimension_bucket_keys(
+    h: u64,
+    w: u64,
+    dim_range: u64,
+) -> impl Iterator<Item = HashKey> {
+    (0..=(dim_range * 2))
+        .map(move |dh_off| h.wrapping_add(dh_off).wrapping_sub(dim_range))
+        .filter(|&dh| dh < 10_000)
+        .flat_map(move |dh| {
+            (0..=(dim_range * 2))
+                .map(move |dw_off| w.wrapping_add(dw_off).wrapping_sub(dim_range))
+                .filter(|&dw| dw < 10_000)
+                .map(move |dw| HashKey(dh * 10_000 + dw))
+        })
+}
+
 impl<'a> Jbig2Encoder<'a> {
     /// Creates a new JBIG2 encoder with the specified configuration
     ///
@@ -350,22 +459,10 @@ impl<'a> Jbig2Encoder<'a> {
         self.add_page_bitimage(bitimage)
     }
 
-    // `add_page_bitimage` (~546 lines) is the per-page symbol-extraction and
-    // matching loop. Its body threads a dozen mutable locals — `comparator`,
-    // `debug_lines`, `cc_index`, `symbol_instances`, `instance_bitmap`,
-    // `recent_cache`, `sym_unify_anchor_map`, and the `sym_unify_*` counters —
-    // through three nested match searches (recent-cache, anchor, hash-bucket)
-    // that share early-exit control flow (`matched`, labelled `break`s).
-    // Splitting it into helper methods would mean passing all of that state
-    // across function boundaries via a dozen `&mut` parameters or a new
-    // carrier struct, for a bit-exact encoder where a subtle slip would only
-    // surface as silently different output bytes. That risk is not worth the
-    // line-count savings here — this is the second documented exception to
-    // the ~1000-line target called out in REFACTOR_JBIG2ENC.md (alongside
-    // `plan_document` in `symbol/planning.rs`). It must also stay in `mod.rs`
-    // as a `pub fn`: external integration test crates call it directly on
-    // `Jbig2Encoder`, and `mod symbol` is a private module, so relocating it
-    // there would make it externally unreachable.
+    // `add_page_bitimage` must stay in `mod.rs` as a `pub fn`: external
+    // integration test crates call it directly on `Jbig2Encoder`, and
+    // `mod symbol` is a private module, so relocating it there would make
+    // it externally unreachable.
     pub fn add_page_bitimage(&mut self, bitimage: BitImage) -> Result<()> {
         self.config
             .validate_exact_symbol_mode()
@@ -379,593 +476,596 @@ impl<'a> Jbig2Encoder<'a> {
         {
             return self.add_page_exact_symbols(bitimage);
         }
-        #[cfg(feature = "symboldict")]
-        let page_num = self.pages.len();
         self.page_symbol_indices.push(Vec::new());
+        // Extract symbols if symbol mode is enabled
+        let extract_symbols = self.config.symbol_mode && self.state.segment;
         #[cfg(feature = "symboldict")]
-        let mut symbol_instances = Vec::new();
+        let symbol_instances = self.ingest_page_symbols(&bitimage, extract_symbols);
+        // Without `symboldict` there is no symbol extraction to enable.
+        #[cfg(not(feature = "symboldict"))]
+        let _ = extract_symbols;
         #[cfg(not(feature = "symboldict"))]
         let symbol_instances = Vec::new();
-        #[cfg(feature = "symboldict")]
-        let mut comparator = Comparator::default();
-        #[cfg(feature = "symboldict")]
-        let debug_matching =
-            page_num == 0 && std::env::var("JBIG2_DEBUG").map_or(false, |v| v == "1");
-        #[cfg(feature = "symboldict")]
-        let no_reuse = std::env::var("JBIG2_NO_REUSE").map_or(false, |v| v == "1");
-
-        #[cfg(feature = "symboldict")]
-        let mut debug_lines: Vec<String> = Vec::new();
-        #[cfg(feature = "symboldict")]
-        if debug_matching {
-            debug_lines.push("=== PAGE 0 MATCHING LOG ===".to_string());
-            debug_lines.push(format!("Image: {}x{}", bitimage.width, bitimage.height));
-        }
-        #[cfg(feature = "symboldict")]
-        let mut cc_index = 0usize;
-        #[cfg(feature = "symboldict")]
-        let mut sym_unify_anchor_map = (self.config.lossy_symbol_mode
-            == LossySymbolMode::SymbolUnify
-            && !self.global_symbols.is_empty())
-        .then(|| self.build_sym_unify_anchor_map(page_num));
-        #[cfg(feature = "symboldict")]
-        let sym_unify_initial_anchor_count = sym_unify_anchor_map
-            .as_ref()
-            .map(|anchors| anchors.values().map(Vec::len).sum::<usize>())
-            .unwrap_or(0);
-        #[cfg(feature = "symboldict")]
-        let sym_unify_initial_anchor_bytes = sym_unify_anchor_map
-            .as_ref()
-            .map(|anchors| anchor_map_dictionary_bytes(&self.global_symbols, anchors))
-            .unwrap_or(0);
-        #[cfg(feature = "symboldict")]
-        let mut sym_unify_recent_hits = 0usize;
-        #[cfg(feature = "symboldict")]
-        let mut sym_unify_anchor_hits = 0usize;
-        #[cfg(feature = "symboldict")]
-        let mut sym_unify_bucket_hits = 0usize;
-        #[cfg(feature = "symboldict")]
-        let mut sym_unify_new_symbols = 0usize;
-        #[cfg(feature = "symboldict")]
-        let mut sym_unify_anchor_score_rejects = 0usize;
-        #[cfg(feature = "symboldict")]
-        let mut sym_unify_anchor_outside_rejects = 0usize;
-        #[cfg(feature = "symboldict")]
-        let mut sym_unify_anchor_compare_rejects = 0usize;
-        #[cfg(feature = "symboldict")]
-        let mut sym_unify_anchor_overlap_rejects = 0usize;
-
-        // Extract symbols if symbol mode is enabled
-        if self.config.symbol_mode && self.state.segment {
-            #[cfg(feature = "symboldict")]
-            {
-                let dpi = 300; // Default DPI
-                let losslevel =
-                    if self.config.symbol_mode || self.config.uses_lossy_symbol_dictionary() {
-                        0
-                    } else if self.config.is_lossless {
-                        0
-                    } else {
-                        1
-                    };
-                let cc_start = Instant::now();
-                let cc_image = analyze_page(&bitimage, dpi, losslevel);
-                let extracted = cc_image.extract_shape_refs();
-                self.metrics.symbol_stats.input_components += extracted.len();
-                self.metrics.symbol_mode.cc_extraction += cc_start.elapsed();
-
-                // Check if symbol extraction makes sense for this image
-                // If we only get one symbol that covers the entire image,
-                // it's better to use generic region encoding
-                let should_use_symbols = if extracted.len() == 1 {
-                    let bbox = extracted[0].bbox;
-                    !(bbox.xmin == 0
-                        && bbox.ymin == 0
-                        && bbox.width() as usize >= bitimage.width.saturating_sub(2)
-                        && bbox.height() as usize >= bitimage.height.saturating_sub(2))
-                } else {
-                    !extracted.is_empty()
-                };
-
-                if should_use_symbols {
-                    let matching_start = Instant::now();
-                    let mut recent_cache = RecentSymbolCache::new(RECENT_SYMBOL_CACHE_CAP);
-                    let mut recent_candidates = [0usize; RECENT_SYMBOL_CACHE_CAP];
-                    let mut last_y = 0u32;
-
-                    for shape in extracted {
-                        if Self::should_skip_symbol_candidate(
-                            shape.bbox.width().max(0) as usize,
-                            shape.bbox.height().max(0) as usize,
-                            shape.black_pixels,
-                        ) || shape.run_count == 0
-                        {
-                            continue;
-                        }
-                        let Some(symbol) = cc_image.get_bitmap_for_cc(shape.ccid) else {
-                            continue;
-                        };
-                        let (trim_offset, trimmed) = symbol.trim();
-                        let pixel_count = trimmed.count_ones();
-                        if Self::should_skip_symbol_candidate(
-                            trimmed.width,
-                            trimmed.height,
-                            pixel_count,
-                        ) {
-                            continue;
-                        }
-
-                        // The CC bbox is the bounding box from CC analysis.
-                        // trim() may remove whitespace rows/cols from the symbol.
-                        // Adjust position by trim offset so the dictionary bitmap
-                        // renders at the correct location on the page.
-                        let rect = Rect {
-                            x: shape.bbox.xmin as u32 + trim_offset.x,
-                            y: shape.bbox.ymin as u32 + trim_offset.y,
-                            width: trimmed.width as u32,
-                            height: trimmed.height as u32,
-                        };
-                        if rect.y > last_y.saturating_add(24) {
-                            recent_cache.clear();
-                        }
-                        last_y = rect.y;
-
-                        // Only unification's family test reads the hole count;
-                        // a new symbol gets its complete signature below.
-                        let trimmed_sig = if self.config.lossy_symbol_mode
-                            == LossySymbolMode::SymbolUnify
-                        {
-                            Self::compute_symbol_signature(&trimmed)
-                        } else {
-                            crate::jbig2classify::compute_symbol_signature_without_holes(&trimmed)
-                        };
-                        let mut matched = false;
-                        let mut instance_bitmap = Some(symbol);
-
-                        // Error tolerance for matching.
-                        let area = (trimmed.width * trimmed.height) as u32;
-                        let max_err = if self.config.text_refine {
-                            (area / self.config.match_tolerance).max(3)
-                        } else {
-                            ((area as f32 * 0.05) as u32).max(2)
-                        };
-
-                        if !matched && !no_reuse {
-                            let recent_len = recent_cache.copy_into(&mut recent_candidates);
-                            'recent_search: for &idx in &recent_candidates[..recent_len] {
-                                if let Some((err, dx, dy, needs_refinement)) = self
-                                    .evaluate_symbol_match(
-                                        &trimmed,
-                                        trimmed_sig,
-                                        pixel_count,
-                                        idx,
-                                        &mut comparator,
-                                        max_err,
-                                    )
-                                {
-                                    if debug_matching {
-                                        let mode = if needs_refinement {
-                                            "REFINE"
-                                        } else if err == 0 && dx == 0 && dy == 0 {
-                                            "EXACT "
-                                        } else {
-                                            "LOSSY "
-                                        };
-                                        let proto = &self.global_symbols[idx];
-                                        debug_lines.push(format!(
-                                            "CC#{:04} {} pos=({},{}) {}x{} → proto#{} {}x{} err={} dx={} dy={} [recent]",
-                                            cc_index,
-                                            mode,
-                                            rect.x,
-                                            rect.y,
-                                            rect.width,
-                                            rect.height,
-                                            idx,
-                                            proto.width,
-                                            proto.height,
-                                            err,
-                                            dx,
-                                            dy
-                                        ));
-                                    }
-
-                                    self.symbol_usage[idx] += 1;
-                                    self.note_symbol_page(idx, page_num);
-                                    symbol_instances.push(SymbolInstance {
-                                        symbol_index: idx,
-                                        position: rect,
-                                        instance_bitmap: instance_bitmap.take().unwrap(),
-                                        needs_refinement,
-                                        refinement_dx: if needs_refinement { dx } else { 0 },
-                                        refinement_dy: if needs_refinement { dy } else { 0 },
-                                    });
-                                    recent_cache.touch(idx);
-                                    if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify
-                                    {
-                                        sym_unify_recent_hits += 1;
-                                    }
-                                    matched = true;
-                                    break 'recent_search;
-                                }
-                            }
-                        }
-
-                        if !matched
-                            && !no_reuse
-                            && self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify
-                        {
-                            if let Some(anchor_map) = sym_unify_anchor_map.as_mut() {
-                                let anchor_key =
-                                    family_bucket_key_for_symbol(&trimmed, &trimmed_sig);
-                                let mut visited = FxHashSet::default();
-                                let mut exact_examined = 0usize;
-                                if let Some(bucket) = anchor_map.get(&anchor_key) {
-                                    'anchor_search_exact: for &idx in bucket {
-                                        if exact_examined >= SYM_UNIFY_EXACT_ANCHOR_BUDGET {
-                                            break 'anchor_search_exact;
-                                        }
-                                        exact_examined += 1;
-                                        if !visited.insert(idx) {
-                                            continue;
-                                        }
-                                        let decision = self.evaluate_symbol_unify_anchor_match(
-                                            &trimmed,
-                                            trimmed_sig,
-                                            pixel_count,
-                                            idx,
-                                            &mut comparator,
-                                        );
-                                        let (score, dx, dy) = match decision {
-                                            SymUnifyAnchorDecision::Accept { score, dx, dy } => {
-                                                (score, dx, dy)
-                                            }
-                                            SymUnifyAnchorDecision::RejectScore { .. } => {
-                                                sym_unify_anchor_score_rejects += 1;
-                                                continue;
-                                            }
-                                            SymUnifyAnchorDecision::RejectOutsideInk => {
-                                                sym_unify_anchor_outside_rejects += 1;
-                                                continue;
-                                            }
-                                            SymUnifyAnchorDecision::RejectCompare => {
-                                                sym_unify_anchor_compare_rejects += 1;
-                                                continue;
-                                            }
-                                            SymUnifyAnchorDecision::RejectOverlap => {
-                                                sym_unify_anchor_overlap_rejects += 1;
-                                                continue;
-                                            }
-                                            _ => continue,
-                                        };
-
-                                        if debug_matching {
-                                            let proto = &self.global_symbols[idx];
-                                            debug_lines.push(format!(
-                                                "CC#{:04} UNIFY  pos=({},{}) {}x{} → proto#{} {}x{} score={} dx={} dy={} [anchor]",
-                                                cc_index,
-                                                rect.x,
-                                                rect.y,
-                                                rect.width,
-                                                rect.height,
-                                                idx,
-                                                proto.width,
-                                                proto.height,
-                                                score,
-                                                dx,
-                                                dy
-                                            ));
-                                        }
-
-                                        self.symbol_usage[idx] += 1;
-                                        self.note_symbol_page(idx, page_num);
-                                        self.maybe_add_sym_unify_anchor(anchor_map, idx, page_num);
-                                        symbol_instances.push(SymbolInstance {
-                                            symbol_index: idx,
-                                            position: rect,
-                                            instance_bitmap: instance_bitmap.take().unwrap(),
-                                            needs_refinement: false,
-                                            refinement_dx: 0,
-                                            refinement_dy: 0,
-                                        });
-                                        recent_cache.touch(idx);
-                                        sym_unify_anchor_hits += 1;
-                                        matched = true;
-                                        break;
-                                    }
-                                }
-
-                                if !matched {
-                                    let mut neighbor_examined = 0usize;
-                                    'anchor_search_neighbors: for neighbor in
-                                        family_bucket_neighbors(anchor_key)
-                                    {
-                                        if neighbor == anchor_key {
-                                            continue;
-                                        }
-                                        let Some(bucket) = anchor_map.get(&neighbor) else {
-                                            continue;
-                                        };
-                                        for &idx in bucket {
-                                            if neighbor_examined >= SYM_UNIFY_NEIGHBOR_ANCHOR_BUDGET
-                                            {
-                                                break 'anchor_search_neighbors;
-                                            }
-                                            neighbor_examined += 1;
-                                            if !visited.insert(idx) {
-                                                continue;
-                                            }
-                                            let decision = self.evaluate_symbol_unify_anchor_match(
-                                                &trimmed,
-                                                trimmed_sig,
-                                                pixel_count,
-                                                idx,
-                                                &mut comparator,
-                                            );
-                                            let (score, dx, dy) = match decision {
-                                                SymUnifyAnchorDecision::Accept {
-                                                    score,
-                                                    dx,
-                                                    dy,
-                                                } => (score, dx, dy),
-                                                SymUnifyAnchorDecision::RejectScore { .. } => {
-                                                    sym_unify_anchor_score_rejects += 1;
-                                                    continue;
-                                                }
-                                                SymUnifyAnchorDecision::RejectOutsideInk => {
-                                                    sym_unify_anchor_outside_rejects += 1;
-                                                    continue;
-                                                }
-                                                SymUnifyAnchorDecision::RejectCompare => {
-                                                    sym_unify_anchor_compare_rejects += 1;
-                                                    continue;
-                                                }
-                                                SymUnifyAnchorDecision::RejectOverlap => {
-                                                    sym_unify_anchor_overlap_rejects += 1;
-                                                    continue;
-                                                }
-                                                _ => continue,
-                                            };
-
-                                            if debug_matching {
-                                                let proto = &self.global_symbols[idx];
-                                                debug_lines.push(format!(
-                                                    "CC#{:04} UNIFY  pos=({},{}) {}x{} → proto#{} {}x{} score={} dx={} dy={} [anchor]",
-                                                    cc_index,
-                                                    rect.x,
-                                                    rect.y,
-                                                    rect.width,
-                                                    rect.height,
-                                                    idx,
-                                                    proto.width,
-                                                    proto.height,
-                                                    score,
-                                                    dx,
-                                                    dy
-                                                ));
-                                            }
-
-                                            self.symbol_usage[idx] += 1;
-                                            self.note_symbol_page(idx, page_num);
-                                            self.maybe_add_sym_unify_anchor(
-                                                anchor_map, idx, page_num,
-                                            );
-                                            symbol_instances.push(SymbolInstance {
-                                                symbol_index: idx,
-                                                position: rect,
-                                                instance_bitmap: instance_bitmap.take().unwrap(),
-                                                needs_refinement: false,
-                                                refinement_dx: 0,
-                                                refinement_dy: 0,
-                                            });
-                                            recent_cache.touch(idx);
-                                            sym_unify_anchor_hits += 1;
-                                            matched = true;
-                                            break 'anchor_search_neighbors;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if !matched && !no_reuse {
-                            let h = trimmed.height as u64;
-                            let w = trimmed.width as u64;
-                            let dim_range: u64 = if self.config.text_refine { 2 } else { 0 };
-
-                            'bucket_search: for dh_off in 0..=(dim_range * 2) {
-                                let dh = h.wrapping_add(dh_off).wrapping_sub(dim_range);
-                                if dh >= 10_000 {
-                                    continue;
-                                }
-                                for dw_off in 0..=(dim_range * 2) {
-                                    let dw = w.wrapping_add(dw_off).wrapping_sub(dim_range);
-                                    if dw >= 10_000 {
-                                        continue;
-                                    }
-
-                                    let nk = HashKey(dh * 10_000 + dw);
-                                    if let Some(bucket) = self.hash_map.get(&nk) {
-                                        let bucket_len = bucket.len();
-                                        let bucket_ptr = bucket.as_ptr();
-                                        for bucket_pos in 0..bucket_len {
-                                            let idx = unsafe { *bucket_ptr.add(bucket_pos) };
-                                            let Some((err, dx, dy, needs_refinement)) = self
-                                                .evaluate_symbol_match(
-                                                    &trimmed,
-                                                    trimmed_sig,
-                                                    pixel_count,
-                                                    idx,
-                                                    &mut comparator,
-                                                    max_err,
-                                                )
-                                            else {
-                                                continue;
-                                            };
-
-                                            if debug_matching {
-                                                let mode = if needs_refinement {
-                                                    "REFINE"
-                                                } else if err == 0 && dx == 0 && dy == 0 {
-                                                    "EXACT "
-                                                } else {
-                                                    "LOSSY "
-                                                };
-                                                let proto = &self.global_symbols[idx];
-                                                debug_lines.push(format!(
-                                                    "CC#{:04} {} pos=({},{}) {}x{} → proto#{} {}x{} err={} dx={} dy={}",
-                                                    cc_index,
-                                                    mode,
-                                                    rect.x,
-                                                    rect.y,
-                                                    rect.width,
-                                                    rect.height,
-                                                    idx,
-                                                    proto.width,
-                                                    proto.height,
-                                                    err,
-                                                    dx,
-                                                    dy
-                                                ));
-                                            }
-
-                                            self.symbol_usage[idx] += 1;
-                                            self.note_symbol_page(idx, page_num);
-                                            if let Some(anchor_map) = sym_unify_anchor_map.as_mut()
-                                            {
-                                                self.maybe_add_sym_unify_anchor(
-                                                    anchor_map, idx, page_num,
-                                                );
-                                            }
-                                            symbol_instances.push(SymbolInstance {
-                                                symbol_index: idx,
-                                                position: rect,
-                                                instance_bitmap: instance_bitmap.take().unwrap(),
-                                                needs_refinement,
-                                                refinement_dx: if needs_refinement {
-                                                    dx
-                                                } else {
-                                                    0
-                                                },
-                                                refinement_dy: if needs_refinement {
-                                                    dy
-                                                } else {
-                                                    0
-                                                },
-                                            });
-                                            recent_cache.touch(idx);
-                                            if self.config.lossy_symbol_mode
-                                                == LossySymbolMode::SymbolUnify
-                                            {
-                                                sym_unify_bucket_hits += 1;
-                                            }
-                                            matched = true;
-                                            break 'bucket_search;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if !matched {
-                            let signature =
-                                if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify {
-                                    trimmed_sig
-                                } else {
-                                    crate::jbig2classify::with_hole_count(trimmed_sig, &trimmed)
-                                };
-                            let idx = self.push_symbol_with_signature(
-                                trimmed,
-                                pixel_count,
-                                page_num,
-                                signature,
-                            );
-                            self.metrics.symbol_stats.symbols_discovered += 1;
-                            if debug_matching {
-                                debug_lines.push(format!(
-                                    "CC#{:04} NEW    pos=({},{}) {}x{} trim_off=({},{}) → new proto#{} {}x{}",
-                                    cc_index, rect.x, rect.y, rect.width, rect.height,
-                                    trim_offset.x, trim_offset.y,
-                                    idx, self.global_symbols[idx].width, self.global_symbols[idx].height
-                                ));
-                            }
-                            let key = hash_key(&self.global_symbols[idx]);
-                            self.hash_map.entry(key).or_default().push(idx);
-                            if let Some(anchor_map) = sym_unify_anchor_map.as_mut() {
-                                self.maybe_add_sym_unify_anchor(anchor_map, idx, page_num);
-                            }
-                            symbol_instances.push(SymbolInstance {
-                                symbol_index: idx,
-                                position: rect,
-                                instance_bitmap: instance_bitmap.take().unwrap(),
-                                needs_refinement: false,
-                                refinement_dx: 0,
-                                refinement_dy: 0,
-                            });
-                            recent_cache.touch(idx);
-                            if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify {
-                                sym_unify_new_symbols += 1;
-                            }
-                        }
-                        cc_index += 1;
-                    }
-                    self.metrics.symbol_mode.matching_dedup += matching_start.elapsed();
-                }
-            }
-        }
-
-        // Write page 0 matching debug log
-        #[cfg(feature = "symboldict")]
-        if debug_matching && !debug_lines.is_empty() {
-            debug_lines.push(format!(
-                "\nTotal CCs: {}, Instances: {}",
-                cc_index,
-                symbol_instances.len()
-            ));
-            let log_path = std::path::Path::new("jbig2_debug_page0.log");
-            if let Ok(mut f) = std::fs::File::create(log_path) {
-                use std::io::Write;
-                for line in &debug_lines {
-                    let _ = writeln!(f, "{}", line);
-                }
-            }
-        }
-
-        #[cfg(feature = "symboldict")]
-        if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify
-            && encoder_diagnostics_enabled()
-        {
-            let final_anchor_count = sym_unify_anchor_map
-                .as_ref()
-                .map(|anchors| anchors.values().map(Vec::len).sum::<usize>())
-                .unwrap_or(0);
-            let final_anchor_bytes = sym_unify_anchor_map
-                .as_ref()
-                .map(|anchors| anchor_map_dictionary_bytes(&self.global_symbols, anchors))
-                .unwrap_or(0);
-            self.state.ingest_debug_lines.push(format!(
-                "sym_unify ingest page={}: cc={} recent_hits={} anchor_hits={} bucket_hits={} new_symbols={} initial_anchors={} final_anchors={} initial_anchor_bytes={} final_anchor_bytes={} anchor_score_rejects={} anchor_outside_rejects={} anchor_compare_rejects={} anchor_overlap_rejects={}",
-                page_num + 1,
-                cc_index,
-                sym_unify_recent_hits,
-                sym_unify_anchor_hits,
-                sym_unify_bucket_hits,
-                sym_unify_new_symbols,
-                sym_unify_initial_anchor_count,
-                final_anchor_count,
-                sym_unify_initial_anchor_bytes,
-                final_anchor_bytes,
-                sym_unify_anchor_score_rejects,
-                sym_unify_anchor_outside_rejects,
-                sym_unify_anchor_compare_rejects,
-                sym_unify_anchor_overlap_rejects,
-            ));
-        }
 
         self.pages.push(PageData {
             image: bitimage,
             symbol_instances,
         });
         Ok(())
+    }
+
+    /// Extracts the page's symbols when `extract_symbols`, matching each
+    /// against the symbols seen so far, writes the page 0 matching log and the
+    /// unification ingest diagnostics, and returns the page's symbol instances.
+    #[cfg(feature = "symboldict")]
+    fn ingest_page_symbols(
+        &mut self,
+        bitimage: &BitImage,
+        extract_symbols: bool,
+    ) -> Vec<SymbolInstance> {
+        let page_num = self.pages.len();
+        let mut symbol_instances = Vec::new();
+        let mut ingest = self.begin_page_ingest(page_num, bitimage);
+
+        if extract_symbols {
+            self.match_page_components(bitimage, &mut ingest, &mut symbol_instances);
+        }
+
+        // Write page 0 matching debug log
+        if ingest.debug_matching && !ingest.debug_lines.is_empty() {
+            ingest.debug_lines.push(format!(
+                "\nTotal CCs: {}, Instances: {}",
+                ingest.cc_index,
+                symbol_instances.len()
+            ));
+            write_matching_log(&ingest.debug_lines);
+        }
+
+        if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify
+            && encoder_diagnostics_enabled()
+        {
+            self.record_ingest_diagnostics(&ingest);
+        }
+        symbol_instances
+    }
+
+    /// Sets up a page's ingest: the debug switches, the matching log header
+    /// and, under unification, the anchor map of the symbols seen so far.
+    #[cfg(feature = "symboldict")]
+    fn begin_page_ingest(&self, page_num: usize, bitimage: &BitImage) -> PageIngest {
+        let debug_matching =
+            page_num == 0 && std::env::var("JBIG2_DEBUG").map_or(false, |v| v == "1");
+        let no_reuse = std::env::var("JBIG2_NO_REUSE").map_or(false, |v| v == "1");
+
+        let mut debug_lines: Vec<String> = Vec::new();
+        if debug_matching {
+            debug_lines.push("=== PAGE 0 MATCHING LOG ===".to_string());
+            debug_lines.push(format!("Image: {}x{}", bitimage.width, bitimage.height));
+        }
+        let sym_unify_anchor_map = (self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify
+            && !self.global_symbols.is_empty())
+        .then(|| self.build_sym_unify_anchor_map(page_num));
+        let initial_anchor_count = sym_unify_anchor_map
+            .as_ref()
+            .map(|anchors| anchors.values().map(Vec::len).sum::<usize>())
+            .unwrap_or(0);
+        let initial_anchor_bytes = sym_unify_anchor_map
+            .as_ref()
+            .map(|anchors| anchor_map_dictionary_bytes(&self.global_symbols, anchors))
+            .unwrap_or(0);
+        PageIngest {
+            page_num,
+            comparator: Comparator::default(),
+            debug_matching,
+            no_reuse,
+            debug_lines,
+            cc_index: 0,
+            sym_unify_anchor_map,
+            initial_anchor_count,
+            initial_anchor_bytes,
+            counters: SymUnifyIngestCounters::default(),
+        }
+    }
+
+    /// Runs connected-component analysis on the page and, unless the page
+    /// is one solid component, ingests every component as a symbol.
+    #[cfg(feature = "symboldict")]
+    fn match_page_components(
+        &mut self,
+        bitimage: &BitImage,
+        ingest: &mut PageIngest,
+        symbol_instances: &mut Vec<SymbolInstance>,
+    ) {
+        let dpi = 300; // Default DPI
+        let losslevel = if self.config.symbol_mode || self.config.uses_lossy_symbol_dictionary() {
+            0
+        } else if self.config.is_lossless {
+            0
+        } else {
+            1
+        };
+        let cc_start = Instant::now();
+        let cc_image = analyze_page(bitimage, dpi, losslevel);
+        let extracted = cc_image.extract_shape_refs();
+        self.metrics.symbol_stats.input_components += extracted.len();
+        self.metrics.symbol_mode.cc_extraction += cc_start.elapsed();
+
+        // Check if symbol extraction makes sense for this image
+        // If we only get one symbol that covers the entire image,
+        // it's better to use generic region encoding
+        let should_use_symbols = if extracted.len() == 1 {
+            let bbox = extracted[0].bbox;
+            !(bbox.xmin == 0
+                && bbox.ymin == 0
+                && bbox.width() as usize >= bitimage.width.saturating_sub(2)
+                && bbox.height() as usize >= bitimage.height.saturating_sub(2))
+        } else {
+            !extracted.is_empty()
+        };
+        if !should_use_symbols {
+            return;
+        }
+
+        let matching_start = Instant::now();
+        let mut recent = RecentSymbols {
+            cache: RecentSymbolCache::new(RECENT_SYMBOL_CACHE_CAP),
+            candidates: [0usize; RECENT_SYMBOL_CACHE_CAP],
+            last_y: 0,
+        };
+        for shape in extracted {
+            let Some(component) = self.page_component(&cc_image, &shape, &mut recent) else {
+                continue;
+            };
+            match self.find_component_match(&component, ingest, &mut recent) {
+                Some(found) => self.record_component_match(
+                    found,
+                    component,
+                    ingest,
+                    &mut recent,
+                    symbol_instances,
+                ),
+                None => self.record_new_symbol(component, ingest, &mut recent, symbol_instances),
+            }
+            ingest.cc_index += 1;
+        }
+        self.metrics.symbol_mode.matching_dedup += matching_start.elapsed();
+    }
+
+    /// Cuts one connected component out of the page, trimmed and placed,
+    /// with its signature and match tolerance; `None` for a component too
+    /// small or too thin to be a symbol. A component far below the previous
+    /// one starts a new line and clears the recent-symbol cache.
+    #[cfg(feature = "symboldict")]
+    fn page_component(
+        &self,
+        cc_image: &crate::jbig2cc::CCImage,
+        shape: &crate::jbig2cc::ShapeRef,
+        recent: &mut RecentSymbols,
+    ) -> Option<PageComponent> {
+        if Self::should_skip_symbol_candidate(
+            shape.bbox.width().max(0) as usize,
+            shape.bbox.height().max(0) as usize,
+            shape.black_pixels,
+        ) || shape.run_count == 0
+        {
+            return None;
+        }
+        let symbol = cc_image.get_bitmap_for_cc(shape.ccid)?;
+        let (trim_offset, trimmed) = symbol.trim();
+        let pixel_count = trimmed.count_ones();
+        if Self::should_skip_symbol_candidate(trimmed.width, trimmed.height, pixel_count) {
+            return None;
+        }
+
+        // The CC bbox is the bounding box from CC analysis.
+        // trim() may remove whitespace rows/cols from the symbol.
+        // Adjust position by trim offset so the dictionary bitmap
+        // renders at the correct location on the page.
+        let rect = Rect {
+            x: shape.bbox.xmin as u32 + trim_offset.x,
+            y: shape.bbox.ymin as u32 + trim_offset.y,
+            width: trimmed.width as u32,
+            height: trimmed.height as u32,
+        };
+        if rect.y > recent.last_y.saturating_add(24) {
+            recent.cache.clear();
+        }
+        recent.last_y = rect.y;
+
+        // Only unification's family test reads the hole count;
+        // a new symbol gets its complete signature below.
+        let signature = if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify {
+            Self::compute_symbol_signature(&trimmed)
+        } else {
+            crate::jbig2classify::compute_symbol_signature_without_holes(&trimmed)
+        };
+
+        // Error tolerance for matching.
+        let area = (trimmed.width * trimmed.height) as u32;
+        let max_err = if self.config.text_refine {
+            (area / self.config.match_tolerance).max(3)
+        } else {
+            ((area as f32 * 0.05) as u32).max(2)
+        };
+        Some(PageComponent {
+            symbol,
+            trimmed,
+            trim_offset,
+            signature,
+            pixel_count,
+            rect,
+            max_err,
+        })
+    }
+
+    /// Looks for a known symbol to code the component as: first among the
+    /// recently used symbols, then among the unification anchors, then in
+    /// the dimension buckets of every symbol.
+    #[cfg(feature = "symboldict")]
+    fn find_component_match(
+        &mut self,
+        component: &PageComponent,
+        ingest: &mut PageIngest,
+        recent: &mut RecentSymbols,
+    ) -> Option<ComponentMatch> {
+        if ingest.no_reuse {
+            return None;
+        }
+        let recent_len = recent.cache.copy_into(&mut recent.candidates);
+        for &idx in &recent.candidates[..recent_len] {
+            if let Some(found) =
+                self.symbol_match(component, idx, MatchSource::Recent, &mut ingest.comparator)
+            {
+                return Some(found);
+            }
+        }
+
+        if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify
+            && let Some(anchor_map) = ingest.sym_unify_anchor_map.as_ref()
+            && let Some(found) = self.find_anchor_match(
+                component,
+                anchor_map,
+                &mut ingest.comparator,
+                &mut ingest.counters,
+            )
+        {
+            return Some(found);
+        }
+
+        let h = component.trimmed.height as u64;
+        let w = component.trimmed.width as u64;
+        let dim_range: u64 = if self.config.text_refine { 2 } else { 0 };
+        for nk in dimension_bucket_keys(h, w, dim_range) {
+            let Some(bucket) = self.hash_map.get(&nk) else {
+                continue;
+            };
+            let bucket_len = bucket.len();
+            let bucket_ptr = bucket.as_ptr();
+            for bucket_pos in 0..bucket_len {
+                let idx = unsafe { *bucket_ptr.add(bucket_pos) };
+                if let Some(found) =
+                    self.symbol_match(component, idx, MatchSource::Bucket, &mut ingest.comparator)
+                {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// Evaluates one known symbol as a match for the component.
+    #[cfg(feature = "symboldict")]
+    #[inline(always)]
+    fn symbol_match(
+        &mut self,
+        component: &PageComponent,
+        idx: usize,
+        source: MatchSource,
+        comparator: &mut Comparator,
+    ) -> Option<ComponentMatch> {
+        let (err, dx, dy, needs_refinement) = self.evaluate_symbol_match(
+            &component.trimmed,
+            component.signature,
+            component.pixel_count,
+            idx,
+            comparator,
+            component.max_err,
+        )?;
+        Some(ComponentMatch {
+            symbol_index: idx,
+            source,
+            err_or_score: err,
+            dx,
+            dy,
+            needs_refinement,
+        })
+    }
+
+    /// Searches the unification anchors in the component's family bucket,
+    /// then in its neighbouring buckets, each within its budget, counting
+    /// the rejects by reason.
+    #[cfg(feature = "symboldict")]
+    fn find_anchor_match(
+        &mut self,
+        component: &PageComponent,
+        anchor_map: &FxHashMap<FamilyBucketKey, Vec<usize>>,
+        comparator: &mut Comparator,
+        counters: &mut SymUnifyIngestCounters,
+    ) -> Option<ComponentMatch> {
+        let anchor_key = family_bucket_key_for_symbol(&component.trimmed, &component.signature);
+        let mut visited = FxHashSet::default();
+        let mut exact_examined = 0usize;
+        if let Some(bucket) = anchor_map.get(&anchor_key) {
+            for &idx in bucket {
+                if exact_examined >= SYM_UNIFY_EXACT_ANCHOR_BUDGET {
+                    break;
+                }
+                exact_examined += 1;
+                if !visited.insert(idx) {
+                    continue;
+                }
+                if let Some(found) = self.anchor_match(component, idx, comparator, counters) {
+                    return Some(found);
+                }
+            }
+        }
+
+        let mut neighbor_examined = 0usize;
+        for neighbor in family_bucket_neighbors(anchor_key) {
+            if neighbor == anchor_key {
+                continue;
+            }
+            let Some(bucket) = anchor_map.get(&neighbor) else {
+                continue;
+            };
+            for &idx in bucket {
+                if neighbor_examined >= SYM_UNIFY_NEIGHBOR_ANCHOR_BUDGET {
+                    return None;
+                }
+                neighbor_examined += 1;
+                if !visited.insert(idx) {
+                    continue;
+                }
+                if let Some(found) = self.anchor_match(component, idx, comparator, counters) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// Evaluates one anchor for the component, counting a reject by reason.
+    #[cfg(feature = "symboldict")]
+    fn anchor_match(
+        &mut self,
+        component: &PageComponent,
+        idx: usize,
+        comparator: &mut Comparator,
+        counters: &mut SymUnifyIngestCounters,
+    ) -> Option<ComponentMatch> {
+        let decision = self.evaluate_symbol_unify_anchor_match(
+            &component.trimmed,
+            component.signature,
+            component.pixel_count,
+            idx,
+            comparator,
+        );
+        let (score, dx, dy) = match decision {
+            SymUnifyAnchorDecision::Accept { score, dx, dy } => (score, dx, dy),
+            SymUnifyAnchorDecision::RejectScore { .. } => {
+                counters.anchor_score_rejects += 1;
+                return None;
+            }
+            SymUnifyAnchorDecision::RejectOutsideInk => {
+                counters.anchor_outside_rejects += 1;
+                return None;
+            }
+            SymUnifyAnchorDecision::RejectCompare => {
+                counters.anchor_compare_rejects += 1;
+                return None;
+            }
+            SymUnifyAnchorDecision::RejectOverlap => {
+                counters.anchor_overlap_rejects += 1;
+                return None;
+            }
+            _ => return None,
+        };
+        Some(ComponentMatch {
+            symbol_index: idx,
+            source: MatchSource::Anchor,
+            err_or_score: score,
+            dx,
+            dy,
+            needs_refinement: false,
+        })
+    }
+
+    /// Codes the component as the matched symbol: counts the use, records
+    /// the page, grows the anchor map, and adds the instance.
+    #[cfg(feature = "symboldict")]
+    fn record_component_match(
+        &mut self,
+        found: ComponentMatch,
+        component: PageComponent,
+        ingest: &mut PageIngest,
+        recent: &mut RecentSymbols,
+        symbol_instances: &mut Vec<SymbolInstance>,
+    ) {
+        let idx = found.symbol_index;
+        if ingest.debug_matching {
+            let line = self.matching_debug_line(&found, &component.rect, ingest.cc_index);
+            ingest.debug_lines.push(line);
+        }
+
+        self.symbol_usage[idx] += 1;
+        self.note_symbol_page(idx, ingest.page_num);
+        if found.source != MatchSource::Recent
+            && let Some(anchor_map) = ingest.sym_unify_anchor_map.as_mut()
+        {
+            self.maybe_add_sym_unify_anchor(anchor_map, idx, ingest.page_num);
+        }
+        let needs_refinement = found.needs_refinement;
+        symbol_instances.push(SymbolInstance {
+            symbol_index: idx,
+            position: component.rect,
+            instance_bitmap: component.symbol,
+            needs_refinement,
+            refinement_dx: if needs_refinement { found.dx } else { 0 },
+            refinement_dy: if needs_refinement { found.dy } else { 0 },
+        });
+        recent.cache.touch(idx);
+        let unify = self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify;
+        match found.source {
+            MatchSource::Recent if unify => ingest.counters.recent_hits += 1,
+            MatchSource::Anchor => ingest.counters.anchor_hits += 1,
+            MatchSource::Bucket if unify => ingest.counters.bucket_hits += 1,
+            MatchSource::Recent | MatchSource::Bucket => {}
+        }
+    }
+
+    /// The page 0 matching log line for a matched component.
+    #[cfg(feature = "symboldict")]
+    fn matching_debug_line(&self, found: &ComponentMatch, rect: &Rect, cc_index: usize) -> String {
+        let idx = found.symbol_index;
+        let proto = &self.global_symbols[idx];
+        let (err, dx, dy) = (found.err_or_score, found.dx, found.dy);
+        if found.source == MatchSource::Anchor {
+            return format!(
+                "CC#{:04} UNIFY  pos=({},{}) {}x{} → proto#{} {}x{} score={} dx={} dy={} [anchor]",
+                cc_index,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                idx,
+                proto.width,
+                proto.height,
+                err,
+                dx,
+                dy
+            );
+        }
+        let mode = if found.needs_refinement {
+            "REFINE"
+        } else if err == 0 && dx == 0 && dy == 0 {
+            "EXACT "
+        } else {
+            "LOSSY "
+        };
+        let suffix = if found.source == MatchSource::Recent {
+            " [recent]"
+        } else {
+            ""
+        };
+        format!(
+            "CC#{:04} {} pos=({},{}) {}x{} → proto#{} {}x{} err={} dx={} dy={}{}",
+            cc_index,
+            mode,
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            idx,
+            proto.width,
+            proto.height,
+            err,
+            dx,
+            dy,
+            suffix
+        )
+    }
+
+    /// Stores an unmatched component as a new symbol and adds its instance.
+    #[cfg(feature = "symboldict")]
+    fn record_new_symbol(
+        &mut self,
+        component: PageComponent,
+        ingest: &mut PageIngest,
+        recent: &mut RecentSymbols,
+        symbol_instances: &mut Vec<SymbolInstance>,
+    ) {
+        let PageComponent {
+            symbol,
+            trimmed,
+            trim_offset,
+            signature: trimmed_sig,
+            pixel_count,
+            rect,
+            ..
+        } = component;
+        let page_num = ingest.page_num;
+        let signature = if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify {
+            trimmed_sig
+        } else {
+            crate::jbig2classify::with_hole_count(trimmed_sig, &trimmed)
+        };
+        let idx = self.push_symbol_with_signature(trimmed, pixel_count, page_num, signature);
+        self.metrics.symbol_stats.symbols_discovered += 1;
+        if ingest.debug_matching {
+            ingest.debug_lines.push(format!(
+                "CC#{:04} NEW    pos=({},{}) {}x{} trim_off=({},{}) → new proto#{} {}x{}",
+                ingest.cc_index,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                trim_offset.x,
+                trim_offset.y,
+                idx,
+                self.global_symbols[idx].width,
+                self.global_symbols[idx].height
+            ));
+        }
+        let key = hash_key(&self.global_symbols[idx]);
+        self.hash_map.entry(key).or_default().push(idx);
+        if let Some(anchor_map) = ingest.sym_unify_anchor_map.as_mut() {
+            self.maybe_add_sym_unify_anchor(anchor_map, idx, page_num);
+        }
+        symbol_instances.push(SymbolInstance {
+            symbol_index: idx,
+            position: rect,
+            instance_bitmap: symbol,
+            needs_refinement: false,
+            refinement_dx: 0,
+            refinement_dy: 0,
+        });
+        recent.cache.touch(idx);
+        if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify {
+            ingest.counters.new_symbols += 1;
+        }
+    }
+
+    /// Logs the page's unification ingest counters and anchor growth.
+    #[cfg(feature = "symboldict")]
+    fn record_ingest_diagnostics(&mut self, ingest: &PageIngest) {
+        let final_anchor_count = ingest
+            .sym_unify_anchor_map
+            .as_ref()
+            .map(|anchors| anchors.values().map(Vec::len).sum::<usize>())
+            .unwrap_or(0);
+        let final_anchor_bytes = ingest
+            .sym_unify_anchor_map
+            .as_ref()
+            .map(|anchors| anchor_map_dictionary_bytes(&self.global_symbols, anchors))
+            .unwrap_or(0);
+        let counters = &ingest.counters;
+        self.state.ingest_debug_lines.push(format!(
+            "sym_unify ingest page={}: cc={} recent_hits={} anchor_hits={} bucket_hits={} new_symbols={} initial_anchors={} final_anchors={} initial_anchor_bytes={} final_anchor_bytes={} anchor_score_rejects={} anchor_outside_rejects={} anchor_compare_rejects={} anchor_overlap_rejects={}",
+            ingest.page_num + 1,
+            ingest.cc_index,
+            counters.recent_hits,
+            counters.anchor_hits,
+            counters.bucket_hits,
+            counters.new_symbols,
+            ingest.initial_anchor_count,
+            final_anchor_count,
+            ingest.initial_anchor_bytes,
+            final_anchor_bytes,
+            counters.anchor_score_rejects,
+            counters.anchor_outside_rejects,
+            counters.anchor_compare_rejects,
+            counters.anchor_overlap_rejects,
+        ));
     }
 
     pub fn collect_symbols(&mut self, roi: &Array2<u8>) -> Result<()> {
@@ -1183,11 +1283,12 @@ pub fn hash_key(img: &BitImage) -> HashKey {
 pub fn first_black_pixel(image: &BitImage) -> Option<(usize, usize)> {
     for y in 0..image.height {
         for (word_index, &word) in image.row_words(y).iter().enumerate() {
-            if word != 0 {
-                let x = word_index * 32 + word.leading_zeros() as usize;
-                if x < image.width {
-                    return Some((x, y));
-                }
+            if word == 0 {
+                continue;
+            }
+            let x = word_index * 32 + word.leading_zeros() as usize;
+            if x < image.width {
+                return Some((x, y));
             }
         }
     }

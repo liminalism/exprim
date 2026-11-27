@@ -214,6 +214,86 @@ struct ArithRegisters {
     data: Vec<u8>, // Output data
 }
 
+/// Logs a generic region's size, packed length and first black pixel.
+#[cfg(debug_assertions)]
+fn log_generic_region_input(packed: &[u32], width: usize, height: usize, template: u8) {
+    log::debug!(
+        "encode_generic_region_inner: {}x{}, template={}",
+        width,
+        height,
+        template
+    );
+    log::debug!(
+        "  packed data: {} words ({} bytes), expected {} words for {}x{} bitmap",
+        packed.len(),
+        packed.len() * 4,
+        ((width + 31) / 32) * height,
+        width,
+        height
+    );
+
+    if let Some(idx) = packed.iter().position(|w| *w != 0) {
+        let first_bit = (idx * 32) + (31 - packed[idx].leading_zeros() as usize);
+        let row = first_bit / width;
+        let col = first_bit % width;
+        log::debug!(
+            "first black pixel according to Rust packer: ({}, {})",
+            col,
+            row
+        );
+    } else {
+        log::debug!("packed data all zero - no black pixels");
+    }
+
+    if template == 0 {
+        log::debug!("Using Template 0 (Standard 16-pixel context)");
+    }
+}
+
+/// Adds `uses` to the debug histogram entry of `context`.
+#[cfg(debug_assertions)]
+#[inline]
+fn count_context_uses(
+    context_distribution: &mut HashMap<usize, usize>,
+    context: usize,
+    uses: usize,
+) {
+    *context_distribution.entry(context).or_insert(0) += uses;
+}
+
+/// Logs, once per tenth of the region, the context histogram since the last
+/// report, then clears it.
+#[cfg(debug_assertions)]
+fn report_encoding_progress(
+    y: usize,
+    height: usize,
+    last_reported_progress: &mut i32,
+    context_distribution: &mut HashMap<usize, usize>,
+) {
+    let progress = (y as i32 * 10) / height as i32;
+    if progress <= *last_reported_progress {
+        return;
+    }
+    *last_reported_progress = progress;
+    let unique_contexts = context_distribution.len();
+    let total_samples: usize = context_distribution.values().sum();
+    let avg_occurrences = if unique_contexts > 0 {
+        total_samples / unique_contexts
+    } else {
+        0
+    };
+
+    log::debug!(
+        "Progress: {}% - Line {}/{} - Contexts: {} unique (avg {:.1} uses/context)",
+        progress * 10,
+        y,
+        height,
+        unique_contexts,
+        avg_occurrences as f32
+    );
+    context_distribution.clear();
+}
+
 impl Jbig2ArithCoder {
     #[inline(always)]
     fn encode_bit_with_state_idx(&mut self, state_idx: usize, d: bool) -> usize {
@@ -633,39 +713,7 @@ impl Jbig2ArithCoder {
         }
 
         #[cfg(debug_assertions)]
-        {
-            log::debug!(
-                "encode_generic_region_inner: {}x{}, template={}",
-                width,
-                height,
-                template
-            );
-            log::debug!(
-                "  packed data: {} words ({} bytes), expected {} words for {}x{} bitmap",
-                packed.len(),
-                packed.len() * 4,
-                ((width + 31) / 32) * height,
-                width,
-                height
-            );
-
-            if let Some(idx) = packed.iter().position(|w| *w != 0) {
-                let first_bit = (idx * 32) + (31 - packed[idx].leading_zeros() as usize);
-                let row = first_bit / width;
-                let col = first_bit % width;
-                log::debug!(
-                    "first black pixel according to Rust packer: ({}, {})",
-                    col,
-                    row
-                );
-            } else {
-                log::debug!("packed data all zero - no black pixels");
-            }
-
-            if template == 0 {
-                log::debug!("Using Template 0 (Standard 16-pixel context)");
-            }
-        }
+        log_generic_region_input(packed, width, height, template);
 
         let words_per_row = (width + 31) / 32;
 
@@ -678,29 +726,12 @@ impl Jbig2ArithCoder {
         let registers = &mut self.registers;
         for y in 0..height {
             #[cfg(debug_assertions)]
-            {
-                let progress = (y as i32 * 10) / height as i32;
-                if progress > last_reported_progress {
-                    last_reported_progress = progress;
-                    let unique_contexts = context_distribution.len();
-                    let total_samples: usize = context_distribution.values().sum();
-                    let avg_occurrences = if unique_contexts > 0 {
-                        total_samples / unique_contexts
-                    } else {
-                        0
-                    };
-
-                    log::debug!(
-                        "Progress: {}% - Line {}/{} - Contexts: {} unique (avg {:.1} uses/context)",
-                        progress * 10,
-                        y,
-                        height,
-                        unique_contexts,
-                        avg_occurrences as f32
-                    );
-                    context_distribution.clear();
-                }
-            }
+            report_encoding_progress(
+                y,
+                height,
+                &mut last_reported_progress,
+                &mut context_distribution,
+            );
 
             let row = &packed[y * words_per_row..(y + 1) * words_per_row];
             let prev1 = if y > 0 {
@@ -744,9 +775,7 @@ impl Jbig2ArithCoder {
                 if context == 0 && pixels == 0 && (above1 >> 32) == 0 && (above2 >> 32) == 0 {
                     registers.encode_zero_run(&mut contexts[0], count);
                     #[cfg(debug_assertions)]
-                    {
-                        *context_distribution.entry(0).or_insert(0) += count;
-                    }
+                    count_context_uses(&mut context_distribution, 0, count);
                     continue;
                 }
                 for _ in 0..count {
@@ -754,9 +783,7 @@ impl Jbig2ArithCoder {
                     let state = &mut contexts[context as usize];
                     registers.encode_bitmap_bit(state, pixel != 0);
                     #[cfg(debug_assertions)]
-                    {
-                        *context_distribution.entry(context as usize).or_insert(0) += 1;
-                    }
+                    count_context_uses(&mut context_distribution, context as usize, 1);
                     context = ((context << 1) & 0xf7ee)
                         | ((above2 >> 52) as u16 & 0x0800)
                         | ((above1 >> 59) as u16 & 0x0010)
@@ -768,9 +795,7 @@ impl Jbig2ArithCoder {
             }
 
             #[cfg(debug_assertions)]
-            {
-                log::trace!("Finished encoding line {}/{}", y + 1, height);
-            }
+            log::trace!("Finished encoding line {}/{}", y + 1, height);
         }
 
         Ok(())
@@ -786,6 +811,37 @@ impl Jbig2ArithCoder {
         at: &[(i8, i8); 4],
     ) -> Result<(), String> {
         const STATIC: [(i8, i8); 6] = [(-1, -2), (0, -2), (1, -2), (-2, -1), (-1, -1), (0, -1)];
+
+        /// The AT pixel at offset `(dx, dy)` from `(x, y)` as the decoder reads
+        /// it: from the coded part of the current line, or from earlier lines.
+        fn verify_at_pixel(
+            width: usize,
+            y: usize,
+            static_buf: &[bool],
+            current_buf: &[bool],
+            x: i32,
+            (dx, dy): (i8, i8),
+        ) -> bool {
+            let xx = x + dx as i32;
+            let yy = y as i32 + dy as i32;
+            if yy == y as i32 {
+                if xx < 0 || xx >= x {
+                    false
+                } else {
+                    current_buf[xx as usize]
+                }
+            } else if yy == y as i32 - 1 {
+                if xx < 0 || xx >= width as i32 || yy < 0 {
+                    false
+                } else {
+                    static_buf[yy as usize * width + xx as usize]
+                }
+            } else if yy < 0 || xx < 0 || xx >= width as i32 || yy >= y as i32 {
+                false
+            } else {
+                static_buf[yy as usize * width + xx as usize]
+            }
+        }
 
         let mut idx = 0;
         for x in 0..width as i32 {
@@ -806,26 +862,8 @@ impl Jbig2ArithCoder {
             }
 
             // four AT pixels
-            for (dx, dy) in at {
-                let xx = x + *dx as i32;
-                let yy = y as i32 + *dy as i32;
-                let bit = if yy == y as i32 {
-                    if xx < 0 || xx >= x {
-                        false
-                    } else {
-                        current_buf[xx as usize]
-                    }
-                } else if yy == y as i32 - 1 {
-                    if xx < 0 || xx >= width as i32 || yy < 0 {
-                        false
-                    } else {
-                        static_buf[yy as usize * width + xx as usize]
-                    }
-                } else if yy < 0 || xx < 0 || xx >= width as i32 || yy >= y as i32 {
-                    false
-                } else {
-                    static_buf[yy as usize * width + xx as usize]
-                };
+            for &(dx, dy) in at {
+                let bit = verify_at_pixel(width, y, static_buf, current_buf, x, (dx, dy));
                 cx |= (bit as usize) << bp;
                 bp += 1;
             }
@@ -1300,6 +1338,22 @@ mod refinement_window_timing {
         image
     }
 
+    /// A copy of `reference` with each pixel flipped with probability 1/50.
+    fn flip_about_one_in_fifty(seed: &mut u64, reference: &BitImage) -> BitImage {
+        let mut target = reference.clone();
+        for y in 0..reference.height {
+            for x in 0..reference.width {
+                *seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                if (*seed >> 33).is_multiple_of(50) {
+                    target.set_usize(x, y, !target.get_usize(x, y));
+                }
+            }
+        }
+        target
+    }
+
     /// `cargo test --release --lib refinement_window_timing -- --ignored --nocapture`
     #[test]
     #[ignore = "timing comparison of the windowed and per-pixel refinement coders"]
@@ -1310,17 +1364,7 @@ mod refinement_window_timing {
         let pairs: Vec<(BitImage, BitImage)> = (0..2000)
             .map(|_| {
                 let reference = glyph(&mut seed, 31, 37);
-                let mut target = reference.clone();
-                for y in 0..37 {
-                    for x in 0..31 {
-                        seed = seed
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(1442695040888963407);
-                        if (seed >> 33).is_multiple_of(50) {
-                            target.set_usize(x, y, !target.get_usize(x, y));
-                        }
-                    }
-                }
+                let target = flip_about_one_in_fifty(&mut seed, &reference);
                 (target, reference)
             })
             .collect();

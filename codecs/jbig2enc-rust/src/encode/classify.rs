@@ -57,6 +57,10 @@ pub(crate) fn with_hole_count(mut signature: SymbolSignature, img: &BitImage) ->
 /// Every signature field except `hole_count`, which is left zero. Only
 /// [`family_signatures_are_compatible`] reads the hole count, so matching that
 /// does not use it can skip the background scan.
+#[allow(
+    clippy::excessive_nesting,
+    reason = "per-black-pixel kernel: walks the set bits of each packed row word and updates the bounds, centroid sums and half masses for every pixel, once per extracted component"
+)]
 pub(crate) fn compute_symbol_signature_without_holes(img: &BitImage) -> SymbolSignature {
     let mut black = 0u32;
     let mut left_col = img.width;
@@ -147,6 +151,47 @@ pub(crate) fn count_enclosed_white_components_4(img: &BitImage) -> usize {
     count_white_components(img, false)
 }
 
+/// Joins the components of white runs `i` and `j` under the lower root;
+/// the joined component touches the border if either part did.
+fn union_white_runs(parent: &mut [u32], border: &mut [bool], i: u32, j: u32) {
+    let a = find_root(parent, i);
+    let b = find_root(parent, j);
+    if a == b {
+        return;
+    }
+    let (keep, drop) = if a < b { (a, b) } else { (b, a) };
+    parent[drop as usize] = keep;
+    border[keep as usize] |= border[drop as usize];
+}
+
+/// Joins the components of every pair of touching white runs in two
+/// consecutive rows, walking both sorted rows in one merge-like pass; a
+/// joined component touches the border if either part did.
+fn join_touching_white_runs(
+    runs: &[(u32, u32)],
+    parent: &mut [u32],
+    border: &mut [bool],
+    previous: std::ops::Range<usize>,
+    current: std::ops::Range<usize>,
+    slack: usize,
+) {
+    let (mut i, mut j) = (previous.start, current.start);
+    while i < previous.end && j < current.end {
+        let (a_start, a_end) = runs[i];
+        let (b_start, b_end) = runs[j];
+        if (a_start as usize) < b_end as usize + slack
+            && (b_start as usize) < a_end as usize + slack
+        {
+            union_white_runs(parent, border, i as u32, j as u32);
+        }
+        if a_end <= b_end {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+}
+
 /// Counts white components that do not touch the bitmap border.
 ///
 /// `diagonals` selects 8-connectivity for the background; otherwise it is
@@ -188,27 +233,14 @@ fn count_white_components(img: &BitImage, diagonals: bool) -> usize {
         }
         let current = first..runs.len();
 
-        let (mut i, mut j) = (previous.start, current.start);
-        while i < previous.end && j < current.end {
-            let (a_start, a_end) = runs[i];
-            let (b_start, b_end) = runs[j];
-            if (a_start as usize) < b_end as usize + slack
-                && (b_start as usize) < a_end as usize + slack
-            {
-                let a = find_root(&mut parent, i as u32);
-                let b = find_root(&mut parent, j as u32);
-                if a != b {
-                    let (keep, drop) = if a < b { (a, b) } else { (b, a) };
-                    parent[drop as usize] = keep;
-                    border[keep as usize] |= border[drop as usize];
-                }
-            }
-            if a_end <= b_end {
-                i += 1;
-            } else {
-                j += 1;
-            }
-        }
+        join_touching_white_runs(
+            &runs,
+            &mut parent,
+            &mut border,
+            previous,
+            current.clone(),
+            slack,
+        );
         previous = current;
     }
 
@@ -341,21 +373,19 @@ pub fn estimate_symbol_scale_profile(
 
 pub fn family_bucket_neighbors(key: FamilyBucketKey) -> Vec<FamilyBucketKey> {
     let mut out = Vec::with_capacity(27);
-    for dh in -1i32..=1 {
-        for dw in -1i32..=1 {
-            for dd in -1i32..=1 {
-                let candidate = FamilyBucketKey {
-                    w_bin: (key.w_bin as i32 + dw).max(0) as u16,
-                    h_bin: (key.h_bin as i32 + dh).max(0) as u16,
-                    density_bin: (key.density_bin as i32 + dd).clamp(0, 15) as u8,
-                    aspect_bin: key.aspect_bin,
-                    centroid_y_bin: key.centroid_y_bin,
-                    lr_balance_bin: key.lr_balance_bin,
-                };
-                if !out.contains(&candidate) {
-                    out.push(candidate);
-                }
-            }
+    let offsets = (-1i32..=1)
+        .flat_map(|dh| (-1i32..=1).flat_map(move |dw| (-1i32..=1).map(move |dd| (dh, dw, dd))));
+    for (dh, dw, dd) in offsets {
+        let candidate = FamilyBucketKey {
+            w_bin: (key.w_bin as i32 + dw).max(0) as u16,
+            h_bin: (key.h_bin as i32 + dh).max(0) as u16,
+            density_bin: (key.density_bin as i32 + dd).clamp(0, 15) as u8,
+            aspect_bin: key.aspect_bin,
+            centroid_y_bin: key.centroid_y_bin,
+            lr_balance_bin: key.lr_balance_bin,
+        };
+        if !out.contains(&candidate) {
+            out.push(candidate);
         }
     }
     out
@@ -442,13 +472,44 @@ pub fn family_match_details(
 mod tests {
     use super::*;
 
+    /// Marks the white component containing the visited pixel `(x, y)`
+    /// and returns whether it touches the bitmap border.
+    fn flood_white_from(
+        img: &BitImage,
+        visited: &mut [bool],
+        x: usize,
+        y: usize,
+        diagonals: bool,
+    ) -> bool {
+        let mut stack = vec![(x, y)];
+        let mut touches_border = x == 0 || y == 0 || x + 1 == img.width || y + 1 == img.height;
+        while let Some((cx, cy)) = stack.pop() {
+            let neighbors = (cy.saturating_sub(1)..=(cy + 1).min(img.height - 1))
+                .flat_map(|ny| {
+                    (cx.saturating_sub(1)..=(cx + 1).min(img.width - 1)).map(move |nx| (nx, ny))
+                })
+                .filter(|&(nx, ny)| diagonals || nx == cx || ny == cy);
+            for (nx, ny) in neighbors {
+                let nidx = ny * img.width + nx;
+                if visited[nidx] || img.get_usize(nx, ny) {
+                    continue;
+                }
+                visited[nidx] = true;
+                if nx == 0 || ny == 0 || nx + 1 == img.width || ny + 1 == img.height {
+                    touches_border = true;
+                }
+                stack.push((nx, ny));
+            }
+        }
+        touches_border
+    }
+
     /// The per-pixel flood fill this module used before run-based counting.
     fn flood_fill_white_components(img: &BitImage, diagonals: bool) -> usize {
         if img.width < 3 || img.height < 3 {
             return 0;
         }
         let mut visited = vec![false; img.width * img.height];
-        let mut stack = Vec::new();
         let mut holes = 0usize;
         for y in 0..img.height {
             for x in 0..img.width {
@@ -457,33 +518,31 @@ mod tests {
                     continue;
                 }
                 visited[idx] = true;
-                stack.push((x, y));
-                let mut touches_border =
-                    x == 0 || y == 0 || x + 1 == img.width || y + 1 == img.height;
-                while let Some((cx, cy)) = stack.pop() {
-                    for ny in cy.saturating_sub(1)..=(cy + 1).min(img.height - 1) {
-                        for nx in cx.saturating_sub(1)..=(cx + 1).min(img.width - 1) {
-                            if !diagonals && nx != cx && ny != cy {
-                                continue;
-                            }
-                            let nidx = ny * img.width + nx;
-                            if visited[nidx] || img.get_usize(nx, ny) {
-                                continue;
-                            }
-                            visited[nidx] = true;
-                            if nx == 0 || ny == 0 || nx + 1 == img.width || ny + 1 == img.height {
-                                touches_border = true;
-                            }
-                            stack.push((nx, ny));
-                        }
-                    }
-                }
+                let touches_border = flood_white_from(img, &mut visited, x, y, diagonals);
                 if !touches_border {
                     holes += 1;
                 }
             }
         }
         holes
+    }
+
+    /// A random bitmap with about `density` percent of its pixels black.
+    fn random_image(
+        next: &mut impl FnMut() -> u64,
+        width: usize,
+        height: usize,
+        density: u64,
+    ) -> BitImage {
+        let mut img = BitImage::new(width as u32, height as u32).unwrap();
+        for y in 0..height {
+            for x in 0..width {
+                if next() % 100 < density {
+                    img.set_usize(x, y, true);
+                }
+            }
+        }
+        img
     }
 
     #[test]
@@ -499,14 +558,7 @@ mod tests {
             let width = 1 + (next() % 70) as usize;
             let height = 1 + (next() % 40) as usize;
             let density = 20 + (next() % 60);
-            let mut img = BitImage::new(width as u32, height as u32).unwrap();
-            for y in 0..height {
-                for x in 0..width {
-                    if next() % 100 < density {
-                        img.set_usize(x, y, true);
-                    }
-                }
-            }
+            let img = random_image(&mut next, width, height, density);
             for diagonals in [true, false] {
                 assert_eq!(
                     count_white_components(&img, diagonals),

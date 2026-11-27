@@ -52,6 +52,123 @@ pub(crate) fn symbol_id_from_dense_maps(
     }
 }
 
+/// One text-region instance in coding order: its strip, S coordinate, T
+/// offset within the strip, symbol ID and width.
+#[derive(Clone, Copy)]
+struct EncodedInstance {
+    strip_base: i32,
+    x: i32,
+    t_offset: i32,
+    symbol_id: u32,
+    symbol_width: i32,
+}
+
+/// Replays the T.88 §6.4.5 decoding of the coded instances and logs, for
+/// the first 60 and for any mismatch, where the decoder would place each
+/// against where the encoder meant it.
+fn push_decode_simulation_lines(
+    enc_debug_lines: &mut Vec<String>,
+    encoded_instances: &[EncodedInstance],
+    strip_width: i32,
+    sbdsoffset: i32,
+    min_x: u32,
+    min_y: u32,
+) {
+    enc_debug_lines.push(String::new());
+    enc_debug_lines.push(format!("=== DECODE SIMULATION ==="));
+    enc_debug_lines.push(format!(
+        "{:<6} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<8}",
+        "Idx", "ExpX", "ExpY", "DecS", "DecT", "AbsX", "AbsY", "Match?"
+    ));
+
+    // Collect the IADT, IAFS, IADS, IAIT values and symbol_ids in encoding order for replay
+    let sbstrips = strip_width;
+    let mut dec_stript = 0i32;
+    let mut dec_firsts = 0i32;
+    let mut sim_idx = 0usize;
+    let mut strip_start = 0usize;
+
+    // Group instances by strip_base (they're already sorted)
+    while sim_idx < encoded_instances.len() {
+        let current_strip = encoded_instances[sim_idx].strip_base;
+
+        // §6.4.5 step 2: STRIPT = STRIPT + IADT × SBSTRIPS
+        if sim_idx == strip_start || sim_idx == 0 {
+            let iadt_value = (current_strip - dec_stript) / sbstrips;
+            dec_stript += iadt_value * sbstrips;
+        }
+
+        let mut first_in_strip = true;
+        let mut dec_curs = 0i32;
+        let strip_base = current_strip;
+
+        while sim_idx < encoded_instances.len()
+            && encoded_instances[sim_idx].strip_base == strip_base
+        {
+            let item = encoded_instances[sim_idx];
+
+            if first_in_strip {
+                // §6.4.5: FIRSTS = FIRSTS + IAFS; CURS = FIRSTS
+                let iafs = item.x - dec_firsts;
+                dec_firsts += iafs;
+                dec_curs = dec_firsts;
+                first_in_strip = false;
+            } else {
+                // §6.4.5: encoder emits IADS = item.x - dec_curs - SBDSOFFSET so that
+                // the decoder's CURS = CURS + IADS + SBDSOFFSET lands on item.x.
+                let iads = item.x - dec_curs - sbdsoffset;
+                dec_curs += iads + sbdsoffset;
+            }
+
+            // §6.4.5: TI = STRIPT * SBSTRIPS + IAIT (IAIT=0 when SBSTRIPS=1)
+            let dec_ti = dec_stript;
+            let dec_si = dec_curs;
+
+            // Absolute page coords the decoder would compute
+            let abs_x = dec_si + min_x as i32;
+            let abs_y = dec_ti + min_y as i32;
+
+            // Expected absolute coords (what we intended)
+            let exp_x = item.x + min_x as i32;
+            let exp_y = item.strip_base + min_y as i32;
+
+            let ok = abs_x == exp_x && abs_y == exp_y;
+            let tag = if ok { "OK" } else { "MISMATCH!" };
+
+            if !ok || sim_idx < 60 {
+                enc_debug_lines.push(format!(
+                    "{:<6} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<8}",
+                    sim_idx, exp_x, exp_y, dec_si, dec_ti, abs_x, abs_y, tag
+                ));
+            }
+
+            // §6.4.5 step 4g: CURS = CURS + WI - 1
+            dec_curs += item.symbol_width - 1;
+            sim_idx += 1;
+        }
+        strip_start = sim_idx;
+    }
+}
+
+/// Appends the page 0 encoding log to the matching log file, ignoring I/O
+/// failures.
+fn append_encoding_log(enc_debug_lines: &[String]) {
+    let log_path = std::path::Path::new("jbig2_debug_page0.log");
+    // Append to same file as matching log
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    else {
+        return;
+    };
+    use std::io::Write;
+    let _ = writeln!(f, "");
+    for line in enc_debug_lines {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
 pub fn encode_text_region_mapped(
     instances: &[SymbolInstance],
     config: &Jbig2Config,
@@ -113,15 +230,6 @@ pub fn encode_text_region_mapped(
     // spurious 1-bit IAID there desyncs the arithmetic decoder for every later
     // symbol (S-coordinate corruption). encode_iaid is skipped when this is 0.
     let symbol_id_bits = log2up(num_total_dict_symbols.max(1));
-
-    #[derive(Clone, Copy)]
-    struct EncodedInstance {
-        strip_base: i32,
-        x: i32,
-        t_offset: i32,
-        symbol_id: u32,
-        symbol_width: i32,
-    }
 
     let strip_width = 1i32 << params.log_strips.min(3);
     let mut encoded_instances = Vec::with_capacity(instances.len());
@@ -277,98 +385,19 @@ pub fn encode_text_region_mapped(
     // Decode simulation: replay §6.4.5 from the encoder's perspective
     // to verify positions match what the decoder will compute.
     if debug_encoding {
-        enc_debug_lines.push(String::new());
-        enc_debug_lines.push(format!("=== DECODE SIMULATION ==="));
-        enc_debug_lines.push(format!(
-            "{:<6} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<8}",
-            "Idx", "ExpX", "ExpY", "DecS", "DecT", "AbsX", "AbsY", "Match?"
-        ));
-
-        // Collect the IADT, IAFS, IADS, IAIT values and symbol_ids in encoding order for replay
-        let sbstrips = strip_width;
-        let sbdsoffset = params.ds_offset as i32;
-        let mut dec_stript = 0i32;
-        let mut dec_firsts = 0i32;
-        let mut sim_idx = 0usize;
-        let mut strip_start = 0usize;
-
-        // Group instances by strip_base (they're already sorted)
-        while sim_idx < encoded_instances.len() {
-            let current_strip = encoded_instances[sim_idx].strip_base;
-
-            // §6.4.5 step 2: STRIPT = STRIPT + IADT × SBSTRIPS
-            if sim_idx == strip_start || sim_idx == 0 {
-                let iadt_value = (current_strip - dec_stript) / sbstrips;
-                dec_stript += iadt_value * sbstrips;
-            }
-
-            let mut first_in_strip = true;
-            let mut dec_curs = 0i32;
-            let strip_base = current_strip;
-
-            while sim_idx < encoded_instances.len()
-                && encoded_instances[sim_idx].strip_base == strip_base
-            {
-                let item = encoded_instances[sim_idx];
-
-                if first_in_strip {
-                    // §6.4.5: FIRSTS = FIRSTS + IAFS; CURS = FIRSTS
-                    let iafs = item.x - dec_firsts;
-                    dec_firsts += iafs;
-                    dec_curs = dec_firsts;
-                    first_in_strip = false;
-                } else {
-                    // §6.4.5: encoder emits IADS = item.x - dec_curs - SBDSOFFSET so that
-                    // the decoder's CURS = CURS + IADS + SBDSOFFSET lands on item.x.
-                    let iads = item.x - dec_curs - sbdsoffset;
-                    dec_curs += iads + sbdsoffset;
-                }
-
-                // §6.4.5: TI = STRIPT * SBSTRIPS + IAIT (IAIT=0 when SBSTRIPS=1)
-                let dec_ti = dec_stript;
-                let dec_si = dec_curs;
-
-                // Absolute page coords the decoder would compute
-                let abs_x = dec_si + min_x as i32;
-                let abs_y = dec_ti + min_y as i32;
-
-                // Expected absolute coords (what we intended)
-                let exp_x = item.x + min_x as i32;
-                let exp_y = item.strip_base + min_y as i32;
-
-                let ok = abs_x == exp_x && abs_y == exp_y;
-                let tag = if ok { "OK" } else { "MISMATCH!" };
-
-                if !ok || sim_idx < 60 {
-                    enc_debug_lines.push(format!(
-                        "{:<6} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<8}",
-                        sim_idx, exp_x, exp_y, dec_si, dec_ti, abs_x, abs_y, tag
-                    ));
-                }
-
-                // §6.4.5 step 4g: CURS = CURS + WI - 1
-                dec_curs += item.symbol_width - 1;
-                sim_idx += 1;
-            }
-            strip_start = sim_idx;
-        }
+        push_decode_simulation_lines(
+            &mut enc_debug_lines,
+            &encoded_instances,
+            strip_width,
+            params.ds_offset as i32,
+            min_x,
+            min_y,
+        );
     }
 
     // Write encoding debug log for page 0
     if debug_encoding && !enc_debug_lines.is_empty() {
-        let log_path = std::path::Path::new("jbig2_debug_page0.log");
-        // Append to same file as matching log
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-        {
-            use std::io::Write;
-            let _ = writeln!(f, "");
-            for line in &enc_debug_lines {
-                let _ = writeln!(f, "{}", line);
-            }
-        }
+        append_encoding_log(&enc_debug_lines);
     }
 
     coder.flush_with_termination(true, config.canonical_arithmetic_termination);
@@ -498,15 +527,6 @@ pub fn encode_text_region(
     // spurious 1-bit IAID there desyncs the arithmetic decoder for every later
     // symbol (S-coordinate corruption). encode_iaid is skipped when this is 0.
     let symbol_id_bits = log2up(num_total_dict_symbols.max(1));
-
-    #[derive(Clone, Copy)]
-    struct EncodedInstance {
-        strip_base: i32,
-        x: i32,
-        t_offset: i32,
-        symbol_id: u32,
-        symbol_width: i32,
-    }
 
     let strip_width = 1i32 << params.log_strips.min(3);
     let mut encoded_instances = Vec::with_capacity(instances.len());
@@ -727,14 +747,15 @@ pub fn encode_page_with_symbol_dictionary(
         .collect();
 
     for (orig_idx, refinement) in dict_layout.refinements.iter().enumerate() {
-        if let Some(refinement) = refinement {
-            for instance in &mut symbol_instances {
-                if instance.symbol_index == orig_idx {
-                    instance.symbol_index = refinement.prototype_input_index;
-                    instance.needs_refinement = true;
-                    instance.refinement_dx = refinement.refinement_dx;
-                    instance.refinement_dy = refinement.refinement_dy;
-                }
+        let Some(refinement) = refinement else {
+            continue;
+        };
+        for instance in &mut symbol_instances {
+            if instance.symbol_index == orig_idx {
+                instance.symbol_index = refinement.prototype_input_index;
+                instance.needs_refinement = true;
+                instance.refinement_dx = refinement.refinement_dx;
+                instance.refinement_dy = refinement.refinement_dy;
             }
         }
     }

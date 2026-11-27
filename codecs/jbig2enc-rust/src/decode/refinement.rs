@@ -337,6 +337,10 @@ fn target_at_pixel(
 /// registers loaded once per 32-pixel block. Under TPGRON the 3×3 uniformity
 /// test (`typical_pixel`) reduces to checking those 9 bits directly.
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::excessive_nesting,
+    reason = "T.88 6.3.5 generic refinement decoding kernel: the per-pixel TPGRON typical-pixel test (6.3.5.6) and the GRTEMPLATE context built from rolling reference windows, monomorphised per template and AT layout"
+)]
 fn decode_refinement_windowed<const T: u8, const CUSTOM_AT: bool>(
     target: &mut MonoBitmap,
     decoder: &mut ArithmeticDecoder<'_>,
@@ -596,6 +600,10 @@ fn typical_pixel(reference: &MonoBitmap, rx: i64, ry: i64) -> Option<bool> {
 /// the bit-exactness oracle for the windowed decoder.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::excessive_nesting,
+    reason = "test-only pre-optimisation reference decoder, kept as the bit-exactness oracle for decode_refinement_windowed"
+)]
 fn decode_refinement_reference(
     dec: &mut ArithmeticDecoder<'_>,
     reference: &MonoBitmap,
@@ -747,6 +755,26 @@ mod grat2_tests {
         );
     }
 
+    /// A `rw` x `rh` bitmap filled with `fill` where about one pixel in five
+    /// is set to a random value.
+    fn noisy_reference(
+        next: &mut impl FnMut() -> u32,
+        rw: u32,
+        rh: u32,
+        fill: bool,
+        limits: &DecodeLimits,
+    ) -> MonoBitmap {
+        let mut reference = MonoBitmap::new(rw, rh, fill, limits).unwrap();
+        for y in 0..rh {
+            for x in 0..rw {
+                if next().is_multiple_of(5) {
+                    reference.set(x, y, next().is_multiple_of(2));
+                }
+            }
+        }
+        reference
+    }
+
     #[test]
     fn windowed_refinement_matches_reference() {
         let limits = DecodeLimits::default();
@@ -786,14 +814,7 @@ mod grat2_tests {
 
             // Build reference bitmap with uniform regions (to trigger TPGRON
             // typical_pixel both 0 and 9) mixed with sparse noise.
-            let mut reference = MonoBitmap::new(rw, rh, (case / 8) % 2 == 1, &limits).unwrap();
-            for y in 0..rh {
-                for x in 0..rw {
-                    if next() % 5 == 0 {
-                        reference.set(x, y, next() % 2 == 0);
-                    }
-                }
-            }
+            let reference = noisy_reference(&mut next, rw, rh, (case / 8) % 2 == 1, &limits);
 
             let data_len = 32 + (next() % 256) as usize;
             let data: Vec<u8> = (0..data_len)

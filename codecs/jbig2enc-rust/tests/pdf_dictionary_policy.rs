@@ -4,6 +4,19 @@ use common::pbm::{Pbm, assert_pixels_eq};
 use jbig2enc_rust::decode::{DecodeOptions, decode_embedded};
 use jbig2enc_rust::{Array2, Jbig2Config, PdfDictionaryPolicy, encode_document_pdf_split};
 
+/// Draws a `w` x `h` box whose right side is open above row 5, at
+/// `(left, top)`.
+fn draw_open_box(image: &mut Pbm, (left, top): (u32, u32), (w, h): (u32, u32)) {
+    let width = image.width;
+    for y in 0..h {
+        for x in 0..w {
+            if x == 0 || y == 0 || y == h - 1 || (x == w - 1 && y > 4) {
+                image.pixels[((top + y) * width + left + x) as usize] = 1;
+            }
+        }
+    }
+}
+
 fn page(local_width: u32, shared: bool) -> Pbm {
     let (width, height) = (193, 97);
     let mut image = Pbm::new(width, height, vec![0; (width * height) as usize]);
@@ -13,15 +26,41 @@ fn page(local_width: u32, shared: bool) -> Pbm {
         } else {
             (5 + (index % 4) * 31, 45, local_width, 17)
         };
-        for y in 0..h {
-            for x in 0..w {
-                if x == 0 || y == 0 || y == h - 1 || (x == w - 1 && y > 4) {
-                    image.pixels[((top + y) * width + left + x) as usize] = 1;
-                }
-            }
-        }
+        draw_open_box(&mut image, (left, top), (w, h));
     }
     image
+}
+
+/// Checks one embedded page decodes to its source natively, with jbig2dec
+/// and through every available PDF renderer.
+fn assert_policy_page_exact(source: &Pbm, globals: Option<&[u8]>, stream: &[u8]) {
+    let decoded = decode_embedded(globals, stream, &DecodeOptions::default()).unwrap();
+    let pixels = (0..source.height)
+        .flat_map(|y| {
+            let decoded = &decoded;
+            (0..source.width).map(move |x| u8::from(decoded.get(x, y)))
+        })
+        .collect();
+    assert_pixels_eq(
+        source,
+        &Pbm::new(source.width, source.height, pixels),
+        "native PDF policy",
+    );
+    if let Some(oracle) = common::oracle::decode_embedded(globals, stream) {
+        assert_pixels_eq(source, &oracle.unwrap(), "jbig2dec PDF policy");
+    }
+    let pdf = common::pdf::wrap_page(source.width, source.height, globals, stream);
+    for backend in ["PDFTOPPM", "PDFIUM_PYTHON"] {
+        let Some(rendered) = common::pdf::render(backend, &pdf) else {
+            continue;
+        };
+        let control =
+            common::pdf::render(backend, &common::pdf::wrap_uncompressed(source)).unwrap();
+        assert_pixels_eq(&control, &rendered, backend);
+        if backend == "PDFIUM_PYTHON" {
+            assert_pixels_eq(source, &rendered, "PDFium source equality");
+        }
+    }
 }
 
 fn verify(shared: bool) {
@@ -72,34 +111,7 @@ fn verify(shared: bool) {
             );
         }
         for (source, stream) in pages.iter().zip(&split.page_streams) {
-            let globals = split.global_segments.as_deref();
-            let decoded = decode_embedded(globals, stream, &DecodeOptions::default()).unwrap();
-            let pixels = (0..source.height)
-                .flat_map(|y| {
-                    let decoded = &decoded;
-                    (0..source.width).map(move |x| u8::from(decoded.get(x, y)))
-                })
-                .collect();
-            assert_pixels_eq(
-                source,
-                &Pbm::new(source.width, source.height, pixels),
-                "native PDF policy",
-            );
-            if let Some(oracle) = common::oracle::decode_embedded(globals, stream) {
-                assert_pixels_eq(source, &oracle.unwrap(), "jbig2dec PDF policy");
-            }
-            let pdf = common::pdf::wrap_page(source.width, source.height, globals, stream);
-            for backend in ["PDFTOPPM", "PDFIUM_PYTHON"] {
-                if let Some(rendered) = common::pdf::render(backend, &pdf) {
-                    let control =
-                        common::pdf::render(backend, &common::pdf::wrap_uncompressed(source))
-                            .unwrap();
-                    assert_pixels_eq(&control, &rendered, backend);
-                    if backend == "PDFIUM_PYTHON" {
-                        assert_pixels_eq(source, &rendered, "PDFium source equality");
-                    }
-                }
-            }
+            assert_policy_page_exact(source, split.global_segments.as_deref(), stream);
         }
     }
 }
@@ -139,6 +151,15 @@ fn pdf_renderer_generic_control() {
     }
 }
 
+/// Checks a decoded page against its source pixel by pixel.
+fn assert_bitmap_matches(source: &Pbm, bitmap: &jbig2enc_rust::shared::bitmap::MonoBitmap) {
+    for y in 0..source.height {
+        for x in 0..source.width {
+            assert_eq!(source.get(x, y) != 0, bitmap.get(x, y));
+        }
+    }
+}
+
 #[test]
 fn pdf_policy_settings_preserve_standalone_behavior() {
     let pages = [page(9, true), page(15, true)];
@@ -174,11 +195,7 @@ fn pdf_policy_settings_preserve_standalone_behavior() {
             jbig2enc_rust::decode::decode_file(&stream, &DecodeOptions::default()).unwrap();
         assert_eq!(decoded.pages.len(), pages.len());
         for (source, page) in pages.iter().zip(&decoded.pages) {
-            for y in 0..source.height {
-                for x in 0..source.width {
-                    assert_eq!(source.get(x, y) != 0, page.bitmap.get(x, y));
-                }
-            }
+            assert_bitmap_matches(source, &page.bitmap);
         }
     }
 }

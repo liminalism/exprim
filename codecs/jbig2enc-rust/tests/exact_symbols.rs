@@ -5,21 +5,31 @@ use jbig2enc_rust::jbig2enc::Jbig2Encoder;
 use jbig2enc_rust::jbig2structs::LossySymbolMode;
 use jbig2enc_rust::{Array2, Jbig2Config, PdfDictionaryPolicy};
 
+/// Sets one pixel of a `width`-wide one-byte-per-pixel page.
+fn set_pixel(pixels: &mut [u8], width: u32, x: u32, y: u32) {
+    pixels[(y * width + x) as usize] = 1;
+}
+
+/// Draws a 9x13 box outline at `(left, top)`, with a middle bar if
+/// `barred`.
+fn draw_box_glyph(pixels: &mut [u8], width: u32, (left, top): (u32, u32), barred: bool) {
+    for y in 0..13 {
+        for x in 0..9 {
+            if x == 0 || x == 8 || y == 0 || y == 12 || (barred && y == 6) {
+                set_pixel(pixels, width, left + x, top + y);
+            }
+        }
+    }
+}
+
 fn fixture(variation: u32) -> Pbm {
     let (width, height) = (321, 129);
     let mut pixels = vec![0; (width * height) as usize];
-    let mut set = |x: u32, y: u32| pixels[(y * width + x) as usize] = 1;
     for index in 0..12 {
         let (left, top) = (5 + (index % 6) * 30, 7 + (index / 6) * 30);
-        for y in 0..13 {
-            for x in 0..9 {
-                if x == 0 || x == 8 || y == 0 || y == 12 || (index % 3 == 1 && y == 6) {
-                    set(left + x, top + y);
-                }
-            }
-        }
+        draw_box_glyph(&mut pixels, width, (left, top), index % 3 == 1);
         if index % 3 == 2 {
-            set(left + 1 + variation % 3, top + 1);
+            set_pixel(&mut pixels, width, left + 1 + variation % 3, top + 1);
         }
     }
     // Single pixels, touching diagonals, a dense component and long thin rule.
@@ -32,15 +42,15 @@ fn fixture(variation: u32) -> Pbm {
         (230, 80),
         (231, 81),
     ] {
-        set(x, y);
+        set_pixel(&mut pixels, width, x, y);
     }
     for y in 90..110 {
         for x in 230..260 {
-            set(x, y);
+            set_pixel(&mut pixels, width, x, y);
         }
     }
     for x in 3..300 {
-        set(x, 119);
+        set_pixel(&mut pixels, width, x, 119);
     }
     Pbm::new(width, height, pixels)
 }
@@ -64,6 +74,91 @@ fn assert_native(source: &Pbm, decoded: &jbig2enc_rust::shared::bitmap::MonoBitm
     );
 }
 
+/// Checks that an embedded page decodes to its source natively, with
+/// jbig2dec, and through every available PDF renderer.
+fn assert_page_exact_everywhere(source: &Pbm, globals: Option<&[u8]>, stream: &[u8]) {
+    assert_native(
+        source,
+        &decode_embedded(globals, stream, &DecodeOptions::default()).unwrap(),
+    );
+    if let Some(oracle) = common::oracle::decode_embedded(globals, stream) {
+        assert_pixels_eq(source, &oracle.unwrap(), "exact jbig2dec");
+    }
+    let pdf = common::pdf::wrap_page(source.width, source.height, globals, stream);
+    for backend in ["PDFTOPPM", "PDFIUM_PYTHON"] {
+        let Some(rendered) = common::pdf::render(backend, &pdf) else {
+            continue;
+        };
+        let control =
+            common::pdf::render(backend, &common::pdf::wrap_uncompressed(source)).unwrap();
+        assert_pixels_eq(&control, &rendered, backend);
+        if backend == "PDFIUM_PYTHON" {
+            assert_pixels_eq(source, &rendered, "exact PDFium");
+        }
+    }
+}
+
+/// Checks that an embedded page decodes to its source natively and with
+/// jbig2dec.
+fn assert_page_decodes_exactly(source: &Pbm, globals: Option<&[u8]>, stream: &[u8]) {
+    assert_native(
+        source,
+        &decode_embedded(globals, stream, &DecodeOptions::default()).unwrap(),
+    );
+    if let Some(oracle) = common::oracle::decode_embedded(globals, stream) {
+        assert_pixels_eq(source, &oracle.unwrap(), "optimized exact jbig2dec");
+    }
+}
+
+/// The total bytes of a PDF split: globals plus page streams.
+fn split_bytes(split: &jbig2enc_rust::jbig2enc::PdfSplitOutput) -> usize {
+    split.global_segments.as_ref().map_or(0, Vec::len)
+        + split.page_streams.iter().map(Vec::len).sum::<usize>()
+}
+
+/// The size of the sources encoded with the plain lossless symbol preset
+/// under `policy`, as a PDF split or a standalone file.
+fn lossless_policy_bytes(sources: &[Pbm], policy: PdfDictionaryPolicy, pdf: bool) -> usize {
+    let mut baseline_config = Jbig2Config::text_lossless();
+    baseline_config.pdf_dictionary_policy = policy;
+    let mut baseline = Jbig2Encoder::new(&baseline_config);
+    for source in sources {
+        baseline.add_page(&array(source)).unwrap();
+    }
+    if pdf {
+        split_bytes(&baseline.flush_pdf_split().unwrap())
+    } else {
+        baseline.flush().unwrap().len()
+    }
+}
+
+/// Encodes the sources as a PDF split or a standalone file and checks
+/// every page comes back exact.
+fn assert_exact_round_trip(config: &Jbig2Config, sources: &[Pbm], pdf: bool) {
+    let mut encoder = Jbig2Encoder::new(config);
+    for source in sources {
+        encoder.add_page(&array(source)).unwrap();
+    }
+    if pdf {
+        let split = encoder.flush_pdf_split().unwrap();
+        assert!(
+            split.text_region_bytes_per_page.iter().sum::<usize>() > 0,
+            "must exercise symbol compression"
+        );
+        for (source, stream) in sources.iter().zip(&split.page_streams) {
+            assert_page_exact_everywhere(source, split.global_segments.as_deref(), stream);
+        }
+    } else {
+        let bytes = encoder.flush().unwrap();
+        let decoded = decode_file(&bytes, &DecodeOptions::default()).unwrap();
+        assert_eq!(sources.len(), decoded.pages.len());
+        for (source, page) in sources.iter().zip(&decoded.pages) {
+            assert_native(source, &page.bitmap);
+        }
+    }
+    assert!(encoder.metrics_snapshot().symbol_stats.exact_hits > 0);
+}
+
 #[test]
 fn exact_symbols_preserve_all_components_in_pdf_and_standalone() {
     let sources = [fixture(0), fixture(1), fixture(2)];
@@ -79,49 +174,7 @@ fn exact_symbols_preserve_all_components_in_pdf_and_standalone() {
         config.refine = true;
         config.text_refine = true;
         for pdf in [false, true] {
-            let mut encoder = Jbig2Encoder::new(&config);
-            for source in &sources {
-                encoder.add_page(&array(source)).unwrap();
-            }
-            if pdf {
-                let split = encoder.flush_pdf_split().unwrap();
-                assert!(
-                    split.text_region_bytes_per_page.iter().sum::<usize>() > 0,
-                    "must exercise symbol compression"
-                );
-                for (source, stream) in sources.iter().zip(&split.page_streams) {
-                    let globals = split.global_segments.as_deref();
-                    assert_native(
-                        source,
-                        &decode_embedded(globals, stream, &DecodeOptions::default()).unwrap(),
-                    );
-                    if let Some(oracle) = common::oracle::decode_embedded(globals, stream) {
-                        assert_pixels_eq(source, &oracle.unwrap(), "exact jbig2dec");
-                    }
-                    let pdf = common::pdf::wrap_page(source.width, source.height, globals, stream);
-                    for backend in ["PDFTOPPM", "PDFIUM_PYTHON"] {
-                        if let Some(rendered) = common::pdf::render(backend, &pdf) {
-                            let control = common::pdf::render(
-                                backend,
-                                &common::pdf::wrap_uncompressed(source),
-                            )
-                            .unwrap();
-                            assert_pixels_eq(&control, &rendered, backend);
-                            if backend == "PDFIUM_PYTHON" {
-                                assert_pixels_eq(source, &rendered, "exact PDFium");
-                            }
-                        }
-                    }
-                }
-            } else {
-                let bytes = encoder.flush().unwrap();
-                let decoded = decode_file(&bytes, &DecodeOptions::default()).unwrap();
-                assert_eq!(sources.len(), decoded.pages.len());
-                for (source, page) in sources.iter().zip(&decoded.pages) {
-                    assert_native(source, &page.bitmap);
-                }
-            }
-            assert!(encoder.metrics_snapshot().symbol_stats.exact_hits > 0);
+            assert_exact_round_trip(&config, &sources, pdf);
         }
     }
 }
@@ -213,23 +266,9 @@ fn optimized_exact_streams_measure_real_costs_with_a_hard_trial_budget() {
         let actual_bytes;
         if pdf {
             let split = encoder.flush_pdf_split().unwrap();
-            actual_bytes = split.global_segments.as_ref().map_or(0, Vec::len)
-                + split.page_streams.iter().map(Vec::len).sum::<usize>();
+            actual_bytes = split_bytes(&split);
             for (source, stream) in sources.iter().zip(&split.page_streams) {
-                assert_native(
-                    source,
-                    &decode_embedded(
-                        split.global_segments.as_deref(),
-                        stream,
-                        &DecodeOptions::default(),
-                    )
-                    .unwrap(),
-                );
-                if let Some(oracle) =
-                    common::oracle::decode_embedded(split.global_segments.as_deref(), stream)
-                {
-                    assert_pixels_eq(source, &oracle.unwrap(), "optimized exact jbig2dec");
-                }
+                assert_page_decodes_exactly(source, split.global_segments.as_deref(), stream);
             }
         } else {
             let bytes = encoder.flush().unwrap();
@@ -251,19 +290,7 @@ fn optimized_exact_streams_measure_real_costs_with_a_hard_trial_budget() {
             PdfDictionaryPolicy::SharedGlobal,
             PdfDictionaryPolicy::SharedGlobalWithLocal,
         ] {
-            let mut baseline_config = Jbig2Config::text_lossless();
-            baseline_config.pdf_dictionary_policy = policy;
-            let mut baseline = Jbig2Encoder::new(&baseline_config);
-            for source in &sources {
-                baseline.add_page(&array(source)).unwrap();
-            }
-            let baseline_bytes = if pdf {
-                let split = baseline.flush_pdf_split().unwrap();
-                split.global_segments.as_ref().map_or(0, Vec::len)
-                    + split.page_streams.iter().map(Vec::len).sum::<usize>()
-            } else {
-                baseline.flush().unwrap().len()
-            };
+            let baseline_bytes = lossless_policy_bytes(&sources, policy, pdf);
             assert!(
                 report.selected_bytes <= baseline_bytes,
                 "optimizer must retain cheaper exact policy {policy:?}"

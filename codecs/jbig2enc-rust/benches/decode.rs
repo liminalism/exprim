@@ -13,6 +13,16 @@ use jbig2enc_rust::jbig2structs::{GenericRegionParams, Jbig2Config};
 use jbig2enc_rust::jbig2sym::BitImage;
 use jbig2enc_rust::{Jbig2Context, encode_single_image_with_config};
 
+/// Sets the pixels of a `w`-wide one-byte-per-pixel page in the given
+/// column and row ranges.
+fn fill_ink(px: &mut [u8], w: u32, xs: std::ops::Range<u32>, ys: std::ops::Range<u32>) {
+    for yy in ys {
+        for xx in xs.clone() {
+            px[(yy * w + xx) as usize] = 1;
+        }
+    }
+}
+
 /// Deterministically synthesise a "text-like" bitmap: rows of short black runs
 /// (glyph strokes) with generous white gaps, at the given size.
 fn synth_textlike(w: u32, h: u32) -> Vec<u8> {
@@ -34,11 +44,12 @@ fn synth_textlike(w: u32, h: u32) -> Vec<u8> {
             let gap = 2 + (next() % 10);
             let glyph_h = 8 + (next() % 24);
             if next() % 3 != 0 {
-                for yy in base_y..(base_y + glyph_h).min(h) {
-                    for xx in x..(x + run).min(w) {
-                        px[(yy * w + xx) as usize] = 1;
-                    }
-                }
+                fill_ink(
+                    &mut px,
+                    w,
+                    x..(x + run).min(w),
+                    base_y..(base_y + glyph_h).min(h),
+                );
             }
             x += run + gap;
         }
@@ -72,6 +83,26 @@ fn bench_decode_generic_a4(c: &mut Criterion) {
     group.finish();
 }
 
+/// Draws glyph shape `kind` (one of six) in the `gw` x `gh` cell at
+/// `(x, y)`.
+fn stamp_glyph(px: &mut [u8], w: u32, (x, y): (u32, u32), kind: u32, (gw, gh): (u32, u32)) {
+    for dy in 0..gh {
+        for dx in 0..gw {
+            let on = match kind {
+                0 => dx == 0 || dx == gw - 1 || dy == 0 || dy == gh - 1,
+                1 => dx == gw / 2 || dy == gh / 2,
+                2 => (dx + dy) % 3 == 0,
+                3 => dx == dy || dx + dy == gw - 1,
+                4 => dy < 3 || dy >= gh - 3,
+                _ => dx < 2 || dx >= gw - 2,
+            };
+            if on {
+                px[((y + dy) * w + (x + dx)) as usize] = 1;
+            }
+        }
+    }
+}
+
 /// Synthesise a text-heavy page (many repeated glyphs) so the encoder builds a
 /// symbol dictionary + text region, then benchmark decoding it (Gap D).
 fn synth_glyph_page(w: u32, h: u32) -> Vec<u8> {
@@ -89,21 +120,7 @@ fn synth_glyph_page(w: u32, h: u32) -> Vec<u8> {
         let mut x = 4;
         while x + gw + 4 < w {
             let kind = next() % 6;
-            for dy in 0..gh {
-                for dx in 0..gw {
-                    let on = match kind {
-                        0 => dx == 0 || dx == gw - 1 || dy == 0 || dy == gh - 1,
-                        1 => dx == gw / 2 || dy == gh / 2,
-                        2 => (dx + dy) % 3 == 0,
-                        3 => dx == dy || dx + dy == gw - 1,
-                        4 => dy < 3 || dy >= gh - 3,
-                        _ => dx < 2 || dx >= gw - 2,
-                    };
-                    if on {
-                        px[((y + dy) * w + (x + dx)) as usize] = 1;
-                    }
-                }
-            }
+            stamp_glyph(&mut px, w, (x, y), kind, (gw, gh));
             x += gw + 4;
         }
         y += gh + 4;

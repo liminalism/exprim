@@ -349,13 +349,8 @@ fn pixel_context(
             let p = |dx: i64, dy: i64| -> u32 {
                 let xx = xi + dx;
                 match dy {
-                    0 => {
-                        if xx < 0 || xx >= xi || xx >= width as i64 {
-                            0
-                        } else {
-                            sample(cur, width, xx)
-                        }
-                    }
+                    0 if xx < 0 || xx >= xi || xx >= width as i64 => 0,
+                    0 => sample(cur, width, xx),
                     -1 => sample(prev1, width, xx),
                     _ => sample(prev2, width, xx),
                 }
@@ -620,6 +615,64 @@ fn row_window(row: &[u32], start: i64, tail_mask: u32) -> u32 {
     }
 }
 
+/// Where AT pixel `(dx, dy)` reads from on row `y`.
+#[inline(always)]
+fn at_source((dx, dy): (i16, i8), y: u32) -> AtSource {
+    let (dx, dy) = (dx as i64, dy as i64);
+    if dy < 0 {
+        let yy = y as i64 + dy;
+        return if yy < 0 {
+            AtSource::Zero
+        } else {
+            AtSource::Row(yy as u32)
+        };
+    }
+    if dy == 0 && dx < 0 {
+        let dist = (-dx) as u32;
+        return if dist <= 128 {
+            AtSource::Current(dist)
+        } else {
+            AtSource::CurrentFar(dist)
+        };
+    }
+    AtSource::Zero
+}
+
+/// The decoded rows an AT window can read: all rows above the current one,
+/// the current row's already-written words, and the row geometry.
+struct AtWindowRows<'r> {
+    above: &'r [u32],
+    cur: &'r [u32],
+    stride: usize,
+    tail_mask: u32,
+}
+
+/// The 32-pixel window of an AT pixel for block `block`, for the sources
+/// read through a window (rows above, and far left on the current row);
+/// 0 for the others.
+#[inline(always)]
+fn at_window(src: AtSource, dx: i16, block: usize, rows: &AtWindowRows<'_>) -> u32 {
+    match src {
+        AtSource::Row(yy) => {
+            let start = (block * 32) as i64 + dx as i64;
+            let row_start = (yy as usize) * rows.stride;
+            row_window(
+                &rows.above[row_start..row_start + rows.stride],
+                start,
+                rows.tail_mask,
+            )
+        }
+        AtSource::CurrentFar(dist) => {
+            // `dist > 128`, so `block * 32 - dist + 31 < block * 32`:
+            // all 32 pixels of this window live in already-written
+            // words `cur[..block]`.
+            let start = (block * 32) as i64 - dist as i64;
+            row_window(rows.cur, start, u32::MAX)
+        }
+        AtSource::Zero | AtSource::Current(_) => 0,
+    }
+}
+
 /// Windowed generic-region decoder for template `T` (T.88 §6.2.5).
 ///
 /// The context is kept as one integer and updated incrementally per pixel
@@ -638,6 +691,11 @@ fn row_window(row: &[u32], start: i64, tail_mask: u32) -> u32 {
 /// With other AT positions (`GENERAL == true`) the AT slots are masked out of
 /// the window context and the AT pixels are read from their own per-block
 /// windows (rows above) or from a history of the current row.
+#[allow(
+    clippy::excessive_nesting,
+    clippy::cognitive_complexity,
+    reason = "T.88 6.2.5 generic region decoding kernel: TPGDON row prediction, the per-block row windows and the per-pixel context update with its uniform-MPS-run fast path form one loop nest whose shape keeps per-pixel work free of indexing and bounds checks"
+)]
 fn decode_windowed<const T: u8, const GENERAL: bool>(
     bitmap: &mut MonoBitmap,
     decoder: &mut ArithmeticDecoder<'_>,
@@ -710,25 +768,8 @@ fn decode_windowed<const T: u8, const GENERAL: bool>(
         let mut any_current = false;
         if GENERAL {
             for (k, src) in at_src.iter_mut().enumerate().take(g.at_count) {
-                let (dx, dy) = (at[k].0 as i64, at[k].1 as i64);
-                *src = if dy < 0 {
-                    let yy = y as i64 + dy;
-                    if yy < 0 {
-                        AtSource::Zero
-                    } else {
-                        AtSource::Row(yy as u32)
-                    }
-                } else if dy == 0 && dx < 0 {
-                    let dist = (-dx) as u32;
-                    if dist <= 128 {
-                        any_current = true;
-                        AtSource::Current(dist)
-                    } else {
-                        AtSource::CurrentFar(dist)
-                    }
-                } else {
-                    AtSource::Zero
-                };
+                *src = at_source(at[k], y);
+                any_current |= matches!(src, AtSource::Current(_));
             }
         }
         // Current-row history for `AtSource::Current` (bit 0 = pixel x-1).
@@ -762,23 +803,14 @@ fn decode_windowed<const T: u8, const GENERAL: bool>(
 
             let mut at_win = [0u32; 4];
             if GENERAL {
+                let rows = AtWindowRows {
+                    above,
+                    cur: &cur[..block],
+                    stride,
+                    tail_mask,
+                };
                 for k in 0..g.at_count {
-                    match at_src[k] {
-                        AtSource::Row(yy) => {
-                            let start = (block * 32) as i64 + at[k].0 as i64;
-                            let row_start = (yy as usize) * stride;
-                            at_win[k] =
-                                row_window(&above[row_start..row_start + stride], start, tail_mask);
-                        }
-                        AtSource::CurrentFar(dist) => {
-                            // `dist > 128`, so `block * 32 - dist + 31 < block * 32`:
-                            // all 32 pixels of this window live in already-written
-                            // words `cur[..block]`.
-                            let start = (block * 32) as i64 - dist as i64;
-                            at_win[k] = row_window(&cur[..block], start, u32::MAX);
-                        }
-                        AtSource::Zero | AtSource::Current(_) => {}
-                    }
+                    at_win[k] = at_window(at_src[k], at[k].0, block, &rows);
                 }
             }
 
@@ -1002,6 +1034,10 @@ pub(crate) mod reference {
 
     /// General per-pixel path for arbitrary AT positions. Produces identical
     /// context values to the rolling path when `at == NOMINAL_AT0`.
+    #[allow(
+        clippy::excessive_nesting,
+        reason = "test-only pre-optimisation reference decoder, kept verbatim as the bit-exactness oracle for decode_windowed"
+    )]
     pub(crate) fn decode_template0_general(
         bitmap: &mut MonoBitmap,
         decoder: &mut ReferenceArithmeticDecoder<'_>,
@@ -1394,34 +1430,39 @@ mod tests {
                 }
             }
             1 => {} // blank page of polarity `bg`
-            _ => {
-                for _ in 0..rng.below(8) {
-                    let (x0, y0) = (rng.below(w), rng.below(h));
-                    let (rw, rh) = (1 + rng.below(w), 1 + rng.below(h.min(12)));
-                    for y in y0..(y0 + rh).min(h) {
-                        for x in x0..(x0 + rw).min(w) {
-                            img.set(x, y, !bg);
-                        }
-                    }
-                }
-                let noise = rng.below(4) * 16 + 1;
-                for y in 0..h {
-                    for x in 0..w {
-                        if rng.below(1000) < noise {
-                            img.set(x, y, !img.get(x, y));
-                        }
-                    }
-                }
-                // Duplicate some rows downwards.
-                for y in 1..h {
-                    if rng.below(4) == 0 {
-                        let prev = img.row(y - 1).to_vec();
-                        img.row_mut(y).copy_from_slice(&prev);
-                    }
+            _ => draw_rectangles_noise_and_repeats(&mut img, bg, rng),
+        }
+        img
+    }
+
+    /// Draws up to seven rectangles of the non-background colour, flips
+    /// sparse noise, and duplicates some rows downwards.
+    fn draw_rectangles_noise_and_repeats(img: &mut MonoBitmap, bg: bool, rng: &mut Rng) {
+        let (w, h) = (img.width(), img.height());
+        for _ in 0..rng.below(8) {
+            let (x0, y0) = (rng.below(w), rng.below(h));
+            let (rw, rh) = (1 + rng.below(w), 1 + rng.below(h.min(12)));
+            for y in y0..(y0 + rh).min(h) {
+                for x in x0..(x0 + rw).min(w) {
+                    img.set(x, y, !bg);
                 }
             }
         }
-        img
+        let noise = rng.below(4) * 16 + 1;
+        for y in 0..h {
+            for x in 0..w {
+                if rng.below(1000) < noise {
+                    img.set(x, y, !img.get(x, y));
+                }
+            }
+        }
+        // Duplicate some rows downwards.
+        for y in 1..h {
+            if rng.below(4) == 0 {
+                let prev = img.row(y - 1).to_vec();
+                img.row_mut(y).copy_from_slice(&prev);
+            }
+        }
     }
 
     /// Encode `img` as a generic-region arithmetic payload for any template,
@@ -1511,6 +1552,18 @@ mod tests {
         }
     }
 
+    /// A random causal AT pixel, sometimes at the extremes of the range.
+    fn causal_at_pixel(rng: &mut Rng) -> (i8, i8) {
+        let dy = -(rng.below(4) as i32) - if rng.below(8) == 0 { 120 } else { 0 };
+        let dx = if dy == 0 {
+            let reach = if rng.below(4) == 0 { 128 } else { 6 };
+            -1 - rng.below(reach) as i32
+        } else {
+            rng.below(256) as i32 - 128
+        };
+        (dx.clamp(-128, 127) as i8, dy.clamp(-128, 0) as i8)
+    }
+
     fn random_at(rng: &mut Rng, template: u8) -> [(i8, i8); 4] {
         let nominal = if template == 0 {
             NOMINAL_AT0
@@ -1525,16 +1578,7 @@ mod tests {
             // Valid AT pixels (causal), including the extremes of the range.
             1 | 2 => {
                 for slot in at.iter_mut().take(count) {
-                    let dy = -(rng.below(4) as i32) - if rng.below(8) == 0 { 120 } else { 0 };
-                    let dx = if dy == 0 {
-                        {
-                            let reach = if rng.below(4) == 0 { 128 } else { 6 };
-                            -1 - rng.below(reach) as i32
-                        }
-                    } else {
-                        rng.below(256) as i32 - 128
-                    };
-                    *slot = (dx.clamp(-128, 127) as i8, dy.clamp(-128, 0) as i8);
+                    *slot = causal_at_pixel(rng);
                 }
             }
             // Arbitrary bytes, including non-causal positions the parser
@@ -1558,6 +1602,28 @@ mod tests {
         (w, 1 + rng.below(40))
     }
 
+    /// A fresh context bank, one trained with random valid states, or one
+    /// with some out-of-table states.
+    fn initial_contexts(rng: &mut Rng) -> Vec<MqContext> {
+        let mut initial = contexts();
+        match rng.below(4) {
+            0 => {
+                for c in initial.iter_mut() {
+                    *c = MqContext(rng.below(94) as u8);
+                }
+            }
+            1 => {
+                for c in initial.iter_mut() {
+                    if rng.below(64) == 0 {
+                        *c = MqContext(94 + rng.below(162) as u8);
+                    }
+                }
+            }
+            _ => {}
+        }
+        initial
+    }
+
     /// The windowed decoder is bit-identical to the reference for every
     /// template, nominal and non-nominal (including non-causal) AT pixels,
     /// TPGDON on and off, odd and word-aligned widths, shared context banks
@@ -1577,22 +1643,7 @@ mod tests {
             // Initial context bank: fresh, trained (valid states), or with
             // some out-of-table states, which every path treats as "0, no
             // register change".
-            let mut initial = contexts();
-            match rng.below(4) {
-                0 => {
-                    for c in initial.iter_mut() {
-                        *c = MqContext(rng.below(94) as u8);
-                    }
-                }
-                1 => {
-                    for c in initial.iter_mut() {
-                        if rng.below(64) == 0 {
-                            *c = MqContext(94 + rng.below(162) as u8);
-                        }
-                    }
-                }
-                _ => {}
-            }
+            let initial = initial_contexts(&mut rng);
 
             // A well-formed stream for the first bitmap (realistic statistics
             // and long uniform runs), then arbitrary bytes for the rest of

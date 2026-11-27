@@ -80,6 +80,34 @@ pub fn save_debug_pbm(image: &BitImage, filename: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Marks and pushes the unvisited black 8-neighbours of `(cx, cy)`.
+#[inline]
+fn push_unvisited_black_neighbors(
+    symbol: &BitImage,
+    visited: &mut [bool],
+    stack: &mut Vec<(usize, usize)>,
+    cx: usize,
+    cy: usize,
+) {
+    let w = symbol.width;
+    let h = symbol.height;
+    let x0 = cx.saturating_sub(1);
+    let y0 = cy.saturating_sub(1);
+    let x1 = (cx + 1).min(w - 1);
+    let y1 = (cy + 1).min(h - 1);
+
+    for ny in y0..=y1 {
+        for nx in x0..=x1 {
+            let i = ny * w + nx;
+            if visited[i] || !symbol.get_usize(nx, ny) {
+                continue;
+            }
+            visited[i] = true;
+            stack.push((nx, ny));
+        }
+    }
+}
+
 pub fn extract_symbol_components(symbol: &BitImage) -> Vec<TinyComponent> {
     let w = symbol.width;
     let h = symbol.height;
@@ -112,21 +140,7 @@ pub fn extract_symbol_components(symbol: &BitImage) -> Vec<TinyComponent> {
                 min_y = min_y.min(cy);
                 max_y = max_y.max(cy);
 
-                let x0 = cx.saturating_sub(1);
-                let y0 = cy.saturating_sub(1);
-                let x1 = (cx + 1).min(w - 1);
-                let y1 = (cy + 1).min(h - 1);
-
-                for ny in y0..=y1 {
-                    for nx in x0..=x1 {
-                        let i = idx(nx, ny);
-                        if visited[i] || !symbol.get_usize(nx, ny) {
-                            continue;
-                        }
-                        visited[i] = true;
-                        stack.push((nx, ny));
-                    }
-                }
+                push_unvisited_black_neighbors(symbol, &mut visited, &mut stack, cx, cy);
             }
 
             out.push(TinyComponent {

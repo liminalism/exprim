@@ -306,6 +306,117 @@ impl MonoBitmap {
         }
     }
 
+    /// The single-word fast path of [`combine`](Self::combine): ORs, XORs,
+    /// replaces, ANDs or XNORs one source word per row, shifted right by
+    /// `shift`, into one or two destination words starting at `dst_pos`.
+    #[inline(always)]
+    fn combine_single_word_rows(
+        &mut self,
+        src_slice: &[u32],
+        mut dst_pos: usize,
+        shift: u32,
+        src_width: u32,
+        operator: CombinationOperator,
+    ) {
+        let dst_stride = self.stride_words as usize;
+        let spans_two = shift + src_width > 32;
+        match operator {
+            CombinationOperator::Or => {
+                if !spans_two {
+                    for &sw in src_slice {
+                        self.words[dst_pos] |= sw >> shift;
+                        dst_pos += dst_stride;
+                    }
+                } else {
+                    let rshift = 32 - shift;
+                    for &sw in src_slice {
+                        self.words[dst_pos] |= sw >> shift;
+                        self.words[dst_pos + 1] |= sw << rshift;
+                        dst_pos += dst_stride;
+                    }
+                }
+            }
+            CombinationOperator::Xor => {
+                if !spans_two {
+                    for &sw in src_slice {
+                        self.words[dst_pos] ^= sw >> shift;
+                        dst_pos += dst_stride;
+                    }
+                } else {
+                    let rshift = 32 - shift;
+                    for &sw in src_slice {
+                        self.words[dst_pos] ^= sw >> shift;
+                        self.words[dst_pos + 1] ^= sw << rshift;
+                        dst_pos += dst_stride;
+                    }
+                }
+            }
+            CombinationOperator::Replace => {
+                if !spans_two {
+                    let mask = mask_range(shift, shift + src_width);
+                    let inv = !mask;
+                    for &sw in src_slice {
+                        self.words[dst_pos] = (self.words[dst_pos] & inv) | (sw >> shift);
+                        dst_pos += dst_stride;
+                    }
+                } else {
+                    let rshift = 32 - shift;
+                    let mask0 = mask_range(shift, 32);
+                    let inv0 = !mask0;
+                    let mask1 = mask_range(0, shift + src_width - 32);
+                    let inv1 = !mask1;
+                    for &sw in src_slice {
+                        self.words[dst_pos] = (self.words[dst_pos] & inv0) | (sw >> shift);
+                        self.words[dst_pos + 1] = (self.words[dst_pos + 1] & inv1) | (sw << rshift);
+                        dst_pos += dst_stride;
+                    }
+                }
+            }
+            CombinationOperator::And => {
+                if !spans_two {
+                    let inv = !mask_range(shift, shift + src_width);
+                    for &sw in src_slice {
+                        self.words[dst_pos] &= (sw >> shift) | inv;
+                        dst_pos += dst_stride;
+                    }
+                } else {
+                    let rshift = 32 - shift;
+                    let inv0 = !mask_range(shift, 32);
+                    let inv1 = !mask_range(0, shift + src_width - 32);
+                    for &sw in src_slice {
+                        self.words[dst_pos] &= (sw >> shift) | inv0;
+                        self.words[dst_pos + 1] &= (sw << rshift) | inv1;
+                        dst_pos += dst_stride;
+                    }
+                }
+            }
+            CombinationOperator::Xnor => {
+                if !spans_two {
+                    let mask = mask_range(shift, shift + src_width);
+                    let inv = !mask;
+                    for &sw in src_slice {
+                        let d = self.words[dst_pos];
+                        self.words[dst_pos] = (d & inv) | (!(d ^ (sw >> shift)) & mask);
+                        dst_pos += dst_stride;
+                    }
+                } else {
+                    let rshift = 32 - shift;
+                    let mask0 = mask_range(shift, 32);
+                    let inv0 = !mask0;
+                    let mask1 = mask_range(0, shift + src_width - 32);
+                    let inv1 = !mask1;
+                    for &sw in src_slice {
+                        let d0 = self.words[dst_pos];
+                        self.words[dst_pos] = (d0 & inv0) | (!(d0 ^ (sw >> shift)) & mask0);
+                        let d1 = self.words[dst_pos + 1];
+                        self.words[dst_pos + 1] = (d1 & inv1) | (!(d1 ^ (sw << rshift)) & mask1);
+                        dst_pos += dst_stride;
+                    }
+                }
+            }
+        }
+    }
+
     /// Composite `source` onto `self` with its top-left pixel at destination
     /// coordinate `(x, y)` (signed — negative or overhanging placement is
     /// clipped). Whole interior words are combined at once; only the first and
@@ -346,111 +457,10 @@ impl MonoBitmap {
         if src_stride == 1 && sx_start == 0 && sx_end == source.width as i64 {
             let w_idx = dx_start >> 5;
             let shift = (dx_start & 31) as u32;
-            let spans_two = shift + source.width > 32;
             let src_slice = &source.words[sy_start_u..sy_end_u];
-            let mut dst_pos = dy_start * dst_stride + w_idx;
-            match operator {
-                CombinationOperator::Or => {
-                    if !spans_two {
-                        for &sw in src_slice {
-                            self.words[dst_pos] |= sw >> shift;
-                            dst_pos += dst_stride;
-                        }
-                    } else {
-                        let rshift = 32 - shift;
-                        for &sw in src_slice {
-                            self.words[dst_pos] |= sw >> shift;
-                            self.words[dst_pos + 1] |= sw << rshift;
-                            dst_pos += dst_stride;
-                        }
-                    }
-                    return;
-                }
-                CombinationOperator::Xor => {
-                    if !spans_two {
-                        for &sw in src_slice {
-                            self.words[dst_pos] ^= sw >> shift;
-                            dst_pos += dst_stride;
-                        }
-                    } else {
-                        let rshift = 32 - shift;
-                        for &sw in src_slice {
-                            self.words[dst_pos] ^= sw >> shift;
-                            self.words[dst_pos + 1] ^= sw << rshift;
-                            dst_pos += dst_stride;
-                        }
-                    }
-                    return;
-                }
-                CombinationOperator::Replace => {
-                    if !spans_two {
-                        let mask = mask_range(shift, shift + source.width);
-                        let inv = !mask;
-                        for &sw in src_slice {
-                            self.words[dst_pos] = (self.words[dst_pos] & inv) | (sw >> shift);
-                            dst_pos += dst_stride;
-                        }
-                    } else {
-                        let rshift = 32 - shift;
-                        let mask0 = mask_range(shift, 32);
-                        let inv0 = !mask0;
-                        let mask1 = mask_range(0, shift + source.width - 32);
-                        let inv1 = !mask1;
-                        for &sw in src_slice {
-                            self.words[dst_pos] = (self.words[dst_pos] & inv0) | (sw >> shift);
-                            self.words[dst_pos + 1] =
-                                (self.words[dst_pos + 1] & inv1) | (sw << rshift);
-                            dst_pos += dst_stride;
-                        }
-                    }
-                    return;
-                }
-                CombinationOperator::And => {
-                    if !spans_two {
-                        let inv = !mask_range(shift, shift + source.width);
-                        for &sw in src_slice {
-                            self.words[dst_pos] &= (sw >> shift) | inv;
-                            dst_pos += dst_stride;
-                        }
-                    } else {
-                        let rshift = 32 - shift;
-                        let inv0 = !mask_range(shift, 32);
-                        let inv1 = !mask_range(0, shift + source.width - 32);
-                        for &sw in src_slice {
-                            self.words[dst_pos] &= (sw >> shift) | inv0;
-                            self.words[dst_pos + 1] &= (sw << rshift) | inv1;
-                            dst_pos += dst_stride;
-                        }
-                    }
-                    return;
-                }
-                CombinationOperator::Xnor => {
-                    if !spans_two {
-                        let mask = mask_range(shift, shift + source.width);
-                        let inv = !mask;
-                        for &sw in src_slice {
-                            let d = self.words[dst_pos];
-                            self.words[dst_pos] = (d & inv) | (!(d ^ (sw >> shift)) & mask);
-                            dst_pos += dst_stride;
-                        }
-                    } else {
-                        let rshift = 32 - shift;
-                        let mask0 = mask_range(shift, 32);
-                        let inv0 = !mask0;
-                        let mask1 = mask_range(0, shift + source.width - 32);
-                        let inv1 = !mask1;
-                        for &sw in src_slice {
-                            let d0 = self.words[dst_pos];
-                            self.words[dst_pos] = (d0 & inv0) | (!(d0 ^ (sw >> shift)) & mask0);
-                            let d1 = self.words[dst_pos + 1];
-                            self.words[dst_pos + 1] =
-                                (d1 & inv1) | (!(d1 ^ (sw << rshift)) & mask1);
-                            dst_pos += dst_stride;
-                        }
-                    }
-                    return;
-                }
-            }
+            let dst_pos = dy_start * dst_stride + w_idx;
+            self.combine_single_word_rows(src_slice, dst_pos, shift, source.width, operator);
+            return;
         }
 
         // General multi-word / clipped path: precompute column parameters once
@@ -887,6 +897,24 @@ mod tests {
         assert_eq!(a.words, b.words, "word buffers differ");
     }
 
+    /// Sweeps unaligned and clipped placements, including negative and
+    /// overhanging positions, against the per-pixel reference.
+    fn assert_placements_match_reference(
+        dst: &MonoBitmap,
+        src: &MonoBitmap,
+        op: CombinationOperator,
+    ) {
+        let (dw, dh) = (dst.width, dst.height);
+        for x in [-3i32, -1, 0, 1, 5, dw as i32 - 2, dw as i32 + 4] {
+            for y in [-2i32, 0, 1, dh as i32 - 1, dh as i32 + 2] {
+                let mut got = dst.clone();
+                got.combine(src, x, y, op);
+                let want = combine_reference(dst, src, x, y, op);
+                assert_same(&got, &want);
+            }
+        }
+    }
+
     #[test]
     fn combine_all_operators_widths_and_offsets() {
         let ops = [
@@ -903,16 +931,7 @@ mod tests {
                 let dst = checkerboard(dw, dh, 0);
                 let src = checkerboard(sw, sh, 1);
                 for &op in &ops {
-                    // Sweep unaligned and clipped placements, including
-                    // negative and overhanging positions.
-                    for x in [-3i32, -1, 0, 1, 5, dw as i32 - 2, dw as i32 + 4] {
-                        for y in [-2i32, 0, 1, dh as i32 - 1, dh as i32 + 2] {
-                            let mut got = dst.clone();
-                            got.combine(&src, x, y, op);
-                            let want = combine_reference(&dst, &src, x, y, op);
-                            assert_same(&got, &want);
-                        }
-                    }
+                    assert_placements_match_reference(&dst, &src, op);
                 }
             }
         }

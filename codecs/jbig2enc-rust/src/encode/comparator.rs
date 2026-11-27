@@ -372,12 +372,10 @@ impl Comparator {
                     self.col_b[rx] += 1;
                 }
 
-                if a_on != b_on {
-                    if in_a && in_b {
-                        overlap_err += 1;
-                    } else {
-                        outside_ink_err += 1;
-                    }
+                match (a_on != b_on, in_a && in_b) {
+                    (false, _) => {}
+                    (true, true) => overlap_err += 1,
+                    (true, false) => outside_ink_err += 1,
                 }
             }
 
@@ -402,8 +400,37 @@ impl Comparator {
     }
 }
 
+/// The best alignment found so far by an alignment search.
+#[derive(Clone, Copy)]
+struct BestAlignment {
+    err: u32,
+    dx: i32,
+    dy: i32,
+}
+
+impl BestAlignment {
+    /// The tie rule both alignment searches share: a lower error wins, and
+    /// an equal error from a complete (not early-stopped) row scan wins when
+    /// its offset is closer to the origin.
+    #[inline(always)]
+    fn prefer(&mut self, err: u32, early_break: bool, dx: i32, dy: i32) {
+        if err < self.err {
+            *self = Self { err, dx, dy };
+            return;
+        }
+        if err == self.err && !early_break && dx.abs() + dy.abs() < self.dx.abs() + self.dy.abs() {
+            self.dx = dx;
+            self.dy = dy;
+        }
+    }
+}
+
 /// General word-wise shifted XOR search behind
 /// `Comparator::best_alignment_by_xor_limited`.
+#[allow(
+    clippy::excessive_nesting,
+    reason = "shifted-XOR alignment kernel: the per-row early exit against the running best error sits inside the dy/dx offset scan, and best_alignment_narrow must visit offsets and stop rows exactly as this does (see its doc)"
+)]
 fn best_alignment_words(
     a: &BitImage,
     b: &BitImage,
@@ -416,9 +443,11 @@ fn best_alignment_words(
     let a_words = a.packed_words();
     let b_words = b.packed_words();
 
-    let mut best_err = max_err + 1;
-    let mut best_dx = 0;
-    let mut best_dy = 0;
+    let mut best = BestAlignment {
+        err: max_err + 1,
+        dx: 0,
+        dy: 0,
+    };
 
     for &dy in &SEARCH_OFFSETS {
         if dy.abs() > max_dy {
@@ -458,10 +487,10 @@ fn best_alignment_words(
                 let b_row = &b_words[b_start..b_start + bwpr];
 
                 let result = if bit_shift == 0 {
-                    row_kernel_noshift(a_row, b_row, cols_words, word_shift, err, best_err, max_err)
+                    row_kernel_noshift(a_row, b_row, cols_words, word_shift, err, best.err, max_err)
                 } else {
                     row_kernel_shift(
-                        a_row, b_row, cols_words, word_shift, bit_shift, err, best_err, max_err,
+                        a_row, b_row, cols_words, word_shift, bit_shift, err, best.err, max_err,
                     )
                 };
                 err = result.0;
@@ -471,23 +500,12 @@ fn best_alignment_words(
                 }
             }
 
-            if err < best_err {
-                best_err = err;
-                best_dx = dx;
-                best_dy = dy;
-            } else if err == best_err && !early_break {
-                let curr_dist = dx.abs() + dy.abs();
-                let best_dist = best_dx.abs() + best_dy.abs();
-                if curr_dist < best_dist {
-                    best_dx = dx;
-                    best_dy = dy;
-                }
-            }
+            best.prefer(err, early_break, dx, dy);
         }
     }
 
-    if best_err <= max_err {
-        Some((best_err, best_dx, best_dy))
+    if best.err <= max_err {
+        Some((best.err, best.dx, best.dy))
     } else {
         None
     }
@@ -503,6 +521,10 @@ fn best_alignment_words(
 /// row as one `u64`, masked to those words. It may stop a row after its first
 /// word; that only happens once the error already reaches the best error,
 /// and then the row total does too, so the candidate is rejected either way.
+#[allow(
+    clippy::excessive_nesting,
+    reason = "single-u64-row variant of the shifted-XOR alignment kernel: it must visit offsets, stop rows early and break ties exactly as best_alignment_words does, so it keeps the same dy/dx/row loop shape"
+)]
 fn best_alignment_narrow<const AW: usize, const BW: usize>(
     a: &BitImage,
     b: &BitImage,
@@ -521,9 +543,11 @@ fn best_alignment_narrow<const AW: usize, const BW: usize>(
     let a_words = a.packed_words();
     let b_words = b.packed_words();
     debug_assert!(a_words.len() == a.height * AW && b_words.len() == b.height * BW);
-    let mut best_err = max_err + 1;
-    let mut best_dx = 0;
-    let mut best_dy = 0;
+    let mut best = BestAlignment {
+        err: max_err + 1,
+        dx: 0,
+        dy: 0,
+    };
 
     for &dy in &SEARCH_OFFSETS {
         if dy.abs() > max_dy {
@@ -559,29 +583,18 @@ fn best_alignment_narrow<const AW: usize, const BW: usize>(
                 let b_row = row::<BW>(b_words, b_row_start + offset);
                 let aligned = if dx >= 0 { a_row << dx } else { a_row >> -dx };
                 err = err.saturating_add(((aligned ^ b_row) & mask).count_ones());
-                if err >= best_err || err > max_err {
+                if err >= best.err || err > max_err {
                     early_break = true;
                     break;
                 }
             }
 
-            if err < best_err {
-                best_err = err;
-                best_dx = dx;
-                best_dy = dy;
-            } else if err == best_err && !early_break {
-                let curr_dist = dx.abs() + dy.abs();
-                let best_dist = best_dx.abs() + best_dy.abs();
-                if curr_dist < best_dist {
-                    best_dx = dx;
-                    best_dy = dy;
-                }
-            }
+            best.prefer(err, early_break, dx, dy);
         }
     }
 
-    if best_err <= max_err {
-        Some((best_err, best_dx, best_dy))
+    if best.err <= max_err {
+        Some((best.err, best.dx, best.dy))
     } else {
         None
     }
@@ -820,6 +833,64 @@ mod tests {
         assert!(rejected > 0 && found > 0);
     }
 
+    /// A random bitmap with about `density` percent of its pixels black.
+    fn random_image(
+        next: &mut impl FnMut() -> u64,
+        width: usize,
+        height: usize,
+        density: u64,
+    ) -> BitImage {
+        let mut image = BitImage::new(width as u32, height as u32).unwrap();
+        for y in 0..height {
+            for x in 0..width {
+                if next() % 100 < density {
+                    image.set_usize(x, y, true);
+                }
+            }
+        }
+        image
+    }
+
+    /// A `wb`x`hb` copy of `a` with a case-dependent sprinkle of flipped
+    /// pixels.
+    fn noisy_copy(a: &BitImage, wb: usize, hb: usize, case: u64) -> BitImage {
+        let mut b = BitImage::new(wb as u32, hb as u32).unwrap();
+        for y in 0..hb.min(a.height) {
+            for x in 0..wb.min(a.width) {
+                b.set_usize(
+                    x,
+                    y,
+                    a.get_usize(x, y)
+                        ^ case
+                            .wrapping_mul(x as u64 + 3 * y as u64)
+                            .is_multiple_of(23),
+                );
+            }
+        }
+        b
+    }
+
+    /// Checks the dispatching search against the general one under every
+    /// limit, and returns how many limits were checked.
+    fn assert_searches_agree(a: &BitImage, b: &BitImage, case: u64) -> usize {
+        let (wa, ha, wb, hb) = (a.width, a.height, b.width, b.height);
+        let mut checked = 0usize;
+        for max_err in [0, 1, 3, 8, 20, 200] {
+            for max_dx in 0..=5 {
+                for max_dy in [0, 1, 2, 5] {
+                    assert_eq!(
+                        Comparator::default()
+                            .best_alignment_by_xor_limited(a, b, max_err, max_dx, max_dy),
+                        best_alignment_words(a, b, max_err, max_dx, max_dy),
+                        "case {case} {wa}x{ha} vs {wb}x{hb} err={max_err} dx={max_dx} dy={max_dy}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        checked
+    }
+
     #[test]
     fn narrow_search_matches_general_search() {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
@@ -829,54 +900,20 @@ mod tests {
             state ^= state << 17;
             state
         };
-        let mut random = |width: usize, height: usize, density: u64| {
-            let mut image = BitImage::new(width as u32, height as u32).unwrap();
-            for y in 0..height {
-                for x in 0..width {
-                    if next() % 100 < density {
-                        image.set_usize(x, y, true);
-                    }
-                }
-            }
-            image
-        };
         let mut checked = 0usize;
         for case in 0..1500u64 {
             let wa = 1 + (case * 7 % 64) as usize;
             let ha = 1 + (case * 13 % 40) as usize;
             let wb = (wa as i64 + (case % 11) as i64 - 5).clamp(1, 64) as usize;
             let hb = (ha as i64 + (case % 7) as i64 - 3).max(1) as usize;
-            let a = random(wa, ha, 15 + case % 60);
+            let a = random_image(&mut next, wa, ha, 15 + case % 60);
             // Half the pairs are a noisy copy, so that matches are frequent.
             let b = if case % 2 == 0 {
-                let mut b = BitImage::new(wb as u32, hb as u32).unwrap();
-                for y in 0..hb.min(ha) {
-                    for x in 0..wb.min(wa) {
-                        b.set_usize(
-                            x,
-                            y,
-                            a.get_usize(x, y)
-                                ^ (case.wrapping_mul(x as u64 + 3 * y as u64) % 23 == 0),
-                        );
-                    }
-                }
-                b
+                noisy_copy(&a, wb, hb, case)
             } else {
-                random(wb, hb, 15 + case % 60)
+                random_image(&mut next, wb, hb, 15 + case % 60)
             };
-            for max_err in [0, 1, 3, 8, 20, 200] {
-                for max_dx in 0..=5 {
-                    for max_dy in [0, 1, 2, 5] {
-                        assert_eq!(
-                            Comparator::default()
-                                .best_alignment_by_xor_limited(&a, &b, max_err, max_dx, max_dy),
-                            best_alignment_words(&a, &b, max_err, max_dx, max_dy),
-                            "case {case} {wa}x{ha} vs {wb}x{hb} err={max_err} dx={max_dx} dy={max_dy}"
-                        );
-                        checked += 1;
-                    }
-                }
-            }
+            checked += assert_searches_agree(&a, &b, case);
         }
         assert!(checked > 0);
     }

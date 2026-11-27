@@ -90,6 +90,84 @@ fn add_stages(total: &mut SymbolModeStageMetrics, stages: &SymbolModeStageMetric
     total.generic_region_encoding += stages.generic_region_encoding;
 }
 
+/// Timing and output totals of one preset: the encode time over all
+/// rounds, and the last round's stage metrics, output bytes, output hash
+/// and differing pixels (-1 when not verified).
+struct SpeedTotals {
+    elapsed: Duration,
+    stages: SymbolModeStageMetrics,
+    bytes: usize,
+    hash: u64,
+    differing: i64,
+}
+
+impl SpeedTotals {
+    /// Adds one unit's stage metrics and output to the last round's totals,
+    /// decoding each page to count differing pixels when verifying.
+    fn record_unit(
+        &mut self,
+        unit: &[usize],
+        output: &PdfSplitOutput,
+        unit_stages: &SymbolModeStageMetrics,
+        images: &[BitImage],
+        verify: bool,
+    ) {
+        add_stages(&mut self.stages, unit_stages);
+        let globals = output.global_segments.as_deref();
+        if let Some(globals) = globals {
+            self.bytes += globals.len();
+            fnv(&mut self.hash, globals);
+        } else {
+            fnv(&mut self.hash, &[]);
+        }
+        for (page, stream) in unit.iter().zip(&output.page_streams) {
+            self.bytes += stream.len();
+            fnv(&mut self.hash, stream);
+            if verify {
+                self.differing += differing_pixels(&images[*page], globals, stream) as i64;
+            }
+        }
+        assert_eq!(output.page_streams.len(), unit.len());
+    }
+}
+
+/// Encodes every unit `rounds` times with `cfg`, timing only the encodes,
+/// and records the outputs of the last round.
+fn time_preset(
+    cfg: &Jbig2Config,
+    images: &[BitImage],
+    units: &[Vec<usize>],
+    rounds: usize,
+    verify: bool,
+) -> SpeedTotals {
+    let mut totals = SpeedTotals {
+        elapsed: Duration::ZERO,
+        stages: SymbolModeStageMetrics::default(),
+        bytes: 0,
+        hash: 0xcbf2_9ce4_8422_2325u64,
+        differing: -1,
+    };
+    for round in 0..rounds {
+        let last = round + 1 == rounds;
+        if last {
+            totals.stages = SymbolModeStageMetrics::default();
+            totals.bytes = 0;
+            totals.differing = if verify { 0 } else { -1 };
+        }
+        for unit in units {
+            let input: Vec<BitImage> = unit.iter().map(|&i| images[i].clone()).collect();
+            let start = Instant::now();
+            let (output, unit_stages) = encode(cfg, input);
+            totals.elapsed += start.elapsed();
+            if !last {
+                continue;
+            }
+            totals.record_unit(unit, &output, &unit_stages, images, verify);
+        }
+    }
+    totals
+}
+
 #[test]
 #[ignore = "symbol-mode performance worker; requires SYMBOL_SPEED_DIR"]
 fn symbol_speed_worker() {
@@ -134,44 +212,13 @@ fn symbol_speed_worker() {
                 .build()
                 .unwrap()
         });
-        let mut elapsed = Duration::ZERO;
-        let mut stages = SymbolModeStageMetrics::default();
-        let mut bytes = 0usize;
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        let mut differing = -1i64;
-        for round in 0..rounds {
-            let last = round + 1 == rounds;
-            if last {
-                stages = SymbolModeStageMetrics::default();
-                bytes = 0;
-                differing = if verify { 0 } else { -1 };
-            }
-            for unit in &units {
-                let input: Vec<BitImage> = unit.iter().map(|&i| images[i].clone()).collect();
-                let start = Instant::now();
-                let (output, unit_stages) = encode(&cfg, input);
-                elapsed += start.elapsed();
-                if !last {
-                    continue;
-                }
-                add_stages(&mut stages, &unit_stages);
-                let globals = output.global_segments.as_deref();
-                if let Some(globals) = globals {
-                    bytes += globals.len();
-                    fnv(&mut hash, globals);
-                } else {
-                    fnv(&mut hash, &[]);
-                }
-                for (page, stream) in unit.iter().zip(&output.page_streams) {
-                    bytes += stream.len();
-                    fnv(&mut hash, stream);
-                    if verify {
-                        differing += differing_pixels(&images[*page], globals, stream) as i64;
-                    }
-                }
-                assert_eq!(output.page_streams.len(), unit.len());
-            }
-        }
+        let SpeedTotals {
+            elapsed,
+            stages,
+            bytes,
+            hash,
+            differing,
+        } = time_preset(&cfg, &images, &units, rounds, verify);
         let seconds = elapsed.as_secs_f64();
         let per_page = seconds / (rounds * images.len()) as f64;
         println!(

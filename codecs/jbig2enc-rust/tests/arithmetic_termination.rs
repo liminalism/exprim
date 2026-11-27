@@ -82,6 +82,43 @@ fn canonical_termination_is_explicit_for_legacy_callers_and_enabled_in_new_prese
     }
 }
 
+/// Renders the PDF before and after the padding change with every
+/// available backend, checks both match the source control, and returns
+/// poppler's extraneous-byte warning counts before and after.
+fn compare_padding_renders(old_pdf: &[u8], new_pdf: &[u8], control: &[u8]) -> (usize, usize) {
+    let mut warnings = (0, 0);
+    for backend in ["PDFTOPPM", "PDFIUM_PYTHON"] {
+        let Some((new_image, new_stderr)) = common::pdf::render_with_diagnostics(backend, new_pdf)
+        else {
+            continue;
+        };
+        let (old_image, old_stderr) =
+            common::pdf::render_with_diagnostics(backend, old_pdf).unwrap();
+        let control_image = common::pdf::render(backend, control).unwrap();
+        assert_pixels_eq(
+            &control_image,
+            &new_image,
+            "rendered padding probe vs source control",
+        );
+        assert_pixels_eq(
+            &old_image,
+            &new_image,
+            "rendered padding probe before/after",
+        );
+        if backend == "PDFTOPPM" {
+            warnings = (
+                old_stderr.matches("extraneous byte").count(),
+                new_stderr.matches("extraneous byte").count(),
+            );
+            assert_eq!(
+                warnings.1, 0,
+                "duplicate-prefix removal must resolve this diagnostic"
+            );
+        }
+    }
+    warnings
+}
+
 #[test]
 fn duplicate_stop_prefix_is_redundant_in_arithmetic_segments() {
     let required = std::env::var("JBIG2_REQUIRE_PDF_ORACLES").is_ok_and(|s| s == "1");
@@ -155,37 +192,8 @@ fn duplicate_stop_prefix_is_redundant_in_arithmetic_segments() {
             );
             let new_pdf = common::pdf::wrap_page(source.width, source.height, globals, &page);
             let control = common::pdf::wrap_uncompressed(&source);
-            let mut warnings = (0, 0);
-            for backend in ["PDFTOPPM", "PDFIUM_PYTHON"] {
-                if let Some((new_image, new_stderr)) =
-                    common::pdf::render_with_diagnostics(backend, &new_pdf)
-                {
-                    let (old_image, old_stderr) =
-                        common::pdf::render_with_diagnostics(backend, &old_pdf).unwrap();
-                    let control_image = common::pdf::render(backend, &control).unwrap();
-                    assert_pixels_eq(
-                        &control_image,
-                        &new_image,
-                        "rendered padding probe vs source control",
-                    );
-                    assert_pixels_eq(
-                        &old_image,
-                        &new_image,
-                        "rendered padding probe before/after",
-                    );
-                    if backend == "PDFTOPPM" {
-                        warnings = (
-                            old_stderr.matches("extraneous byte").count(),
-                            new_stderr.matches("extraneous byte").count(),
-                        );
-                        poppler_before += warnings.0;
-                        assert_eq!(
-                            warnings.1, 0,
-                            "duplicate-prefix removal must resolve this diagnostic"
-                        );
-                    }
-                }
-            }
+            let warnings = compare_padding_renders(&old_pdf, &new_pdf, &control);
+            poppler_before += warnings.0;
             report.push_str(&format!(
                 "{mode}\t{path}\t{changed}\t{}\t{}\n",
                 warnings.0, warnings.1

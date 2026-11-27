@@ -20,6 +20,20 @@ fn solid(w: u32, h: u32) -> TestBitmap {
     bm
 }
 
+/// Fills the `hdpw` x `hdpw` grid cell `(ng, mg)`, clipped to the bitmap.
+fn fill_cell(expected: &mut TestBitmap, (ng, mg): (u32, u32), hdpw: u32) {
+    let (w, h) = (expected.width, expected.height);
+    for dy in 0..hdpw {
+        for dx in 0..hdpw {
+            let px = ng * hdpw + dx;
+            let py = mg * hdpw + dy;
+            if px < w && py < h {
+                expected.set(px, py, true);
+            }
+        }
+    }
+}
+
 #[test]
 fn halftone_enable_skip() {
     let hdpw = 4u32;
@@ -46,15 +60,7 @@ fn halftone_enable_skip() {
         for ng in 0..4u32 {
             if cell_values[mg as usize][ng as usize] {
                 // pattern 1 = solid
-                for dy in 0..hdpw {
-                    for dx in 0..hdpw {
-                        let px = ng * hdpw + dx;
-                        let py = mg * hdpw + dy;
-                        if px < w && py < h {
-                            expected.set(px, py, true);
-                        }
-                    }
-                }
+                fill_cell(&mut expected, (ng, mg), hdpw);
             }
         }
     }

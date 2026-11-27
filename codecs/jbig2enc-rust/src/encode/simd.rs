@@ -39,6 +39,10 @@ fn load_u32x8(row: &[u32], start: usize) -> u32x8 {
     ])
 }
 
+#[allow(
+    clippy::excessive_nesting,
+    reason = "SIMD row kernel: XOR-popcounts eight words at a time and, when a chunk would cross the early-exit bound, replays its lanes one word at a time so it stops at exactly the word the scalar kernel stops at"
+)]
 pub(crate) fn xor_popcnt_u32_rows(
     a_row: &[u32],
     b_row: &[u32],
@@ -85,6 +89,10 @@ pub(crate) fn xor_popcnt_u32_rows(
     RowPopcntResult { err, broke: false }
 }
 
+#[allow(
+    clippy::excessive_nesting,
+    reason = "SIMD row kernel, bit-shifted variant of xor_popcnt_u32_rows: the per-lane replay on an early-exit chunk must stop at exactly the word the scalar kernel stops at"
+)]
 pub(crate) fn shift_xor_popcnt_u32_rows(
     a_row: &[u32],
     b_row: &[u32],

@@ -140,6 +140,67 @@ mod tests {
         }
     }
 
+    /// Paints every instance's bitmap at its position on a blank page.
+    fn expected_page(instances: &[SymbolInstance], width: u32, height: u32) -> BitImage {
+        let mut expected = BitImage::new(width, height).unwrap();
+        for instance in instances {
+            paint_instance(&mut expected, instance);
+        }
+        expected
+    }
+
+    /// Sets the black pixels of one instance's bitmap at its position.
+    fn paint_instance(expected: &mut BitImage, instance: &SymbolInstance) {
+        for y in 0..instance.instance_bitmap.height {
+            for x in 0..instance.instance_bitmap.width {
+                if instance.instance_bitmap.get_usize(x, y) {
+                    expected.set(
+                        instance.position.x + x as u32,
+                        instance.position.y + y as u32,
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Decodes the stream with the `jbig2dec` at `oracle` and checks it
+    /// agrees with the native decode pixel for pixel.
+    fn assert_oracle_agrees(
+        oracle: &str,
+        stream: &[u8],
+        decoded: &crate::shared::bitmap::MonoBitmap,
+        width: u32,
+        height: u32,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("residual.jb2");
+        let output = directory.path().join("residual.pbm");
+        std::fs::write(&input, stream).unwrap();
+        let result = std::process::Command::new(oracle)
+            .args(["-e", "-o"])
+            .arg(&output)
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let oracle = super::test_pbm::Pbm::from_p4(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!((oracle.width, oracle.height), (width, height));
+        for y in 0..height {
+            for x in 0..width {
+                assert_eq!(
+                    oracle.get(x, y) != 0,
+                    decoded.get(x, y),
+                    "oracle pixel ({x},{y})"
+                );
+            }
+        }
+    }
+
     fn check_layout(
         instances: &[SymbolInstance],
         width: u32,
@@ -200,52 +261,14 @@ mod tests {
         .write_into(&mut stream)
         .unwrap();
         let decoded = decode_embedded(None, &stream, &DecodeOptions::default()).unwrap();
-        let mut expected = BitImage::new(width, height).unwrap();
-        for instance in instances {
-            for y in 0..instance.instance_bitmap.height {
-                for x in 0..instance.instance_bitmap.width {
-                    if instance.instance_bitmap.get_usize(x, y) {
-                        expected.set(
-                            instance.position.x + x as u32,
-                            instance.position.y + y as u32,
-                            true,
-                        );
-                    }
-                }
-            }
-        }
+        let expected = expected_page(instances, width, height);
         for y in 0..height {
             for x in 0..width {
                 assert_eq!(decoded.get(x, y), expected.get(x, y), "pixel ({x},{y})");
             }
         }
         if let Ok(oracle) = std::env::var("JBIG2DEC") {
-            let directory = tempfile::tempdir().unwrap();
-            let input = directory.path().join("residual.jb2");
-            let output = directory.path().join("residual.pbm");
-            std::fs::write(&input, &stream).unwrap();
-            let result = std::process::Command::new(oracle)
-                .args(["-e", "-o"])
-                .arg(&output)
-                .arg(&input)
-                .output()
-                .unwrap();
-            assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-            let oracle = super::test_pbm::Pbm::from_p4(&std::fs::read(output).unwrap()).unwrap();
-            assert_eq!((oracle.width, oracle.height), (width, height));
-            for y in 0..height {
-                for x in 0..width {
-                    assert_eq!(
-                        oracle.get(x, y) != 0,
-                        decoded.get(x, y),
-                        "oracle pixel ({x},{y})"
-                    );
-                }
-            }
+            assert_oracle_agrees(&oracle, &stream, &decoded, width, height);
         }
         println!(
             "residual {width}x{height}: baseline={baseline_bytes} packed={packed_bytes} regions={} baseline_us={} packed_us={}",

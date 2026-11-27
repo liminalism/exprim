@@ -233,6 +233,19 @@ fn build_refinement_file(
     out
 }
 
+/// Copies `img` into the one-byte-per-pixel page at `(ox, oy)`, replacing
+/// what is there and clipping to the page.
+fn blit_replace(px: &mut [u8], (page_w, page_h): (u32, u32), img: &BitImage, (ox, oy): (u32, u32)) {
+    for gy in 0..img.height as u32 {
+        for gx in 0..img.width as u32 {
+            let (x, y) = (ox + gx, oy + gy);
+            if x < page_w && y < page_h {
+                px[(y * page_w + x) as usize] = img.get_pixel_safely(gx as i32, gy as i32);
+            }
+        }
+    }
+}
+
 /// Render the expected page: `reference` at (rx,ry), then each refinement's
 /// target REPLACE-composited at its (x,y).
 fn expected_page(
@@ -244,19 +257,9 @@ fn expected_page(
     refinements: &[(&BitImage, u32, u32)],
 ) -> Pbm {
     let mut px = vec![0u8; (page_w * page_h) as usize];
-    let mut blit = |img: &BitImage, ox: u32, oy: u32| {
-        for gy in 0..img.height as u32 {
-            for gx in 0..img.width as u32 {
-                let (x, y) = (ox + gx, oy + gy);
-                if x < page_w && y < page_h {
-                    px[(y * page_w + x) as usize] = img.get_pixel_safely(gx as i32, gy as i32);
-                }
-            }
-        }
-    };
-    blit(reference, rx, ry);
+    blit_replace(&mut px, (page_w, page_h), reference, (rx, ry));
     for (t, x, y) in refinements {
-        blit(t, *x, *y);
+        blit_replace(&mut px, (page_w, page_h), t, (*x, *y));
     }
     Pbm::new(page_w, page_h, px)
 }

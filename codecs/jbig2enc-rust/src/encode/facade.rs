@@ -481,6 +481,32 @@ mod tests {
         encoder.finish_file().unwrap()
     }
 
+    /// Checks that the page packed at `stride` in either polarity encodes
+    /// to `reference`.
+    fn assert_packed_layouts_match(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        stride: usize,
+        preset: Preset,
+        reference: &[u8],
+    ) {
+        for zero_is_black in [false, true] {
+            let packed = pack(pixels, width, height, stride, zero_is_black);
+            let polarity = if zero_is_black {
+                Polarity::ZeroIsBlack
+            } else {
+                Polarity::OneIsBlack
+            };
+            let image = BilevelImage::packed(width, height, stride, &packed, polarity).unwrap();
+            assert_eq!(
+                encode(&image, preset),
+                reference,
+                "packed stride {stride} {polarity:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_layout_and_polarity_encodes_identically() {
         let (width, height) = (77u32, 41u32);
@@ -491,21 +517,7 @@ mod tests {
                 preset,
             );
             for stride in [10usize, 13, 16] {
-                for zero_is_black in [false, true] {
-                    let packed = pack(&pixels, width, height, stride, zero_is_black);
-                    let polarity = if zero_is_black {
-                        Polarity::ZeroIsBlack
-                    } else {
-                        Polarity::OneIsBlack
-                    };
-                    let image =
-                        BilevelImage::packed(width, height, stride, &packed, polarity).unwrap();
-                    assert_eq!(
-                        encode(&image, preset),
-                        reference,
-                        "packed stride {stride} {polarity:?}"
-                    );
-                }
+                assert_packed_layouts_match(&pixels, width, height, stride, preset, &reference);
             }
             let inverted: Vec<u8> = pixels.iter().map(|&p| u8::from(p == 0)).collect();
             let image = BilevelImage::new(

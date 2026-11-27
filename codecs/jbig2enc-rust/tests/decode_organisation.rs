@@ -23,6 +23,18 @@ fn random_bitmap(w: u32, h: u32, seed: u32) -> TestBitmap {
     bm
 }
 
+/// Checks jbig2dec's page against the encoded bitmap pixel by pixel.
+fn assert_oracle_matches(pbm: &common::pbm::Pbm, bm: &TestBitmap) {
+    let (w, h) = (bm.width, bm.height);
+    assert_eq!(pbm.width, w);
+    assert_eq!(pbm.height, h);
+    for y in 0..h {
+        for x in 0..w {
+            assert_eq!(pbm.get(x, y) != 0, bm.get(x, y), "oracle ({x},{y})");
+        }
+    }
+}
+
 #[test]
 fn random_access_generic_page() {
     let opts = DecodeOptions::default();
@@ -43,14 +55,7 @@ fn random_access_generic_page() {
 
         // jbig2dec on the same standalone file.
         if let Some(res) = common::oracle::decode_standalone(&file) {
-            let pbm = res.expect("jbig2dec decode");
-            assert_eq!(pbm.width, w);
-            assert_eq!(pbm.height, h);
-            for y in 0..h {
-                for x in 0..w {
-                    assert_eq!(pbm.get(x, y) != 0, bm.get(x, y), "oracle ({x},{y})");
-                }
-            }
+            assert_oracle_matches(&res.expect("jbig2dec decode"), &bm);
         }
     }
 }

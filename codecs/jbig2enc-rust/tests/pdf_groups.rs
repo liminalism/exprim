@@ -17,6 +17,45 @@ fn page(index: usize) -> BitImage {
     image
 }
 
+/// Checks one embedded page decodes to its source natively, with jbig2dec
+/// and through every available PDF renderer.
+fn assert_page_exact(
+    source: &BitImage,
+    globals: Option<&[u8]>,
+    stream: &[u8],
+    options: &DecodeOptions,
+) {
+    let decoded = decode_embedded(globals, stream, options).unwrap();
+    for y in 0..65 {
+        for x in 0..129 {
+            assert_eq!(source.get_usize(x, y), decoded.get(x as u32, y as u32));
+        }
+    }
+    if let Some(oracle) = common::oracle::decode_embedded(globals, stream) {
+        let oracle = oracle.unwrap();
+        for y in 0..65 {
+            for x in 0..129 {
+                assert_eq!(source.get_usize(x, y), oracle.get(x as u32, y as u32) != 0);
+            }
+        }
+    }
+    let expected = common::pbm::Pbm::new(
+        129,
+        65,
+        (0..65)
+            .flat_map(|y| (0..129).map(move |x| u8::from(source.get_usize(x, y))))
+            .collect(),
+    );
+    let encoded_pdf = common::pdf::wrap_page(129, 65, globals, stream);
+    let control_pdf = common::pdf::wrap_uncompressed(&expected);
+    for backend in ["PDFTOPPM", "PDFIUM_PYTHON"] {
+        if let Some(encoded) = common::pdf::render(backend, &encoded_pdf) {
+            let control = common::pdf::render(backend, &control_pdf).unwrap();
+            common::pbm::assert_pixels_eq(&control, &encoded, backend);
+        }
+    }
+}
+
 #[test]
 fn bounded_groups_have_explicit_globals_associations_and_exact_pages() {
     let cfg = Jbig2Config::text_lossless();
@@ -58,39 +97,7 @@ fn bounded_groups_have_explicit_globals_associations_and_exact_pages() {
             group.metrics.resources.global_dictionary_bitmap_bytes
         );
         for (offset, stream) in group.output.page_streams.iter().enumerate() {
-            let source = page(group.first_page + offset);
-            let decoded = decode_embedded(globals, stream, &options).unwrap();
-            for y in 0..65 {
-                for x in 0..129 {
-                    assert_eq!(source.get_usize(x, y), decoded.get(x as u32, y as u32));
-                }
-            }
-            if let Some(oracle) = common::oracle::decode_embedded(globals, stream) {
-                let oracle = oracle.unwrap();
-                for y in 0..65 {
-                    for x in 0..129 {
-                        assert_eq!(source.get_usize(x, y), oracle.get(x as u32, y as u32) != 0);
-                    }
-                }
-            }
-            let expected = common::pbm::Pbm::new(
-                129,
-                65,
-                (0..65)
-                    .flat_map(|y| {
-                        let source = &source;
-                        (0..129).map(move |x| u8::from(source.get_usize(x, y)))
-                    })
-                    .collect(),
-            );
-            let encoded_pdf = common::pdf::wrap_page(129, 65, globals, stream);
-            let control_pdf = common::pdf::wrap_uncompressed(&expected);
-            for backend in ["PDFTOPPM", "PDFIUM_PYTHON"] {
-                if let Some(encoded) = common::pdf::render(backend, &encoded_pdf) {
-                    let control = common::pdf::render(backend, &control_pdf).unwrap();
-                    common::pbm::assert_pixels_eq(&control, &encoded, backend);
-                }
-            }
+            assert_page_exact(&page(group.first_page + offset), globals, stream, &options);
         }
     }
 }

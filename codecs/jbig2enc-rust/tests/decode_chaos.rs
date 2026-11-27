@@ -58,6 +58,18 @@ fn seed_streams() -> Vec<Vec<u8>> {
     ]
 }
 
+/// Draws a 6x10 box with diagonal hatching at `(xx, yy)` of a `sw`-wide
+/// page.
+fn draw_hatched_box(spx: &mut [u8], sw: u32, (xx, yy): (u32, u32)) {
+    for dy in 0..10u32 {
+        for dx in 0..6u32 {
+            if dx == 0 || dx == 5 || dy == 0 || dy == 9 || (dx + dy) % 3 == 0 {
+                spx[((yy + dy) * sw + (xx + dx)) as usize] = 1;
+            }
+        }
+    }
+}
+
 /// A small synthetic text-like page encoded in symbol mode (real symbol
 /// dictionary + refinement text region) for the symbol-mode chaos gate.
 fn symbol_stream() -> Vec<u8> {
@@ -67,13 +79,7 @@ fn symbol_stream() -> Vec<u8> {
     while yy + 12 < sh {
         let mut xx = 3u32;
         while xx + 8 < sw {
-            for dy in 0..10u32 {
-                for dx in 0..6u32 {
-                    if dx == 0 || dx == 5 || dy == 0 || dy == 9 || (dx + dy) % 3 == 0 {
-                        spx[((yy + dy) * sw + (xx + dx)) as usize] = 1;
-                    }
-                }
-            }
+            draw_hatched_box(&mut spx, sw, (xx, yy));
             xx += 10;
         }
         yy += 14;
@@ -86,6 +92,26 @@ fn symbol_stream() -> Vec<u8> {
     )
     .unwrap()
     .page_data
+}
+
+/// Draws a 7-wide "H" at `(ox, oy)` of a `w`-wide page, one pixel wider
+/// if `wide`, clipped at the right edge.
+fn draw_h_glyph(px: &mut [u8], w: u32, (ox, oy): (u32, u32), wide: bool) {
+    let mut set = |gx: u32, gy: u32| {
+        if ox + gx < w {
+            px[((oy + gy) * w + (ox + gx)) as usize] = 1;
+        }
+    };
+    for gy in 0..10 {
+        set(0, gy);
+        set(6, gy);
+    }
+    for gx in 1..6 {
+        set(gx, 5);
+    }
+    if wide {
+        set(7, 5);
+    }
 }
 
 /// A refine-mode page (SBREFINE=1 text region whose instances carry non-zero
@@ -103,21 +129,7 @@ fn refine_stream() -> Vec<u8> {
             let ox = 2 + rx * pitch_x;
             let oy = 2 + ry * pitch_y;
             let wide = (rx + ry) % 2 == 1;
-            let mut set = |gx: u32, gy: u32| {
-                if ox + gx < w {
-                    px[((oy + gy) * w + (ox + gx)) as usize] = 1;
-                }
-            };
-            for gy in 0..10 {
-                set(0, gy);
-                set(6, gy);
-            }
-            for gx in 1..6 {
-                set(gx, 5);
-            }
-            if wide {
-                set(7, 5);
-            }
+            draw_h_glyph(&mut px, w, (ox, oy), wide);
         }
     }
     let mut cfg = Jbig2Config::text();

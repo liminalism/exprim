@@ -1,8 +1,9 @@
 //! Encoding-only child for isolated process RSS. External verification happens
 //! after this child exits, in tools/measure_encode_memory.py. No decode or PDF
 //! rendering takes place here. File writes force all encoded bytes to be used.
+use super::grouped::pbm_to_bitimage;
 use super::{common::pbm::Pbm, config};
-use jbig2enc_rust::{PdfGroupEncoder, PdfGroupOptions, jbig2sym::BitImage};
+use jbig2enc_rust::{PdfGroupEncoder, PdfGroupOptions};
 use std::path::PathBuf;
 
 pub(super) fn run() {
@@ -60,14 +61,7 @@ pub(super) fn run() {
     .unwrap();
     for path in &paths {
         let source = Pbm::from_p4(&std::fs::read(path).unwrap()).unwrap();
-        let mut image = BitImage::new(source.width, source.height).unwrap();
-        for y in 0..source.height {
-            for x in 0..source.width {
-                if source.get(x, y) != 0 {
-                    image.set_usize(x as usize, y as usize, true);
-                }
-            }
-        }
+        let image = pbm_to_bitimage(&source);
         drop(source);
         encoder.push_page(image).unwrap();
     }

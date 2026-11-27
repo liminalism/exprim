@@ -223,6 +223,49 @@ pub(crate) struct TextArithParams {
     pub code_len: u8,
 }
 
+/// §6.4.11 with SBHUFF=0: decodes a refined glyph's size and offset deltas
+/// and its refinement region from the shared arithmetic stream, returning
+/// the glyph and its height.
+fn decode_arith_refined_glyph(
+    dec: &mut ArithmeticDecoder<'_>,
+    int_ctx: &mut IntegerContexts,
+    p: &TextArithParams,
+    symbol: &MonoBitmap,
+    refine_ctx: &mut [MqContext],
+    limits: &DecodeLimits,
+) -> Result<(MonoBitmap, i64), DecodeError> {
+    let rdw = decode_value(int_ctx.decode(dec, IntProc::Iardw))? as i64;
+    let rdh = decode_value(int_ctx.decode(dec, IntProc::Iardh))? as i64;
+    let rdx = decode_value(int_ctx.decode(dec, IntProc::Iardx))?;
+    let rdy = decode_value(int_ctx.decode(dec, IntProc::Iardy))?;
+    let grw = symbol.width() as i64 + rdw;
+    let grh = symbol.height() as i64 + rdh;
+    if grw <= 0 || grh <= 0 || grw > limits.max_width as i64 || grh > limits.max_height as i64 {
+        return Err(DecodeError::Malformed {
+            reason: "refined glyph dimensions out of range",
+        });
+    }
+    // §6.3.5.3: GRREFERENCEDX/DY = floor(RDW/2)+RDX, floor(RDH/2)+RDY.
+    // RDX/RDY are unbounded decoded integers; saturate the sum.
+    let grdx = (rdw.div_euclid(2) as i32).saturating_add(rdx);
+    let grdy = (rdh.div_euclid(2) as i32).saturating_add(rdy);
+    let refined = decode_refinement_region_templated(
+        dec,
+        symbol,
+        grw as u32,
+        grh as u32,
+        grdx,
+        grdy,
+        p.sb_rtemplate,
+        false,
+        p.grat,
+        p.grat2,
+        refine_ctx,
+        limits,
+    )?;
+    Ok((refined, grh))
+}
+
 /// The arithmetic text-region strip/placement loop (T.88 §6.4.5), decoding from
 /// an existing arithmetic decoder and context banks (which the caller has reset
 /// or is carrying across an aggregate invocation).
@@ -271,16 +314,15 @@ pub(crate) fn decode_text_region_arith(
         loop {
             if !first_in_strip {
                 // §6.4.5 3c) subsequent S: IADS, OOB ends the strip.
-                match int_ctx.decode(&mut dec, IntProc::Iads) {
+                let ids = match int_ctx.decode(&mut dec, IntProc::Iads) {
                     DecodedInteger::OutOfBand => break,
-                    DecodedInteger::Value(ids) => {
-                        cur_s = cur_s
-                            .checked_add(ids as i64 + p.sb_ds_offset as i64)
-                            .ok_or(DecodeError::Overflow {
-                                operation: "S coordinate",
-                            })?;
-                    }
-                }
+                    DecodedInteger::Value(ids) => ids,
+                };
+                cur_s = cur_s
+                    .checked_add(ids as i64 + p.sb_ds_offset as i64)
+                    .ok_or(DecodeError::Overflow {
+                        operation: "S coordinate",
+                    })?;
             }
             first_in_strip = false;
 
@@ -317,39 +359,8 @@ pub(crate) fn decode_text_region_arith(
             // The glyph actually placed: the reference symbol, or a decoded
             // refinement of it. `placed_height` anchors bottom reference corners.
             let (placed, placed_height): (PlacedSymbol<'_>, i64) = if ri != 0 {
-                let rdw = decode_value(int_ctx.decode(&mut dec, IntProc::Iardw))? as i64;
-                let rdh = decode_value(int_ctx.decode(&mut dec, IntProc::Iardh))? as i64;
-                let rdx = decode_value(int_ctx.decode(&mut dec, IntProc::Iardx))?;
-                let rdy = decode_value(int_ctx.decode(&mut dec, IntProc::Iardy))?;
-                let grw = symbol.width() as i64 + rdw;
-                let grh = symbol.height() as i64 + rdh;
-                if grw <= 0
-                    || grh <= 0
-                    || grw > limits.max_width as i64
-                    || grh > limits.max_height as i64
-                {
-                    return Err(DecodeError::Malformed {
-                        reason: "refined glyph dimensions out of range",
-                    });
-                }
-                // §6.3.5.3: GRREFERENCEDX/DY = floor(RDW/2)+RDX, floor(RDH/2)+RDY.
-                // RDX/RDY are unbounded decoded integers; saturate the sum.
-                let grdx = (rdw.div_euclid(2) as i32).saturating_add(rdx);
-                let grdy = (rdh.div_euclid(2) as i32).saturating_add(rdy);
-                let refined = decode_refinement_region_templated(
-                    &mut dec,
-                    symbol,
-                    grw as u32,
-                    grh as u32,
-                    grdx,
-                    grdy,
-                    p.sb_rtemplate,
-                    false,
-                    p.grat,
-                    p.grat2,
-                    refine_ctx,
-                    limits,
-                )?;
+                let (refined, grh) =
+                    decode_arith_refined_glyph(&mut dec, int_ctx, p, symbol, refine_ctx, limits)?;
                 (PlacedSymbol::Owned(refined), grh)
             } else {
                 (PlacedSymbol::Borrowed(symbol), hi)
@@ -448,6 +459,17 @@ impl TrTable {
     }
 }
 
+/// Appends `length` `repeat` times, stopping once `num_syms` lengths are
+/// known.
+fn push_repeated_length(lengths: &mut Vec<u32>, length: u32, repeat: usize, num_syms: usize) {
+    for _ in 0..repeat {
+        if lengths.len() >= num_syms {
+            break;
+        }
+        lengths.push(length);
+    }
+}
+
 /// Decode the symbol-ID Huffman table (T.88 §7.4.3.1.7): 35 four-bit RUNCODE
 /// lengths, run-length-coded symbol-ID code lengths, then B.3 code assignment.
 fn decode_symbol_id_table(
@@ -490,33 +512,18 @@ fn decode_symbol_id_table(
             32 => {
                 // Copy the previous length 3–6 times (2 extra bits + 3).
                 let repeat = r.read_bits(2) as usize + 3;
-                for _ in 0..repeat {
-                    if lengths.len() >= num_syms {
-                        break;
-                    }
-                    lengths.push(prev_len);
-                }
+                push_repeated_length(&mut lengths, prev_len, repeat, num_syms);
             }
             33 => {
                 // Repeat length 0 for 3–10 times (3 extra bits + 3).
                 let repeat = r.read_bits(3) as usize + 3;
-                for _ in 0..repeat {
-                    if lengths.len() >= num_syms {
-                        break;
-                    }
-                    lengths.push(0);
-                }
+                push_repeated_length(&mut lengths, 0, repeat, num_syms);
                 prev_len = 0;
             }
             34 => {
                 // Repeat length 0 for 11–138 times (7 extra bits + 11).
                 let repeat = r.read_bits(7) as usize + 11;
-                for _ in 0..repeat {
-                    if lengths.len() >= num_syms {
-                        break;
-                    }
-                    lengths.push(0);
-                }
+                push_repeated_length(&mut lengths, 0, repeat, num_syms);
                 prev_len = 0;
             }
             _ => {
@@ -691,6 +698,70 @@ pub(crate) struct HuffTextTables<'a> {
     pub rsize: &'a HuffmanTable,
 }
 
+/// §6.4.11 with SBHUFF=1: decodes a refined glyph's size and offset deltas,
+/// its bitmap size and its byte-aligned arithmetic refinement block (fresh
+/// GR statistics), returning the glyph and its width and height.
+fn decode_huffman_refined_glyph(
+    br: &mut BitReader<'_>,
+    tables: &HuffTextTables<'_>,
+    p: &HuffTextParams,
+    symbol: &MonoBitmap,
+    refine_ctx: &mut [MqContext],
+    limits: &DecodeLimits,
+) -> Result<(MonoBitmap, i64, i64), DecodeError> {
+    let rdw = huff_value(tables.rdw.decode(br)?)? as i64;
+    let rdh = huff_value(tables.rdh.decode(br)?)? as i64;
+    let rdx = huff_value(tables.rdx.decode(br)?)?;
+    let rdy = huff_value(tables.rdy.decode(br)?)?;
+    // §6.4.11.5 refinement bitmap data size, then byte-align.
+    let bmsize = match tables.rsize.decode(br)? {
+        HuffmanValue::Value(v) if v >= 0 => v as usize,
+        _ => {
+            return Err(DecodeError::Malformed {
+                reason: "invalid Huffman refinement bitmap size",
+            });
+        }
+    };
+    br.align_to_byte();
+    let grw = symbol.width() as i64 + rdw;
+    let grh = symbol.height() as i64 + rdh;
+    if grw <= 0 || grh <= 0 || grw > limits.max_width as i64 || grh > limits.max_height as i64 {
+        return Err(DecodeError::Malformed {
+            reason: "refined glyph dimensions out of range",
+        });
+    }
+    let grdx = (rdw.div_euclid(2) as i32).saturating_add(rdx);
+    let grdy = (rdh.div_euclid(2) as i32).saturating_add(rdy);
+    for c in refine_ctx.iter_mut() {
+        *c = MqContext(0);
+    }
+    let refine_bytes = br.remaining_from_byte();
+    let block = if bmsize > 0 && bmsize <= refine_bytes.len() {
+        &refine_bytes[..bmsize]
+    } else {
+        refine_bytes
+    };
+    let mut rdec = ArithmeticDecoder::new(block);
+    let refined = decode_refinement_region_templated(
+        &mut rdec,
+        symbol,
+        grw as u32,
+        grh as u32,
+        grdx,
+        grdy,
+        p.sb_rtemplate,
+        false,
+        p.grat,
+        p.grat2,
+        refine_ctx,
+        limits,
+    )?;
+    // §6.4.11.5 7): skip exactly BMSIZE bytes, then byte-align.
+    br.skip_bytes(bmsize);
+    br.align_to_byte();
+    Ok((refined, grw, grh))
+}
+
 /// The Huffman text-region strip/placement loop (T.88 §6.4.5, SBHUFF=1),
 /// decoding from an existing bit reader and pre-selected tables. Refinement
 /// bitmaps are byte-aligned arithmetic blocks with fresh GR statistics each
@@ -734,16 +805,15 @@ pub(crate) fn decode_huffman_text_core(
         loop {
             if !first_in_strip {
                 // §6.4.5 4c ii) subsequent S; OOB ends the strip.
-                match tables.ds.decode(br)? {
+                let ids = match tables.ds.decode(br)? {
                     HuffmanValue::Oob => break,
-                    HuffmanValue::Value(ids) => {
-                        cur_s = cur_s
-                            .checked_add(ids as i64 + p.sb_ds_offset as i64)
-                            .ok_or(DecodeError::Overflow {
-                                operation: "S coordinate",
-                            })?;
-                    }
-                }
+                    HuffmanValue::Value(ids) => ids,
+                };
+                cur_s = cur_s
+                    .checked_add(ids as i64 + p.sb_ds_offset as i64)
+                    .ok_or(DecodeError::Overflow {
+                        operation: "S coordinate",
+                    })?;
             }
             first_in_strip = false;
 
@@ -779,60 +849,8 @@ pub(crate) fn decode_huffman_text_core(
             // §6.4.11 refinement indicator (one bit when SBHUFF=1).
             let ri = if p.sbrefine { br.read_bit() } else { 0 };
             let (placed, placed_w, placed_h): (PlacedSymbol<'_>, i64, i64) = if ri != 0 {
-                let rdw = huff_value(tables.rdw.decode(br)?)? as i64;
-                let rdh = huff_value(tables.rdh.decode(br)?)? as i64;
-                let rdx = huff_value(tables.rdx.decode(br)?)?;
-                let rdy = huff_value(tables.rdy.decode(br)?)?;
-                // §6.4.11.5 refinement bitmap data size, then byte-align.
-                let bmsize = match tables.rsize.decode(br)? {
-                    HuffmanValue::Value(v) if v >= 0 => v as usize,
-                    _ => {
-                        return Err(DecodeError::Malformed {
-                            reason: "invalid Huffman refinement bitmap size",
-                        });
-                    }
-                };
-                br.align_to_byte();
-                let grw = symbol.width() as i64 + rdw;
-                let grh = symbol.height() as i64 + rdh;
-                if grw <= 0
-                    || grh <= 0
-                    || grw > limits.max_width as i64
-                    || grh > limits.max_height as i64
-                {
-                    return Err(DecodeError::Malformed {
-                        reason: "refined glyph dimensions out of range",
-                    });
-                }
-                let grdx = (rdw.div_euclid(2) as i32).saturating_add(rdx);
-                let grdy = (rdh.div_euclid(2) as i32).saturating_add(rdy);
-                for c in refine_ctx.iter_mut() {
-                    *c = MqContext(0);
-                }
-                let refine_bytes = br.remaining_from_byte();
-                let block = if bmsize > 0 && bmsize <= refine_bytes.len() {
-                    &refine_bytes[..bmsize]
-                } else {
-                    refine_bytes
-                };
-                let mut rdec = ArithmeticDecoder::new(block);
-                let refined = decode_refinement_region_templated(
-                    &mut rdec,
-                    symbol,
-                    grw as u32,
-                    grh as u32,
-                    grdx,
-                    grdy,
-                    p.sb_rtemplate,
-                    false,
-                    p.grat,
-                    p.grat2,
-                    refine_ctx,
-                    limits,
-                )?;
-                // §6.4.11.5 7): skip exactly BMSIZE bytes, then byte-align.
-                br.skip_bytes(bmsize);
-                br.align_to_byte();
+                let (refined, grw, grh) =
+                    decode_huffman_refined_glyph(br, tables, p, symbol, refine_ctx, limits)?;
                 (PlacedSymbol::Owned(refined), grw, grh)
             } else {
                 (

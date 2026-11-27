@@ -12,7 +12,7 @@ use crate::decode::arith::ArithmeticDecoder;
 use crate::decode::context::DecoderContext;
 use crate::decode::error::{DecodeError, LimitError, ParseError, UnsupportedFeature};
 use crate::decode::file::{ParsedDocument, ParsedSegment};
-use crate::decode::generic::{decode_generic_region_into, parse_generic_region};
+use crate::decode::generic::{GenericRegion, decode_generic_region_into, parse_generic_region};
 use crate::decode::globals::DecodedGlobals;
 use crate::decode::halftone_region::{decode_halftone_region, parse_halftone_region};
 use crate::decode::pattern_dictionary::{PatternDictionary, decode_pattern_dictionary};
@@ -400,377 +400,476 @@ fn run_segments(
     ctx: &mut DecoderContext,
     scratch: SegmentScratch,
 ) -> Result<SegmentScratch, DecodeError> {
-    let SegmentScratch {
-        mut pages,
-        mut unknown_height,
-        mut clean_white,
-        mut store,
-        mut bitmap_pool,
-    } = scratch;
-    let mut current: Option<usize> = None;
-    let globals_store = globals.map(|g| g.store());
+    let mut run = SegmentRun {
+        scratch,
+        current: None,
+        globals_store: globals.map(|g| g.store()),
+        limits,
+    };
 
     // Surface any parse-time recoveries (Compatible mode, jbig2decplan.md §20).
     ctx.recovery_events.clear();
     ctx.recovery_events.extend(doc.recovery.iter().cloned());
 
     for seg in &doc.segments {
-        store.record_dependency_depth(
+        run.scratch.store.record_dependency_depth(
             seg.header.number,
             &seg.header.referred_to,
-            globals_store,
+            run.globals_store,
             limits,
         )?;
+        run.decode_segment(seg, ctx)?;
+    }
+
+    Ok(run.scratch)
+}
+
+/// A decoded region bitmap and where and how it combines onto its page.
+struct PlacedRegion {
+    bitmap: MonoBitmap,
+    x: u32,
+    y: u32,
+    comb_operator: u8,
+}
+
+/// The state the segment loop carries from one segment to the next: the
+/// pooled page and segment buffers, the current page, the shared globals
+/// and the limits.
+struct SegmentRun<'r> {
+    scratch: SegmentScratch,
+    current: Option<usize>,
+    globals_store: Option<&'r SegmentStore>,
+    limits: &'r DecodeLimits,
+}
+
+impl SegmentRun<'_> {
+    /// Decodes one segment by type.
+    fn decode_segment(
+        &mut self,
+        seg: &ParsedSegment<'_>,
+        ctx: &mut DecoderContext,
+    ) -> Result<(), DecodeError> {
+        let limits = self.limits;
         let ty = seg.header.segment_type();
         match ty {
             Some(SegmentType::SymbolDictionary) => {
-                decode_symbol_dict_into(seg, &mut store, globals_store, limits, ctx)?;
-                continue;
+                decode_symbol_dict_into(
+                    seg,
+                    &mut self.scratch.store,
+                    self.globals_store,
+                    limits,
+                    ctx,
+                )?;
+                Ok(())
             }
             Some(
                 SegmentType::ImmediateTextRegion
                 | SegmentType::ImmediateLosslessTextRegion
                 | SegmentType::IntermediateTextRegion,
-            ) => {
-                let mut symbols = std::mem::take(&mut ctx.symbol_scratch);
-                symbols.clear();
-                if let Err(err) = store.gather_symbols_into(
-                    seg.header.number,
-                    &seg.header.referred_to,
-                    globals_store,
-                    &mut symbols,
-                ) {
-                    ctx.symbol_scratch = symbols;
-                    return Err(err);
-                }
-                let tables = store.gather_huffman_tables(&seg.header.referred_to, globals_store);
-                // Ensure the refinement bank is sized, then split disjoint field
-                // borrows for the integer, IAID, and refinement context banks.
-                if ctx.refinement_contexts.len() < REFINEMENT_CONTEXT_COUNT {
-                    ctx.refinement_contexts
-                        .resize(REFINEMENT_CONTEXT_COUNT, Default::default());
-                }
-                let int_ctx = &mut ctx.integer_contexts;
-                let iaid_ctx = &mut ctx.iaid_contexts;
-                let refine_ctx = &mut ctx.refinement_contexts[..REFINEMENT_CONTEXT_COUNT];
-                let result = decode_text_region(
-                    seg.data, &symbols, &tables, limits, int_ctx, iaid_ctx, refine_ctx,
-                );
-                symbols.clear();
-                ctx.symbol_scratch = symbols;
-                let result = result.map_err(|source| annotate(seg.header.number, source))?;
-                if let Some(spare) = place_or_store(
-                    matches!(ty, Some(SegmentType::IntermediateTextRegion)),
-                    seg.header.number,
-                    &mut store,
-                    &mut pages,
-                    &unknown_height,
-                    &mut clean_white,
-                    current,
-                    seg.header.page_association,
-                    result.bitmap,
-                    result.x,
-                    result.y,
-                    result.comb_operator,
-                    limits,
-                )? {
-                    bitmap_pool.push(spare);
-                }
-                continue;
-            }
-            _ => {}
-        }
-        match ty {
-            Some(SegmentType::PageInformation) => {
-                let info = parse_page_info(seg.data).map_err(|source| DecodeError::Segment {
-                    segment: seg.header.number,
-                    source,
-                })?;
-                let is_unknown = info.has_unknown_height();
-                // A page of unknown height starts empty and grows as stripes /
-                // regions arrive; a known-height page is allocated up front.
-                let init_height = if is_unknown { 0 } else { info.height };
-                if !is_unknown {
-                    check_page_pixels(&info, limits)?;
-                }
-                let bitmap = acquire_bitmap(
-                    &mut bitmap_pool,
-                    info.width,
-                    init_height,
-                    info.default_pixel,
-                    limits,
-                )?;
-                pages.push(DecodedPage {
-                    page_number: seg.header.page_association,
-                    bitmap,
-                });
-                unknown_height.push(is_unknown);
-                clean_white.push(!info.default_pixel);
-                current = Some(pages.len() - 1);
-            }
+            ) => self.decode_text_region_segment(seg, ty, ctx),
+            Some(SegmentType::PageInformation) => self.start_page(seg),
             Some(
                 SegmentType::ImmediateGenericRegion
                 | SegmentType::ImmediateLosslessGenericRegion
                 | SegmentType::IntermediateGenericRegion,
-            ) => {
-                let mut region =
-                    parse_generic_region(seg.data).map_err(|source| DecodeError::Segment {
-                        segment: seg.header.number,
-                        source,
-                    })?;
-                if seg.header.is_unknown_length() {
-                    // §7.2.7 / §6.2.6: the data part ends with a four-byte row
-                    // count; the region's true height is that count (<= the
-                    // region-info height). Trim it from the coded data.
-                    let dlen = region.data.len();
-                    if dlen < 4 {
-                        return Err(DecodeError::Malformed {
-                            reason: "unknown-length generic region missing row count",
-                        });
-                    }
-                    let rc = &region.data[dlen - 4..];
-                    let row_count = u32::from_be_bytes([rc[0], rc[1], rc[2], rc[3]]);
-                    if row_count > region.height {
-                        return Err(DecodeError::Malformed {
-                            reason: "unknown-length row count exceeds region height",
-                        });
-                    }
-                    region.height = row_count;
-                    region.data = &region.data[..dlen - 4];
-                }
-                let intermediate = matches!(ty, Some(SegmentType::IntermediateGenericRegion));
-                // Fast path: an immediate generic region covering the entire
-                // page at (0,0) with Replace, or with Or on an untouched white
-                // page, decodes straight into the page buffer without allocating
-                // or zeroing a second page-sized region bitmap.
-                let direct_target = if !intermediate && region.x == 0 && region.y == 0 {
-                    resolve_page(&mut pages, current, seg.header.page_association)
-                        .ok()
-                        .filter(|&idx| {
-                            let page = &pages[idx].bitmap;
-                            let op = combination_operator(region.comb_operator);
-                            region.width == page.width()
-                                && region.height == page.height()
-                                && (matches!(op, CombinationOperator::Replace)
-                                    || (matches!(op, CombinationOperator::Or) && clean_white[idx]))
-                        })
-                } else {
-                    None
-                };
-                if let Some(target_idx) = direct_target {
-                    let page = &mut pages[target_idx].bitmap;
-                    if region.mmr && !clean_white[target_idx] {
-                        page.reset(region.width, region.height, false, limits)?;
-                    }
-                    let (gctx, scr) = ctx.generic_and_scratch();
-                    decode_generic_region_into(&region, limits, gctx, scr, page)?;
-                    clean_white[target_idx] = false;
-                } else {
-                    let mut region_bm = acquire_bitmap(
-                        &mut bitmap_pool,
-                        region.width,
-                        region.height,
-                        false,
-                        limits,
-                    )?;
-                    let (gctx, scr) = ctx.generic_and_scratch();
-                    decode_generic_region_into(&region, limits, gctx, scr, &mut region_bm)?;
-                    if let Some(spare) = place_or_store(
-                        intermediate,
-                        seg.header.number,
-                        &mut store,
-                        &mut pages,
-                        &unknown_height,
-                        &mut clean_white,
-                        current,
-                        seg.header.page_association,
-                        region_bm,
-                        region.x,
-                        region.y,
-                        region.comb_operator,
-                        limits,
-                    )? {
-                        bitmap_pool.push(spare);
-                    }
-                }
-            }
+            ) => self.decode_generic_region_segment(seg, ty, ctx),
             // §7.4.10 end of stripe: a 4-byte end row. For an unknown-height
             // page this communicates the page size, so grow to include it.
-            Some(SegmentType::EndOfStripe) => {
-                if seg.data.len() >= 4 {
-                    let end_row =
-                        u32::from_be_bytes([seg.data[0], seg.data[1], seg.data[2], seg.data[3]]);
-                    if let Some(idx) = current.filter(|&i| unknown_height[i]) {
-                        let target_h = end_row.saturating_add(1);
-                        pages[idx].bitmap.grow_to_height(
-                            target_h,
-                            limits.max_page_pixels,
-                            limits,
-                        )?;
-                    }
-                }
-            }
+            Some(SegmentType::EndOfStripe) => self.end_stripe(seg),
             // Segments the self-decoder ignores structurally.
             Some(
                 SegmentType::EndOfPage
                 | SegmentType::EndOfFile
                 | SegmentType::Profiles
                 | SegmentType::Extension,
-            ) => {}
-            // Not handled in Phase 1.
-            Some(
-                SegmentType::SymbolDictionary
-                | SegmentType::IntermediateTextRegion
-                | SegmentType::ImmediateTextRegion
-                | SegmentType::ImmediateLosslessTextRegion,
-            ) => {
-                return Err(DecodeError::Unsupported(UnsupportedFeature::SymbolCoding));
-            }
+            ) => Ok(()),
             Some(SegmentType::PatternDictionary) => {
-                decode_pattern_dict_into(seg, &mut store, limits, ctx)?;
+                decode_pattern_dict_into(seg, &mut self.scratch.store, limits, ctx)?;
+                Ok(())
             }
             Some(
                 SegmentType::IntermediateHalftoneRegion
                 | SegmentType::ImmediateHalftoneRegion
                 | SegmentType::ImmediateLosslessHalftoneRegion,
-            ) => {
-                let region =
-                    parse_halftone_region(seg.data).map_err(|source| DecodeError::Segment {
-                        segment: seg.header.number,
-                        source,
-                    })?;
-                let patterns = store
-                    .pattern_dictionary(seg.header.number, &seg.header.referred_to, globals_store)?
-                    .clone();
-                let (generic, scratch) = ctx.generic_and_scratch();
-                let region_bm =
-                    decode_halftone_region(&region, &patterns, limits, generic, scratch)
-                        .map_err(|source| annotate(seg.header.number, source))?;
-                if let Some(spare) = place_or_store(
-                    matches!(ty, Some(SegmentType::IntermediateHalftoneRegion)),
-                    seg.header.number,
-                    &mut store,
-                    &mut pages,
-                    &unknown_height,
-                    &mut clean_white,
-                    current,
-                    seg.header.page_association,
-                    region_bm,
-                    region.x,
-                    region.y,
-                    region.comb_operator,
-                    limits,
-                )? {
-                    bitmap_pool.push(spare);
-                }
-            }
+            ) => self.decode_halftone_region_segment(seg, ty, ctx),
             Some(
                 SegmentType::ImmediateGenericRefinementRegion
                 | SegmentType::ImmediateLosslessGenericRefinementRegion
                 | SegmentType::IntermediateGenericRefinementRegion,
-            ) => {
-                // T.88 §7.4.7.4: GRREFERENCE is the referred region segment's
-                // auxiliary buffer (an intermediate region's stored bitmap) when
-                // this segment refers to one, otherwise the page-buffer window
-                // under the region box. GRREFERENCEDX/DY = 0 (Table 35).
-                let region = parse_refinement_region(seg.data)
-                    .map_err(|source| annotate(seg.header.number, source))?;
-                let intermediate =
-                    matches!(ty, Some(SegmentType::IntermediateGenericRefinementRegion));
-
-                let (owned_ref, borrowed_ref, ext_comb) = if seg.header.referred_to.is_empty() {
-                    // No referred region: refine the page buffer window in place;
-                    // §7.4.7.5 step 1 external combination operator is REPLACE.
-                    let target = resolve_page(&mut pages, current, seg.header.page_association)?;
-                    grow_if_unknown(
-                        &mut pages[target].bitmap,
-                        unknown_height[target],
-                        region.y,
-                        region.height,
-                        limits,
-                    )?;
-                    let reference = page_reference_window(
-                        &pages[target].bitmap,
-                        region.x,
-                        region.y,
-                        region.width,
-                        region.height,
-                        limits,
-                    )?;
-                    (Some(reference), None, 4u8)
-                } else {
-                    // Referred region: its retained bitmap is GRREFERENCE (borrow
-                    // directly without cloning the bitmap).
-                    let src = store
-                        .referred_region(&seg.header.referred_to, globals_store)
-                        .ok_or(DecodeError::MissingReferredSegment {
-                            segment: seg.header.number,
-                            referred: seg.header.referred_to.first().copied().unwrap_or(0),
-                        })?
-                        .clone();
-                    (None, Some(src), region.comb_operator)
-                };
-                let reference: &MonoBitmap = match (&owned_ref, &borrowed_ref) {
-                    (Some(bm), _) => bm,
-                    (None, Some(arc)) => arc.as_ref(),
-                    (None, None) => unreachable!(),
-                };
-
-                // §7.4.7.5 step 2: fresh arithmetic statistics per segment.
-                let refine_ctx = ctx.refinement_contexts();
-                let mut dec = ArithmeticDecoder::new(region.data);
-                let refined = decode_refinement_region_templated(
-                    &mut dec,
-                    reference,
-                    region.width,
-                    region.height,
-                    0,
-                    0,
-                    region.grtemplate,
-                    region.tpgron,
-                    region.grat,
-                    region.grat2,
-                    refine_ctx,
-                    limits,
-                )
-                .map_err(|source| annotate(seg.header.number, source))?;
-                if let Some(spare) = place_or_store(
-                    intermediate,
-                    seg.header.number,
-                    &mut store,
-                    &mut pages,
-                    &unknown_height,
-                    &mut clean_white,
-                    current,
-                    seg.header.page_association,
-                    refined,
-                    region.x,
-                    region.y,
-                    ext_comb,
-                    limits,
-                )? {
-                    bitmap_pool.push(spare);
-                }
-            }
-            Some(SegmentType::Tables) => {
-                decode_tables_into(seg, &mut store, limits)?;
-            }
-            Some(SegmentType::ColorPalette) | Some(SegmentType::FileHeader) => {}
-            None => {
-                return Err(DecodeError::Unsupported(UnsupportedFeature::SegmentType(
-                    seg.header.type_code,
-                )));
-            }
+            ) => self.decode_refinement_region_segment(seg, ty, ctx),
+            Some(SegmentType::Tables) => decode_tables_into(seg, &mut self.scratch.store, limits),
+            Some(SegmentType::ColorPalette) | Some(SegmentType::FileHeader) => Ok(()),
+            None => Err(DecodeError::Unsupported(UnsupportedFeature::SegmentType(
+                seg.header.type_code,
+            ))),
         }
     }
 
-    Ok(SegmentScratch {
-        pages,
-        unknown_height,
-        clean_white,
-        store,
-        bitmap_pool,
-    })
+    /// Combines a decoded region onto its page, or stores it for an
+    /// intermediate segment, returning any spare bitmap to the pool.
+    fn place(
+        &mut self,
+        intermediate: bool,
+        seg: &ParsedSegment<'_>,
+        region: PlacedRegion,
+    ) -> Result<(), DecodeError> {
+        let scratch = &mut self.scratch;
+        if let Some(spare) = place_or_store(
+            intermediate,
+            seg.header.number,
+            &mut scratch.store,
+            &mut scratch.pages,
+            &scratch.unknown_height,
+            &mut scratch.clean_white,
+            self.current,
+            seg.header.page_association,
+            region.bitmap,
+            region.x,
+            region.y,
+            region.comb_operator,
+            self.limits,
+        )? {
+            scratch.bitmap_pool.push(spare);
+        }
+        Ok(())
+    }
+
+    /// Decodes a text region against the symbols of the dictionaries it
+    /// refers to.
+    fn decode_text_region_segment(
+        &mut self,
+        seg: &ParsedSegment<'_>,
+        ty: Option<SegmentType>,
+        ctx: &mut DecoderContext,
+    ) -> Result<(), DecodeError> {
+        let store = &self.scratch.store;
+        let mut symbols = std::mem::take(&mut ctx.symbol_scratch);
+        symbols.clear();
+        if let Err(err) = store.gather_symbols_into(
+            seg.header.number,
+            &seg.header.referred_to,
+            self.globals_store,
+            &mut symbols,
+        ) {
+            ctx.symbol_scratch = symbols;
+            return Err(err);
+        }
+        let tables = store.gather_huffman_tables(&seg.header.referred_to, self.globals_store);
+        // Ensure the refinement bank is sized, then split disjoint field
+        // borrows for the integer, IAID, and refinement context banks.
+        if ctx.refinement_contexts.len() < REFINEMENT_CONTEXT_COUNT {
+            ctx.refinement_contexts
+                .resize(REFINEMENT_CONTEXT_COUNT, Default::default());
+        }
+        let int_ctx = &mut ctx.integer_contexts;
+        let iaid_ctx = &mut ctx.iaid_contexts;
+        let refine_ctx = &mut ctx.refinement_contexts[..REFINEMENT_CONTEXT_COUNT];
+        let result = decode_text_region(
+            seg.data,
+            &symbols,
+            &tables,
+            self.limits,
+            int_ctx,
+            iaid_ctx,
+            refine_ctx,
+        );
+        symbols.clear();
+        ctx.symbol_scratch = symbols;
+        let result = result.map_err(|source| annotate(seg.header.number, source))?;
+        self.place(
+            matches!(ty, Some(SegmentType::IntermediateTextRegion)),
+            seg,
+            PlacedRegion {
+                bitmap: result.bitmap,
+                x: result.x,
+                y: result.y,
+                comb_operator: result.comb_operator,
+            },
+        )
+    }
+
+    /// Starts a page: allocates its bitmap (empty for an unknown height)
+    /// and makes it the current page.
+    fn start_page(&mut self, seg: &ParsedSegment<'_>) -> Result<(), DecodeError> {
+        let limits = self.limits;
+        let scratch = &mut self.scratch;
+        let info = parse_page_info(seg.data).map_err(|source| DecodeError::Segment {
+            segment: seg.header.number,
+            source,
+        })?;
+        let is_unknown = info.has_unknown_height();
+        // A page of unknown height starts empty and grows as stripes /
+        // regions arrive; a known-height page is allocated up front.
+        let init_height = if is_unknown { 0 } else { info.height };
+        if !is_unknown {
+            check_page_pixels(&info, limits)?;
+        }
+        let bitmap = acquire_bitmap(
+            &mut scratch.bitmap_pool,
+            info.width,
+            init_height,
+            info.default_pixel,
+            limits,
+        )?;
+        scratch.pages.push(DecodedPage {
+            page_number: seg.header.page_association,
+            bitmap,
+        });
+        scratch.unknown_height.push(is_unknown);
+        scratch.clean_white.push(!info.default_pixel);
+        self.current = Some(scratch.pages.len() - 1);
+        Ok(())
+    }
+
+    /// Decodes a generic region, straight into the page when it covers it,
+    /// otherwise into its own bitmap placed onto the page.
+    fn decode_generic_region_segment(
+        &mut self,
+        seg: &ParsedSegment<'_>,
+        ty: Option<SegmentType>,
+        ctx: &mut DecoderContext,
+    ) -> Result<(), DecodeError> {
+        let limits = self.limits;
+        let mut region = parse_generic_region(seg.data).map_err(|source| DecodeError::Segment {
+            segment: seg.header.number,
+            source,
+        })?;
+        if seg.header.is_unknown_length() {
+            trim_unknown_length_row_count(&mut region)?;
+        }
+        let intermediate = matches!(ty, Some(SegmentType::IntermediateGenericRegion));
+        if let Some(target_idx) = self.direct_generic_target(&region, intermediate, seg) {
+            let page = &mut self.scratch.pages[target_idx].bitmap;
+            if region.mmr && !self.scratch.clean_white[target_idx] {
+                page.reset(region.width, region.height, false, limits)?;
+            }
+            let (gctx, scr) = ctx.generic_and_scratch();
+            decode_generic_region_into(&region, limits, gctx, scr, page)?;
+            self.scratch.clean_white[target_idx] = false;
+            return Ok(());
+        }
+        let mut region_bm = acquire_bitmap(
+            &mut self.scratch.bitmap_pool,
+            region.width,
+            region.height,
+            false,
+            limits,
+        )?;
+        let (gctx, scr) = ctx.generic_and_scratch();
+        decode_generic_region_into(&region, limits, gctx, scr, &mut region_bm)?;
+        self.place(
+            intermediate,
+            seg,
+            PlacedRegion {
+                bitmap: region_bm,
+                x: region.x,
+                y: region.y,
+                comb_operator: region.comb_operator,
+            },
+        )
+    }
+
+    /// The page an immediate generic region can decode straight into.
+    ///
+    /// Fast path: an immediate generic region covering the entire
+    /// page at (0,0) with Replace, or with Or on an untouched white
+    /// page, decodes straight into the page buffer without allocating
+    /// or zeroing a second page-sized region bitmap.
+    fn direct_generic_target(
+        &mut self,
+        region: &GenericRegion<'_>,
+        intermediate: bool,
+        seg: &ParsedSegment<'_>,
+    ) -> Option<usize> {
+        if intermediate || region.x != 0 || region.y != 0 {
+            return None;
+        }
+        let scratch = &mut self.scratch;
+        resolve_page(
+            &mut scratch.pages,
+            self.current,
+            seg.header.page_association,
+        )
+        .ok()
+        .filter(|&idx| {
+            let page = &scratch.pages[idx].bitmap;
+            let op = combination_operator(region.comb_operator);
+            region.width == page.width()
+                && region.height == page.height()
+                && (matches!(op, CombinationOperator::Replace)
+                    || (matches!(op, CombinationOperator::Or) && scratch.clean_white[idx]))
+        })
+    }
+
+    /// Grows the current page of unknown height to include an end-of-stripe
+    /// row.
+    fn end_stripe(&mut self, seg: &ParsedSegment<'_>) -> Result<(), DecodeError> {
+        if seg.data.len() < 4 {
+            return Ok(());
+        }
+        let end_row = u32::from_be_bytes([seg.data[0], seg.data[1], seg.data[2], seg.data[3]]);
+        let unknown_height = &self.scratch.unknown_height;
+        let Some(idx) = self.current.filter(|&i| unknown_height[i]) else {
+            return Ok(());
+        };
+        let target_h = end_row.saturating_add(1);
+        self.scratch.pages[idx].bitmap.grow_to_height(
+            target_h,
+            self.limits.max_page_pixels,
+            self.limits,
+        )?;
+        Ok(())
+    }
+
+    /// Decodes a halftone region against its pattern dictionary and places
+    /// it.
+    fn decode_halftone_region_segment(
+        &mut self,
+        seg: &ParsedSegment<'_>,
+        ty: Option<SegmentType>,
+        ctx: &mut DecoderContext,
+    ) -> Result<(), DecodeError> {
+        let region = parse_halftone_region(seg.data).map_err(|source| DecodeError::Segment {
+            segment: seg.header.number,
+            source,
+        })?;
+        let patterns = self
+            .scratch
+            .store
+            .pattern_dictionary(
+                seg.header.number,
+                &seg.header.referred_to,
+                self.globals_store,
+            )?
+            .clone();
+        let (generic, scratch) = ctx.generic_and_scratch();
+        let region_bm = decode_halftone_region(&region, &patterns, self.limits, generic, scratch)
+            .map_err(|source| annotate(seg.header.number, source))?;
+        self.place(
+            matches!(ty, Some(SegmentType::IntermediateHalftoneRegion)),
+            seg,
+            PlacedRegion {
+                bitmap: region_bm,
+                x: region.x,
+                y: region.y,
+                comb_operator: region.comb_operator,
+            },
+        )
+    }
+
+    /// Decodes a refinement region against its referred region or the page
+    /// window under it, and places it.
+    fn decode_refinement_region_segment(
+        &mut self,
+        seg: &ParsedSegment<'_>,
+        ty: Option<SegmentType>,
+        ctx: &mut DecoderContext,
+    ) -> Result<(), DecodeError> {
+        let limits = self.limits;
+        // T.88 §7.4.7.4: GRREFERENCE is the referred region segment's
+        // auxiliary buffer (an intermediate region's stored bitmap) when
+        // this segment refers to one, otherwise the page-buffer window
+        // under the region box. GRREFERENCEDX/DY = 0 (Table 35).
+        let region = parse_refinement_region(seg.data)
+            .map_err(|source| annotate(seg.header.number, source))?;
+        let intermediate = matches!(ty, Some(SegmentType::IntermediateGenericRefinementRegion));
+
+        let (owned_ref, borrowed_ref, ext_comb) = if seg.header.referred_to.is_empty() {
+            // No referred region: refine the page buffer window in place;
+            // §7.4.7.5 step 1 external combination operator is REPLACE.
+            let scratch = &mut self.scratch;
+            let target = resolve_page(
+                &mut scratch.pages,
+                self.current,
+                seg.header.page_association,
+            )?;
+            grow_if_unknown(
+                &mut scratch.pages[target].bitmap,
+                scratch.unknown_height[target],
+                region.y,
+                region.height,
+                limits,
+            )?;
+            let reference = page_reference_window(
+                &scratch.pages[target].bitmap,
+                region.x,
+                region.y,
+                region.width,
+                region.height,
+                limits,
+            )?;
+            (Some(reference), None, 4u8)
+        } else {
+            // Referred region: its retained bitmap is GRREFERENCE (borrow
+            // directly without cloning the bitmap).
+            let src = self
+                .scratch
+                .store
+                .referred_region(&seg.header.referred_to, self.globals_store)
+                .ok_or(DecodeError::MissingReferredSegment {
+                    segment: seg.header.number,
+                    referred: seg.header.referred_to.first().copied().unwrap_or(0),
+                })?
+                .clone();
+            (None, Some(src), region.comb_operator)
+        };
+        let reference: &MonoBitmap = match (&owned_ref, &borrowed_ref) {
+            (Some(bm), _) => bm,
+            (None, Some(arc)) => arc.as_ref(),
+            (None, None) => unreachable!(),
+        };
+
+        // §7.4.7.5 step 2: fresh arithmetic statistics per segment.
+        let refine_ctx = ctx.refinement_contexts();
+        let mut dec = ArithmeticDecoder::new(region.data);
+        let refined = decode_refinement_region_templated(
+            &mut dec,
+            reference,
+            region.width,
+            region.height,
+            0,
+            0,
+            region.grtemplate,
+            region.tpgron,
+            region.grat,
+            region.grat2,
+            refine_ctx,
+            limits,
+        )
+        .map_err(|source| annotate(seg.header.number, source))?;
+        self.place(
+            intermediate,
+            seg,
+            PlacedRegion {
+                bitmap: refined,
+                x: region.x,
+                y: region.y,
+                comb_operator: ext_comb,
+            },
+        )
+    }
+}
+
+/// §7.2.7 / §6.2.6: the data part of an unknown-length generic region ends
+/// with a four-byte row count; the region's true height is that count (<=
+/// the region-info height). Trims it from the coded data.
+fn trim_unknown_length_row_count(region: &mut GenericRegion<'_>) -> Result<(), DecodeError> {
+    let dlen = region.data.len();
+    if dlen < 4 {
+        return Err(DecodeError::Malformed {
+            reason: "unknown-length generic region missing row count",
+        });
+    }
+    let rc = &region.data[dlen - 4..];
+    let row_count = u32::from_be_bytes([rc[0], rc[1], rc[2], rc[3]]);
+    if row_count > region.height {
+        return Err(DecodeError::Malformed {
+            reason: "unknown-length row count exceeds region height",
+        });
+    }
+    region.height = row_count;
+    region.data = &region.data[..dlen - 4];
+    Ok(())
 }
 
 fn check_page_pixels(info: &PageInformation, limits: &DecodeLimits) -> Result<(), DecodeError> {

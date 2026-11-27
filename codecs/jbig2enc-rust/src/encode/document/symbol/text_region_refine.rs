@@ -206,68 +206,13 @@ pub fn encode_text_region_with_refinement(
             coder.encode_integer(IntProc::Iari, ri)?;
 
             if item.needs_refinement {
-                // Get the original instance data and the prototype
-                let orig_instance = &instances[item.orig_idx];
-                let prototype = &all_symbols[orig_instance.symbol_index];
-
-                // Trim the instance bitmap to get the actual glyph
-                let (_, trimmed_instance) = orig_instance.instance_bitmap.trim();
-
-                // Size deltas: how much wider/taller is the instance vs prototype
-                let rdwi = trimmed_instance.width as i32 - prototype.width as i32;
-                let rdhi = trimmed_instance.height as i32 - prototype.height as i32;
-
-                coder.encode_integer(IntProc::Iardw, rdwi)?;
-                coder.encode_integer(IntProc::Iardh, rdhi)?;
-
-                // Position offsets for aligning the reference within the target.
-                // Per §6.4.11.3.2: GRDX = (RDWI/2) + RDXI, GRDY = (RDHI/2) + RDYI
-                // Use the pre-computed alignment offsets from clustering
-                let rdxi = orig_instance.refinement_dx;
-                let mut rdyi = orig_instance.refinement_dy;
-                // A reference may legally lie outside the target, but PDFium's
-                // optimized refinement decoder normalizes vertical offsets
-                // outside the reference height to zero. Choose that alignment
-                // explicitly and encode the target with the same alignment so
-                // every decoder reads identical contexts. Pixel content and
-                // placement are unchanged; only the reference predictor moves.
-                let requested_grdy = i64::from(rdhi.div_euclid(2)) + i64::from(rdyi);
-                if requested_grdy <= -(prototype.height as i64)
-                    || requested_grdy >= prototype.height as i64
-                {
-                    rdyi = -rdhi.div_euclid(2);
-                }
-
-                coder.encode_integer(IntProc::Iardx, rdxi)?;
-                coder.encode_integer(IntProc::Iardy, rdyi)?;
-
-                // Compute GRDX/GRDY for the refinement region.
-                // §6.4.11.3.2 / §6.3: GRREFERENCEDX = floor(RDW/2) + RDX. Rust's `/`
-                // truncates toward zero, which differs from floor for negative RDW
-                // (instance narrower/shorter than the prototype) and would shift the
-                // reference by one pixel vs the decoder. Use floor division.
-                let grdx = rdwi
-                    .div_euclid(2)
-                    .checked_add(rdxi)
-                    .ok_or_else(|| anyhow!("refinement horizontal offset overflow"))?;
-                let grdy = rdhi.div_euclid(2) + rdyi;
-
-                // Encode the refinement region: pixel-by-pixel difference
-                // between the trimmed instance and the prototype
-                coder.encode_refinement_region(
-                    &trimmed_instance,
-                    prototype,
-                    grdx,
-                    grdy,
-                    config.text_refine_template,
+                encode_instance_refinement(
+                    &mut coder,
+                    &instances[item.orig_idx],
+                    all_symbols,
+                    config,
                     &grat,
                 )?;
-
-                // Do NOT reset the refinement (GR) contexts between symbol
-                // instances. T.88 §6.4.11 codes each instance's refinement with the
-                // generic refinement procedure using the text region's shared GR
-                // statistics; jbig2dec carries them across instances, so resetting
-                // here desynchronises every refinement after the first.
             }
 
             // §6.4.5 step 3c xi): CURS += WI - 1 where WI is the *placed* bitmap
@@ -282,4 +227,75 @@ pub fn encode_text_region_with_refinement(
     payload.extend(coder.as_bytes());
 
     Ok(payload)
+}
+
+/// Codes one refined instance's size deltas, reference offsets and
+/// refinement region against its prototype (T.88 §6.4.11).
+fn encode_instance_refinement(
+    coder: &mut Jbig2ArithCoder,
+    orig_instance: &SymbolInstance,
+    all_symbols: &[BitImage],
+    config: &Jbig2Config,
+    grat: &[(i8, i8); 1],
+) -> Result<()> {
+    // Get the original instance data and the prototype
+    let prototype = &all_symbols[orig_instance.symbol_index];
+
+    // Trim the instance bitmap to get the actual glyph
+    let (_, trimmed_instance) = orig_instance.instance_bitmap.trim();
+
+    // Size deltas: how much wider/taller is the instance vs prototype
+    let rdwi = trimmed_instance.width as i32 - prototype.width as i32;
+    let rdhi = trimmed_instance.height as i32 - prototype.height as i32;
+
+    coder.encode_integer(IntProc::Iardw, rdwi)?;
+    coder.encode_integer(IntProc::Iardh, rdhi)?;
+
+    // Position offsets for aligning the reference within the target.
+    // Per §6.4.11.3.2: GRDX = (RDWI/2) + RDXI, GRDY = (RDHI/2) + RDYI
+    // Use the pre-computed alignment offsets from clustering
+    let rdxi = orig_instance.refinement_dx;
+    let mut rdyi = orig_instance.refinement_dy;
+    // A reference may legally lie outside the target, but PDFium's
+    // optimized refinement decoder normalizes vertical offsets
+    // outside the reference height to zero. Choose that alignment
+    // explicitly and encode the target with the same alignment so
+    // every decoder reads identical contexts. Pixel content and
+    // placement are unchanged; only the reference predictor moves.
+    let requested_grdy = i64::from(rdhi.div_euclid(2)) + i64::from(rdyi);
+    if requested_grdy <= -(prototype.height as i64) || requested_grdy >= prototype.height as i64 {
+        rdyi = -rdhi.div_euclid(2);
+    }
+
+    coder.encode_integer(IntProc::Iardx, rdxi)?;
+    coder.encode_integer(IntProc::Iardy, rdyi)?;
+
+    // Compute GRDX/GRDY for the refinement region.
+    // §6.4.11.3.2 / §6.3: GRREFERENCEDX = floor(RDW/2) + RDX. Rust's `/`
+    // truncates toward zero, which differs from floor for negative RDW
+    // (instance narrower/shorter than the prototype) and would shift the
+    // reference by one pixel vs the decoder. Use floor division.
+    let grdx = rdwi
+        .div_euclid(2)
+        .checked_add(rdxi)
+        .ok_or_else(|| anyhow!("refinement horizontal offset overflow"))?;
+    let grdy = rdhi.div_euclid(2) + rdyi;
+
+    // Encode the refinement region: pixel-by-pixel difference
+    // between the trimmed instance and the prototype
+    coder.encode_refinement_region(
+        &trimmed_instance,
+        prototype,
+        grdx,
+        grdy,
+        config.text_refine_template,
+        grat,
+    )?;
+
+    // Do NOT reset the refinement (GR) contexts between symbol
+    // instances. T.88 §6.4.11 codes each instance's refinement with the
+    // generic refinement procedure using the text region's shared GR
+    // statistics; jbig2dec carries them across instances, so resetting
+    // here desynchronises every refinement after the first.
+    Ok(())
 }

@@ -45,17 +45,7 @@ fn retained_contexts_second_dict() {
     // Expected: dict B's symbols placed at their S positions.
     let mut expected = TestBitmap::new(w, h);
     for &(sym, s) in &placements {
-        let g = &syms_b[sym];
-        for gy in 0..g.height {
-            for gx in 0..g.width {
-                if g.get(gx, gy) {
-                    let px = s + gx as i32;
-                    if px >= 0 && (px as u32) < w {
-                        expected.set(px as u32, gy, true);
-                    }
-                }
-            }
-        }
+        expected.or_glyph(&syms_b[sym], s, 0);
     }
 
     let opts = DecodeOptions::default();

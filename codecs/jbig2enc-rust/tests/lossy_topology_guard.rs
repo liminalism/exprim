@@ -102,20 +102,27 @@ fn tiny_refinement_reference_offsets_are_portable_across_decoders() {
     }
 }
 
+/// Draws a closed 5x7 ring at `(left, top)`, or one with a one-pixel
+/// opening on its right side.
+fn draw_ring(image: &mut Pbm, (left, top): (u32, u32), open: bool) {
+    let width = image.width;
+    for y in 0..7 {
+        for x in 0..5 {
+            let border = x == 0 || x == 4 || y == 0 || y == 6;
+            let opening = open && x == 4 && y == 2;
+            if border && !opening {
+                image.pixels[((top + y) * width + left + x) as usize] = 1;
+            }
+        }
+    }
+}
+
 fn source() -> Pbm {
     let (width, height) = (257, 65);
     let mut image = Pbm::new(width, height, vec![0; (width * height) as usize]);
     for index in 0..48 {
         let (left, top) = (4 + (index % 24) * 10, 4 + (index / 24) * 20);
-        for y in 0..7 {
-            for x in 0..5 {
-                let border = x == 0 || x == 4 || y == 0 || y == 6;
-                let opening = index % 2 == 1 && x == 4 && y == 2;
-                if border && !opening {
-                    image.pixels[((top + y) * width + left + x) as usize] = 1;
-                }
-            }
-        }
+        draw_ring(&mut image, (left, top), index % 2 == 1);
     }
     image
 }
@@ -210,6 +217,67 @@ fn bounded_measured_lossy_planner_distinguishes_substitution_and_refinement() {
     assert!(Jbig2Encoder::try_new(&invalid).is_err());
 }
 
+/// Checks a guarded embedded page against its source with jbig2dec and
+/// every available PDF renderer.
+fn assert_guarded_page_renders_exactly(source: &Pbm, globals: Option<&[u8]>, stream: &[u8]) {
+    if let Some(oracle) = common::oracle::decode_embedded(globals, stream) {
+        assert_pixels_eq(source, &oracle.unwrap(), "guarded jbig2dec");
+    }
+    let pdf = common::pdf::wrap_page(source.width, source.height, globals, stream);
+    for backend in ["PDFTOPPM", "PDFIUM_PYTHON"] {
+        if let Some(rendered) = common::pdf::render(backend, &pdf) {
+            let control =
+                common::pdf::render(backend, &common::pdf::wrap_uncompressed(source)).unwrap();
+            assert_pixels_eq(&control, &rendered, backend);
+        }
+    }
+}
+
+/// Encodes the fixture with or without the topology guard, as a PDF split
+/// or a standalone file, checks the guarded output against the oracles, and
+/// returns how many pixels differ from the source.
+fn guarded_differences(source: &Pbm, input: &Array2<u8>, pdf: bool, safe: bool) -> usize {
+    let config = if safe {
+        Jbig2Config::text_symbol_unify_safe()
+    } else {
+        Jbig2Config::text_symbol_unify()
+    };
+    let mut encoder = Jbig2Encoder::new(&config);
+    encoder.add_page(input).unwrap();
+    let decoded = if pdf {
+        let split = encoder.flush_pdf_split().unwrap();
+        let globals = split.global_segments.as_deref();
+        let stream = &split.page_streams[0];
+        let decoded = decode_embedded(globals, stream, &DecodeOptions::default()).unwrap();
+        if safe {
+            assert_guarded_page_renders_exactly(source, globals, stream);
+        }
+        decoded
+    } else {
+        let stream = encoder.flush().unwrap();
+        if safe && let Some(oracle) = common::oracle::decode_standalone(&stream) {
+            assert_pixels_eq(source, &oracle.unwrap(), "guarded standalone jbig2dec");
+        }
+        decode_file(&stream, &DecodeOptions::default())
+            .unwrap()
+            .pages
+            .remove(0)
+            .bitmap
+    };
+    let differences = (0..source.height)
+        .flat_map(|y| (0..source.width).map(move |x| (x, y)))
+        .filter(|&(x, y)| (source.get(x, y) != 0) != decoded.get(x, y))
+        .count();
+    if safe {
+        assert_eq!(
+            differences, 0,
+            "all components in this fixture are retained"
+        );
+        assert!(encoder.metrics_snapshot().symbol_stats.topology_refinements > 0);
+    }
+    differences
+}
+
 #[test]
 fn final_guard_corrects_one_pixel_hole_closures_after_lossy_unification() {
     let source = source();
@@ -221,59 +289,7 @@ fn final_guard_corrects_one_pixel_hole_closures_after_lossy_unification() {
     for pdf in [false, true] {
         let mut observed = Vec::new();
         for safe in [false, true] {
-            let config = if safe {
-                Jbig2Config::text_symbol_unify_safe()
-            } else {
-                Jbig2Config::text_symbol_unify()
-            };
-            let mut encoder = Jbig2Encoder::new(&config);
-            encoder.add_page(&input).unwrap();
-            let decoded = if pdf {
-                let split = encoder.flush_pdf_split().unwrap();
-                let globals = split.global_segments.as_deref();
-                let stream = &split.page_streams[0];
-                let decoded = decode_embedded(globals, stream, &DecodeOptions::default()).unwrap();
-                if safe {
-                    if let Some(oracle) = common::oracle::decode_embedded(globals, stream) {
-                        assert_pixels_eq(&source, &oracle.unwrap(), "guarded jbig2dec");
-                    }
-                    let pdf = common::pdf::wrap_page(source.width, source.height, globals, stream);
-                    for backend in ["PDFTOPPM", "PDFIUM_PYTHON"] {
-                        if let Some(rendered) = common::pdf::render(backend, &pdf) {
-                            let control = common::pdf::render(
-                                backend,
-                                &common::pdf::wrap_uncompressed(&source),
-                            )
-                            .unwrap();
-                            assert_pixels_eq(&control, &rendered, backend);
-                        }
-                    }
-                }
-                decoded
-            } else {
-                let stream = encoder.flush().unwrap();
-                if safe {
-                    if let Some(oracle) = common::oracle::decode_standalone(&stream) {
-                        assert_pixels_eq(&source, &oracle.unwrap(), "guarded standalone jbig2dec");
-                    }
-                }
-                decode_file(&stream, &DecodeOptions::default())
-                    .unwrap()
-                    .pages
-                    .remove(0)
-                    .bitmap
-            };
-            let differences = (0..source.height)
-                .flat_map(|y| (0..source.width).map(move |x| (x, y)))
-                .filter(|&(x, y)| (source.get(x, y) != 0) != decoded.get(x, y))
-                .count();
-            if safe {
-                assert_eq!(
-                    differences, 0,
-                    "all components in this fixture are retained"
-                );
-                assert!(encoder.metrics_snapshot().symbol_stats.topology_refinements > 0);
-            }
+            let differences = guarded_differences(&source, &input, pdf, safe);
             observed.push(differences);
         }
         assert!(

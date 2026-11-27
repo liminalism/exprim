@@ -18,10 +18,11 @@ use common::pbm::Pbm;
 use jbig2enc_rust::decode::{
     DecodeOptions, DecoderContext, decode_embedded, decode_embedded_with_globals, decode_globals,
 };
-use jbig2enc_rust::jbig2enc::Jbig2Encoder;
+use jbig2enc_rust::jbig2enc::{EncoderMetrics, Jbig2Encoder};
+use jbig2enc_rust::shared::bitmap::MonoBitmap;
 use jbig2enc_rust::{Jbig2Config, PdfDictionaryPolicy, encode_single_image_lossless};
 use ndarray::Array2;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 fn config(mode: &str) -> Jbig2Config {
@@ -88,6 +89,150 @@ fn oracle_differences(source: &Pbm, oracle: &Pbm) -> u64 {
         .count() as u64
 }
 
+/// Prints the encoder's matching, topology, trial, optimization and stage
+/// metrics.
+fn print_encoder_metrics(metrics: &EncoderMetrics) {
+    println!(
+        "QUALITY_MATCHING\tcomponents={}\tingest_comparisons={}\tplanner_comparisons={}\tlegacy_post_ingest_comparisons=unreported",
+        metrics.symbol_stats.input_components,
+        metrics.symbol_stats.comparator_calls,
+        metrics.optimization.candidate_comparisons
+    );
+    println!(
+        "QUALITY_TOPOLOGY\tcorrected_instances={}",
+        metrics.symbol_stats.topology_refinements
+    );
+    for trial in &metrics.optimization.trials {
+        println!(
+            "QUALITY_TRIAL\t{:?}\t{}\t{:?}\t{:?}\t{:?}\t{}\traw={:?}",
+            trial.symbol,
+            trial.representation,
+            trial.policy,
+            trial.estimated_gain_bytes,
+            trial.measured_gain_bytes,
+            trial.encoded_bytes,
+            trial.raw_estimated_gain_bytes
+        );
+    }
+    if !metrics.optimization.trials.is_empty() {
+        println!(
+            "QUALITY_OPTIMIZATION\ttrials={}\tcomparisons={}\tbaseline={}\tgeneric={}\tselected={}\texact_instances={}\trefined_instances={}\tgeneric_instances={}\tsubstituted_instances={}",
+            metrics.optimization.trials.len(),
+            metrics.optimization.candidate_comparisons,
+            metrics.optimization.baseline_bytes,
+            metrics.optimization.generic_bytes,
+            metrics.optimization.selected_bytes,
+            metrics.optimization.exact_instances,
+            metrics.optimization.refined_instances,
+            metrics.optimization.generic_instances,
+            metrics.optimization.substituted_instances
+        );
+    }
+    println!(
+        "QUALITY_STAGES\tcc={:.9}\tmatch={:.9}\tcluster={:.9}\tplan={:.9}\tdict={:.9}\ttext={:.9}\tgeneric={:.9}",
+        metrics.symbol_mode.cc_extraction.as_secs_f64(),
+        metrics.symbol_mode.matching_dedup.as_secs_f64(),
+        metrics.symbol_mode.clustering.as_secs_f64(),
+        metrics.symbol_mode.planning.as_secs_f64(),
+        metrics.symbol_mode.symbol_dict_encoding.as_secs_f64(),
+        metrics.symbol_mode.text_region_encoding.as_secs_f64(),
+        metrics.symbol_mode.generic_region_encoding.as_secs_f64()
+    );
+}
+
+/// Saves the globals and page streams under `directory`.
+fn write_stream_artifacts(directory: &Path, globals: Option<&[u8]>, page_streams: &[Vec<u8>]) {
+    std::fs::create_dir_all(directory).unwrap();
+    if let Some(globals) = globals {
+        std::fs::write(directory.join("globals.jb2"), globals).unwrap();
+    }
+    for (index, stream) in page_streams.iter().enumerate() {
+        std::fs::write(directory.join(format!("page-{index:04}.jb2")), stream).unwrap();
+    }
+}
+
+/// The decoded page's pixels over the source's extent, one byte each.
+fn decoded_pixels(source: &Pbm, cold: &MonoBitmap) -> Vec<u8> {
+    (0..source.height)
+        .flat_map(|y| (0..source.width).map(move |x| u8::from(cold.get(x, y))))
+        .collect()
+}
+
+/// Decodes the page with jbig2dec, checks it agrees with the native decode
+/// on every pixel, and returns its differences from the source.
+fn oracle_page_differences(
+    globals: Option<&[u8]>,
+    stream: &[u8],
+    source: &Pbm,
+    cold: &MonoBitmap,
+    index: usize,
+) -> u64 {
+    let oracle = common::oracle::decode_embedded(globals, stream)
+        .unwrap()
+        .unwrap();
+    // A lossy encoder may change the source; independent decoders must
+    // nevertheless agree with each other on every output pixel.
+    assert_eq!(
+        oracle.pixels,
+        decoded_pixels(source, cold),
+        "decoder disagreement on page {index}"
+    );
+    oracle_differences(source, &oracle)
+}
+
+/// The page wrapped in a PDF and the native decode wrapped as an
+/// uncompressed control PDF.
+struct PdfPage<'p> {
+    index: usize,
+    pdf: &'p [u8],
+    control: &'p [u8],
+    decoded: &'p Pbm,
+}
+
+/// Renders the page PDF with every backend and checks each rendering
+/// against its control (and against the native decode for PDFium), saving
+/// the PDF and decode under the artifact directory if there is one.
+fn check_pdf_renderings(page: &PdfPage<'_>, canonical_termination: bool, artifacts: Option<&Path>) {
+    let index = page.index;
+    if let Some(directory) = artifacts {
+        std::fs::write(directory.join(format!("page-{index:04}.pdf")), page.pdf).unwrap();
+        std::fs::write(
+            directory.join(format!("decoded-{index:04}.pbm")),
+            page.decoded.to_p4(),
+        )
+        .unwrap();
+    }
+    for backend in ["PDFTOPPM", "PDFIUM_PYTHON"] {
+        check_pdf_backend(page, backend, canonical_termination);
+    }
+}
+
+/// Renders the page PDF and its control with one backend and checks they
+/// match.
+fn check_pdf_backend(page: &PdfPage<'_>, backend: &str, canonical_termination: bool) {
+    let index = page.index;
+    let (rendered, diagnostics) =
+        common::pdf::render_with_diagnostics(backend, page.pdf).expect("required PDF backend");
+    let trailing_warnings = diagnostics.matches("extraneous byte").count();
+    if canonical_termination {
+        assert_eq!(
+            trailing_warnings, 0,
+            "canonical {backend} stream has trailing arithmetic bytes"
+        );
+    }
+    println!("QUALITY_PDF_DIAGNOSTICS\t{index}\t{backend}\ttrailing_bytes={trailing_warnings}");
+    let baseline = common::pdf::render(backend, page.control).expect("required PDF control");
+    common::pbm::assert_pixels_eq(
+        &baseline,
+        &rendered,
+        &format!("{backend} rendered control equality"),
+    );
+    if backend == "PDFIUM_PYTHON" {
+        common::pbm::assert_pixels_eq(page.decoded, &rendered, "PDFium native bitmap equality");
+    }
+    println!("QUALITY_PDF\t{index}\t{backend}\tpass");
+}
+
 #[test]
 #[ignore = "run with tools/quality_benchmark.py; requires an explicit corpus and mode"]
 fn quality_corpus_worker() {
@@ -141,52 +286,7 @@ fn quality_corpus_worker() {
     let encode_seconds = start.elapsed().as_secs_f64();
     let metrics = encoder.metrics_snapshot();
     grouped::print_resources(0, &metrics.resources);
-    println!(
-        "QUALITY_MATCHING\tcomponents={}\tingest_comparisons={}\tplanner_comparisons={}\tlegacy_post_ingest_comparisons=unreported",
-        metrics.symbol_stats.input_components,
-        metrics.symbol_stats.comparator_calls,
-        metrics.optimization.candidate_comparisons
-    );
-    println!(
-        "QUALITY_TOPOLOGY\tcorrected_instances={}",
-        metrics.symbol_stats.topology_refinements
-    );
-    for trial in &metrics.optimization.trials {
-        println!(
-            "QUALITY_TRIAL\t{:?}\t{}\t{:?}\t{:?}\t{:?}\t{}\traw={:?}",
-            trial.symbol,
-            trial.representation,
-            trial.policy,
-            trial.estimated_gain_bytes,
-            trial.measured_gain_bytes,
-            trial.encoded_bytes,
-            trial.raw_estimated_gain_bytes
-        );
-    }
-    if !metrics.optimization.trials.is_empty() {
-        println!(
-            "QUALITY_OPTIMIZATION\ttrials={}\tcomparisons={}\tbaseline={}\tgeneric={}\tselected={}\texact_instances={}\trefined_instances={}\tgeneric_instances={}\tsubstituted_instances={}",
-            metrics.optimization.trials.len(),
-            metrics.optimization.candidate_comparisons,
-            metrics.optimization.baseline_bytes,
-            metrics.optimization.generic_bytes,
-            metrics.optimization.selected_bytes,
-            metrics.optimization.exact_instances,
-            metrics.optimization.refined_instances,
-            metrics.optimization.generic_instances,
-            metrics.optimization.substituted_instances
-        );
-    }
-    println!(
-        "QUALITY_STAGES\tcc={:.9}\tmatch={:.9}\tcluster={:.9}\tplan={:.9}\tdict={:.9}\ttext={:.9}\tgeneric={:.9}",
-        metrics.symbol_mode.cc_extraction.as_secs_f64(),
-        metrics.symbol_mode.matching_dedup.as_secs_f64(),
-        metrics.symbol_mode.clustering.as_secs_f64(),
-        metrics.symbol_mode.planning.as_secs_f64(),
-        metrics.symbol_mode.symbol_dict_encoding.as_secs_f64(),
-        metrics.symbol_mode.text_region_encoding.as_secs_f64(),
-        metrics.symbol_mode.generic_region_encoding.as_secs_f64()
-    );
+    print_encoder_metrics(&metrics);
     assert_eq!(split.page_streams.len(), pages.len());
     // Encoding time excludes verification; encoder is dropped before decoding.
     drop(encoder);
@@ -194,13 +294,7 @@ fn quality_corpus_worker() {
     let globals = split.global_segments.as_deref();
     let artifacts = std::env::var_os("QUALITY_ARTIFACT_DIR").map(PathBuf::from);
     if let Some(directory) = &artifacts {
-        std::fs::create_dir_all(directory).unwrap();
-        if let Some(globals) = globals {
-            std::fs::write(directory.join("globals.jb2"), globals).unwrap();
-        }
-        for (index, stream) in split.page_streams.iter().enumerate() {
-            std::fs::write(directory.join(format!("page-{index:04}.jb2")), stream).unwrap();
-        }
+        write_stream_artifacts(directory, globals, &split.page_streams);
     }
     let decoded_globals = globals.map(|bytes| decode_globals(bytes, &options).unwrap());
     let dictionary_memory = decoded_globals.as_ref().map_or(0, |g| g.retained_bytes());
@@ -232,77 +326,23 @@ fn quality_corpus_worker() {
         let warm_s = start.elapsed().as_secs_f64();
         assert_eq!(cold, warm);
         let oracle_diff = if oracle_available {
-            let oracle = common::oracle::decode_embedded(globals, stream)
-                .unwrap()
-                .unwrap();
-            // A lossy encoder may change the source; independent decoders must
-            // nevertheless agree with each other on every output pixel.
-            assert_eq!(
-                oracle.pixels,
-                (0..source.height)
-                    .flat_map(|y| {
-                        let cold = &cold;
-                        (0..source.width).map(move |x| u8::from(cold.get(x, y)))
-                    })
-                    .collect::<Vec<_>>(),
-                "decoder disagreement on page {index}"
-            );
-            let diff = oracle_differences(source, &oracle);
+            let diff = oracle_page_differences(globals, stream, source, &cold, index);
             oracle_total += diff;
             diff.to_string()
         } else {
             "unavailable".to_string()
         };
         if render_pdf {
-            let decoded = Pbm::new(
-                source.width,
-                source.height,
-                (0..source.height)
-                    .flat_map(|y| {
-                        let cold = &cold;
-                        (0..source.width).map(move |x| u8::from(cold.get(x, y)))
-                    })
-                    .collect(),
-            );
+            let decoded = Pbm::new(source.width, source.height, decoded_pixels(source, &cold));
             let pdf = common::pdf::wrap_page(source.width, source.height, globals, stream);
             let control = common::pdf::wrap_uncompressed(&decoded);
-            if let Some(directory) = &artifacts {
-                std::fs::write(directory.join(format!("page-{index:04}.pdf")), &pdf).unwrap();
-                std::fs::write(
-                    directory.join(format!("decoded-{index:04}.pbm")),
-                    decoded.to_p4(),
-                )
-                .unwrap();
-            }
-            for backend in ["PDFTOPPM", "PDFIUM_PYTHON"] {
-                let (rendered, diagnostics) = common::pdf::render_with_diagnostics(backend, &pdf)
-                    .expect("required PDF backend");
-                let trailing_warnings = diagnostics.matches("extraneous byte").count();
-                if canonical_termination {
-                    assert_eq!(
-                        trailing_warnings, 0,
-                        "canonical {backend} stream has trailing arithmetic bytes"
-                    );
-                }
-                println!(
-                    "QUALITY_PDF_DIAGNOSTICS\t{index}\t{backend}\ttrailing_bytes={trailing_warnings}"
-                );
-                let baseline =
-                    common::pdf::render(backend, &control).expect("required PDF control");
-                common::pbm::assert_pixels_eq(
-                    &baseline,
-                    &rendered,
-                    &format!("{backend} rendered control equality"),
-                );
-                if backend == "PDFIUM_PYTHON" {
-                    common::pbm::assert_pixels_eq(
-                        &decoded,
-                        &rendered,
-                        "PDFium native bitmap equality",
-                    );
-                }
-                println!("QUALITY_PDF\t{index}\t{backend}\tpass");
-            }
+            let page = PdfPage {
+                index,
+                pdf: &pdf,
+                control: &control,
+                decoded: &decoded,
+            };
+            check_pdf_renderings(&page, canonical_termination, artifacts.as_deref());
         }
         println!(
             "QUALITY_PAGE\t{index}\t{}\t{difference}\t{cold_s:.9}\t{warm_s:.9}\t{oracle_diff}",

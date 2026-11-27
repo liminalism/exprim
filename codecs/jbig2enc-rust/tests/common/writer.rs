@@ -47,6 +47,19 @@ impl TestBitmap {
         }
     }
 
+    /// ORs the black pixels of `glyph` in with its top-left at `(x, y)`,
+    /// clipping whatever falls outside.
+    pub fn or_glyph(&mut self, glyph: &TestBitmap, x: i32, y: i32) {
+        for gy in 0..glyph.height {
+            for gx in 0..glyph.width {
+                let (px, py) = (x + gx as i32, y + gy as i32);
+                if glyph.get(gx, gy) && px >= 0 && py >= 0 {
+                    self.set(px as u32, py as u32, true);
+                }
+            }
+        }
+    }
+
     #[inline]
     pub fn get(&self, x: u32, y: u32) -> bool {
         if x < self.width && y < self.height {
@@ -724,6 +737,19 @@ fn ref_typical(reference: &TestBitmap, x: i64, y: i64) -> Option<bool> {
     }
 }
 
+/// Whether every typical pixel of row `y` already has its predicted value
+/// in `target`.
+fn typical_pixels_match(target: &TestBitmap, reference: &TestBitmap, y: u32) -> bool {
+    for x in 0..target.width {
+        if let Some(v) = ref_typical(reference, x as i64, y as i64)
+            && target.get(x, y) != v
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Arithmetic data for a refinement region refining `reference` into `target`
 /// (same size, offset 0), with the given template and TPGRON flag.
 pub fn refinement_arith_data(
@@ -743,15 +769,7 @@ pub fn refinement_arith_data(
         if tpgron {
             // A row can use LTP=1 only if every typical pixel already matches its
             // predicted value in `target`.
-            let mut desired = true;
-            for x in 0..target.width {
-                if let Some(v) = ref_typical(reference, x as i64, y as i64) {
-                    if target.get(x, y) != v {
-                        desired = false;
-                        break;
-                    }
-                }
-            }
+            let desired = typical_pixels_match(target, reference, y);
             let sltp = desired ^ ltp;
             coder.encode_bit(sltp_ctx, sltp);
             ltp = desired;
@@ -1050,6 +1068,18 @@ pub fn refagg_page(
 // Halftone HENABLESKIP writer (Phase 5e oracle support)
 // ------------------------------------------------------------------------
 
+/// Sets the black pixels of the `hdpw` x `hdph` pattern `p` in `collective`
+/// at column `left`.
+fn copy_pattern(collective: &mut TestBitmap, p: &TestBitmap, left: u32, (hdpw, hdph): (u32, u32)) {
+    for y in 0..hdph {
+        for x in 0..hdpw {
+            if p.get(x, y) {
+                collective.set(left + x, y, true);
+            }
+        }
+    }
+}
+
 /// Build a pattern-dictionary payload (arithmetic, HDTEMPLATE=0, T.88 §7.4.4).
 /// `patterns` are the HDPW×HDPH patterns, index 0..GRAYMAX, laid out side by
 /// side in one collective bitmap coded with AT1 = (-HDPW, 0) per §6.7.5.
@@ -1058,13 +1088,7 @@ pub fn pattern_dict_payload(patterns: &[TestBitmap], hdpw: u32, hdph: u32) -> Ve
     // Collective bitmap: patterns concatenated left to right.
     let mut collective = TestBitmap::new((graymax + 1) * hdpw, hdph);
     for (i, p) in patterns.iter().enumerate() {
-        for y in 0..hdph {
-            for x in 0..hdpw {
-                if p.get(x, y) {
-                    collective.set(i as u32 * hdpw + x, y, true);
-                }
-            }
-        }
+        copy_pattern(&mut collective, p, i as u32 * hdpw, (hdpw, hdph));
     }
     let at = [(-(hdpw as i32) as i8, 0i8), (-3, -1), (2, -2), (-2, -2)];
     let data = generic_arith_data(&collective, 0, &at, false);

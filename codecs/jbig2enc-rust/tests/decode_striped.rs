@@ -84,13 +84,7 @@ fn striped_unknown_height() {
     let mut expect = TestBitmap::new(40, total_h);
     let mut y0 = 0;
     for b in &bands {
-        for y in 0..b.height {
-            for x in 0..b.width {
-                if b.get(x, y) {
-                    expect.set(x, y0 + y, true);
-                }
-            }
-        }
+        expect.or_glyph(b, 0, y0 as i32);
         y0 += b.height;
     }
 
