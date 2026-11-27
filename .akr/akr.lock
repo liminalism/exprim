@@ -5,7 +5,7 @@ build {
     tool "akr 0.8.1"
     grammar "0.1"
     vocabulary "0.3"
-    source_graph "sha256:fdd85858917e0dcbfaee14e958510a79484a241688d0647024417c7d3e9f7200"
+    source_graph "sha256:5fe04e5f05420b1f94342ba278381c161ee131b3f4edca51b59c7a7be6b6861c"
 }
 
 source ".akr/project.akr" {
@@ -44,7 +44,7 @@ source ".akr/records/exprim/questions.akr" {
 }
 
 source ".akr/records/exprim/work.akr" {
-    hash "sha256:2e538ecec40905b8c475546df169a2bcda4babad853aeb9f3e8133b10e1d4f46"
+    hash "sha256:97749f2fe9cc2fa33685c051ee8343cc5656d8d272c99442ffab5096809301df"
     records 11
 }
 
@@ -195,7 +195,7 @@ resolution @exprim.memory.wrapper-groups-direct/1 {
 resolution @exprim.observation.defects-seen-in-flat-control-flow-review/1 {
     slot derived_from
     to @exprim.work.flat-control-flow-review/1
-    hash "sha256:8dab85cce0a9b3ee116ef4f4832d8c02bc5f1dee5022f91485383a04a60cef9e"
+    hash "sha256:73367da2a20f1233fe924bdb63e49afee8bbd41b679e4104e6c0e922cf200b8c"
 }
 
 resolution @exprim.renderer.g1-exact-speedups/1 {
@@ -387,4 +387,9 @@ seal @exprim.renderer.g1-exact-speedups-ab/1 {
 seal @exprim.work.compile-without-reading-image-bytes/1 {
     state completed
     hash "sha256:85c5aebeb14d74a472ca28af21f2a86d7a25aaeab911de362d7337b39d7d3fb0"
+}
+
+seal @exprim.work.flat-control-flow-review/1 {
+    state completed
+    hash "sha256:73367da2a20f1233fe924bdb63e49afee8bbd41b679e4104e6c0e922cf200b8c"
 }

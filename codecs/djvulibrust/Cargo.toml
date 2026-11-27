@@ -69,3 +69,7 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# Flat control flow; thresholds in clippy.toml.
+[lints.clippy]
+cognitive_complexity = "warn"

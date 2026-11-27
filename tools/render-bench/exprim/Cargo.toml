@@ -14,3 +14,7 @@ exprim = { path = "../../.." }
 anyhow = "1"
 serde_json = "1"
 png = "0.18"
+
+# Flat control flow; thresholds in clippy.toml.
+[lints.clippy]
+cognitive_complexity = "warn"

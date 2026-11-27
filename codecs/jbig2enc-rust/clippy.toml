@@ -1,0 +1,6 @@
+# Flat control flow: more than three levels of control-flow nesting is a design
+# defect, and so is a cognitive complexity above 25. Exceptions are
+# function-level #[allow(..., reason = "...")] attributes. Kept in step with the
+# clippy.toml at the exprim repository root (tools/check-control-flow.py checks).
+excessive-nesting-threshold = 5
+cognitive-complexity-threshold = 25

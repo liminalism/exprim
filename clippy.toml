@@ -1,0 +1,18 @@
+# Flat control flow: more than three levels of control-flow nesting is a design
+# defect, and so is a cognitive complexity above 25.
+#
+# excessive_nesting counts every enclosing block from the file root, so this
+# threshold is exact for methods (impl + fn + three levels) and one level
+# lenient for free functions. `tools/check-control-flow.py` judges each function
+# at its own item depth and is the gate; this file keeps `cargo clippy` and the
+# editor close to it.
+#
+# A justified exception (numeric kernel, state machine, spec-shaped loop,
+# necessary resource scope) is a function-level
+# #[allow(clippy::excessive_nesting, reason = "...")], never a crate- or
+# module-wide one. The script fails on an exception with no reason.
+#
+# The codecs are published on their own and carry a copy, so the rule holds in a
+# checkout of one of them alone; the script checks the copies agree.
+excessive-nesting-threshold = 5
+cognitive-complexity-threshold = 25

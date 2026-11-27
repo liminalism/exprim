@@ -27,3 +27,7 @@ jbig2enc-rust = { version = "0.6.3", path = "..", default-features = false, feat
 # the binding's value. maturin adds `extension-module` for wheel builds (see
 # pyproject.toml), which leaves the Python symbols to be resolved at import.
 pyo3 = { version = "0.29", features = ["abi3-py311"] }
+
+# Flat control flow; thresholds in clippy.toml.
+[lints.clippy]
+cognitive_complexity = "warn"

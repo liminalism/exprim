@@ -9,3 +9,7 @@ libloading = "0.8"
 exprim = { path = "../.." }
 
 [workspace]
+
+# Flat control flow; thresholds in clippy.toml.
+[lints.clippy]
+cognitive_complexity = "warn"

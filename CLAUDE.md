@@ -54,6 +54,12 @@ release. `jp2lam` 0.3.1 must be on crates.io before `exprim` can publish
 ## Rules
 
 - Library code denies `unwrap`, `expect` and `panic` (workspace clippy lints).
+- Flat control flow: more than three levels of control-flow nesting, or a
+  cognitive complexity above 25, is a defect. `tools/check-control-flow.py`
+  is the gate (plain `cargo clippy` is one level lenient for free functions).
+  A justified exception is a function-level
+  `#[allow(clippy::excessive_nesting, reason = "...")]` naming the kernel or
+  specification clause; never a crate- or module-wide one.
 - No global state: every page renders against an immutable snapshot with
   worker-owned scratch.
 - Performance changes must keep page hashes identical; the history is in

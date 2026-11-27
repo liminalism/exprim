@@ -57,3 +57,7 @@ exprim = { path = "../.." }
 
 [profile.release]
 debug = "line-tables-only"
+
+# Flat control flow; thresholds in clippy.toml.
+[lints.clippy]
+cognitive_complexity = "warn"

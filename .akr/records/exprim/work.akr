@@ -453,7 +453,7 @@ record exprim.work.compile-without-reading-image-bytes/1 : work {
 
 record exprim.work.flat-control-flow-review/1 : work {
     title "Flatten control flow and cut cognitive complexity across exprim and its codecs"
-    state proposed
+    state completed
     scope [
         path "agent/**",
         path "cli/**",
@@ -476,7 +476,8 @@ record exprim.work.flat-control-flow-review/1 : work {
         "Workers had no tool to start Sonnet subagents, so each Opus worker did its whole partition alone; partitions were sized by lint hits, not lines.",
         "Orchestration was split around real stages; 18 exceptions remain, all function-level on spec-shaped kernels: Tier-1 passes, IW44 lifting, JBIG2 generic and refinement decode, JPEG MCU loop.",
         "Tests alone cannot show byte identity for symbol planning, so outputs were hashed against the starting commit: pages, text, and every codec preset.",
-        "Split into one commit per published crate plus the gate, at the owner's request: unlike a format commit, a restructuring can regress, and bisect should narrow to a crate."
+        "Split into one commit per published crate plus the gate, at the owner's request: unlike a format commit, a restructuring can regress, and bisect should narrow to a crate.",
+        "Timing against the starting commit: rendering, jp2lam and djvu within 2 percent; a first jbig2 run read 8 percent slower from file writes, in-process encode and decode matched within 1 percent."
     ]
     author "Claude"
 }

@@ -16,3 +16,7 @@ rayon = "1.11"
 png = "0.18"
 bytemuck = "1"
 hayro = "=0.9.0"
+
+# Flat control flow; thresholds in clippy.toml.
+[lints.clippy]
+cognitive_complexity = "warn"

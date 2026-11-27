@@ -75,3 +75,7 @@ ssimulacra2 = "0.5.1"
 debug = true
 lto = "fat"
 codegen-units = 1
+
+# Flat control flow; thresholds in clippy.toml.
+[lints.clippy]
+cognitive_complexity = "warn"

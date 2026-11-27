@@ -88,3 +88,7 @@ path = "fuzz_targets/text_extract.rs"
 test = false
 doc = false
 bench = false
+
+# Flat control flow; thresholds in clippy.toml.
+[lints.clippy]
+cognitive_complexity = "warn"

@@ -291,3 +291,7 @@ codegen-units = 1
 # Load-bearing for the C ABI: every `jbig2rs_*` export catches unwinds so a
 # panic cannot cross into C. With `abort` a codec bug kills the host process.
 panic = "unwind"
+
+# Flat control flow; thresholds in clippy.toml.
+[lints.clippy]
+cognitive_complexity = "warn"

@@ -41,3 +41,7 @@ strip = false
 inherits = "release"
 debug = "line-tables-only"
 strip = false
+
+# Flat control flow; thresholds in clippy.toml.
+[lints.clippy]
+cognitive_complexity = "warn"

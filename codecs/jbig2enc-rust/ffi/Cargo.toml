@@ -43,3 +43,7 @@ parallel = ["jbig2enc-rust/parallel"]
 [dev-dependencies]
 # Regenerates the header in `tests/header.rs` to catch drift.
 cbindgen = { version = "0.29", default-features = false }
+
+# Flat control flow; thresholds in clippy.toml.
+[lints.clippy]
+cognitive_complexity = "warn"

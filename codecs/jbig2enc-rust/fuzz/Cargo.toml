@@ -85,3 +85,7 @@ bench = false
 
 [profile.release]
 debug = 1
+
+# Flat control flow; thresholds in clippy.toml.
+[lints.clippy]
+cognitive_complexity = "warn"
