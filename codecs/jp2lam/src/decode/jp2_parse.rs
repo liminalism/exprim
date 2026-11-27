@@ -263,6 +263,26 @@ fn parse_jp2_header(
     Ok((header, pclr_payload, cmap_payload))
 }
 
+/// One big-endian palette entry of `precision` bits, sign-extended when
+/// `signed`.
+fn palette_value(bytes: &[u8], precision: u8, signed: bool) -> i32 {
+    let mut raw = 0u32;
+    for &byte in bytes {
+        raw = (raw << 8) | u32::from(byte);
+    }
+    let mask = if precision == 32 {
+        u32::MAX
+    } else {
+        (1u32 << precision) - 1
+    };
+    raw &= mask;
+    if signed && raw & (1u32 << (precision - 1)) != 0 {
+        (raw | !mask) as i32
+    } else {
+        raw as i32
+    }
+}
+
 /// Resolve a `pclr` palette against a `cmap` component mapping into per-output
 /// channel lookup tables. Palette-mapped channels must be sourced from
 /// component 0; entry widths from 1 through 32 bits, signed or unsigned, are
@@ -395,23 +415,10 @@ fn resolve_palette(pclr: &[u8], cmap: &[u8], materialize_values: bool) -> Result
             let bytes = &pclr[offset..offset + byte_count];
             let unique_index = source_to_unique[source];
             if unique_index != usize::MAX {
-                let mut raw = 0u32;
-                for &byte in bytes {
-                    raw = (raw << 8) | u32::from(byte);
-                }
-                let mask = if precision == 32 {
-                    u32::MAX
-                } else {
-                    (1u32 << precision) - 1
-                };
-                raw &= mask;
                 let signed = depth & 0x80 != 0;
-                let value = if signed && raw & (1u32 << (precision - 1)) != 0 {
-                    (raw | !mask) as i32
-                } else {
-                    raw as i32
-                };
-                unique[unique_index].values.push(value);
+                unique[unique_index]
+                    .values
+                    .push(palette_value(bytes, precision, signed));
             }
             offset += byte_count;
         }

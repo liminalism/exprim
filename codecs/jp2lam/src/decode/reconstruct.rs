@@ -1059,6 +1059,30 @@ fn for_each_row_band(
     );
 }
 
+/// Builds the colour planes' synthesis prefixes one after another so each
+/// is timed into `stats`, checking for cancellation before each one; a
+/// cancellation recycles the prefixes already built.
+fn build_prefixes_97_timed(
+    colour_tiles: Vec<DecodedTileCoefficients>,
+    levels: u8,
+    kernel: Kernel,
+    pool: &super::Jp2BufferPool,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    stats: &mut StatsSink<'_>,
+) -> Result<Vec<SynthesisPrefix>> {
+    let mut prefixes: Vec<SynthesisPrefix> = Vec::with_capacity(3);
+    for tile in colour_tiles {
+        if cancel.is_some_and(|f| f()) {
+            for p in prefixes {
+                p.recycle(pool);
+            }
+            return Err(Jp2LamError::Cancelled);
+        }
+        prefixes.push(build_prefix_97(tile, levels, kernel, pool, stats)?);
+    }
+    Ok(prefixes)
+}
+
 fn build_prefix_97(
     tile: DecodedTileCoefficients,
     levels: u8,
@@ -1112,6 +1136,30 @@ fn build_prefix_97(
             ));
         }
     })
+}
+
+/// Builds the colour planes' synthesis prefixes one after another so each
+/// is timed into `stats`, checking for cancellation before each one; a
+/// cancellation recycles the prefixes already built.
+fn build_prefixes_53_timed(
+    colour_tiles: Vec<DecodedTileCoefficients>,
+    levels: u8,
+    kernel: Kernel,
+    pool: &super::Jp2BufferPool,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    stats: &mut StatsSink<'_>,
+) -> Result<Vec<SynthesisPrefix53>> {
+    let mut prefixes: Vec<SynthesisPrefix53> = Vec::with_capacity(3);
+    for tile in colour_tiles {
+        if cancel.is_some_and(|f| f()) {
+            for p in prefixes {
+                p.recycle(pool);
+            }
+            return Err(Jp2LamError::Cancelled);
+        }
+        prefixes.push(build_prefix_53(tile, levels, kernel, pool, stats)?);
+    }
+    Ok(prefixes)
 }
 
 fn build_prefix_53(
@@ -1374,6 +1422,42 @@ fn write_gray_plane_f32(
     });
 }
 
+/// Writes the pixel at `index` of the decoded planes into `data` at `off`
+/// in the given packed layout.
+#[inline]
+fn write_packed_pixel(
+    data: &mut [u8],
+    off: usize,
+    component_u8: &[Vec<u8>],
+    index: usize,
+    layout: PackedLayout,
+) {
+    match layout {
+        PackedLayout::Sequential => {
+            for (ci, plane) in component_u8.iter().enumerate() {
+                data[off + ci] = plane[index];
+            }
+        }
+        PackedLayout::Rgbx => {
+            data[off] = component_u8[0][index];
+            data[off + 1] = component_u8[1][index];
+            data[off + 2] = component_u8[2][index];
+            data[off + 3] = 255;
+        }
+        PackedLayout::Bgra => {
+            let a = if component_u8.len() > 3 {
+                component_u8[3][index]
+            } else {
+                255
+            };
+            data[off] = component_u8[2][index];
+            data[off + 1] = component_u8[1][index];
+            data[off + 2] = component_u8[0][index];
+            data[off + 3] = a;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_interleaved_u8_into(
     header: &CodestreamHeader,
@@ -1445,30 +1529,7 @@ fn reconstruct_interleaved_u8_into(
         for x in 0..w {
             let index = target.source_index(x, y, source_width);
             let off = target.pixel_offset(x, y);
-            match layout {
-                PackedLayout::Sequential => {
-                    for (ci, plane) in component_u8.iter().enumerate() {
-                        target.data[off + ci] = plane[index];
-                    }
-                }
-                PackedLayout::Rgbx => {
-                    target.data[off] = component_u8[0][index];
-                    target.data[off + 1] = component_u8[1][index];
-                    target.data[off + 2] = component_u8[2][index];
-                    target.data[off + 3] = 255;
-                }
-                PackedLayout::Bgra => {
-                    let a = if component_u8.len() > 3 {
-                        component_u8[3][index]
-                    } else {
-                        255
-                    };
-                    target.data[off] = component_u8[2][index];
-                    target.data[off + 1] = component_u8[1][index];
-                    target.data[off + 2] = component_u8[0][index];
-                    target.data[off + 3] = a;
-                }
-            }
+            write_packed_pixel(target.data, off, &component_u8, index, layout);
         }
     }
     record_finalize_time(stats, start);
@@ -1511,6 +1572,56 @@ fn can_fuse_packed(
         .iter()
         .take(kept)
         .all(|c| c.precision == 8)
+}
+
+/// Reconstructs the colour planes of the unfused 9/7 path, checking for
+/// cancellation before each one; a cancellation parks the planes already
+/// built.
+fn reconstruct_97_colour_planes(
+    header: &CodestreamHeader,
+    colour_tiles: Vec<DecodedTileCoefficients>,
+    pool: &super::Jp2BufferPool,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    stats: &mut StatsSink<'_>,
+) -> Result<Vec<Vec<f32>>> {
+    let mut planes = Vec::with_capacity(3);
+    for tile in colour_tiles {
+        if cancel.is_some_and(|f| f()) {
+            for plane in planes {
+                pool.park_f32(plane);
+            }
+            return Err(Jp2LamError::Cancelled);
+        }
+        planes.push(reconstruct_irreversible_97_tile_centered(
+            header, tile, pool, stats,
+        )?);
+    }
+    Ok(planes)
+}
+
+/// Reconstructs the colour planes of the unfused 5/3 path, checking for
+/// cancellation before each one; a cancellation parks the planes already
+/// built.
+fn reconstruct_53_colour_planes(
+    header: &CodestreamHeader,
+    colour_tiles: Vec<DecodedTileCoefficients>,
+    pool: &super::Jp2BufferPool,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    stats: &mut StatsSink<'_>,
+) -> Result<Vec<Vec<i32>>> {
+    let mut planes = Vec::with_capacity(3);
+    for tile in colour_tiles {
+        if cancel.is_some_and(|f| f()) {
+            for plane in planes {
+                pool.park_i32(plane);
+            }
+            return Err(Jp2LamError::Cancelled);
+        }
+        planes.push(reconstruct_reversible_53_tile_centered(
+            header, tile, pool, stats,
+        )?);
+    }
+    Ok(planes)
 }
 
 /// Inverse DWT → fused inverse MCT (if any) + level-shift + pack into the
@@ -1560,18 +1671,7 @@ fn reconstruct_fused_packed_into(
                     stats,
                 );
             }
-            let mut planes = Vec::with_capacity(3);
-            for tile in colour_tiles {
-                if cancel.is_some_and(|f| f()) {
-                    for plane in planes {
-                        pool.park_f32(plane);
-                    }
-                    return Err(Jp2LamError::Cancelled);
-                }
-                planes.push(reconstruct_irreversible_97_tile_centered(
-                    header, tile, pool, stats,
-                )?);
-            }
+            let planes = reconstruct_97_colour_planes(header, colour_tiles, pool, cancel, stats)?;
             let start = stats.start();
             let res = fuse_pack_f32_into_cancellable(
                 &planes[0],
@@ -1618,18 +1718,7 @@ fn reconstruct_fused_packed_into(
                     stats,
                 );
             }
-            let mut planes = Vec::with_capacity(3);
-            for tile in colour_tiles {
-                if cancel.is_some_and(|f| f()) {
-                    for plane in planes {
-                        pool.park_i32(plane);
-                    }
-                    return Err(Jp2LamError::Cancelled);
-                }
-                planes.push(reconstruct_reversible_53_tile_centered(
-                    header, tile, pool, stats,
-                )?);
-            }
+            let planes = reconstruct_53_colour_planes(header, colour_tiles, pool, cancel, stats)?;
             let start = stats.start();
             let res = fuse_pack_i32_into_cancellable(
                 &planes[0],
@@ -2029,6 +2118,67 @@ struct PackRowParams {
     kernel: Kernel,
 }
 
+/// Byte interleave of [`pack_row_f32`]'s `wide` path: stores eight finished
+/// pixels (`rgb` lanes, alpha from `aux` at columns `x..x + 8`) into `dst` in
+/// the packed layout.
+#[cfg(feature = "simd")]
+#[inline(always)]
+fn interleave_eight(
+    dst: &mut [u8],
+    [r, g, b]: [[i32; 8]; 3],
+    aux: Option<&[u8]>,
+    x: usize,
+    layout: PackedLayout,
+    channels: usize,
+) {
+    match (layout, channels) {
+        (PackedLayout::Sequential, 3) => {
+            for k in 0..8 {
+                dst[3 * k] = r[k] as u8;
+                dst[3 * k + 1] = g[k] as u8;
+                dst[3 * k + 2] = b[k] as u8;
+            }
+        }
+        (PackedLayout::Sequential, 4) => {
+            for k in 0..8 {
+                dst[4 * k] = r[k] as u8;
+                dst[4 * k + 1] = g[k] as u8;
+                dst[4 * k + 2] = b[k] as u8;
+                dst[4 * k + 3] = aux.map_or(255, |p| p[x + k]);
+            }
+        }
+        (PackedLayout::Rgbx, _) => {
+            for k in 0..8 {
+                dst[4 * k] = r[k] as u8;
+                dst[4 * k + 1] = g[k] as u8;
+                dst[4 * k + 2] = b[k] as u8;
+                dst[4 * k + 3] = 255;
+            }
+        }
+        (PackedLayout::Bgra, _) => {
+            for k in 0..8 {
+                dst[4 * k] = b[k] as u8;
+                dst[4 * k + 1] = g[k] as u8;
+                dst[4 * k + 2] = r[k] as u8;
+                dst[4 * k + 3] = aux.map_or(255, |p| p[x + k]);
+            }
+        }
+        _ => {
+            for k in 0..8 {
+                store_rgb_layout(
+                    &mut dst[k * channels..(k + 1) * channels],
+                    layout,
+                    channels,
+                    r[k] as u8,
+                    g[k] as u8,
+                    b[k] as u8,
+                    aux.map_or(255, |p| p[x + k]),
+                );
+            }
+        }
+    }
+}
+
 /// Pack one row of centered `f32` colour samples (optionally through the
 /// inverse ICT) into `out`, which holds exactly `width * channels` bytes.
 ///
@@ -2090,52 +2240,7 @@ fn pack_row_f32(
             let g = finalize(g);
             let b = finalize(b);
             let dst = &mut out[x * channels..(x + 8) * channels];
-            match (params.layout, channels) {
-                (PackedLayout::Sequential, 3) => {
-                    for k in 0..8 {
-                        dst[3 * k] = r[k] as u8;
-                        dst[3 * k + 1] = g[k] as u8;
-                        dst[3 * k + 2] = b[k] as u8;
-                    }
-                }
-                (PackedLayout::Sequential, 4) => {
-                    for k in 0..8 {
-                        dst[4 * k] = r[k] as u8;
-                        dst[4 * k + 1] = g[k] as u8;
-                        dst[4 * k + 2] = b[k] as u8;
-                        dst[4 * k + 3] = aux.map_or(255, |p| p[x + k]);
-                    }
-                }
-                (PackedLayout::Rgbx, _) => {
-                    for k in 0..8 {
-                        dst[4 * k] = r[k] as u8;
-                        dst[4 * k + 1] = g[k] as u8;
-                        dst[4 * k + 2] = b[k] as u8;
-                        dst[4 * k + 3] = 255;
-                    }
-                }
-                (PackedLayout::Bgra, _) => {
-                    for k in 0..8 {
-                        dst[4 * k] = b[k] as u8;
-                        dst[4 * k + 1] = g[k] as u8;
-                        dst[4 * k + 2] = r[k] as u8;
-                        dst[4 * k + 3] = aux.map_or(255, |p| p[x + k]);
-                    }
-                }
-                _ => {
-                    for k in 0..8 {
-                        store_rgb_layout(
-                            &mut dst[k * channels..(k + 1) * channels],
-                            params.layout,
-                            channels,
-                            r[k] as u8,
-                            g[k] as u8,
-                            b[k] as u8,
-                            aux.map_or(255, |p| p[x + k]),
-                        );
-                    }
-                }
-            }
+            interleave_eight(dst, [r, g, b], aux, x, params.layout, channels);
             x += 8;
         }
     }
@@ -3070,17 +3175,7 @@ fn reconstruct_irreversible_97_fused_pack(
     let dwt_start = stats.start();
     let plane_width = header.siz.width as usize;
     let prefixes: Vec<SynthesisPrefix> = if stats.is_enabled() {
-        let mut prefixes: Vec<SynthesisPrefix> = Vec::with_capacity(3);
-        for tile in colour_tiles {
-            if cancel.is_some_and(|f| f()) {
-                for p in prefixes {
-                    p.recycle(pool);
-                }
-                return Err(Jp2LamError::Cancelled);
-            }
-            prefixes.push(build_prefix_97(tile, levels, kernel, pool, stats)?);
-        }
-        prefixes
+        build_prefixes_97_timed(colour_tiles, levels, kernel, pool, cancel, stats)?
     } else {
         let synthesize = |tile: DecodedTileCoefficients| -> Result<SynthesisPrefix> {
             if cancel.is_some_and(|f| f()) {
@@ -3228,17 +3323,7 @@ fn reconstruct_reversible_53_fused_pack(
     let dwt_start = stats.start();
     let plane_width = header.siz.width as usize;
     let prefixes: Vec<SynthesisPrefix53> = if stats.is_enabled() {
-        let mut prefixes: Vec<SynthesisPrefix53> = Vec::with_capacity(3);
-        for tile in colour_tiles {
-            if cancel.is_some_and(|f| f()) {
-                for p in prefixes {
-                    p.recycle(pool);
-                }
-                return Err(Jp2LamError::Cancelled);
-            }
-            prefixes.push(build_prefix_53(tile, levels, kernel, pool, stats)?);
-        }
-        prefixes
+        build_prefixes_53_timed(colour_tiles, levels, kernel, pool, cancel, stats)?
     } else {
         let synthesize = |tile: DecodedTileCoefficients| -> Result<SynthesisPrefix53> {
             if cancel.is_some_and(|f| f()) {
@@ -3504,127 +3589,148 @@ mod pack_kernel_tests {
             .collect()
     }
 
+    /// The (apply colour transform, with alpha) combinations, colour
+    /// transform outer.
+    const TRANSFORM_AUX: [(bool, bool); 4] =
+        [(false, false), (false, true), (true, false), (true, true)];
+
+    const LAYOUTS: [(PackedLayout, usize); 4] = [
+        (PackedLayout::Sequential, 3),
+        (PackedLayout::Sequential, 4),
+        (PackedLayout::Rgbx, 4),
+        (PackedLayout::Bgra, 4),
+    ];
+
+    /// Packs one `f32` row with the scalar kernel and with every available
+    /// kernel and asserts the bytes are identical.
+    fn assert_f32_kernels_agree(
+        kernels: &[Kernel],
+        (layout, channels): (PackedLayout, usize),
+        width: usize,
+        (apply_ict, with_aux): (bool, bool),
+    ) {
+        let y = samples(width, width as u32 * 3 + 1);
+        let cb = samples(width, width as u32 * 3 + 2);
+        let cr = samples(width, width as u32 * 3 + 3);
+        let aux: Vec<u8> = (0..width).map(|i| (i * 37 % 256) as u8).collect();
+        let aux = with_aux.then_some(aux.as_slice());
+        let mut reference = vec![0u8; width * channels];
+        pack_row_f32(
+            &y,
+            &cb,
+            &cr,
+            aux,
+            PackRowParams {
+                apply_ict,
+                layout,
+                channels,
+                kernel: Kernel::Scalar,
+            },
+            &mut reference,
+        );
+        for &kernel in kernels {
+            let mut out = vec![0xaau8; width * channels];
+            pack_row_f32(
+                &y,
+                &cb,
+                &cr,
+                aux,
+                PackRowParams {
+                    apply_ict,
+                    layout,
+                    channels,
+                    kernel,
+                },
+                &mut out,
+            );
+            assert_eq!(
+                out, reference,
+                "{kernel:?} {layout:?} channels {channels} width {width} ict {apply_ict} aux {with_aux}"
+            );
+        }
+    }
+
     #[test]
     fn every_kernel_packs_identical_bytes() {
         let kernels = Kernel::available();
-        for &(layout, channels) in &[
-            (PackedLayout::Sequential, 3usize),
-            (PackedLayout::Sequential, 4),
-            (PackedLayout::Rgbx, 4),
-            (PackedLayout::Bgra, 4),
-        ] {
+        for layout in LAYOUTS {
             for width in (1..=40).chain([300, 1001]) {
-                for apply_ict in [false, true] {
-                    for with_aux in [false, true] {
-                        let y = samples(width, width as u32 * 3 + 1);
-                        let cb = samples(width, width as u32 * 3 + 2);
-                        let cr = samples(width, width as u32 * 3 + 3);
-                        let aux: Vec<u8> = (0..width).map(|i| (i * 37 % 256) as u8).collect();
-                        let aux = with_aux.then_some(aux.as_slice());
-                        let mut reference = vec![0u8; width * channels];
-                        pack_row_f32(
-                            &y,
-                            &cb,
-                            &cr,
-                            aux,
-                            PackRowParams {
-                                apply_ict,
-                                layout,
-                                channels,
-                                kernel: Kernel::Scalar,
-                            },
-                            &mut reference,
-                        );
-                        for &kernel in &kernels {
-                            let mut out = vec![0xaau8; width * channels];
-                            pack_row_f32(
-                                &y,
-                                &cb,
-                                &cr,
-                                aux,
-                                PackRowParams {
-                                    apply_ict,
-                                    layout,
-                                    channels,
-                                    kernel,
-                                },
-                                &mut out,
-                            );
-                            assert_eq!(
-                                out, reference,
-                                "{kernel:?} {layout:?} channels {channels} width {width} ict {apply_ict} aux {with_aux}"
-                            );
-                        }
-                    }
+                for transform_aux in TRANSFORM_AUX {
+                    assert_f32_kernels_agree(&kernels, layout, width, transform_aux);
                 }
             }
         }
     }
 
+    fn samples_i32(len: usize, seed: u32) -> Vec<i32> {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(77);
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state % 1001) as i32 - 500
+            })
+            .collect()
+    }
+
+    /// Packs one `i32` row with the scalar kernel and with every available
+    /// kernel and asserts the bytes are identical.
+    fn assert_i32_kernels_agree(
+        kernels: &[Kernel],
+        (layout, channels): (PackedLayout, usize),
+        width: usize,
+        (apply_rct, with_aux): (bool, bool),
+    ) {
+        use super::{PackRowI32Params, pack_row_i32};
+        let y = samples_i32(width, width as u32 * 3 + 1);
+        let db = samples_i32(width, width as u32 * 3 + 2);
+        let dr = samples_i32(width, width as u32 * 3 + 3);
+        let aux: Vec<u8> = (0..width).map(|i| (i * 41 % 256) as u8).collect();
+        let aux = with_aux.then_some(aux.as_slice());
+        let mut reference = vec![0u8; width * channels];
+        pack_row_i32(
+            &y,
+            &db,
+            &dr,
+            aux,
+            PackRowI32Params {
+                apply_rct,
+                layout,
+                channels,
+                kernel: Kernel::Scalar,
+            },
+            &mut reference,
+        );
+        for &kernel in kernels {
+            let mut out = vec![0xaau8; width * channels];
+            pack_row_i32(
+                &y,
+                &db,
+                &dr,
+                aux,
+                PackRowI32Params {
+                    apply_rct,
+                    layout,
+                    channels,
+                    kernel,
+                },
+                &mut out,
+            );
+            assert_eq!(
+                out, reference,
+                "{kernel:?} {layout:?} channels {channels} width {width} rct {apply_rct} aux {with_aux}"
+            );
+        }
+    }
+
     #[test]
     fn every_i32_kernel_packs_identical_bytes() {
-        use super::{PackRowI32Params, pack_row_i32};
         let kernels = Kernel::available();
-        let samples_i32 = |len: usize, seed: u32| -> Vec<i32> {
-            let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(77);
-            (0..len)
-                .map(|_| {
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                    (state % 1001) as i32 - 500
-                })
-                .collect()
-        };
-        for &(layout, channels) in &[
-            (PackedLayout::Sequential, 3usize),
-            (PackedLayout::Sequential, 4),
-            (PackedLayout::Rgbx, 4),
-            (PackedLayout::Bgra, 4),
-        ] {
+        for layout in LAYOUTS {
             for width in (1..=40).chain([300, 1001]) {
-                for apply_rct in [false, true] {
-                    for with_aux in [false, true] {
-                        let y = samples_i32(width, width as u32 * 3 + 1);
-                        let db = samples_i32(width, width as u32 * 3 + 2);
-                        let dr = samples_i32(width, width as u32 * 3 + 3);
-                        let aux: Vec<u8> = (0..width).map(|i| (i * 41 % 256) as u8).collect();
-                        let aux = with_aux.then_some(aux.as_slice());
-                        let mut reference = vec![0u8; width * channels];
-                        pack_row_i32(
-                            &y,
-                            &db,
-                            &dr,
-                            aux,
-                            PackRowI32Params {
-                                apply_rct,
-                                layout,
-                                channels,
-                                kernel: Kernel::Scalar,
-                            },
-                            &mut reference,
-                        );
-                        for &kernel in &kernels {
-                            let mut out = vec![0xaau8; width * channels];
-                            pack_row_i32(
-                                &y,
-                                &db,
-                                &dr,
-                                aux,
-                                PackRowI32Params {
-                                    apply_rct,
-                                    layout,
-                                    channels,
-                                    kernel,
-                                },
-                                &mut out,
-                            );
-                            assert_eq!(
-                                out, reference,
-                                "{kernel:?} {layout:?} channels {channels} width {width} rct {apply_rct} aux {with_aux}"
-                            );
-                        }
-                    }
+                for transform_aux in TRANSFORM_AUX {
+                    assert_i32_kernels_agree(&kernels, layout, width, transform_aux);
                 }
             }
         }

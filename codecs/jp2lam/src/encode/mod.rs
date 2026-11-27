@@ -220,6 +220,32 @@ fn display_resampled_source(
     box_downscale_view(image, width, height).map(Some)
 }
 
+/// Horizontal pass of [`box_downscale_view`]: each output sample is its
+/// tap window of the linear-light source `row`, weighted.
+fn box_filter_row(out: &mut [f32], row: &[f32], xmap: &[(usize, Vec<f32>)]) {
+    for (slot, (start, weights)) in out.iter_mut().zip(xmap) {
+        let mut acc = 0.0f32;
+        for (offset, weight) in weights.iter().enumerate() {
+            acc += row[start + offset] * weight;
+        }
+        *slot = acc;
+    }
+}
+
+/// Vertical pass of [`box_downscale_view`] for one output row: weights the
+/// horizontally filtered rows `start..` of `temp` per column and encodes the
+/// result back to sRGB codes.
+fn box_filter_column_taps(out: &mut [i32], temp: &[f32], start: usize, weights: &[f32]) {
+    let dst_width = out.len();
+    for (x, slot) in out.iter_mut().enumerate() {
+        let mut acc = 0.0f32;
+        for (offset, weight) in weights.iter().enumerate() {
+            acc += temp[(start + offset) * dst_width + x] * weight;
+        }
+        *slot = i32::from(ssim::linear_to_srgb8(acc));
+    }
+}
+
 /// Area-average an 8-bit image down to `width` x `height`, one plane at a time.
 ///
 /// The averaging is in linear light, exactly like the metric's display
@@ -241,23 +267,12 @@ fn box_downscale_view(image: &ImageView<'_>, width: u32, height: u32) -> Result<
         for y in 0..image.height {
             ssim::linear_row(source, y, lut, &mut row)?;
             let out = &mut temp[y as usize * dst_width..(y as usize + 1) * dst_width];
-            for (slot, (start, weights)) in out.iter_mut().zip(&xmap) {
-                let mut acc = 0.0f32;
-                for (offset, weight) in weights.iter().enumerate() {
-                    acc += row[start + offset] * weight;
-                }
-                *slot = acc;
-            }
+            box_filter_row(out, &row, &xmap);
         }
         let mut data = vec![0i32; dst_width * height as usize];
         for (y, (start, weights)) in ymap.iter().enumerate() {
-            for x in 0..dst_width {
-                let mut acc = 0.0f32;
-                for (offset, weight) in weights.iter().enumerate() {
-                    acc += temp[(start + offset) * dst_width + x] * weight;
-                }
-                data[y * dst_width + x] = i32::from(ssim::linear_to_srgb8(acc));
-            }
+            let out = &mut data[y * dst_width..(y + 1) * dst_width];
+            box_filter_column_taps(out, &temp, *start, weights);
         }
         components.push(crate::model::Component {
             data,
@@ -709,6 +724,42 @@ mod tests {
         }
     }
 
+    /// Sums of source, reconstruction, their squares and their product over
+    /// the 8×8 block at (`block_x`, `block_y`), in raster order.
+    fn block_sums(
+        source: &[u8],
+        reconstructed: &[i32],
+        width: usize,
+        block_x: usize,
+        block_y: usize,
+    ) -> [f64; 5] {
+        const BLOCK: usize = 8;
+        let mut sum_source = 0.0;
+        let mut sum_reconstructed = 0.0;
+        let mut sum_source_squared = 0.0;
+        let mut sum_reconstructed_squared = 0.0;
+        let mut sum_product = 0.0;
+        for y in block_y..block_y + BLOCK {
+            for x in block_x..block_x + BLOCK {
+                let index = y * width + x;
+                let expected = f64::from(source[index]);
+                let actual = f64::from(reconstructed[index]);
+                sum_source += expected;
+                sum_reconstructed += actual;
+                sum_source_squared += expected * expected;
+                sum_reconstructed_squared += actual * actual;
+                sum_product += expected * actual;
+            }
+        }
+        [
+            sum_source,
+            sum_reconstructed,
+            sum_source_squared,
+            sum_reconstructed_squared,
+            sum_product,
+        ]
+    }
+
     fn ssim_from_gray(source: &[u8], reconstructed: &[i32], width: usize, height: usize) -> f64 {
         const BLOCK: usize = 8;
         const C1: f64 = (0.01 * 255.0) * (0.01 * 255.0);
@@ -717,23 +768,13 @@ mod tests {
         let mut blocks = 0usize;
         for block_y in (0..height / BLOCK).map(|index| index * BLOCK) {
             for block_x in (0..width / BLOCK).map(|index| index * BLOCK) {
-                let mut sum_source = 0.0;
-                let mut sum_reconstructed = 0.0;
-                let mut sum_source_squared = 0.0;
-                let mut sum_reconstructed_squared = 0.0;
-                let mut sum_product = 0.0;
-                for y in block_y..block_y + BLOCK {
-                    for x in block_x..block_x + BLOCK {
-                        let index = y * width + x;
-                        let expected = f64::from(source[index]);
-                        let actual = f64::from(reconstructed[index]);
-                        sum_source += expected;
-                        sum_reconstructed += actual;
-                        sum_source_squared += expected * expected;
-                        sum_reconstructed_squared += actual * actual;
-                        sum_product += expected * actual;
-                    }
-                }
+                let [
+                    sum_source,
+                    sum_reconstructed,
+                    sum_source_squared,
+                    sum_reconstructed_squared,
+                    sum_product,
+                ] = block_sums(source, reconstructed, width, block_x, block_y);
                 let n = (BLOCK * BLOCK) as f64;
                 let mean_source = sum_source / n;
                 let mean_reconstructed = sum_reconstructed / n;

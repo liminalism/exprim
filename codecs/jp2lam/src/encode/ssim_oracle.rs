@@ -493,6 +493,23 @@ pub(crate) fn source_band_stats(tile: &UnquantizedTileDwt) -> (u64, u64, f64, f6
     (near, total, ll, high)
 }
 
+/// Counts a plane's near-zero and total coefficients, and appends their
+/// magnitudes to `mags` until it holds [`MAGNITUDE_CAP`] of them.
+fn tally_coefficients(data: &[f32], mags: &mut Vec<f64>) -> (u64, u64) {
+    let mut near = 0u64;
+    let mut total = 0u64;
+    for &coeff in data {
+        total += 1;
+        if coeff.abs() < NEAR_ZERO {
+            near += 1;
+        }
+        if mags.len() < MAGNITUDE_CAP {
+            mags.push(coeff.abs() as f64);
+        }
+    }
+    (near, total)
+}
+
 fn dwt_features(tiles: &[UnquantizedTileDwt]) -> DwtFeat {
     let mut ll = 0.0;
     let mut hl = 0.0;
@@ -516,15 +533,9 @@ fn dwt_features(tiles: &[UnquantizedTileDwt]) -> DwtFeat {
             } else {
                 chroma_energy += plane_e;
             }
-            for &coeff in &plane.data {
-                total += 1;
-                if coeff.abs() < NEAR_ZERO {
-                    near += 1;
-                }
-                if mags.len() < MAGNITUDE_CAP {
-                    mags.push(coeff.abs() as f64);
-                }
-            }
+            let (plane_near, plane_total) = tally_coefficients(&plane.data, &mut mags);
+            near += plane_near;
+            total += plane_total;
         }
     }
     mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));

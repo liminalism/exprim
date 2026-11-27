@@ -643,26 +643,32 @@ fn max_tile_grid_decompositions(
     let tiles_y = image_height.div_ceil(tile_height);
     for tile_y in 0..tiles_y {
         for tile_x in 0..tiles_x {
-            let mut ax = tile_x * tile_width;
-            let mut ay = tile_y * tile_height;
-            let mut bx = ax.saturating_add(tile_width).min(image_width);
-            let mut by = ay.saturating_add(tile_height).min(image_height);
-            let mut levels = 0u32;
-            while levels < 31 {
-                let next_ax = ax.div_ceil(2);
-                let next_ay = ay.div_ceil(2);
-                let next_bx = bx.div_ceil(2);
-                let next_by = by.div_ceil(2);
-                if next_ax >= next_bx || next_ay >= next_by {
-                    break;
-                }
-                levels += 1;
-                (ax, ay, bx, by) = (next_ax, next_ay, next_bx, next_by);
-            }
-            common = common.min(levels);
+            let ax = tile_x * tile_width;
+            let ay = tile_y * tile_height;
+            let bx = ax.saturating_add(tile_width).min(image_width);
+            let by = ay.saturating_add(tile_height).min(image_height);
+            common = common.min(rect_decompositions(ax, ay, bx, by));
         }
     }
     if common == u32::MAX { 0 } else { common }
+}
+
+/// How many times (up to 31) the rectangle `[ax, bx) x [ay, by)` on the
+/// reference grid can be halved before a resolution of it is empty.
+fn rect_decompositions(mut ax: u32, mut ay: u32, mut bx: u32, mut by: u32) -> u32 {
+    let mut levels = 0u32;
+    while levels < 31 {
+        let next_ax = ax.div_ceil(2);
+        let next_ay = ay.div_ceil(2);
+        let next_bx = bx.div_ceil(2);
+        let next_by = by.div_ceil(2);
+        if next_ax >= next_bx || next_ay >= next_by {
+            break;
+        }
+        levels += 1;
+        (ax, ay, bx, by) = (next_ax, next_ay, next_bx, next_by);
+    }
+    levels
 }
 
 fn derive_auto_tile_dimensions(

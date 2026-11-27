@@ -198,6 +198,19 @@ fn forward_97_1d_with_scratch_phase(
     samples.copy_from_slice(tmp);
 }
 
+/// One coarse job of [`forward_97_rows_in_place`]: transforms each full row of
+/// `rows` with a line scratch of its own.
+#[cfg(test)]
+fn forward_97_rows_job(rows: &mut [f32], stride: usize, active_width: usize, use_wide: bool) {
+    let mut local_scratch = vec![0.0f32; active_width];
+    for row in rows.chunks_mut(stride) {
+        if row.len() < active_width {
+            break;
+        }
+        forward_97_1d_with_scratch(&mut row[..active_width], &mut local_scratch, use_wide);
+    }
+}
+
 #[cfg(test)]
 fn forward_97_rows_in_place(
     data: &mut [f32],
@@ -216,19 +229,7 @@ fn forward_97_rows_in_place(
         let rows_per_job = active_height.div_ceil(workers * 2).max(1);
         data[..active_height * stride]
             .par_chunks_mut(rows_per_job * stride)
-            .for_each(|rows| {
-                let mut local_scratch = vec![0.0f32; active_width];
-                for row in rows.chunks_mut(stride) {
-                    if row.len() < active_width {
-                        break;
-                    }
-                    forward_97_1d_with_scratch(
-                        &mut row[..active_width],
-                        &mut local_scratch,
-                        use_wide,
-                    );
-                }
-            });
+            .for_each(|rows| forward_97_rows_job(rows, stride, active_width, use_wide));
     } else {
         for y in 0..active_height {
             let row_start = y * stride;
@@ -971,6 +972,19 @@ fn phase_steps(
     steps
 }
 
+/// One coarse job of [`inverse_97_rows_in_place`]: transforms each full row of
+/// `rows` with a line scratch of its own.
+#[cfg(test)]
+fn inverse_97_rows_job(rows: &mut [f32], stride: usize, active_width: usize, use_wide: bool) {
+    let mut local_scratch = vec![0.0f32; active_width];
+    for row in rows.chunks_mut(stride) {
+        if row.len() < active_width {
+            break;
+        }
+        inverse_97_1d_with_scratch(&mut row[..active_width], &mut local_scratch, use_wide);
+    }
+}
+
 #[cfg(test)]
 fn inverse_97_rows_in_place(
     data: &mut [f32],
@@ -987,19 +1001,7 @@ fn inverse_97_rows_in_place(
         let rows_per_job = active_height.div_ceil(workers * 2).max(1);
         data[..active_height * stride]
             .par_chunks_mut(rows_per_job * stride)
-            .for_each(|rows| {
-                let mut local_scratch = vec![0.0f32; active_width];
-                for row in rows.chunks_mut(stride) {
-                    if row.len() < active_width {
-                        break;
-                    }
-                    inverse_97_1d_with_scratch(
-                        &mut row[..active_width],
-                        &mut local_scratch,
-                        use_wide,
-                    );
-                }
-            });
+            .for_each(|rows| inverse_97_rows_job(rows, stride, active_width, use_wide));
     } else {
         for y in 0..active_height {
             let row_start = y * stride;
@@ -1176,22 +1178,34 @@ mod tests {
         check_vertical_lift_parallel_matches_sequential(true);
     }
 
+    /// Runs the forward and inverse 9/7 over one pattern and checks every
+    /// sample comes back within [`ROUNDTRIP_TOL`].
+    fn assert_roundtrips_within_tolerance(
+        name: &str,
+        original: &[i32],
+        width: usize,
+        height: usize,
+        levels: u8,
+    ) {
+        let mut data = original.iter().map(|&v| v as f32).collect::<Vec<_>>();
+        forward_97_2d_in_place(&mut data, width, height, levels).expect("forward dwt");
+        inverse_97_2d_in_place(&mut data, width, height, levels);
+        for (idx, (&out, &orig)) in data.iter().zip(original.iter()).enumerate() {
+            let diff = (out - orig as f32).abs();
+            assert!(
+                diff < ROUNDTRIP_TOL,
+                "{name} {width}x{height} levels={levels} idx={idx} diff={diff} out={out} orig={orig}"
+            );
+        }
+    }
+
     #[test]
     fn forward_then_inverse_97_roundtrips_within_tolerance_for_small_images() {
         for height in 1..=8 {
             for width in 1..=8 {
                 let levels = max_decompositions(width, height).min(3) as u8;
                 for (name, original) in tiny_patterns(width, height) {
-                    let mut data = original.iter().map(|&v| v as f32).collect::<Vec<_>>();
-                    forward_97_2d_in_place(&mut data, width, height, levels).expect("forward dwt");
-                    inverse_97_2d_in_place(&mut data, width, height, levels);
-                    for (idx, (&out, &orig)) in data.iter().zip(original.iter()).enumerate() {
-                        let diff = (out - orig as f32).abs();
-                        assert!(
-                            diff < ROUNDTRIP_TOL,
-                            "{name} {width}x{height} levels={levels} idx={idx} diff={diff} out={out} orig={orig}"
-                        );
-                    }
+                    assert_roundtrips_within_tolerance(name, &original, width, height, levels);
                 }
             }
         }
@@ -1199,34 +1213,40 @@ mod tests {
 
     #[test]
     fn annex_f_origin_phases_roundtrip_within_tolerance() {
-        for y0 in 0..8usize {
-            for x0 in 0..8usize {
-                for height in 1..=9usize {
-                    for width in 1..=9usize {
-                        let levels = max_decompositions(width, height).min(3) as u8;
-                        let original = (0..height)
-                            .flat_map(|y| {
-                                (0..width).map(move |x| {
-                                    let gx = (x0 + x) as f32;
-                                    let gy = (y0 + y) as f32;
-                                    gx * 1.75 - gy * 2.25 + (gx * gy * 0.03125)
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        let mut data = original.clone();
-                        forward_97_2d_in_place_at(&mut data, width, height, levels, x0, y0)
-                            .expect("phase-aware forward 9/7");
-                        inverse_97_2d_in_place_at(&mut data, width, height, levels, x0, y0)
-                            .expect("phase-aware inverse 9/7");
-                        for (actual, expected) in data.iter().zip(&original) {
-                            assert!(
-                                (actual - expected).abs() < 2e-3,
-                                "origin=({x0},{y0}) size={width}x{height}: {actual} != {expected}"
-                            );
-                        }
-                    }
+        // Every origin phase (x0, y0) in 0..8, y0 outer.
+        for phase in 0..64usize {
+            let (y0, x0) = (phase / 8, phase % 8);
+            for height in 1..=9usize {
+                for width in 1..=9usize {
+                    assert_phase_roundtrip_within_tolerance(x0, y0, width, height);
                 }
             }
+        }
+    }
+
+    /// Runs the phase-aware forward and inverse 9/7 over a ramp at origin
+    /// (`x0`, `y0`) and checks it comes back within tolerance.
+    fn assert_phase_roundtrip_within_tolerance(x0: usize, y0: usize, width: usize, height: usize) {
+        let levels = max_decompositions(width, height).min(3) as u8;
+        let original = (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    let gx = (x0 + x) as f32;
+                    let gy = (y0 + y) as f32;
+                    gx * 1.75 - gy * 2.25 + (gx * gy * 0.03125)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut data = original.clone();
+        forward_97_2d_in_place_at(&mut data, width, height, levels, x0, y0)
+            .expect("phase-aware forward 9/7");
+        inverse_97_2d_in_place_at(&mut data, width, height, levels, x0, y0)
+            .expect("phase-aware inverse 9/7");
+        for (actual, expected) in data.iter().zip(&original) {
+            assert!(
+                (actual - expected).abs() < 2e-3,
+                "origin=({x0},{y0}) size={width}x{height}: {actual} != {expected}"
+            );
         }
     }
 

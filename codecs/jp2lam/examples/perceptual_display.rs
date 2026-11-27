@@ -73,54 +73,84 @@ fn main() -> Result<(), String> {
                     .map_err(|err| err.to_string())?,
                 ),
             };
+            let stem = input.file_stem().unwrap_or_default().to_string_lossy();
+            let cell = Cell {
+                image: &image,
+                stem: &stem,
+                name: &name,
+                display,
+            };
             for &floor in &floors {
-                let target = match display {
-                    None => PerceptualTarget::new(floor, PerceptualEffort::Fast),
-                    Some(profile) => {
-                        PerceptualTarget::for_display(floor, profile, PerceptualEffort::Fast)
-                    }
-                }
-                .map_err(|err| err.to_string())?;
-                PERCEPTUAL_PROBES.store(0, Ordering::Relaxed);
-                let started = std::time::Instant::now();
-                let encoded = encode(
-                    &image,
-                    &EncodeOptions {
-                        rate_control: Some(RateControl::Perceptual(target)),
-                        format: OutputFormat::Jp2,
-                        ..Default::default()
-                    },
-                );
-                let millis = started.elapsed().as_millis();
-                let probes = PERCEPTUAL_PROBES.load(Ordering::Relaxed);
-                let stem = input.file_stem().unwrap_or_default().to_string_lossy();
-                let bytes = match encoded {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        println!("{stem} {floor} {name} {probes} 0 0 0 {millis} MISS:{error}");
-                        continue;
-                    }
-                };
-                let source_score = source_eval
-                    .score_stream(&bytes)
-                    .map_err(|err| err.to_string())?
-                    .score;
-                let display_score = match display_eval.as_mut() {
-                    None => source_score,
-                    Some(evaluator) => {
-                        evaluator
-                            .score_stream(&bytes)
-                            .map_err(|err| err.to_string())?
-                            .score
-                    }
-                };
-                println!(
-                    "{stem} {floor} {name} {probes} {} {display_score:.3} {source_score:.3} {millis} ok",
-                    bytes.len()
-                );
+                report_floor(&cell, floor, &mut source_eval, display_eval.as_mut())?;
             }
         }
     }
+    Ok(())
+}
+
+/// One source image under one display profile.
+struct Cell<'a> {
+    image: &'a Image,
+    stem: &'a str,
+    name: &'a str,
+    display: Option<DisplayProfile>,
+}
+
+/// Encodes `cell` at `floor` and prints its line: the scores against the
+/// display and the source, or a MISS line when the encode fails.
+fn report_floor(
+    cell: &Cell<'_>,
+    floor: f64,
+    source_eval: &mut StreamEvaluator,
+    display_eval: Option<&mut StreamEvaluator>,
+) -> Result<(), String> {
+    let Cell {
+        image,
+        stem,
+        name,
+        display,
+    } = *cell;
+    let target = match display {
+        None => PerceptualTarget::new(floor, PerceptualEffort::Fast),
+        Some(profile) => PerceptualTarget::for_display(floor, profile, PerceptualEffort::Fast),
+    }
+    .map_err(|err| err.to_string())?;
+    PERCEPTUAL_PROBES.store(0, Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    let encoded = encode(
+        image,
+        &EncodeOptions {
+            rate_control: Some(RateControl::Perceptual(target)),
+            format: OutputFormat::Jp2,
+            ..Default::default()
+        },
+    );
+    let millis = started.elapsed().as_millis();
+    let probes = PERCEPTUAL_PROBES.load(Ordering::Relaxed);
+    let bytes = match encoded {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            println!("{stem} {floor} {name} {probes} 0 0 0 {millis} MISS:{error}");
+            return Ok(());
+        }
+    };
+    let source_score = source_eval
+        .score_stream(&bytes)
+        .map_err(|err| err.to_string())?
+        .score;
+    let display_score = match display_eval {
+        None => source_score,
+        Some(evaluator) => {
+            evaluator
+                .score_stream(&bytes)
+                .map_err(|err| err.to_string())?
+                .score
+        }
+    };
+    println!(
+        "{stem} {floor} {name} {probes} {} {display_score:.3} {source_score:.3} {millis} ok",
+        bytes.len()
+    );
     Ok(())
 }
 

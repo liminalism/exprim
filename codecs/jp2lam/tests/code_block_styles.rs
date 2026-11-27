@@ -168,6 +168,24 @@ fn psnr(image: &Image, decoded: &Image) -> f64 {
     }
 }
 
+/// Encodes `image` losslessly with `style`, checks the style is signalled and
+/// that this decoder and OpenJPEG (when installed) both reproduce the image
+/// exactly, and returns the encoded bytes.
+fn assert_lossless_with_style(image: &Image, style: CodeBlockStyle, label: &str) -> Vec<u8> {
+    let encoded = encode(image, &options(RateControl::Lossless, style))
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+    let meta = inspect_jp2(&encoded).expect("inspect");
+    assert_eq!(meta.codestream.cod.code_block_style, style, "{label}");
+    let decoded = decode_jp2(&encoded).unwrap_or_else(|e| panic!("{label}: decode: {e}"));
+    for (a, b) in decoded.components.iter().zip(&image.components) {
+        assert_eq!(a.data, b.data, "{label}");
+    }
+    if let Some(external) = decode_with_openjpeg(&encoded, image) {
+        assert_eq!(external, interleaved(image), "{label}: OpenJPEG");
+    }
+    encoded
+}
+
 #[test]
 fn every_style_is_signalled_and_round_trips_losslessly() {
     let images = [("gray", gray(97, 61)), ("rgb", rgb(80, 70))];
@@ -175,22 +193,13 @@ fn every_style_is_signalled_and_round_trips_losslessly() {
     for (name, style) in styles() {
         for (kind, image) in &images {
             let label = format!("{name} {kind}");
-            let encoded = encode(image, &options(RateControl::Lossless, style))
-                .unwrap_or_else(|e| panic!("{label}: {e}"));
-            let meta = inspect_jp2(&encoded).expect("inspect");
-            assert_eq!(meta.codestream.cod.code_block_style, style, "{label}");
-            let decoded = decode_jp2(&encoded).unwrap_or_else(|e| panic!("{label}: decode: {e}"));
-            for (a, b) in decoded.components.iter().zip(&image.components) {
-                assert_eq!(a.data, b.data, "{label}");
-            }
-            if let Some(external) = decode_with_openjpeg(&encoded, image) {
-                assert_eq!(external, interleaved(image), "{label}: OpenJPEG");
-            }
+            let encoded = assert_lossless_with_style(image, style, &label);
+            let image_index = if *kind == "gray" { 0 } else { 1 };
             if name == "default" {
                 default_sizes.push(encoded.len());
             } else {
                 // Every switch costs a little; none should cost much.
-                let base = default_sizes[if *kind == "gray" { 0 } else { 1 }];
+                let base = default_sizes[image_index];
                 assert!(
                     encoded.len() < base + base / 5,
                     "{label}: {} bytes against {base} for the default style",

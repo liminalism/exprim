@@ -129,40 +129,53 @@ fn lossy_high_bit_depth_round_trips_at_declared_precision() {
                 RateControl::ApproxQuality(85),
                 RateControl::CompressionRatio(8.0),
             ] {
-                let options = EncodeOptions {
-                    rate_control: Some(rate_control),
-                    format: OutputFormat::Jp2,
-                    ..EncodeOptions::default()
-                };
-                let encoded = encode_view(view.clone(), &options)
-                    .unwrap_or_else(|err| panic!("{label} {bits}-bit {rate_control:?}: {err}"));
-                let decoded = decode_jp2(&encoded).expect("decode");
-                assert_eq!(decoded.components.len(), view.components.len());
-                for (index, component) in decoded.components.iter().enumerate() {
-                    assert_eq!(component.precision, bits, "{label} {bits}-bit");
-                    let original: Vec<u16> = if label == "gray" {
-                        gray.clone()
-                    } else {
-                        rgb.iter().skip(index).step_by(3).copied().collect()
-                    };
-                    let psnr = psnr_at_depth(&original, &component.data, bits);
-                    assert!(
-                        psnr > 35.0,
-                        "{label} {bits}-bit {rate_control:?} component {index}: {psnr:.1} dB"
-                    );
-                }
-                if let RateControl::CompressionRatio(ratio) = rate_control {
-                    let source_bytes =
-                        (width * height) as f64 * view.components.len() as f64 * f64::from(bits)
-                            / 8.0;
-                    let achieved = source_bytes / encoded.len() as f64;
-                    assert!(
-                        achieved >= f64::from(ratio) * 0.95,
-                        "{label} {bits}-bit ratio {achieved:.2}"
-                    );
-                }
+                assert_lossy_round_trip(label, &view, rate_control, bits, (&gray, &rgb));
             }
         }
+    }
+}
+
+/// Encodes `view` lossily at `rate_control` and checks every component
+/// decodes at the declared precision within 35 dB, and that a compression
+/// ratio target is met. `gray` and interleaved `rgb` are the source samples.
+fn assert_lossy_round_trip(
+    label: &str,
+    view: &ImageView<'_>,
+    rate_control: RateControl,
+    bits: u32,
+    (gray, rgb): (&[u16], &[u16]),
+) {
+    let options = EncodeOptions {
+        rate_control: Some(rate_control),
+        format: OutputFormat::Jp2,
+        ..EncodeOptions::default()
+    };
+    let encoded = encode_view(view.clone(), &options)
+        .unwrap_or_else(|err| panic!("{label} {bits}-bit {rate_control:?}: {err}"));
+    let decoded = decode_jp2(&encoded).expect("decode");
+    assert_eq!(decoded.components.len(), view.components.len());
+    for (index, component) in decoded.components.iter().enumerate() {
+        assert_eq!(component.precision, bits, "{label} {bits}-bit");
+        let original: Vec<u16> = if label == "gray" {
+            gray.to_vec()
+        } else {
+            rgb.iter().skip(index).step_by(3).copied().collect()
+        };
+        let psnr = psnr_at_depth(&original, &component.data, bits);
+        assert!(
+            psnr > 35.0,
+            "{label} {bits}-bit {rate_control:?} component {index}: {psnr:.1} dB"
+        );
+    }
+    if let RateControl::CompressionRatio(ratio) = rate_control {
+        let source_bytes =
+            f64::from(view.width * view.height) * view.components.len() as f64 * f64::from(bits)
+                / 8.0;
+        let achieved = source_bytes / encoded.len() as f64;
+        assert!(
+            achieved >= f64::from(ratio) * 0.95,
+            "{label} {bits}-bit ratio {achieved:.2}"
+        );
     }
 }
 
@@ -559,48 +572,65 @@ fn non_mct_sequential_component_packed_decode_matches_planar_across_layouts_and_
             );
 
             for resolution in [DecodeResolution::Full, DecodeResolution::ReduceLevels(1)] {
-                let DecodeResult::Native(planar) = decoder
-                    .decode(
-                        &encoded,
-                        &DecodeRequest {
-                            resolution,
-                            output: DecodeOutputFormat::NativePlanarI32,
-                            ..DecodeRequest::default()
-                        },
-                    )
-                    .expect("planar reference")
-                else {
-                    panic!("expected planar");
-                };
-
-                for &format in formats {
-                    let expected = pack_planar_reference(&planar, format);
-                    for concurrency in [DecodeConcurrency::Serial, DecodeConcurrency::Budgeted(4)] {
-                        let DecodeResult::Raster(raster) = decoder
-                            .decode(
-                                &encoded,
-                                &DecodeRequest {
-                                    resolution,
-                                    output: format,
-                                    concurrency,
-                                    ..DecodeRequest::default()
-                                },
-                            )
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "{label} {rate_control:?} {resolution:?} {format:?} {concurrency:?}: {e}"
-                                )
-                            })
-                        else {
-                            panic!("expected raster");
-                        };
-                        assert_eq!(
-                            raster.data, expected,
-                            "{label} {rate_control:?} {resolution:?} {format:?} {concurrency:?}"
-                        );
-                    }
-                }
+                assert_packed_matches_planar(
+                    &mut decoder,
+                    &encoded,
+                    resolution,
+                    formats,
+                    &format!("{label} {rate_control:?}"),
+                );
             }
+        }
+    }
+}
+
+/// Decodes `encoded` at `resolution` as native planes and, in every packed
+/// format and at both concurrencies, checks the packed output equals the
+/// planes packed by the reference.
+fn assert_packed_matches_planar(
+    decoder: &mut Jp2Decoder,
+    encoded: &[u8],
+    resolution: DecodeResolution,
+    formats: &[DecodeOutputFormat],
+    case: &str,
+) {
+    let DecodeResult::Native(planar) = decoder
+        .decode(
+            encoded,
+            &DecodeRequest {
+                resolution,
+                output: DecodeOutputFormat::NativePlanarI32,
+                ..DecodeRequest::default()
+            },
+        )
+        .expect("planar reference")
+    else {
+        panic!("expected planar");
+    };
+
+    for &format in formats {
+        let expected = pack_planar_reference(&planar, format);
+        for concurrency in [DecodeConcurrency::Serial, DecodeConcurrency::Budgeted(4)] {
+            let DecodeResult::Raster(raster) = decoder
+                .decode(
+                    encoded,
+                    &DecodeRequest {
+                        resolution,
+                        output: format,
+                        concurrency,
+                        ..DecodeRequest::default()
+                    },
+                )
+                .unwrap_or_else(|e| {
+                    panic!("{case} {resolution:?} {format:?} {concurrency:?}: {e}")
+                })
+            else {
+                panic!("expected raster");
+            };
+            assert_eq!(
+                raster.data, expected,
+                "{case} {resolution:?} {format:?} {concurrency:?}"
+            );
         }
     }
 }

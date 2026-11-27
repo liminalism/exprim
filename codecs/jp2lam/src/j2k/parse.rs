@@ -19,51 +19,62 @@ impl CodestreamParts {
             let marker_start = cursor.position();
             let marker = cursor.read_u16()?;
             if marker == MARKER_SOT {
-                let mut tile_parts = Vec::new();
-                tile_parts.push(cursor.read_tile_part(marker_start, marker)?);
-
-                while cursor.position() < bytes.len().saturating_sub(2) {
-                    let next_start = cursor.position();
-                    let next_marker = cursor.read_u16()?;
-                    if next_marker == MARKER_EOC {
-                        if cursor.position() != bytes.len() {
-                            return Err(Jp2LamError::EncodeFailed(
-                                "trailing bytes after EOC are unsupported".to_string(),
-                            ));
-                        }
-                        return Ok(Self {
-                            main_header_segments,
-                            tile_parts,
-                        });
-                    }
-                    if next_marker != MARKER_SOT {
-                        return Err(Jp2LamError::EncodeFailed(format!(
-                            "unexpected marker 0x{next_marker:04x} after tile-part payload"
-                        )));
-                    }
-                    tile_parts.push(cursor.read_tile_part(next_start, next_marker)?);
-                }
-
-                if cursor.position() == bytes.len().saturating_sub(2) {
-                    let eoc = cursor.read_u16()?;
-                    if eoc == MARKER_EOC {
-                        return Ok(Self {
-                            main_header_segments,
-                            tile_parts,
-                        });
-                    }
-                    return Err(Jp2LamError::EncodeFailed(format!(
-                        "expected EOC at end of codestream, found 0x{eoc:04x}"
-                    )));
-                }
-
-                return Err(Jp2LamError::EncodeFailed(
-                    "backend codestream ended before EOC".to_string(),
-                ));
+                return Self::read_tile_parts(cursor, main_header_segments, marker_start, marker);
             }
 
             main_header_segments.push(cursor.read_segment(marker)?);
         }
+    }
+
+    /// Reads the tile-parts that follow the main header, from the first SOT
+    /// at `first_start`, through the closing EOC.
+    fn read_tile_parts(
+        mut cursor: Cursor<'_>,
+        main_header_segments: Vec<Vec<u8>>,
+        first_start: usize,
+        first_marker: u16,
+    ) -> Result<Self> {
+        let bytes = cursor.bytes;
+        let mut tile_parts = Vec::new();
+        tile_parts.push(cursor.read_tile_part(first_start, first_marker)?);
+
+        while cursor.position() < bytes.len().saturating_sub(2) {
+            let next_start = cursor.position();
+            let next_marker = cursor.read_u16()?;
+            if next_marker == MARKER_EOC {
+                if cursor.position() != bytes.len() {
+                    return Err(Jp2LamError::EncodeFailed(
+                        "trailing bytes after EOC are unsupported".to_string(),
+                    ));
+                }
+                return Ok(Self {
+                    main_header_segments,
+                    tile_parts,
+                });
+            }
+            if next_marker != MARKER_SOT {
+                return Err(Jp2LamError::EncodeFailed(format!(
+                    "unexpected marker 0x{next_marker:04x} after tile-part payload"
+                )));
+            }
+            tile_parts.push(cursor.read_tile_part(next_start, next_marker)?);
+        }
+
+        if cursor.position() != bytes.len().saturating_sub(2) {
+            return Err(Jp2LamError::EncodeFailed(
+                "backend codestream ended before EOC".to_string(),
+            ));
+        }
+        let eoc = cursor.read_u16()?;
+        if eoc != MARKER_EOC {
+            return Err(Jp2LamError::EncodeFailed(format!(
+                "expected EOC at end of codestream, found 0x{eoc:04x}"
+            )));
+        }
+        Ok(Self {
+            main_header_segments,
+            tile_parts,
+        })
     }
 }
 

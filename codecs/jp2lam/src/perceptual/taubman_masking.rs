@@ -51,6 +51,27 @@ pub struct TaubmanMaskMap {
     pub cell_nu: Vec<f64>,
 }
 
+/// Mean of `synthesis_norm * |v|` over one cell's rows and columns of the
+/// subband; zero for an empty cell.
+#[cfg(test)]
+fn cell_mean_magnitude(
+    coeffs: &[f64],
+    width: usize,
+    (rows, cols): (std::ops::Range<usize>, std::ops::Range<usize>),
+    synthesis_norm: f64,
+) -> f64 {
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for row in rows {
+        for col in cols.clone() {
+            let v = coeffs[row * width + col];
+            sum += synthesis_norm * v.abs();
+            count += 1;
+        }
+    }
+    if count > 0 { sum / count as f64 } else { 0.0 }
+}
+
 #[cfg(test)]
 impl TaubmanMaskMap {
     /// Compute a Taubman masking map from wavelet subband coefficients.
@@ -69,16 +90,12 @@ impl TaubmanMaskMap {
                 let row_end = (row_start + CELL_SIZE).min(height);
                 let col_end = (col_start + CELL_SIZE).min(width);
 
-                let mut sum = 0.0f64;
-                let mut count = 0usize;
-                for row in row_start..row_end {
-                    for col in col_start..col_end {
-                        let v = coeffs[row * width + col];
-                        sum += synthesis_norm * v.abs();
-                        count += 1;
-                    }
-                }
-                let nu = if count > 0 { sum / count as f64 } else { 0.0 };
+                let nu = cell_mean_magnitude(
+                    coeffs,
+                    width,
+                    (row_start..row_end, col_start..col_end),
+                    synthesis_norm,
+                );
                 cell_nu[cell_row * cell_cols + cell_col] = nu;
             }
         }

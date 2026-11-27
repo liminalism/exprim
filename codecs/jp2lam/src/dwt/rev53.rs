@@ -954,26 +954,9 @@ fn inverse_53_vertical_even_in_place(
         let scratch = &mut scratch[..band_width * active_height];
 
         if band_width.saturating_mul(active_height) >= PARALLEL_COLUMN_THRESHOLD {
-            // Reads only come from `data` (a separate, read-only buffer here),
-            // and each chunk's first row is exactly the "even" row this loop
-            // writes for a given `i` — no cross-chunk reads, so plain
-            // `par_chunks_mut` needs no snapshot.
-            scratch
-                .par_chunks_mut(2 * band_width)
-                .enumerate()
-                .for_each(|(i, chunk)| {
-                    let low = i * stride + band_x;
-                    let high_left = (sn + i.saturating_sub(1).min(dn - 1)) * stride + band_x;
-                    let high_right = (sn + i.min(dn - 1)) * stride + band_x;
-                    inverse_predict_row_into(
-                        data,
-                        low,
-                        high_left,
-                        high_right,
-                        &mut chunk[..band_width],
-                        use_wide,
-                    );
-                });
+            inverse_predict_rows_parallel(
+                data, stride, band_x, scratch, sn, dn, band_width, use_wide,
+            );
         } else {
             for i in 0..sn {
                 let low = i * stride + band_x;
@@ -991,19 +974,9 @@ fn inverse_53_vertical_even_in_place(
                 data, stride, band_x, scratch, sn, dn, band_width, use_wide,
             );
         } else {
-            for i in 0..dn {
-                let high = (sn + i) * stride + band_x;
-                let even = (2 * i) * band_width;
-                let odd = (2 * i + 1) * band_width;
-                let right_even = if i + 1 < sn {
-                    (2 * (i + 1)) * band_width
-                } else {
-                    even
-                };
-                inverse_update_row(
-                    data, scratch, high, even, right_even, odd, band_width, use_wide,
-                );
-            }
+            inverse_update_rows_sequential(
+                data, stride, band_x, scratch, sn, dn, band_width, use_wide,
+            );
         }
 
         for y in 0..active_height {
@@ -1012,6 +985,70 @@ fn inverse_53_vertical_even_in_place(
             data[dst..dst + band_width].copy_from_slice(&scratch[src..src + band_width]);
         }
     }
+}
+
+/// Sequential form of the update step of [`inverse_53_vertical_even_in_place`]
+/// for one column band: writes every odd scratch row from the `data` high
+/// row and the even scratch rows around it.
+#[allow(clippy::too_many_arguments)]
+fn inverse_update_rows_sequential(
+    data: &[i32],
+    stride: usize,
+    band_x: usize,
+    scratch: &mut [i32],
+    sn: usize,
+    dn: usize,
+    band_width: usize,
+    use_wide: bool,
+) {
+    for i in 0..dn {
+        let high = (sn + i) * stride + band_x;
+        let even = (2 * i) * band_width;
+        let odd = (2 * i + 1) * band_width;
+        let right_even = if i + 1 < sn {
+            (2 * (i + 1)) * band_width
+        } else {
+            even
+        };
+        inverse_update_row(
+            data, scratch, high, even, right_even, odd, band_width, use_wide,
+        );
+    }
+}
+
+/// Parallel form of the prediction step of [`inverse_53_vertical_even_in_place`]
+/// for one column band: writes every even scratch row from `data`.
+///
+/// Reads only come from `data` (a separate, read-only buffer here), and each
+/// chunk's first row is exactly the "even" row this writes for a given `i` —
+/// no cross-chunk reads, so plain `par_chunks_mut` needs no snapshot.
+#[allow(clippy::too_many_arguments)]
+fn inverse_predict_rows_parallel(
+    data: &[i32],
+    stride: usize,
+    band_x: usize,
+    scratch: &mut [i32],
+    sn: usize,
+    dn: usize,
+    band_width: usize,
+    use_wide: bool,
+) {
+    scratch
+        .par_chunks_mut(2 * band_width)
+        .enumerate()
+        .for_each(|(i, chunk)| {
+            let low = i * stride + band_x;
+            let high_left = (sn + i.saturating_sub(1).min(dn - 1)) * stride + band_x;
+            let high_right = (sn + i.min(dn - 1)) * stride + band_x;
+            inverse_predict_row_into(
+                data,
+                low,
+                high_left,
+                high_right,
+                &mut chunk[..band_width],
+                use_wide,
+            );
+        });
 }
 
 /// `right_even` can land in the *next* row-pair (`i+1 < sn`), which a
@@ -1583,30 +1620,36 @@ mod tests {
 
     #[test]
     fn annex_f_origin_phases_roundtrip_exactly() {
-        for y0 in 0..8usize {
-            for x0 in 0..8usize {
-                for height in 1..=9usize {
-                    for width in 1..=9usize {
-                        let levels = max_decompositions(width, height).min(3) as u8;
-                        let original = (0..height)
-                            .flat_map(|y| {
-                                (0..width).map(move |x| {
-                                    let gx = (x0 + x) as i32;
-                                    let gy = (y0 + y) as i32;
-                                    ((gx * 37 + gy * 61 + (gx ^ gy) * 11) & 0x3ff) - 512
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        let mut data = original.clone();
-                        forward_53_2d_in_place_at(&mut data, width, height, levels, x0, y0)
-                            .expect("phase-aware forward 5/3");
-                        inverse_53_2d_in_place_at(&mut data, width, height, levels, x0, y0)
-                            .expect("phase-aware inverse 5/3");
-                        assert_eq!(data, original, "origin=({x0},{y0}) size={width}x{height}");
-                    }
+        // Every origin phase (x0, y0) in 0..8, y0 outer.
+        for phase in 0..64usize {
+            let (y0, x0) = (phase / 8, phase % 8);
+            for height in 1..=9usize {
+                for width in 1..=9usize {
+                    assert_phase_roundtrip_exact(x0, y0, width, height);
                 }
             }
         }
+    }
+
+    /// Runs the phase-aware forward and inverse 5/3 over a pattern at origin
+    /// (`x0`, `y0`) and checks it comes back exactly.
+    fn assert_phase_roundtrip_exact(x0: usize, y0: usize, width: usize, height: usize) {
+        let levels = max_decompositions(width, height).min(3) as u8;
+        let original = (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    let gx = (x0 + x) as i32;
+                    let gy = (y0 + y) as i32;
+                    ((gx * 37 + gy * 61 + (gx ^ gy) * 11) & 0x3ff) - 512
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut data = original.clone();
+        forward_53_2d_in_place_at(&mut data, width, height, levels, x0, y0)
+            .expect("phase-aware forward 5/3");
+        inverse_53_2d_in_place_at(&mut data, width, height, levels, x0, y0)
+            .expect("phase-aware inverse 5/3");
+        assert_eq!(data, original, "origin=({x0},{y0}) size={width}x{height}");
     }
 
     fn max_decompositions(width: usize, height: usize) -> usize {

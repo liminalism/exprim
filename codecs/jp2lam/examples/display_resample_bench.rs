@@ -65,67 +65,13 @@ fn main() {
                 path.file_stem().unwrap().to_string_lossy()
             );
             images += 1;
-            for (slot, resample) in [(0usize, false), (1, true)] {
-                if only.is_some_and(|want| want != resample) {
-                    continue;
-                }
-                let profile = if resample {
-                    display.resampling_source()
-                } else {
-                    display
-                };
-                let target = PerceptualTarget::for_display(FLOOR, profile, PerceptualEffort::Fast)
-                    .expect("target");
-                let options = EncodeOptions {
-                    rate_control: Some(RateControl::Perceptual(target)),
-                    format: OutputFormat::Jp2,
-                    ..Default::default()
-                };
-                PERCEPTUAL_PROBES.store(0, Ordering::Relaxed);
-                let started = Instant::now();
-                let bytes = encode_view(view.clone(), &options).expect("encode");
-                let encode_ms = started.elapsed().as_secs_f64() * 1000.0;
-                let probes = PERCEPTUAL_PROBES.load(Ordering::Relaxed);
-                let encoder_score = last_achieved_score();
-
-                let started = Instant::now();
-                let decoded = decode_jp2(&bytes).expect("decode");
-                let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
-                let expected = if resample {
-                    profile.encoded_size(width, height)
-                } else {
-                    (width, height)
-                };
-                assert_eq!(
-                    (decoded.width, decoded.height),
-                    expected,
-                    "emitted dimensions"
-                );
-
-                // The reader's view: source conditioned into the box on one
-                // side, the emitted stream conditioned into the same box on the
-                // other. `for_display` accepts a candidate that already decodes
-                // at the box size, which is what a resampled encode emits.
-                let mut evaluator =
-                    StreamEvaluator::for_display(view.clone(), display).expect("evaluator");
-                let score = evaluator.score_stream(&bytes).expect("score").score;
-                assert!(
-                    score >= FLOOR,
-                    "{label} resample={resample} scored {score} below floor {FLOOR}"
-                );
-                // The encoder verified its floor against this very measurement,
-                // so its own number is the reader's number: the only slack left
-                // is reconstruct-vs-decode, and there is none.
-                assert!(
-                    (encoder_score - score).abs() < 1e-6,
-                    "{label} resample={resample}: encoder scored {encoder_score}, reader {score}"
-                );
-                println!(
-                    "{label:<28} {:>11} {:>9} {encode_ms:>8.1} {probes:>6} {encoder_score:>8.2} {score:>8.2} {decode_ms:>7.1}",
-                    if resample { "resampled" } else { "source-res" },
-                    bytes.len(),
-                );
-                totals[slot].0 += bytes.len() as u64;
+            let sides = [(0usize, false), (1, true)]
+                .into_iter()
+                .filter(|&(_, resample)| only.is_none_or(|want| want == resample));
+            for (slot, resample) in sides {
+                let (bytes, encode_ms, decode_ms) =
+                    encode_and_score(&view, display, resample, &label, (width, height));
+                totals[slot].0 += bytes;
                 totals[slot].1 += encode_ms;
                 totals[slot].2 += decode_ms;
             }
@@ -147,4 +93,72 @@ fn main() {
         totals[1].1 / totals[0].1,
         totals[1].2 / totals[0].2
     );
+}
+
+/// Encodes one image for the display, at source resolution or resampled into
+/// the box, checks the reader's score against the floor and the encoder's own,
+/// prints the row, and returns (bytes, encode ms, decode ms).
+fn encode_and_score(
+    view: &ImageView<'_>,
+    display: DisplayProfile,
+    resample: bool,
+    label: &str,
+    (width, height): (u32, u32),
+) -> (u64, f64, f64) {
+    let profile = if resample {
+        display.resampling_source()
+    } else {
+        display
+    };
+    let target =
+        PerceptualTarget::for_display(FLOOR, profile, PerceptualEffort::Fast).expect("target");
+    let options = EncodeOptions {
+        rate_control: Some(RateControl::Perceptual(target)),
+        format: OutputFormat::Jp2,
+        ..Default::default()
+    };
+    PERCEPTUAL_PROBES.store(0, Ordering::Relaxed);
+    let started = Instant::now();
+    let bytes = encode_view(view.clone(), &options).expect("encode");
+    let encode_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let probes = PERCEPTUAL_PROBES.load(Ordering::Relaxed);
+    let encoder_score = last_achieved_score();
+
+    let started = Instant::now();
+    let decoded = decode_jp2(&bytes).expect("decode");
+    let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let expected = if resample {
+        profile.encoded_size(width, height)
+    } else {
+        (width, height)
+    };
+    assert_eq!(
+        (decoded.width, decoded.height),
+        expected,
+        "emitted dimensions"
+    );
+
+    // The reader's view: source conditioned into the box on one
+    // side, the emitted stream conditioned into the same box on the
+    // other. `for_display` accepts a candidate that already decodes
+    // at the box size, which is what a resampled encode emits.
+    let mut evaluator = StreamEvaluator::for_display(view.clone(), display).expect("evaluator");
+    let score = evaluator.score_stream(&bytes).expect("score").score;
+    assert!(
+        score >= FLOOR,
+        "{label} resample={resample} scored {score} below floor {FLOOR}"
+    );
+    // The encoder verified its floor against this very measurement,
+    // so its own number is the reader's number: the only slack left
+    // is reconstruct-vs-decode, and there is none.
+    assert!(
+        (encoder_score - score).abs() < 1e-6,
+        "{label} resample={resample}: encoder scored {encoder_score}, reader {score}"
+    );
+    println!(
+        "{label:<28} {:>11} {:>9} {encode_ms:>8.1} {probes:>6} {encoder_score:>8.2} {score:>8.2} {decode_ms:>7.1}",
+        if resample { "resampled" } else { "source-res" },
+        bytes.len(),
+    );
+    (bytes.len() as u64, encode_ms, decode_ms)
 }

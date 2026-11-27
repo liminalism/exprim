@@ -351,63 +351,7 @@ impl PacketProgression {
                 precinct: 0,
             },
             order @ (ProgressionOrder::Rpcl | ProgressionOrder::Pcrl | ProgressionOrder::Cprl) => {
-                let mut streams = Vec::new();
-                streams
-                    .try_reserve_exact(
-                        header
-                            .siz
-                            .components
-                            .len()
-                            .checked_mul(usize::from(header.cod.decomposition_levels) + 1)
-                            .ok_or_else(|| invalid("packet-position stream count overflow"))?,
-                    )
-                    .map_err(|_| invalid("packet-position stream allocation failed"))?;
-                for component in 0..header.siz.components.len() {
-                    for resolution in 0..=header.cod.decomposition_levels {
-                        let grid = grids
-                            .get(component)
-                            .and_then(|component_grids| {
-                                component_grids.get(usize::from(resolution))
-                            })
-                            .ok_or_else(|| {
-                                invalid("packet plan references a missing precinct grid")
-                            })?;
-                        let precinct_count = grid
-                            .width
-                            .checked_mul(grid.height)
-                            .ok_or_else(|| invalid("precinct count overflow"))?;
-                        if precinct_count != 0 {
-                            streams.push(PacketPositionStream {
-                                resolution,
-                                component,
-                                next_precinct: 0,
-                                precinct_count,
-                            });
-                        }
-                    }
-                }
-                let mut heap = BinaryHeap::new();
-                heap.try_reserve(streams.len())
-                    .map_err(|_| invalid("spatial packet heap allocation failed"))?;
-                for (stream_index, stream) in streams.iter().enumerate() {
-                    heap.push(Reverse(SpatialHeapEntry {
-                        key: spatial_packet_key(
-                            header,
-                            &grids,
-                            order,
-                            stream.component,
-                            stream.resolution,
-                            0,
-                        )?,
-                        stream: stream_index,
-                    }));
-                }
-                PacketProgressionState::Spatial {
-                    order,
-                    streams,
-                    heap,
-                    pending: None,
-                }
+                Self::spatial_state(header, &grids, order)?
             }
         };
         Ok(Self {
@@ -418,6 +362,79 @@ impl PacketProgression {
             emitted: 0,
             total,
         })
+    }
+
+    /// Progression state for the position-driven orders (RPCL, PCRL, CPRL):
+    /// one packet-position stream per non-empty (component, resolution),
+    /// merged through a heap keyed on each stream's next spatial position.
+    fn spatial_state(
+        header: &CodestreamHeader,
+        grids: &[Vec<PrecinctGrid>],
+        order: ProgressionOrder,
+    ) -> Result<PacketProgressionState> {
+        let streams = Self::position_streams(header, grids)?;
+        let mut heap = BinaryHeap::new();
+        heap.try_reserve(streams.len())
+            .map_err(|_| invalid("spatial packet heap allocation failed"))?;
+        for (stream_index, stream) in streams.iter().enumerate() {
+            heap.push(Reverse(SpatialHeapEntry {
+                key: spatial_packet_key(
+                    header,
+                    grids,
+                    order,
+                    stream.component,
+                    stream.resolution,
+                    0,
+                )?,
+                stream: stream_index,
+            }));
+        }
+        Ok(PacketProgressionState::Spatial {
+            order,
+            streams,
+            heap,
+            pending: None,
+        })
+    }
+
+    /// One packet-position stream per (component, resolution) that has at
+    /// least one precinct, in component-then-resolution order.
+    fn position_streams(
+        header: &CodestreamHeader,
+        grids: &[Vec<PrecinctGrid>],
+    ) -> Result<Vec<PacketPositionStream>> {
+        let mut streams = Vec::new();
+        streams
+            .try_reserve_exact(
+                header
+                    .siz
+                    .components
+                    .len()
+                    .checked_mul(usize::from(header.cod.decomposition_levels) + 1)
+                    .ok_or_else(|| invalid("packet-position stream count overflow"))?,
+            )
+            .map_err(|_| invalid("packet-position stream allocation failed"))?;
+        for component in 0..header.siz.components.len() {
+            for resolution in 0..=header.cod.decomposition_levels {
+                let grid = grids
+                    .get(component)
+                    .and_then(|component_grids| component_grids.get(usize::from(resolution)))
+                    .ok_or_else(|| invalid("packet plan references a missing precinct grid"))?;
+                let precinct_count = grid
+                    .width
+                    .checked_mul(grid.height)
+                    .ok_or_else(|| invalid("precinct count overflow"))?;
+                if precinct_count != 0 {
+                    streams.push(PacketPositionStream {
+                        resolution,
+                        component,
+                        next_precinct: 0,
+                        precinct_count,
+                    });
+                }
+            }
+        }
+        Ok(streams)
     }
 
     fn next(&mut self) -> Result<Option<PacketPosition>> {
@@ -910,17 +927,17 @@ impl<'a> TilePacketDecoder<'a> {
                     .get(body_pos..end)
                     .ok_or_else(|| invalid("codeword segment exceeds packet body"))?;
                 body_pos = end;
-                if retain {
-                    let merged = MergedSegment {
-                        passes: segment.passes,
-                        terminated: segment.terminated,
-                        chunks: InlineValues::One(data),
-                    };
-                    if let Some(new_segments) = &mut new_segments {
-                        new_segments.try_push(merged)?;
-                    } else {
-                        new_segments = Some(InlineValues::One(merged));
-                    }
+                if !retain {
+                    continue;
+                }
+                let merged = MergedSegment {
+                    passes: segment.passes,
+                    terminated: segment.terminated,
+                    chunks: InlineValues::One(data),
+                };
+                match &mut new_segments {
+                    Some(new_segments) => new_segments.try_push(merged)?,
+                    None => new_segments = Some(InlineValues::One(merged)),
                 }
             }
             if !retain {
@@ -935,23 +952,7 @@ impl<'a> TilePacketDecoder<'a> {
             match &mut block.merged {
                 Some(existing) => {
                     existing.passes += contribution.passes;
-                    // A segment left open by the previous layer continues
-                    // with this layer's first piece; every piece after a
-                    // termination starts a segment of its own.
-                    for piece in new_segments.into_vec() {
-                        let open = existing
-                            .segments
-                            .last_mut()
-                            .filter(|segment| !segment.terminated);
-                        match open {
-                            Some(segment) => {
-                                segment.passes += piece.passes;
-                                segment.terminated = piece.terminated;
-                                segment.chunks.try_extend(piece.chunks)?;
-                            }
-                            None => existing.segments.try_push(piece)?,
-                        }
-                    }
+                    append_layer_segments(existing, new_segments)?;
                 }
                 None => {
                     self.order.push(key);
@@ -1024,6 +1025,31 @@ struct MergedSegment<'a> {
     chunks: InlineValues<&'a [u8]>,
 }
 
+/// Appends one layer's codeword pieces to a block's merged segments.
+///
+/// A segment left open by the previous layer continues with this layer's
+/// first piece; every piece after a termination starts a segment of its own.
+fn append_layer_segments<'a>(
+    existing: &mut MergedBlock<'a>,
+    new_segments: InlineValues<MergedSegment<'a>>,
+) -> Result<()> {
+    for piece in new_segments.into_vec() {
+        let open = existing
+            .segments
+            .last_mut()
+            .filter(|segment| !segment.terminated);
+        match open {
+            Some(segment) => {
+                segment.passes += piece.passes;
+                segment.terminated = piece.terminated;
+                segment.chunks.try_extend(piece.chunks)?;
+            }
+            None => existing.segments.try_push(piece)?,
+        }
+    }
+    Ok(())
+}
+
 fn validate_packet_scope(header: &CodestreamHeader) -> Result<()> {
     // All five Annex B.12 progression orders are traversed by the stateful
     // packet plan, including the precinct-position axis.
@@ -1083,19 +1109,12 @@ fn read_band_contributions(
             continue;
         }
 
-        let zero_bitplanes = if let Some(value) = band.blocks[block_index].zero_bitplanes {
-            value
-        } else {
-            let tree = &mut precinct.zero_bitplanes;
-            tree.decode(bio, leaf_index, 999)?;
-            let value = tree
-                .value(leaf_index)
-                .ok_or_else(|| invalid("zero-bitplane tag tree did not terminate"))?;
-            let value = u32::try_from(value)
-                .map_err(|_| invalid("negative zero-bitplane tag-tree value"))?;
-            band.blocks[block_index].zero_bitplanes = Some(value);
-            value
-        };
+        let zero_bitplanes = read_zero_bitplanes(
+            bio,
+            &mut precinct.zero_bitplanes,
+            leaf_index,
+            &mut band.blocks[block_index].zero_bitplanes,
+        )?;
 
         let passes = read_numpasses(bio)?;
         let increment = read_commacode(bio)?;
@@ -1103,45 +1122,14 @@ fn read_band_contributions(
             .numlenbits
             .checked_add(increment)
             .ok_or_else(|| invalid("codeword length-bit count overflow"))?;
-        // B.10.7: one length per codeword segment the contribution touches.
-        // Terminations fall where the code-block style puts them (every
-        // pass with TERMALL, the Table D.9 points with bypass); a run that
-        // reaches the end of the contribution without one stays open for the
-        // next layer.
         let first_pass = band.blocks[block_index].passes;
-        let mut segments: InlineValues<ContributionSegment> =
-            InlineValues::One(ContributionSegment {
-                passes: 0,
-                length: 0,
-                terminated: false,
-            });
-        let mut first = true;
-        let mut run = 0u32;
-        for offset in 0..passes {
-            run += 1;
-            let index = first_pass
-                .checked_add(offset)
-                .ok_or_else(|| invalid("coding-pass index overflow"))?;
-            let terminated = style.pass_is_terminated(index);
-            if terminated || offset + 1 == passes {
-                let len_bits = band.blocks[block_index]
-                    .numlenbits
-                    .checked_add(floor_log2(run))
-                    .ok_or_else(|| invalid("codeword segment length-bit count overflow"))?;
-                let segment = ContributionSegment {
-                    passes: run,
-                    length: bio.read_bits_usize(len_bits)?,
-                    terminated,
-                };
-                if first {
-                    segments = InlineValues::One(segment);
-                    first = false;
-                } else {
-                    segments.try_push(segment)?;
-                }
-                run = 0;
-            }
-        }
+        let segments = read_segment_lengths(
+            bio,
+            style,
+            first_pass,
+            passes,
+            band.blocks[block_index].numlenbits,
+        )?;
         band.blocks[block_index].passes = first_pass
             .checked_add(passes)
             .ok_or_else(|| invalid("coding-pass count overflow"))?;
@@ -1155,6 +1143,76 @@ fn read_band_contributions(
         });
     }
     Ok(())
+}
+
+/// The block's zero-bit-plane count: remembered from its first inclusion,
+/// or read now from the precinct's tag tree (B.10.5) and remembered.
+fn read_zero_bitplanes(
+    bio: &mut PacketBioReader<'_>,
+    tree: &mut TagTreeReader,
+    leaf_index: usize,
+    known: &mut Option<u32>,
+) -> Result<u32> {
+    if let Some(value) = *known {
+        return Ok(value);
+    }
+    tree.decode(bio, leaf_index, 999)?;
+    let value = tree
+        .value(leaf_index)
+        .ok_or_else(|| invalid("zero-bitplane tag tree did not terminate"))?;
+    let value =
+        u32::try_from(value).map_err(|_| invalid("negative zero-bitplane tag-tree value"))?;
+    *known = Some(value);
+    Ok(value)
+}
+
+/// Reads the codeword-segment lengths of a contribution of `passes` passes
+/// starting at pass `first_pass` (B.10.7): one length per codeword segment
+/// the contribution touches.
+///
+/// Terminations fall where the code-block style puts them (every pass with
+/// TERMALL, the Table D.9 points with bypass); a run that reaches the end of
+/// the contribution without one stays open for the next layer.
+fn read_segment_lengths(
+    bio: &mut PacketBioReader<'_>,
+    style: CodeBlockStyle,
+    first_pass: u32,
+    passes: u32,
+    numlenbits: u32,
+) -> Result<InlineValues<ContributionSegment>> {
+    let mut segments: InlineValues<ContributionSegment> = InlineValues::One(ContributionSegment {
+        passes: 0,
+        length: 0,
+        terminated: false,
+    });
+    let mut first = true;
+    let mut run = 0u32;
+    for offset in 0..passes {
+        run += 1;
+        let index = first_pass
+            .checked_add(offset)
+            .ok_or_else(|| invalid("coding-pass index overflow"))?;
+        let terminated = style.pass_is_terminated(index);
+        if !terminated && offset + 1 != passes {
+            continue;
+        }
+        let len_bits = numlenbits
+            .checked_add(floor_log2(run))
+            .ok_or_else(|| invalid("codeword segment length-bit count overflow"))?;
+        let segment = ContributionSegment {
+            passes: run,
+            length: bio.read_bits_usize(len_bits)?,
+            terminated,
+        };
+        if first {
+            segments = InlineValues::One(segment);
+            first = false;
+        } else {
+            segments.try_push(segment)?;
+        }
+        run = 0;
+    }
+    Ok(segments)
 }
 
 fn build_band_lookup(
@@ -1288,14 +1346,15 @@ fn next_lrcp(
         }
         *precinct = 0;
         *component += 1;
-        if *component == grids.len() {
-            *component = 0;
-            if *resolution == max_resolution {
-                *resolution = 0;
-                *layer += 1;
-            } else {
-                *resolution += 1;
-            }
+        if *component != grids.len() {
+            continue;
+        }
+        *component = 0;
+        if *resolution == max_resolution {
+            *resolution = 0;
+            *layer += 1;
+        } else {
+            *resolution += 1;
         }
     }
     Ok(None)
@@ -1332,17 +1391,19 @@ fn next_rlcp(
         }
         *precinct = 0;
         *component += 1;
-        if *component == grids.len() {
-            *component = 0;
-            *layer += 1;
-            if *layer == layers {
-                *layer = 0;
-                if *resolution == max_resolution {
-                    *resolution = max_resolution.saturating_add(1);
-                } else {
-                    *resolution += 1;
-                }
-            }
+        if *component != grids.len() {
+            continue;
+        }
+        *component = 0;
+        *layer += 1;
+        if *layer != layers {
+            continue;
+        }
+        *layer = 0;
+        if *resolution == max_resolution {
+            *resolution = max_resolution.saturating_add(1);
+        } else {
+            *resolution += 1;
         }
     }
     Ok(None)
@@ -1505,58 +1566,13 @@ fn build_precinct_band<'a>(
                 .min(geometry.bounds.y1),
         };
         let first_block = blocks.len();
-        let mut columns = 0usize;
-        let mut rows = 0usize;
-        if cell.x0 < cell.x1 && cell.y0 < cell.y1 {
-            let block_grid_x0 = cell.x0 / code_block_width;
-            let block_grid_x1 = cell.x1.div_ceil(code_block_width);
-            let block_grid_y0 = cell.y0 / code_block_height;
-            let block_grid_y1 = cell.y1.div_ceil(code_block_height);
-            columns = usize::try_from(block_grid_x1 - block_grid_x0)
-                .map_err(|_| invalid("code-block column count exceeds usize"))?;
-            rows = usize::try_from(block_grid_y1 - block_grid_y0)
-                .map_err(|_| invalid("code-block row count exceeds usize"))?;
-            let new_blocks = columns
-                .checked_mul(rows)
-                .ok_or_else(|| invalid("code-block count overflow"))?;
-            if new_blocks > *remaining_code_blocks {
-                return Err(invalid(format!(
-                    "tile code-block count exceeds remaining decode budget {}",
-                    *remaining_code_blocks
-                )));
-            }
-            blocks
-                .try_reserve(new_blocks)
-                .map_err(|_| invalid("code-block state allocation failed"))?;
-            *remaining_code_blocks -= new_blocks;
-            for block_y in block_grid_y0..block_grid_y1 {
-                let nominal_y0 = block_y * code_block_height;
-                let y0 = nominal_y0.max(cell.y0).max(geometry.bounds.y0);
-                let y1 = nominal_y0
-                    .saturating_add(code_block_height)
-                    .min(cell.y1)
-                    .min(geometry.bounds.y1);
-                for block_x in block_grid_x0..block_grid_x1 {
-                    let nominal_x0 = block_x * code_block_width;
-                    let x0 = nominal_x0.max(cell.x0).max(geometry.bounds.x0);
-                    let x1 = nominal_x0
-                        .saturating_add(code_block_width)
-                        .min(cell.x1)
-                        .min(geometry.bounds.x1);
-                    blocks.push(BlockState {
-                        x0: geometry.packed_x0 + (x0 - geometry.bounds.x0),
-                        y0: geometry.packed_y0 + (y0 - geometry.bounds.y0),
-                        x1: geometry.packed_x0 + (x1 - geometry.bounds.x0),
-                        y1: geometry.packed_y0 + (y1 - geometry.bounds.y0),
-                        included: false,
-                        numlenbits: 3,
-                        zero_bitplanes: None,
-                        passes: 0,
-                        merged: None,
-                    });
-                }
-            }
-        }
+        let (columns, rows) = push_precinct_blocks(
+            &mut blocks,
+            cell,
+            geometry,
+            (code_block_width, code_block_height),
+            remaining_code_blocks,
+        )?;
         precincts.push(BandPrecinctState {
             block_indices: first_block..blocks.len(),
             inclusion: TagTreeReader::try_new(columns.max(1), rows.max(1))?,
@@ -1571,6 +1587,71 @@ fn build_precinct_band<'a>(
         blocks,
         precincts,
     })
+}
+
+/// Appends the code-block states of one precinct cell, in raster order and
+/// clipped to the cell and the subband, charging them to the decode budget.
+/// Returns the cell's code-block grid size (columns, rows); an empty cell
+/// has none.
+fn push_precinct_blocks(
+    blocks: &mut Vec<BlockState<'_>>,
+    cell: Rect,
+    geometry: BandGeometry,
+    (code_block_width, code_block_height): (u32, u32),
+    remaining_code_blocks: &mut usize,
+) -> Result<(usize, usize)> {
+    if cell.x0 >= cell.x1 || cell.y0 >= cell.y1 {
+        return Ok((0, 0));
+    }
+    let block_grid_x0 = cell.x0 / code_block_width;
+    let block_grid_x1 = cell.x1.div_ceil(code_block_width);
+    let block_grid_y0 = cell.y0 / code_block_height;
+    let block_grid_y1 = cell.y1.div_ceil(code_block_height);
+    let columns = usize::try_from(block_grid_x1 - block_grid_x0)
+        .map_err(|_| invalid("code-block column count exceeds usize"))?;
+    let rows = usize::try_from(block_grid_y1 - block_grid_y0)
+        .map_err(|_| invalid("code-block row count exceeds usize"))?;
+    let new_blocks = columns
+        .checked_mul(rows)
+        .ok_or_else(|| invalid("code-block count overflow"))?;
+    if new_blocks > *remaining_code_blocks {
+        return Err(invalid(format!(
+            "tile code-block count exceeds remaining decode budget {}",
+            *remaining_code_blocks
+        )));
+    }
+    blocks
+        .try_reserve(new_blocks)
+        .map_err(|_| invalid("code-block state allocation failed"))?;
+    *remaining_code_blocks -= new_blocks;
+    for block_y in block_grid_y0..block_grid_y1 {
+        let nominal_y0 = block_y * code_block_height;
+        let y0 = nominal_y0.max(cell.y0).max(geometry.bounds.y0);
+        let y1 = nominal_y0
+            .saturating_add(code_block_height)
+            .min(cell.y1)
+            .min(geometry.bounds.y1);
+        for block_x in block_grid_x0..block_grid_x1 {
+            let nominal_x0 = block_x * code_block_width;
+            let x0 = nominal_x0.max(cell.x0).max(geometry.bounds.x0);
+            let x1 = nominal_x0
+                .saturating_add(code_block_width)
+                .min(cell.x1)
+                .min(geometry.bounds.x1);
+            blocks.push(BlockState {
+                x0: geometry.packed_x0 + (x0 - geometry.bounds.x0),
+                y0: geometry.packed_y0 + (y0 - geometry.bounds.y0),
+                x1: geometry.packed_x0 + (x1 - geometry.bounds.x0),
+                y1: geometry.packed_y0 + (y1 - geometry.bounds.y0),
+                included: false,
+                numlenbits: 3,
+                zero_bitplanes: None,
+                passes: 0,
+                merged: None,
+            });
+        }
+    }
+    Ok((columns, rows))
 }
 
 fn resolution_bounds(header: &CodestreamHeader, component: usize) -> Result<Vec<Rect>> {
@@ -1949,26 +2030,7 @@ impl TagTreeReader {
 
         let mut low = 0i32;
         loop {
-            {
-                let node = &mut self.nodes[node_idx];
-                if low > node.low {
-                    node.low = low;
-                } else {
-                    low = node.low;
-                }
-                while low < threshold && !node.known {
-                    if bio.read_bit()? == 1 {
-                        node.value = low;
-                        node.known = true;
-                    } else {
-                        low += 1;
-                    }
-                }
-                if node.known && node.value > low {
-                    low = node.value;
-                }
-                node.low = low;
-            }
+            low = decode_tag_tree_node(&mut self.nodes[node_idx], bio, low, threshold)?;
 
             if depth == 0 {
                 break;
@@ -1985,6 +2047,37 @@ impl TagTreeReader {
             .get(leafno)
             .and_then(|node| node.known.then_some(node.value))
     }
+}
+
+/// Annex B.10.2 step for one tag-tree node on the root-to-leaf path: reads
+/// bits until the node's value is known or `threshold` is reached, starting
+/// from the larger of `low` and the node's stored lower bound. Returns the
+/// lower bound to carry to the child.
+#[inline]
+fn decode_tag_tree_node(
+    node: &mut TgtNode,
+    bio: &mut PacketBioReader<'_>,
+    mut low: i32,
+    threshold: i32,
+) -> Result<i32> {
+    if low > node.low {
+        node.low = low;
+    } else {
+        low = node.low;
+    }
+    while low < threshold && !node.known {
+        if bio.read_bit()? == 1 {
+            node.value = low;
+            node.known = true;
+        } else {
+            low += 1;
+        }
+    }
+    if node.known && node.value > low {
+        low = node.value;
+    }
+    node.low = low;
+    Ok(low)
 }
 
 pub(crate) fn read_commacode(bio: &mut PacketBioReader<'_>) -> Result<u32> {
@@ -2030,21 +2123,7 @@ fn link_parents(
     for i in 0..numlvls.saturating_sub(1) {
         let mut j = 0i32;
         while j < nplv[i] {
-            let mut k = nplh[i];
-            loop {
-                k -= 1;
-                if k < 0 {
-                    break;
-                }
-                nodes[node_idx].parent = l_parent_idx as u32;
-                node_idx += 1;
-                k -= 1;
-                if k >= 0 {
-                    nodes[node_idx].parent = l_parent_idx as u32;
-                    node_idx += 1;
-                }
-                l_parent_idx += 1;
-            }
+            link_row(nodes, &mut node_idx, &mut l_parent_idx, nplh[i]);
             if j & 1 != 0 || j == nplv[i] - 1 {
                 l_parent_idx0 = l_parent_idx;
             } else {
@@ -2056,6 +2135,27 @@ fn link_parents(
     }
     if node_idx < nodes.len() {
         nodes[node_idx].parent = TGT_NO_PARENT;
+    }
+}
+
+/// Points one row of `width` tag-tree nodes, starting at `*node_idx`, at
+/// their parents: each run of two horizontal siblings shares one parent,
+/// starting at `*l_parent_idx`.
+fn link_row(nodes: &mut [TgtNode], node_idx: &mut usize, l_parent_idx: &mut usize, width: i32) {
+    let mut k = width;
+    loop {
+        k -= 1;
+        if k < 0 {
+            break;
+        }
+        nodes[*node_idx].parent = *l_parent_idx as u32;
+        *node_idx += 1;
+        k -= 1;
+        if k >= 0 {
+            nodes[*node_idx].parent = *l_parent_idx as u32;
+            *node_idx += 1;
+        }
+        *l_parent_idx += 1;
     }
 }
 
@@ -2229,6 +2329,74 @@ mod tests {
         }
     }
 
+    /// Pushes the keyed packets of every layer of `first`'s precinct, in layer
+    /// order.
+    fn push_layer_packets(
+        keyed: &mut Vec<([u64; 6], PacketPosition)>,
+        header: &CodestreamHeader,
+        first: PacketPosition,
+        position: (u64, u64),
+    ) {
+        for layer in 0..header.cod.layers {
+            let packet = PacketPosition { layer, ..first };
+            let key = oracle_key(header.cod.progression_order, packet, position);
+            keyed.push((key, packet));
+        }
+    }
+
+    /// Sort key of `packet` in `order`, with (`x`, `y`) its precinct's
+    /// reference-grid position.
+    fn oracle_key(order: ProgressionOrder, packet: PacketPosition, (x, y): (u64, u64)) -> [u64; 6] {
+        let PacketPosition {
+            layer,
+            resolution,
+            component,
+            precinct,
+        } = packet;
+        match order {
+            ProgressionOrder::Lrcp => [
+                u64::from(layer),
+                u64::from(resolution),
+                component as u64,
+                precinct as u64,
+                0,
+                0,
+            ],
+            ProgressionOrder::Rlcp => [
+                u64::from(resolution),
+                u64::from(layer),
+                component as u64,
+                precinct as u64,
+                0,
+                0,
+            ],
+            ProgressionOrder::Rpcl => [
+                u64::from(resolution),
+                y,
+                x,
+                component as u64,
+                u64::from(layer),
+                precinct as u64,
+            ],
+            ProgressionOrder::Pcrl => [
+                y,
+                x,
+                component as u64,
+                u64::from(resolution),
+                u64::from(layer),
+                precinct as u64,
+            ],
+            ProgressionOrder::Cprl => [
+                component as u64,
+                y,
+                x,
+                u64::from(resolution),
+                u64::from(layer),
+                precinct as u64,
+            ],
+        }
+    }
+
     fn materialized_packet_oracle(
         header: &CodestreamHeader,
         grids: &[Vec<PrecinctGrid>],
@@ -2240,57 +2408,13 @@ mod tests {
                 for precinct in 0..grid.width * grid.height {
                     let (x, y) =
                         precinct_reference_position(header, grid, resolution, precinct).unwrap();
-                    for layer in 0..header.cod.layers {
-                        let packet = PacketPosition {
-                            layer,
-                            resolution,
-                            component,
-                            precinct,
-                        };
-                        let key = match header.cod.progression_order {
-                            ProgressionOrder::Lrcp => [
-                                u64::from(layer),
-                                u64::from(resolution),
-                                component as u64,
-                                precinct as u64,
-                                0,
-                                0,
-                            ],
-                            ProgressionOrder::Rlcp => [
-                                u64::from(resolution),
-                                u64::from(layer),
-                                component as u64,
-                                precinct as u64,
-                                0,
-                                0,
-                            ],
-                            ProgressionOrder::Rpcl => [
-                                u64::from(resolution),
-                                y,
-                                x,
-                                component as u64,
-                                u64::from(layer),
-                                precinct as u64,
-                            ],
-                            ProgressionOrder::Pcrl => [
-                                y,
-                                x,
-                                component as u64,
-                                u64::from(resolution),
-                                u64::from(layer),
-                                precinct as u64,
-                            ],
-                            ProgressionOrder::Cprl => [
-                                component as u64,
-                                y,
-                                x,
-                                u64::from(resolution),
-                                u64::from(layer),
-                                precinct as u64,
-                            ],
-                        };
-                        keyed.push((key, packet));
-                    }
+                    let first = PacketPosition {
+                        layer: 0,
+                        resolution,
+                        component,
+                        precinct,
+                    };
+                    push_layer_packets(&mut keyed, header, first, (x, y));
                 }
             }
         }

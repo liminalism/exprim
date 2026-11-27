@@ -271,6 +271,16 @@ fn lossless_rgb_produces_valid_jp2() {
     );
 }
 
+/// Draws one pixel row of a text line starting at `row`: 5-pixel dark dashes
+/// every 7 pixels, 10 pixels in from each side.
+fn draw_stroke_row(gray: &mut [u8], row: usize, width: usize) {
+    for x in (10..width - 10).step_by(7) {
+        for dx in 0..5 {
+            gray[row + x + dx] = 20;
+        }
+    }
+}
+
 /// Document profile: synthetic text-like page (black strokes on white).
 /// Must produce a valid, decodable JP2 that is smaller than the General
 /// profile at the same quality, with a faithful reconstruction.
@@ -283,12 +293,7 @@ fn document_profile_gray_text_page() {
     // Horizontal "text lines": 3px strokes every 16 rows with gaps.
     for y in (8..height as usize).step_by(16) {
         for dy in 0..3 {
-            let row = (y + dy) * width as usize;
-            for x in (10..width as usize - 10).step_by(7) {
-                for dx in 0..5 {
-                    gray[row + x + dx] = 20;
-                }
-            }
+            draw_stroke_row(&mut gray, (y + dy) * width as usize, width as usize);
         }
     }
     let image = Image::from_gray_bytes(width, height, &gray).expect("gray image");

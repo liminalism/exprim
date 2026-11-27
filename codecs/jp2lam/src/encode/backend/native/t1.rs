@@ -1371,6 +1371,24 @@ fn encode_symbol(coder: &mut MqCoder, mode: NativeTier1PassCodingMode, ctx: u8, 
     }
 }
 
+/// Marks the coefficients that first become significant at `bitplane` and
+/// returns how many there are.
+fn mark_newly_significant(coefficients: &[i32], significant: &mut [bool], bitplane: u8) -> usize {
+    // Optimized: direct loop instead of iterator chain
+    let mut newly_significant = 0;
+    for i in 0..coefficients.len() {
+        if significant[i] {
+            continue;
+        }
+        let magnitude = coefficients[i].unsigned_abs();
+        if ((magnitude >> bitplane) & 1) != 0 {
+            significant[i] = true;
+            newly_significant += 1;
+        }
+    }
+    newly_significant
+}
+
 fn plan_coding_passes(coefficients: &[i32], magnitude_bitplanes: u8) -> Vec<NativeTier1Pass> {
     if magnitude_bitplanes == 0 {
         return Vec::new();
@@ -1382,17 +1400,7 @@ fn plan_coding_passes(coefficients: &[i32], magnitude_bitplanes: u8) -> Vec<Nati
     let mut pass_index = 0u16;
     let top = magnitude_bitplanes - 1;
 
-    // Optimized: direct loop instead of iterator chain
-    let mut top_newly_significant = 0;
-    for i in 0..coefficients.len() {
-        if !significant[i] {
-            let magnitude = coefficients[i].unsigned_abs();
-            if ((magnitude >> top) & 1) != 0 {
-                significant[i] = true;
-                top_newly_significant += 1;
-            }
-        }
-    }
+    let top_newly_significant = mark_newly_significant(coefficients, &mut significant, top);
 
     let significant_before = significant_count;
     significant_count += top_newly_significant;
@@ -1411,17 +1419,7 @@ fn plan_coding_passes(coefficients: &[i32], magnitude_bitplanes: u8) -> Vec<Nati
     pass_index += 1;
 
     for bitplane in (0..top).rev() {
-        // Optimized: direct loop instead of iterator chain
-        let mut newly_significant = 0;
-        for i in 0..coefficients.len() {
-            if !significant[i] {
-                let magnitude = coefficients[i].unsigned_abs();
-                if ((magnitude >> bitplane) & 1) != 0 {
-                    significant[i] = true;
-                    newly_significant += 1;
-                }
-            }
-        }
+        let newly_significant = mark_newly_significant(coefficients, &mut significant, bitplane);
 
         let significant_before = significant_count;
         significant_count += newly_significant;

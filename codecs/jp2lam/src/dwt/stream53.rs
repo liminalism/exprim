@@ -1256,15 +1256,20 @@ mod tests {
         }
     }
 
+    /// Runs [`check`] for one size and level count with every kernel.
+    fn check_every_kernel(width: usize, height: usize, levels: u8, kernels: &[Kernel]) {
+        for &kernel in kernels {
+            check(width, height, levels, kernel);
+        }
+    }
+
     #[test]
     fn streaming_53_matches_in_place_reference_small_sizes() {
         let kernels = Kernel::available();
         for height in 1..=19usize {
             for width in 1..=19usize {
                 for levels in 0..=4u8 {
-                    for &kernel in &kernels {
-                        check(width, height, levels, kernel);
-                    }
+                    check_every_kernel(width, height, levels, &kernels);
                 }
             }
         }

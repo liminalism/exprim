@@ -366,35 +366,54 @@ fn layers_split_the_same_stream_without_changing_the_picture() {
         let reference = decode_jp2(&single).expect("decode single");
         for order in ORDERS {
             for count in [2u16, 4, 7] {
-                let options = EncodeOptions {
-                    coding: CodingOptions {
-                        progression_order: order,
-                        layers: QualityLayers::Count(count),
-                        ..CodingOptions::default()
-                    },
-                    ..layered(rate_control, QualityLayers::One)
-                };
-                let label = format!("{rate_control:?} {order:?} x{count}");
-                let encoded = encode(&image, &options).unwrap_or_else(|e| panic!("{label}: {e}"));
-                let meta = inspect_jp2(&encoded).expect("inspect");
-                assert_eq!(meta.codestream.cod.layers, count, "{label}");
-                assert_eq!(meta.codestream.cod.progression_order, order, "{label}");
-                let decoded = decode_jp2(&encoded).unwrap_or_else(|e| panic!("{label}: {e}"));
-                for (a, b) in decoded.components.iter().zip(&reference.components) {
-                    assert_eq!(a.data, b.data, "{label}");
-                }
-                // Packets per layer: one per (resolution, component).
-                let packets = (usize::from(meta.codestream.cod.decomposition_levels) + 1) * 3;
-                let overhead = encoded.len() - single.len();
-                assert!(
-                    overhead <= packets * usize::from(count - 1) * 24,
-                    "{label}: {overhead} bytes of layer overhead"
+                assert_layers_keep_picture(
+                    &image,
+                    rate_control,
+                    order,
+                    count,
+                    (&single, &reference),
                 );
-                if let Some(external) = decode_with_openjpeg(&encoded, &image) {
-                    assert_close(&external, &interleaved(&decoded), rate_control, &label);
-                }
             }
         }
+    }
+}
+
+/// Encodes `image` with `count` layers in `order` and checks the stream
+/// signals them, decodes to the single-layer picture `reference`, grows over
+/// `single` by packet headers alone, and agrees with OpenJPEG when installed.
+fn assert_layers_keep_picture(
+    image: &Image,
+    rate_control: RateControl,
+    order: ProgressionOrder,
+    count: u16,
+    (single, reference): (&[u8], &Image),
+) {
+    let options = EncodeOptions {
+        coding: CodingOptions {
+            progression_order: order,
+            layers: QualityLayers::Count(count),
+            ..CodingOptions::default()
+        },
+        ..layered(rate_control, QualityLayers::One)
+    };
+    let label = format!("{rate_control:?} {order:?} x{count}");
+    let encoded = encode(image, &options).unwrap_or_else(|e| panic!("{label}: {e}"));
+    let meta = inspect_jp2(&encoded).expect("inspect");
+    assert_eq!(meta.codestream.cod.layers, count, "{label}");
+    assert_eq!(meta.codestream.cod.progression_order, order, "{label}");
+    let decoded = decode_jp2(&encoded).unwrap_or_else(|e| panic!("{label}: {e}"));
+    for (a, b) in decoded.components.iter().zip(&reference.components) {
+        assert_eq!(a.data, b.data, "{label}");
+    }
+    // Packets per layer: one per (resolution, component).
+    let packets = (usize::from(meta.codestream.cod.decomposition_levels) + 1) * 3;
+    let overhead = encoded.len() - single.len();
+    assert!(
+        overhead <= packets * usize::from(count - 1) * 24,
+        "{label}: {overhead} bytes of layer overhead"
+    );
+    if let Some(external) = decode_with_openjpeg(&encoded, image) {
+        assert_close(&external, &interleaved(&decoded), rate_control, &label);
     }
 }
 

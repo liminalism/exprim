@@ -1289,14 +1289,14 @@ fn decode_packed_direct_to_target(
             reduced_axis_bounds(x0, x0 + width, parameters.reduce_levels);
         let (reduced_y0, reduced_y1) =
             reduced_axis_bounds(y0, y0 + height, parameters.reduce_levels);
-        if let Some(region) = region {
-            if reduced_x0 >= region.x1
+        let outside_region = region.is_some_and(|region| {
+            reduced_x0 >= region.x1
                 || region.x0 >= reduced_x1
                 || reduced_y0 >= region.y1
                 || region.y0 >= reduced_y1
-            {
-                continue;
-            }
+        });
+        if outside_region {
+            continue;
         }
         let clip_x0 = region.map_or(reduced_x0, |region| reduced_x0.max(region.x0));
         let clip_y0 = region.map_or(reduced_y0, |region| reduced_y0.max(region.y0));
@@ -1358,19 +1358,9 @@ fn decode_packed_direct_to_target(
                     &scratch.pool,
                     cancel,
                 )?;
-                stats.finish(tier1_start, |stats, elapsed| {
-                    stats.tier1_total_ns = stats.tier1_total_ns.saturating_add(elapsed);
-                });
+                record_tier1_time(stats, tier1_start);
                 let tile = one.remove(0);
-                let dst_channel = match parameters.layout {
-                    reconstruct::PackedLayout::Bgra => match c {
-                        0 => 2,
-                        1 => 1,
-                        2 => 0,
-                        _ => 3,
-                    },
-                    reconstruct::PackedLayout::Sequential | reconstruct::PackedLayout::Rgbx => c,
-                };
+                let dst_channel = packed_channel_of_component(parameters.layout, c);
                 reconstruct::reconstruct_component_channel_u8_into(
                     &header,
                     tile,
@@ -1386,13 +1376,7 @@ fn decode_packed_direct_to_target(
                 || (matches!(parameters.layout, reconstruct::PackedLayout::Bgra)
                     && parameters.active_components == 3)
             {
-                for y in 0..write_height {
-                    let row = &mut target.data[(origin_y + y) * stride + origin_x * 4
-                        ..(origin_y + y) * stride + (origin_x + write_width) * 4];
-                    for px in row.chunks_exact_mut(4) {
-                        px[3] = 255;
-                    }
-                }
+                fill_opaque_alpha(&mut target);
             }
             stats.update(|s| {
                 s.output_pixels = s
@@ -1415,9 +1399,7 @@ fn decode_packed_direct_to_target(
             &scratch.pool,
             cancel,
         )?;
-        stats.finish(tier1_start, |stats, elapsed| {
-            stats.tier1_total_ns = stats.tier1_total_ns.saturating_add(elapsed);
-        });
+        record_tier1_time(stats, tier1_start);
         let stitch_start = stats.start();
         reconstruct::reconstruct_packed_u8_into(
             &header,
@@ -1449,6 +1431,39 @@ fn decode_packed_direct_to_target(
     }
 
     Ok(())
+}
+
+/// Adds the Tier-1 time since `start` to the stats.
+fn record_tier1_time(stats: &mut StatsSink<'_>, start: Option<std::time::Instant>) {
+    stats.finish(start, |stats, elapsed| {
+        stats.tier1_total_ns = stats.tier1_total_ns.saturating_add(elapsed);
+    });
+}
+
+/// Output channel of component `c` in a packed layout: BGRA swaps the first
+/// and third components, the other layouts keep component order.
+fn packed_channel_of_component(layout: reconstruct::PackedLayout, c: usize) -> usize {
+    match layout {
+        reconstruct::PackedLayout::Bgra => match c {
+            0 => 2,
+            1 => 1,
+            2 => 0,
+            _ => 3,
+        },
+        reconstruct::PackedLayout::Sequential | reconstruct::PackedLayout::Rgbx => c,
+    }
+}
+
+/// Sets the alpha byte of every four-byte pixel in the target window to 255.
+fn fill_opaque_alpha(target: &mut reconstruct::PackedWriteTarget<'_>) {
+    let (stride, origin_x, origin_y) = (target.stride, target.origin_x, target.origin_y);
+    for y in 0..target.height {
+        let row = &mut target.data[(origin_y + y) * stride + origin_x * 4
+            ..(origin_y + y) * stride + (origin_x + target.width) * 4];
+        for px in row.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+    }
 }
 
 /// A crop rectangle in reduced-image pixel indices (0-based within the
@@ -1872,38 +1887,47 @@ fn decode_tile_packets_filtered<'a>(
             .codeblocks
             .retain(|block| code_block_intersects_region(&windows, block));
     }
-    stats.update(|stats| {
-        stats.packets = stats
-            .packets
-            .saturating_add(u64::try_from(packets.packet_stats.count).unwrap_or(u64::MAX));
-        stats.packet_header_bytes = stats
-            .packet_header_bytes
-            .saturating_add(u64::try_from(packets.packet_stats.header_bytes).unwrap_or(u64::MAX));
-        stats.codeword_bytes = stats
-            .codeword_bytes
-            .saturating_add(u64::try_from(packets.packet_stats.body_bytes).unwrap_or(u64::MAX));
-        stats.codeblocks = stats
-            .codeblocks
-            .saturating_add(u64::try_from(packets.codeblocks.len()).unwrap_or(u64::MAX));
-        for block in &packets.codeblocks {
-            for pass in 0..block.passes {
-                match pass {
-                    0 => stats.cleanup_passes = stats.cleanup_passes.saturating_add(1),
-                    _ if (pass - 1) % 3 == 0 => {
-                        stats.significance_passes = stats.significance_passes.saturating_add(1)
-                    }
-                    _ if (pass - 1) % 3 == 1 => {
-                        stats.refinement_passes = stats.refinement_passes.saturating_add(1)
-                    }
-                    _ => stats.cleanup_passes = stats.cleanup_passes.saturating_add(1),
-                }
-            }
-            let pixels = u64::from(block.x1 - block.x0) * u64::from(block.y1 - block.y0);
-            stats.coefficient_pixels = stats.coefficient_pixels.saturating_add(pixels);
-            stats.peak_scratch_bytes = stats.peak_scratch_bytes.max(pixels.saturating_mul(6));
-        }
-    });
+    stats.update(|stats| record_packet_stats(stats, &packets));
     Ok((reconstruction_header, packets))
+}
+
+/// Adds a tile's packet, codeword and code-block counts to the stats.
+fn record_packet_stats(stats: &mut Jp2DecodeStats, packets: &t2::DecodedTilePackets<'_>) {
+    stats.packets = stats
+        .packets
+        .saturating_add(u64::try_from(packets.packet_stats.count).unwrap_or(u64::MAX));
+    stats.packet_header_bytes = stats
+        .packet_header_bytes
+        .saturating_add(u64::try_from(packets.packet_stats.header_bytes).unwrap_or(u64::MAX));
+    stats.codeword_bytes = stats
+        .codeword_bytes
+        .saturating_add(u64::try_from(packets.packet_stats.body_bytes).unwrap_or(u64::MAX));
+    stats.codeblocks = stats
+        .codeblocks
+        .saturating_add(u64::try_from(packets.codeblocks.len()).unwrap_or(u64::MAX));
+    for block in &packets.codeblocks {
+        count_coding_passes(stats, block.passes);
+        let pixels = u64::from(block.x1 - block.x0) * u64::from(block.y1 - block.y0);
+        stats.coefficient_pixels = stats.coefficient_pixels.saturating_add(pixels);
+        stats.peak_scratch_bytes = stats.peak_scratch_bytes.max(pixels.saturating_mul(6));
+    }
+}
+
+/// Counts a code-block's coding passes by kind: the first is a cleanup pass,
+/// then significance, refinement and cleanup repeat.
+fn count_coding_passes(stats: &mut Jp2DecodeStats, passes: u32) {
+    for pass in 0..passes {
+        match pass {
+            0 => stats.cleanup_passes = stats.cleanup_passes.saturating_add(1),
+            _ if (pass - 1) % 3 == 0 => {
+                stats.significance_passes = stats.significance_passes.saturating_add(1)
+            }
+            _ if (pass - 1) % 3 == 1 => {
+                stats.refinement_passes = stats.refinement_passes.saturating_add(1)
+            }
+            _ => stats.cleanup_passes = stats.cleanup_passes.saturating_add(1),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2905,6 +2929,34 @@ pub fn decode_from_reader_request<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The archive.org gray sample's SIZ: one 8-bit component in one tile.
+    fn assert_archive_org_sample_siz(siz: &crate::j2k::decode_markers::SizSegment) {
+        assert_eq!(siz.width, 3494);
+        assert_eq!(siz.height, 4967);
+        assert_eq!(siz.tile_width, 3494);
+        assert_eq!(siz.tile_height, 4967);
+        assert_eq!(siz.components.len(), 1);
+        assert_eq!(siz.components[0].precision, 8);
+        assert!(!siz.components[0].signed);
+        assert_eq!(siz.components[0].dx, 1);
+        assert_eq!(siz.components[0].dy, 1);
+    }
+
+    /// The archive.org gray sample's COD: one LRCP layer, five 9/7 levels,
+    /// 64x64 code-blocks, no precincts and no SOP/EPH markers.
+    fn assert_archive_org_sample_cod(cod: &crate::j2k::decode_markers::CodSegment) {
+        assert_eq!(cod.progression_order, ProgressionOrder::Lrcp);
+        assert_eq!(cod.layers, 1);
+        assert_eq!(cod.decomposition_levels, 5);
+        assert_eq!(cod.code_block_width, 64);
+        assert_eq!(cod.code_block_height, 64);
+        assert_eq!(cod.code_block_style, CodeBlockStyle::default());
+        assert_eq!(cod.transform, WaveletTransform::Irreversible97);
+        assert!(!cod.uses_precincts);
+        assert!(!cod.sop_markers);
+        assert!(!cod.eph_markers);
+    }
+
     #[test]
     fn archive_org_sample_header_matches_decoder_scope() {
         let Some(bytes) = maybe_read_archive_org_sample() else {
@@ -2919,28 +2971,8 @@ mod tests {
         assert_eq!(metadata.tile_part_count, 1);
         assert!(metadata.first_tile_payload_len > 1_000_000);
 
-        let siz = &metadata.codestream.siz;
-        assert_eq!(siz.width, 3494);
-        assert_eq!(siz.height, 4967);
-        assert_eq!(siz.tile_width, 3494);
-        assert_eq!(siz.tile_height, 4967);
-        assert_eq!(siz.components.len(), 1);
-        assert_eq!(siz.components[0].precision, 8);
-        assert!(!siz.components[0].signed);
-        assert_eq!(siz.components[0].dx, 1);
-        assert_eq!(siz.components[0].dy, 1);
-
-        let cod = &metadata.codestream.cod;
-        assert_eq!(cod.progression_order, ProgressionOrder::Lrcp);
-        assert_eq!(cod.layers, 1);
-        assert_eq!(cod.decomposition_levels, 5);
-        assert_eq!(cod.code_block_width, 64);
-        assert_eq!(cod.code_block_height, 64);
-        assert_eq!(cod.code_block_style, CodeBlockStyle::default());
-        assert_eq!(cod.transform, WaveletTransform::Irreversible97);
-        assert!(!cod.uses_precincts);
-        assert!(!cod.sop_markers);
-        assert!(!cod.eph_markers);
+        assert_archive_org_sample_siz(&metadata.codestream.siz);
+        assert_archive_org_sample_cod(&metadata.codestream.cod);
 
         let qcd = &metadata.codestream.qcd;
         assert_eq!(qcd.style, QuantizationStyle::ScalarExpounded);
@@ -4643,57 +4675,52 @@ mod tests {
         }
     }
 
+    /// Payload offset of the first `box_type` box in `bytes`, descending into
+    /// `jp2h`.
     fn find_box_payload(bytes: &[u8], box_type: &[u8; 4]) -> Option<usize> {
-        fn walk_boxes(bytes: &[u8], box_type: &[u8; 4]) -> Option<usize> {
-            let mut pos = 0usize;
-            while pos + 8 <= bytes.len() {
-                let start = pos;
-                let lbox = u32::from_be_bytes([
+        let mut pos = 0usize;
+        while pos + 8 <= bytes.len() {
+            let start = pos;
+            let lbox =
+                u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                    as usize;
+            let current_type = &bytes[pos + 4..pos + 8];
+            pos += 8;
+            let (payload_start, end) = if lbox == 1 {
+                if pos + 8 > bytes.len() {
+                    return None;
+                }
+                let xlbox = u64::from_be_bytes([
                     bytes[pos],
                     bytes[pos + 1],
                     bytes[pos + 2],
                     bytes[pos + 3],
+                    bytes[pos + 4],
+                    bytes[pos + 5],
+                    bytes[pos + 6],
+                    bytes[pos + 7],
                 ]) as usize;
-                let current_type = &bytes[pos + 4..pos + 8];
                 pos += 8;
-                let (payload_start, end) = if lbox == 1 {
-                    if pos + 8 > bytes.len() {
-                        return None;
-                    }
-                    let xlbox = u64::from_be_bytes([
-                        bytes[pos],
-                        bytes[pos + 1],
-                        bytes[pos + 2],
-                        bytes[pos + 3],
-                        bytes[pos + 4],
-                        bytes[pos + 5],
-                        bytes[pos + 6],
-                        bytes[pos + 7],
-                    ]) as usize;
-                    pos += 8;
-                    (pos, start.checked_add(xlbox)?)
-                } else if lbox == 0 {
-                    (pos, bytes.len())
-                } else {
-                    (pos, start.checked_add(lbox)?)
-                };
-                if end > bytes.len() || end < payload_start {
-                    return None;
-                }
-                if current_type == box_type {
-                    return Some(payload_start);
-                }
-                if current_type == b"jp2h" {
-                    if let Some(found) = walk_boxes(&bytes[payload_start..end], box_type) {
-                        return Some(payload_start + found);
-                    }
-                }
-                pos = end;
+                (pos, start.checked_add(xlbox)?)
+            } else if lbox == 0 {
+                (pos, bytes.len())
+            } else {
+                (pos, start.checked_add(lbox)?)
+            };
+            if end > bytes.len() || end < payload_start {
+                return None;
             }
-            None
+            if current_type == box_type {
+                return Some(payload_start);
+            }
+            if current_type == b"jp2h" {
+                if let Some(found) = find_box_payload(&bytes[payload_start..end], box_type) {
+                    return Some(payload_start + found);
+                }
+            }
+            pos = end;
         }
-
-        walk_boxes(bytes, box_type)
+        None
     }
 
     fn split_native_jp2_tile_at_packet_boundary(bytes: &[u8], total_parts: u8) -> Vec<u8> {

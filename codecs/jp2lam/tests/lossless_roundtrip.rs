@@ -198,6 +198,56 @@ fn lossless_borrowed_interleaved_rgb8_view_roundtrips_exactly() {
     }
 }
 
+/// Test sample at (`x`, `y`): black then white in the first two pixels, a
+/// ramp along the rest of the first row, random samples below it.
+fn gray16_test_sample(x: u32, y: u32, width: u32, max: u16, rng: &mut XorShift32) -> u16 {
+    match (x, y) {
+        (0, 0) => 0,
+        (1, 0) => max,
+        (_, 0) => ((x * u32::from(max)) / (width - 1)) as u16,
+        _ => rng.next_u16() & max,
+    }
+}
+
+/// Interleaved RGB16 test samples of [`rgb16_test_pixel`] for the whole
+/// image, with the planes they should decode to.
+fn rgb16_test_image(
+    width: u32,
+    height: u32,
+    max: u16,
+    rng: &mut XorShift32,
+) -> (Vec<u16>, [Vec<i32>; 3]) {
+    let mut samples = Vec::with_capacity(width as usize * height as usize * 3);
+    let mut expected = [Vec::new(), Vec::new(), Vec::new()];
+    for y in 0..height {
+        for x in 0..width {
+            let rgb = rgb16_test_pixel(x, y, width, max, rng);
+            samples.extend_from_slice(&rgb);
+            for component in 0..3 {
+                expected[component].push(i32::from(rgb[component]));
+            }
+        }
+    }
+    (samples, expected)
+}
+
+/// Test pixel at (`x`, `y`): a fixed corner, a ramp and its complement along
+/// the first row, random samples below it.
+fn rgb16_test_pixel(x: u32, y: u32, width: u32, max: u16, rng: &mut XorShift32) -> [u16; 3] {
+    match (x, y) {
+        (0, 0) => [0, max, max / 2],
+        (_, 0) => {
+            let ramp = ((x * u32::from(max)) / (width - 1)) as u16;
+            [ramp, max - ramp, ramp / 2]
+        }
+        _ => [
+            rng.next_u16() & max,
+            rng.next_u16() & max,
+            rng.next_u16() & max,
+        ],
+    }
+}
+
 #[test]
 fn lossless_gray_u16_storage_roundtrips_exactly_at_supported_precisions() {
     let (width, height) = (17u32, 13u32);
@@ -207,15 +257,7 @@ fn lossless_gray_u16_storage_roundtrips_exactly_at_supported_precisions() {
         let mut samples = Vec::with_capacity((width * height) as usize);
         for y in 0..height {
             for x in 0..width {
-                samples.push(if x == 0 && y == 0 {
-                    0
-                } else if x == 1 && y == 0 {
-                    max
-                } else if y == 0 {
-                    ((x * u32::from(max)) / (width - 1)) as u16
-                } else {
-                    rng.next_u16() & max
-                });
+                samples.push(gray16_test_sample(x, y, width, max, &mut rng));
             }
         }
         let encoded = encode_view(
@@ -259,28 +301,7 @@ fn lossless_rgb_u16_storage_roundtrips_exactly_at_supported_precisions() {
     for precision in [8u32, 10, 12, 14, 16] {
         let max = ((1u32 << precision) - 1) as u16;
         let mut rng = XorShift32::new(0x5247_0000 | precision);
-        let mut samples = Vec::with_capacity(width as usize * height as usize * 3);
-        let mut expected = [Vec::new(), Vec::new(), Vec::new()];
-        for y in 0..height {
-            for x in 0..width {
-                let rgb = if y == 0 && x == 0 {
-                    [0, max, max / 2]
-                } else if y == 0 {
-                    let ramp = ((x * u32::from(max)) / (width - 1)) as u16;
-                    [ramp, max - ramp, ramp / 2]
-                } else {
-                    [
-                        rng.next_u16() & max,
-                        rng.next_u16() & max,
-                        rng.next_u16() & max,
-                    ]
-                };
-                samples.extend_from_slice(&rgb);
-                for component in 0..3 {
-                    expected[component].push(i32::from(rgb[component]));
-                }
-            }
-        }
+        let (samples, expected) = rgb16_test_image(width, height, max, &mut rng);
         let encoded = encode_view(
             ImageView::from_rgb16_interleaved(width, height, &samples, precision)
                 .expect("rgb16 view"),

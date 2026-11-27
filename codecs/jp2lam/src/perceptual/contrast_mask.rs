@@ -99,21 +99,25 @@ pub fn dct8x8_luma(block: &[f64; 64]) -> [[f64; 8]; 8] {
             let au = if u == 0 { 1.0 / 2.0f64.sqrt() } else { 1.0 };
             let av = if v == 0 { 1.0 / 2.0f64.sqrt() } else { 1.0 };
 
-            let mut sum = 0.0;
-            for y in 0..8 {
-                for x in 0..8 {
-                    let sx = block[y * 8 + x];
-                    let cx = (((2 * x + 1) as f64 * u as f64 * std::f64::consts::PI) / 16.0).cos();
-                    let cy = (((2 * y + 1) as f64 * v as f64 * std::f64::consts::PI) / 16.0).cos();
-                    sum += sx * cx * cy;
-                }
-            }
-
-            out[u][v] = 0.25 * au * av * sum;
+            out[u][v] = 0.25 * au * av * dct_basis_sum(block, u, v);
         }
     }
 
     out
+}
+
+/// Unnormalised DCT-II sum of `block` against the cosine basis (`u`, `v`).
+fn dct_basis_sum(block: &[f64; 64], u: usize, v: usize) -> f64 {
+    let mut sum = 0.0;
+    for y in 0..8 {
+        for x in 0..8 {
+            let sx = block[y * 8 + x];
+            let cx = (((2 * x + 1) as f64 * u as f64 * std::f64::consts::PI) / 16.0).cos();
+            let cy = (((2 * y + 1) as f64 * v as f64 * std::f64::consts::PI) / 16.0).cos();
+            sum += sx * cx * cy;
+        }
+    }
+    sum
 }
 
 /// Compute weighted DCT energy using CSF weights

@@ -59,40 +59,7 @@ fn synth_image() -> Image {
 
     for y in 0..H {
         for x in 0..W {
-            let (rv, gv, bv): (u8, u8, u8) = match (x < hw, y < hh) {
-                // TL: smooth gradient
-                (true, true) => {
-                    let rv = (x * 255 / (hw - 1)) as u8;
-                    let gv = (y * 255 / (hh - 1)) as u8;
-                    (rv, gv, 128)
-                }
-                // TR: 8×8 black-and-white checkerboard
-                (false, true) => {
-                    let checker = ((x - hw) / 8 + y / 8) % 2 == 0;
-                    if checker {
-                        (240, 240, 240)
-                    } else {
-                        (16, 16, 16)
-                    }
-                }
-                // BL: coloured diagonal stripes
-                (true, false) => match (x + (y - hh)) / 8 % 3 {
-                    0 => (210, 40, 40),
-                    1 => (40, 210, 40),
-                    _ => (40, 40, 210),
-                },
-                // BR: radial + sine modulation
-                (false, false) => {
-                    let cx = (x - hw) as f32 - hw as f32 / 2.0;
-                    let cy = (y - hh) as f32 - hh as f32 / 2.0;
-                    let dist = (cx * cx + cy * cy).sqrt();
-                    let max_d = (hw as f32 * 0.5f32.hypot(0.5) * hw as f32).sqrt();
-                    let radial = (dist / max_d * 255.0).min(255.0) as u8;
-                    let wave = ((cx * 0.25).sin() * (cy * 0.25).sin() * 80.0 + 128.0)
-                        .clamp(0.0, 255.0) as u8;
-                    (radial, wave, 255 - radial)
-                }
-            };
+            let (rv, gv, bv) = synth_pixel(x, y, hw, hh);
             r.push(rv as i32);
             g.push(gv as i32);
             b.push(bv as i32);
@@ -113,6 +80,45 @@ fn synth_image() -> Image {
         height: H,
         components: vec![comp(r), comp(g), comp(b)],
         colorspace: ColorSpace::Srgb,
+    }
+}
+
+/// The pixel at (`x`, `y`) of [`synth_image`], whose quadrants are `hw` by
+/// `hh` pixels.
+fn synth_pixel(x: u32, y: u32, hw: u32, hh: u32) -> (u8, u8, u8) {
+    match (x < hw, y < hh) {
+        // TL: smooth gradient
+        (true, true) => {
+            let rv = (x * 255 / (hw - 1)) as u8;
+            let gv = (y * 255 / (hh - 1)) as u8;
+            (rv, gv, 128)
+        }
+        // TR: 8×8 black-and-white checkerboard
+        (false, true) => {
+            let checker = ((x - hw) / 8 + y / 8) % 2 == 0;
+            if checker {
+                (240, 240, 240)
+            } else {
+                (16, 16, 16)
+            }
+        }
+        // BL: coloured diagonal stripes
+        (true, false) => match (x + (y - hh)) / 8 % 3 {
+            0 => (210, 40, 40),
+            1 => (40, 210, 40),
+            _ => (40, 40, 210),
+        },
+        // BR: radial + sine modulation
+        (false, false) => {
+            let cx = (x - hw) as f32 - hw as f32 / 2.0;
+            let cy = (y - hh) as f32 - hh as f32 / 2.0;
+            let dist = (cx * cx + cy * cy).sqrt();
+            let max_d = (hw as f32 * 0.5f32.hypot(0.5) * hw as f32).sqrt();
+            let radial = (dist / max_d * 255.0).min(255.0) as u8;
+            let wave =
+                ((cx * 0.25).sin() * (cy * 0.25).sin() * 80.0 + 128.0).clamp(0.0, 255.0) as u8;
+            (radial, wave, 255 - radial)
+        }
     }
 }
 

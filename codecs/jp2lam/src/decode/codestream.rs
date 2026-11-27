@@ -73,52 +73,63 @@ pub(crate) fn parse_codestream_view(
         let marker_start = cursor.position();
         let marker = cursor.read_u16()?;
         if marker == MARKER_SOT {
-            let mut tile_parts = Vec::new();
-            let tile_part = cursor.read_tile_part(marker_start, marker)?;
-            cursor.push_structural(&mut tile_parts, tile_part)?;
-
-            while cursor.position() < bytes.len().saturating_sub(2) {
-                let next_start = cursor.position();
-                let next_marker = cursor.read_u16()?;
-                if next_marker == MARKER_EOC {
-                    if cursor.position() != bytes.len() {
-                        return Err(invalid("trailing bytes after EOC are unsupported"));
-                    }
-                    return Ok(CodestreamView {
-                        main_header_segments,
-                        tile_parts,
-                        structural_bytes: cursor.structural_bytes,
-                    });
-                }
-                if next_marker != MARKER_SOT {
-                    return Err(invalid(format!(
-                        "unexpected marker 0x{next_marker:04x} after tile-part payload"
-                    )));
-                }
-                let tile_part = cursor.read_tile_part(next_start, next_marker)?;
-                cursor.push_structural(&mut tile_parts, tile_part)?;
-            }
-
-            if cursor.position() == bytes.len().saturating_sub(2) {
-                let eoc = cursor.read_u16()?;
-                if eoc == MARKER_EOC {
-                    return Ok(CodestreamView {
-                        main_header_segments,
-                        tile_parts,
-                        structural_bytes: cursor.structural_bytes,
-                    });
-                }
-                return Err(invalid(format!(
-                    "expected EOC at end of codestream, found 0x{eoc:04x}"
-                )));
-            }
-
-            return Err(invalid("codestream ended before EOC"));
+            return read_tile_parts(cursor, main_header_segments, marker_start, marker);
         }
 
         let segment = cursor.read_segment(marker_start, marker)?;
         cursor.push_structural(&mut main_header_segments, segment)?;
     }
+}
+
+/// Reads the tile-parts that follow the main header, from the first SOT at
+/// `first_start`, through the closing EOC.
+fn read_tile_parts<'a>(
+    mut cursor: Cursor<'a>,
+    main_header_segments: Vec<&'a [u8]>,
+    first_start: usize,
+    first_marker: u16,
+) -> Result<CodestreamView<'a>> {
+    let bytes = cursor.bytes;
+    let mut tile_parts = Vec::new();
+    let tile_part = cursor.read_tile_part(first_start, first_marker)?;
+    cursor.push_structural(&mut tile_parts, tile_part)?;
+
+    while cursor.position() < bytes.len().saturating_sub(2) {
+        let next_start = cursor.position();
+        let next_marker = cursor.read_u16()?;
+        if next_marker == MARKER_EOC {
+            if cursor.position() != bytes.len() {
+                return Err(invalid("trailing bytes after EOC are unsupported"));
+            }
+            return Ok(CodestreamView {
+                main_header_segments,
+                tile_parts,
+                structural_bytes: cursor.structural_bytes,
+            });
+        }
+        if next_marker != MARKER_SOT {
+            return Err(invalid(format!(
+                "unexpected marker 0x{next_marker:04x} after tile-part payload"
+            )));
+        }
+        let tile_part = cursor.read_tile_part(next_start, next_marker)?;
+        cursor.push_structural(&mut tile_parts, tile_part)?;
+    }
+
+    if cursor.position() != bytes.len().saturating_sub(2) {
+        return Err(invalid("codestream ended before EOC"));
+    }
+    let eoc = cursor.read_u16()?;
+    if eoc != MARKER_EOC {
+        return Err(invalid(format!(
+            "expected EOC at end of codestream, found 0x{eoc:04x}"
+        )));
+    }
+    Ok(CodestreamView {
+        main_header_segments,
+        tile_parts,
+        structural_bytes: cursor.structural_bytes,
+    })
 }
 
 #[derive(Debug, Clone)]

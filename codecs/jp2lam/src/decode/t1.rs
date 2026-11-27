@@ -1273,9 +1273,16 @@ fn decode_codeblock_segments_into(
         )));
     }
     let max_passes = 1u32 + 3u32 * u32::from(magnitude_bitplanes.saturating_sub(1));
-    let pass_limit = pass_count.min(max_passes);
 
-    let top = magnitude_bitplanes - 1;
+    let block = CodeBlockPasses {
+        width,
+        height,
+        band,
+        style,
+        top: magnitude_bitplanes - 1,
+        pass_limit: pass_count.min(max_passes),
+        pass_count,
+    };
     let mut pass_index = 0u32;
     let mut contexts = None;
 
@@ -1286,47 +1293,8 @@ fn decode_codeblock_segments_into(
         // D.6: a raw segment holds significance and refinement passes of the
         // fifth and later significant bit-planes; MQ contexts are untouched.
         if style.pass_is_raw(pass_index) {
-            let mut raw = RawDecoder::new(&segment.data);
-            for _ in 0..segment.passes {
-                if pass_index == pass_limit {
-                    return Ok(());
-                }
-                let (pass_kind, bitplane) = pass_kind_and_bitplane(pass_index, top)?;
-                let pass_start = stats.start();
-                match pass_kind {
-                    PassKind::Significance => sigpass_decode_raw(
-                        &mut raw,
-                        bitplane,
-                        &mut scratch.flags,
-                        &mut scratch.coefficients,
-                        width,
-                        height,
-                        style.vertical_causal,
-                    ),
-                    PassKind::Refinement => refpass_decode_raw(
-                        &mut raw,
-                        bitplane,
-                        &mut scratch.flags,
-                        &mut scratch.coefficients,
-                        width,
-                        height,
-                    ),
-                    PassKind::Cleanup => {
-                        return Err(invalid("cleanup pass inside a raw bypass codeword segment"));
-                    }
-                }
-                stats.finish(pass_start, |stats, elapsed| match pass_kind {
-                    PassKind::Significance => {
-                        stats.tier1_significance_ns =
-                            stats.tier1_significance_ns.saturating_add(elapsed);
-                    }
-                    PassKind::Refinement => {
-                        stats.tier1_refinement_ns =
-                            stats.tier1_refinement_ns.saturating_add(elapsed);
-                    }
-                    PassKind::Cleanup => {}
-                });
-                pass_index += 1;
+            if !block.decode_raw_segment(segment, &mut pass_index, scratch, stats)? {
+                return Ok(());
             }
             continue;
         }
@@ -1338,65 +1306,16 @@ fn decode_codeblock_segments_into(
         };
 
         for _ in 0..segment.passes {
-            if pass_index == pass_limit {
+            if pass_index == block.pass_limit {
                 return Ok(());
             }
-            let (pass_kind, bitplane) = pass_kind_and_bitplane(pass_index, top)?;
+            let (pass_kind, bitplane) = pass_kind_and_bitplane(pass_index, block.top)?;
             if style.pass_is_raw(pass_index) {
                 return Err(invalid("bypass-coded pass inside an MQ codeword segment"));
             }
             let pass_start = stats.start();
-            match pass_kind {
-                PassKind::Significance => sigpass_decode(
-                    &mut decoder,
-                    band,
-                    bitplane,
-                    &mut scratch.flags,
-                    &mut scratch.coefficients,
-                    width,
-                    height,
-                    style.vertical_causal,
-                ),
-                PassKind::Refinement => refpass_decode(
-                    &mut decoder,
-                    bitplane,
-                    &mut scratch.flags,
-                    &mut scratch.coefficients,
-                    width,
-                    height,
-                ),
-                PassKind::Cleanup => {
-                    cleanup_decode(
-                        &mut decoder,
-                        band,
-                        bitplane,
-                        &mut scratch.flags,
-                        &mut scratch.coefficients,
-                        width,
-                        height,
-                        style.vertical_causal,
-                    );
-                    if style.segmentation_symbols {
-                        read_segmentation_symbol(&mut decoder, pass_index + 1 == pass_count)?;
-                    }
-                    debug_assert!(
-                        !scratch.flags.has_visited(),
-                        "cleanup pass must clear every visited flag"
-                    );
-                }
-            }
-            stats.finish(pass_start, |stats, elapsed| match pass_kind {
-                PassKind::Significance => {
-                    stats.tier1_significance_ns =
-                        stats.tier1_significance_ns.saturating_add(elapsed);
-                }
-                PassKind::Refinement => {
-                    stats.tier1_refinement_ns = stats.tier1_refinement_ns.saturating_add(elapsed);
-                }
-                PassKind::Cleanup => {
-                    stats.tier1_cleanup_ns = stats.tier1_cleanup_ns.saturating_add(elapsed);
-                }
-            });
+            block.decode_mq_pass(&mut decoder, pass_kind, bitplane, pass_index, scratch)?;
+            record_pass_time(stats, pass_start, pass_kind);
             pass_index += 1;
             if style.reset_contexts {
                 decoder.reset_contexts();
@@ -1405,6 +1324,142 @@ fn decode_codeblock_segments_into(
         contexts = Some(decoder.contexts());
     }
     Ok(())
+}
+
+/// The parameters every coding pass of one code-block shares.
+#[derive(Clone, Copy)]
+struct CodeBlockPasses {
+    width: usize,
+    height: usize,
+    band: BandOrientation,
+    style: CodeBlockStyle,
+    /// Bit-plane of the first (cleanup) pass.
+    top: u8,
+    /// Passes decoded before stopping: the signalled count, capped at what
+    /// the block's bit-planes can hold.
+    pass_limit: u32,
+    /// Passes signalled for the block.
+    pass_count: u32,
+}
+
+impl CodeBlockPasses {
+    /// Decodes the passes of one raw (bypass) codeword segment (D.6),
+    /// advancing `pass_index`. Returns `false` once the pass limit is reached.
+    #[inline]
+    fn decode_raw_segment(
+        &self,
+        segment: &DecodedCodewordSegment<'_>,
+        pass_index: &mut u32,
+        scratch: &mut Tier1Scratch,
+        stats: &mut StatsSink<'_>,
+    ) -> Result<bool> {
+        let mut raw = RawDecoder::new(&segment.data);
+        for _ in 0..segment.passes {
+            if *pass_index == self.pass_limit {
+                return Ok(false);
+            }
+            let (pass_kind, bitplane) = pass_kind_and_bitplane(*pass_index, self.top)?;
+            let pass_start = stats.start();
+            match pass_kind {
+                PassKind::Significance => sigpass_decode_raw(
+                    &mut raw,
+                    bitplane,
+                    &mut scratch.flags,
+                    &mut scratch.coefficients,
+                    self.width,
+                    self.height,
+                    self.style.vertical_causal,
+                ),
+                PassKind::Refinement => refpass_decode_raw(
+                    &mut raw,
+                    bitplane,
+                    &mut scratch.flags,
+                    &mut scratch.coefficients,
+                    self.width,
+                    self.height,
+                ),
+                PassKind::Cleanup => {
+                    return Err(invalid("cleanup pass inside a raw bypass codeword segment"));
+                }
+            }
+            record_pass_time(stats, pass_start, pass_kind);
+            *pass_index += 1;
+        }
+        Ok(true)
+    }
+
+    /// Decodes one MQ-coded pass, with the segmentation symbol that follows
+    /// a cleanup pass when the style signals it.
+    #[inline]
+    fn decode_mq_pass(
+        &self,
+        decoder: &mut MqDecoder<'_>,
+        pass_kind: PassKind,
+        bitplane: u8,
+        pass_index: u32,
+        scratch: &mut Tier1Scratch,
+    ) -> Result<()> {
+        match pass_kind {
+            PassKind::Significance => sigpass_decode(
+                decoder,
+                self.band,
+                bitplane,
+                &mut scratch.flags,
+                &mut scratch.coefficients,
+                self.width,
+                self.height,
+                self.style.vertical_causal,
+            ),
+            PassKind::Refinement => refpass_decode(
+                decoder,
+                bitplane,
+                &mut scratch.flags,
+                &mut scratch.coefficients,
+                self.width,
+                self.height,
+            ),
+            PassKind::Cleanup => {
+                cleanup_decode(
+                    decoder,
+                    self.band,
+                    bitplane,
+                    &mut scratch.flags,
+                    &mut scratch.coefficients,
+                    self.width,
+                    self.height,
+                    self.style.vertical_causal,
+                );
+                if self.style.segmentation_symbols {
+                    read_segmentation_symbol(decoder, pass_index + 1 == self.pass_count)?;
+                }
+                debug_assert!(
+                    !scratch.flags.has_visited(),
+                    "cleanup pass must clear every visited flag"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Adds one coding pass's elapsed time to its kind's Tier-1 counter.
+#[inline]
+pub(super) fn record_pass_time(
+    stats: &mut StatsSink<'_>,
+    pass_start: Option<std::time::Instant>,
+    pass_kind: PassKind,
+) {
+    stats.finish(pass_start, |stats, elapsed| match pass_kind {
+        PassKind::Significance => {
+            stats.tier1_significance_ns = stats.tier1_significance_ns.saturating_add(elapsed);
+        }
+        PassKind::Refinement => {
+            stats.tier1_refinement_ns = stats.tier1_refinement_ns.saturating_add(elapsed);
+        }
+        PassKind::Cleanup => {
+            stats.tier1_cleanup_ns = stats.tier1_cleanup_ns.saturating_add(elapsed);
+        }
+    });
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1588,6 +1643,10 @@ fn decode_new_significant(
 
 /// Significance propagation pass (D.3.1) over the whole block.
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::excessive_nesting,
+    reason = "Tier-1 significance propagation pass (ITU-T T.800 D.3.1): stripe, column and pending-sample loops are the standard's scan order, and the per-sample body is the decoder's measured hot loop, kept inline as the optimiser sees it"
+)]
 fn sigpass_decode(
     decoder: &mut MqDecoder<'_>,
     band: BandOrientation,
@@ -1640,6 +1699,10 @@ fn sigpass_decode(
 /// Raw significance pass (D.6): the same traversal and membership test as
 /// [`sigpass_decode`], with the significance bit and then the sign read as
 /// plain bits, no context and no sign prediction.
+#[allow(
+    clippy::excessive_nesting,
+    reason = "raw (bypass) significance pass (ITU-T T.800 D.6, scan of D.3.1): the same stripe, column and pending-sample loops as sigpass_decode, kept in the same shape so the two passes can be checked side by side"
+)]
 fn sigpass_decode_raw(
     raw: &mut RawDecoder<'_>,
     bitplane: u8,
@@ -1713,6 +1776,10 @@ fn magnitude_context(word: u32, shift: u32) -> u8 {
 }
 
 /// Magnitude refinement pass (D.3.3) over the whole block.
+#[allow(
+    clippy::excessive_nesting,
+    reason = "Tier-1 magnitude refinement pass (ITU-T T.800 D.3.3): stripe, column and per-sample scan of the standard, the decoder's measured hot loop"
+)]
 fn refpass_decode(
     decoder: &mut MqDecoder<'_>,
     bitplane: u8,
@@ -1775,6 +1842,10 @@ fn refpass_decode_raw(
 /// Cleanup pass (D.3.4) over the whole block, with run-length coding of
 /// columns whose word is zero in a full stripe.
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::excessive_nesting,
+    reason = "Tier-1 cleanup pass (ITU-T T.800 D.3.4): the run-length branch and the per-sample loop sit inside the stripe and column scan the standard prescribes, the decoder's measured hot loop"
+)]
 fn cleanup_decode(
     decoder: &mut MqDecoder<'_>,
     band: BandOrientation,
@@ -2229,6 +2300,58 @@ mod stripe_equivalence_tests {
     /// decoder verifies, so every pass prefix a layer can end on must decode
     /// without a marker error: the per-pass lengths have to cover the bytes
     /// the MQ coder still holds in its registers at the pass boundary.
+    /// Encodes a seeded coefficient field of the given flavour and checks
+    /// every pass prefix of each resulting block; returns the prefixes checked.
+    fn check_field_prefixes(
+        seed: u64,
+        (w, h, levels): (usize, usize, u8),
+        style: CodeBlockStyle,
+        flavour: u32,
+    ) -> usize {
+        let mut rng = Lcg(seed);
+        let coefficients = field(&mut rng, w * h, flavour);
+        let mut checked = 0usize;
+        for (block, encoded) in encoded_blocks(w, h, levels, coefficients, style) {
+            checked += check_every_pass_prefix(&block, &encoded, style, flavour);
+        }
+        checked
+    }
+
+    /// Decodes every pass prefix of one encoded block, checks that the full
+    /// prefix reproduces the coefficients, and returns the prefixes checked.
+    fn check_every_pass_prefix(
+        block: &NativeTier1CodeBlock,
+        encoded: &NativeEncodedTier1CodeBlock,
+        style: CodeBlockStyle,
+        flavour: u32,
+    ) -> usize {
+        let total = encoded.passes.len();
+        let max_bitplanes = block.zero_bitplanes + block.magnitude_bitplanes;
+        for pass_count in 1..=total {
+            let segments = segments(encoded, pass_count);
+            let decoded = decode_codeblock_segments(
+                block.width,
+                block.height,
+                block.band,
+                max_bitplanes,
+                u32::from(block.zero_bitplanes),
+                pass_count as u32,
+                style,
+                &segments,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{style:?} {}x{} {:?} flavour {flavour} passes {pass_count}/{total}: {error}",
+                    block.width, block.height, block.band
+                )
+            });
+            if pass_count == total {
+                assert_eq!(decoded.coefficients, block.coefficients);
+            }
+        }
+        total
+    }
+
     #[test]
     fn segmentation_symbol_prefixes_decode_at_every_pass() {
         let d = CodeBlockStyle::default();
@@ -2269,35 +2392,8 @@ mod stripe_equivalence_tests {
                 (5, 7, 0),
             ] {
                 for flavour in 0..4u32 {
-                    let mut rng = Lcg(5000 + i as u64 * 100 + (w * h) as u64 + flavour as u64);
-                    let coefficients = field(&mut rng, w * h, flavour);
-                    for (block, encoded) in encoded_blocks(w, h, levels, coefficients, style) {
-                        let total = encoded.passes.len();
-                        let max_bitplanes = block.zero_bitplanes + block.magnitude_bitplanes;
-                        for pass_count in 1..=total {
-                            let segments = segments(&encoded, pass_count);
-                            let decoded = decode_codeblock_segments(
-                                block.width,
-                                block.height,
-                                block.band,
-                                max_bitplanes,
-                                u32::from(block.zero_bitplanes),
-                                pass_count as u32,
-                                style,
-                                &segments,
-                            )
-                            .unwrap_or_else(|error| {
-                                panic!(
-                                    "{style:?} {}x{} {:?} flavour {flavour} passes {pass_count}/{total}: {error}",
-                                    block.width, block.height, block.band
-                                )
-                            });
-                            if pass_count == total {
-                                assert_eq!(decoded.coefficients, block.coefficients);
-                            }
-                            checked += 1;
-                        }
-                    }
+                    let seed = 5000 + i as u64 * 100 + (w * h) as u64 + flavour as u64;
+                    checked += check_field_prefixes(seed, (w, h, levels), style, flavour);
                 }
             }
         }

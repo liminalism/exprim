@@ -1044,6 +1044,45 @@ impl NativeBackend {
         }))
     }
 
+    /// Quantizes and Tier-1 codes every tile of one search rung into `store`:
+    /// from the cached unquantized DWT when there is one, otherwise from the
+    /// source, one tile at a time.
+    fn prepare_stored_tiles(
+        &self,
+        rung_context: &EncodeContext<'_>,
+        tile_rects: &[TileRect],
+        dwt_cache: Option<&[UnquantizedTileDwt]>,
+        store: &mut EncodedBlockStore,
+    ) -> Result<Vec<(TileRect, Vec<StoredTier1Layout>)>> {
+        let mut stored_tiles = Vec::with_capacity(tile_rects.len());
+        let Some(cache) = dwt_cache else {
+            for tile in tile_rects {
+                stored_tiles.push((
+                    *tile,
+                    self.prepare_stored_tier1_for_tile_rect(rung_context, *tile, store)?,
+                ));
+            }
+            return Ok(stored_tiles);
+        };
+        if cache.len() != tile_rects.len() {
+            return Err(Jp2LamError::EncodeFailed(
+                "unquantized DWT cache tile count does not match the tile grid".into(),
+            ));
+        }
+        for (cached, tile) in cache.iter().zip(tile_rects) {
+            if cached.tile != *tile {
+                return Err(Jp2LamError::EncodeFailed(
+                    "unquantized DWT cache tile does not match the tile grid".into(),
+                ));
+            }
+            stored_tiles.push((
+                cached.tile,
+                self.prepare_stored_tier1_from_unquantized_dwt(rung_context, cached, store)?,
+            ));
+        }
+        Ok(stored_tiles)
+    }
+
     pub(crate) fn search_perceptual_tile_parts_with_optional_cache(
         &self,
         context: &EncodeContext<'_>,
@@ -1083,36 +1122,8 @@ impl NativeBackend {
             let rung_context = context.with_plan(plan.clone());
             let mut store =
                 EncodedBlockStore::from_resource_limits(&rung_context.plan.resource_limits);
-            let mut stored_tiles = Vec::with_capacity(tile_rects.len());
-            if let Some(cache) = dwt_cache {
-                if cache.len() != tile_rects.len() {
-                    return Err(Jp2LamError::EncodeFailed(
-                        "unquantized DWT cache tile count does not match the tile grid".into(),
-                    ));
-                }
-                for (cached, tile) in cache.iter().zip(tile_rects) {
-                    if cached.tile != *tile {
-                        return Err(Jp2LamError::EncodeFailed(
-                            "unquantized DWT cache tile does not match the tile grid".into(),
-                        ));
-                    }
-                    stored_tiles.push((
-                        cached.tile,
-                        self.prepare_stored_tier1_from_unquantized_dwt(
-                            &rung_context,
-                            cached,
-                            &mut store,
-                        )?,
-                    ));
-                }
-            } else {
-                for tile in tile_rects {
-                    stored_tiles.push((
-                        *tile,
-                        self.prepare_stored_tier1_for_tile_rect(&rung_context, *tile, &mut store)?,
-                    ));
-                }
-            }
+            let stored_tiles =
+                self.prepare_stored_tiles(&rung_context, tile_rects, dwt_cache, &mut store)?;
             let shared_store = store.into_shared();
             match select_perceptual_tile_parts(
                 &stored_tiles,
@@ -1866,14 +1877,7 @@ fn layer_stored_selections(
     let mut final_body = 0u64;
     for ((_, layouts), selections) in stored_tiles.iter().zip(&final_selections) {
         for (layout, selection) in layouts.iter().zip(selections) {
-            for (band, selected) in layout.bands.iter().zip(&selection.bands) {
-                for (block, &count) in band.blocks.iter().zip(&selected.selected_passes) {
-                    final_counts.push(count);
-                    if count > 0 {
-                        final_body += block.passes[usize::from(count) - 1].cumulative_length as u64;
-                    }
-                }
-            }
+            final_body += push_selected_counts(&mut final_counts, layout, selection);
         }
     }
 
@@ -1995,6 +1999,25 @@ fn layer_stored_selections(
     Ok(layered)
 }
 
+/// Appends one component's selected pass counts to `counts`, in band and
+/// block order, and returns the body bytes those passes take.
+fn push_selected_counts(
+    counts: &mut Vec<u16>,
+    layout: &StoredTier1Layout,
+    selection: &t1::NativeTier1SelectionLayout,
+) -> u64 {
+    let mut body = 0u64;
+    for (band, selected) in layout.bands.iter().zip(&selection.bands) {
+        for (block, &count) in band.blocks.iter().zip(&selected.selected_passes) {
+            counts.push(count);
+            if count > 0 {
+                body += block.passes[usize::from(count) - 1].cumulative_length as u64;
+            }
+        }
+    }
+    body
+}
+
 pub(crate) fn max_stored_body_bytes(stored_tiles: &[(TileRect, Vec<StoredTier1Layout>)]) -> u32 {
     stored_tiles
         .iter()
@@ -2035,6 +2058,29 @@ fn select_perceptual_tile_parts(
         score: f64,
         output_bytes: u64,
         tile_parts: Vec<TilePart>,
+    }
+
+    /// A probe's (body, score).
+    type BodyScore = (u32, f64);
+
+    /// The smallest probe that meets `target_score` and the largest that
+    /// misses it.
+    fn bracket(
+        probed: &[Observation],
+        target_score: f64,
+    ) -> (Option<BodyScore>, Option<BodyScore>) {
+        let mut best_feasible: Option<(u32, f64)> = None;
+        let mut worst_infeasible: Option<(u32, f64)> = None;
+        for obs in probed {
+            if obs.score >= target_score {
+                if best_feasible.is_none_or(|(body, _)| obs.body < body) {
+                    best_feasible = Some((obs.body, obs.score));
+                }
+            } else if worst_infeasible.is_none_or(|(body, _)| obs.body > body) {
+                worst_infeasible = Some((obs.body, obs.score));
+            }
+        }
+        (best_feasible, worst_infeasible)
     }
 
     let mut probed: Vec<Observation> = Vec::new();
@@ -2130,17 +2176,7 @@ fn select_perceptual_tile_parts(
         } else {
             consecutive_infeasible + 1
         };
-        let mut best_feasible: Option<(u32, f64)> = None;
-        let mut worst_infeasible: Option<(u32, f64)> = None;
-        for obs in &probed {
-            if obs.score >= target.score {
-                if best_feasible.is_none_or(|(body, _)| obs.body < body) {
-                    best_feasible = Some((obs.body, obs.score));
-                }
-            } else if worst_infeasible.is_none_or(|(body, _)| obs.body > body) {
-                worst_infeasible = Some((obs.body, obs.score));
-            }
-        }
+        let (best_feasible, worst_infeasible) = bracket(&probed, target.score);
         if best_feasible.is_some_and(|(_, score)| score - target.score <= band) {
             break;
         }
@@ -2610,6 +2646,32 @@ fn component_parallel_working_memory_floor(plan: &EncodingPlan) -> Option<usize>
         .checked_mul(components)
 }
 
+/// Sums of x, y, x², y² and xy over the 8×8 block whose top-left sample is
+/// (`x0`, `y0`), in raster order.
+#[inline]
+fn block_moments_8x8(orig: &[f32], recon: &[f32], width: usize, y0: usize, x0: usize) -> [f64; 5] {
+    const BLOCK: usize = 8;
+    let mut sum_x = 0.0f64;
+    let mut sum_y = 0.0f64;
+    let mut sum_xx = 0.0f64;
+    let mut sum_yy = 0.0f64;
+    let mut sum_xy = 0.0f64;
+
+    for dy in 0..BLOCK {
+        for dx in 0..BLOCK {
+            let idx = (y0 + dy) * width + (x0 + dx);
+            let x = orig[idx] as f64;
+            let y = recon[idx] as f64;
+            sum_x += x;
+            sum_y += y;
+            sum_xx += x * x;
+            sum_yy += y * y;
+            sum_xy += x * y;
+        }
+    }
+    [sum_x, sum_y, sum_xx, sum_yy, sum_xy]
+}
+
 /// Mean SSIM over non-overlapping 8×8 luma blocks.
 /// Wang et al. (2004), constants from the standard formulation.
 fn mssim_8x8(orig: &[f32], recon: &[f32], width: usize, height: usize, sample_peak: f64) -> f64 {
@@ -2628,24 +2690,8 @@ fn mssim_8x8(orig: &[f32], recon: &[f32], width: usize, height: usize, sample_pe
 
     for br in 0..block_rows {
         for bc in 0..block_cols {
-            let mut sum_x = 0.0f64;
-            let mut sum_y = 0.0f64;
-            let mut sum_xx = 0.0f64;
-            let mut sum_yy = 0.0f64;
-            let mut sum_xy = 0.0f64;
-
-            for dy in 0..BLOCK {
-                for dx in 0..BLOCK {
-                    let idx = (br * BLOCK + dy) * width + (bc * BLOCK + dx);
-                    let x = orig[idx] as f64;
-                    let y = recon[idx] as f64;
-                    sum_x += x;
-                    sum_y += y;
-                    sum_xx += x * x;
-                    sum_yy += y * y;
-                    sum_xy += x * y;
-                }
-            }
+            let [sum_x, sum_y, sum_xx, sum_yy, sum_xy] =
+                block_moments_8x8(orig, recon, width, br * BLOCK, bc * BLOCK);
 
             let ux = sum_x / n;
             let uy = sum_y / n;
@@ -3079,7 +3125,7 @@ mod tests {
     /// rate control's own selection.
     #[test]
     fn quality_layers_nest_and_track_their_budgets() {
-        use super::{layer_stored_selections, select_stored_tile_passes, t1};
+        use super::{layer_stored_selections, push_selected_counts, select_stored_tile_passes, t1};
         use crate::encode::block_store::EncodedBlockStore;
         use crate::encode::context::EncodeContext;
         use crate::model::{CodingOptions, EncodeOptions, Image, QualityLayers, RateControl};
@@ -3131,18 +3177,13 @@ mod tests {
             assert_eq!(layers.last(), final_selections.first());
 
             let body_bytes = |selection: &Vec<t1::NativeTier1SelectionLayout>| -> u64 {
-                let mut total = 0u64;
-                for (layout, selected) in stored_tiles[0].1.iter().zip(selection) {
-                    for (band, counts) in layout.bands.iter().zip(&selected.bands) {
-                        for (block, &count) in band.blocks.iter().zip(&counts.selected_passes) {
-                            if count > 0 {
-                                total +=
-                                    block.passes[usize::from(count) - 1].cumulative_length as u64;
-                            }
-                        }
-                    }
-                }
-                total
+                let mut counts = Vec::new();
+                stored_tiles[0]
+                    .1
+                    .iter()
+                    .zip(selection)
+                    .map(|(layout, selected)| push_selected_counts(&mut counts, layout, selected))
+                    .sum()
             };
             let final_body = body_bytes(layers.last().expect("final layer")) as f64;
             for (index, fraction) in expected_fractions.iter().enumerate() {
@@ -3152,17 +3193,24 @@ mod tests {
                     (achieved - fraction).abs() < 0.08,
                     "layer {index}: {achieved:.3} of the final body, wanted {fraction}"
                 );
-                // Nesting: no block loses passes from one layer to the next.
-                for (lower, upper) in layers[index].iter().zip(&layers[index + 1]) {
-                    for (a, b) in lower.bands.iter().zip(&upper.bands) {
-                        assert!(
-                            a.selected_passes
-                                .iter()
-                                .zip(&b.selected_passes)
-                                .all(|(x, y)| x <= y)
-                        );
-                    }
-                }
+                assert_layers_nest(&layers[index], &layers[index + 1]);
+            }
+        }
+    }
+
+    /// Nesting: no block loses passes from one layer to the next.
+    fn assert_layers_nest(
+        lower_layer: &[super::t1::NativeTier1SelectionLayout],
+        upper_layer: &[super::t1::NativeTier1SelectionLayout],
+    ) {
+        for (lower, upper) in lower_layer.iter().zip(upper_layer) {
+            for (a, b) in lower.bands.iter().zip(&upper.bands) {
+                assert!(
+                    a.selected_passes
+                        .iter()
+                        .zip(&b.selected_passes)
+                        .all(|(x, y)| x <= y)
+                );
             }
         }
     }

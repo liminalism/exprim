@@ -1,4 +1,6 @@
-use crate::encode::block_store::{SharedEncodedBlockStore, StoredCodeBlock, StoredTier1Layout};
+use crate::encode::block_store::{
+    SharedEncodedBlockStore, StoredBand, StoredCodeBlock, StoredTier1Layout,
+};
 use crate::encode::profile_enter;
 use crate::error::{Jp2LamError, Result};
 use crate::plan::ProgressionOrder;
@@ -134,21 +136,7 @@ impl TagTree {
         for i in 0..numlvls.saturating_sub(1) {
             let mut j = 0i32;
             while j < nplv[i] {
-                let mut k = nplh[i];
-                loop {
-                    k -= 1;
-                    if k < 0 {
-                        break;
-                    }
-                    nodes[node_idx].parent = l_parent_idx as u32;
-                    node_idx += 1;
-                    k -= 1;
-                    if k >= 0 {
-                        nodes[node_idx].parent = l_parent_idx as u32;
-                        node_idx += 1;
-                    }
-                    l_parent_idx += 1;
-                }
+                Self::link_row(nodes, &mut node_idx, &mut l_parent_idx, nplh[i]);
                 if j & 1 != 0 || j == nplv[i] - 1 {
                     l_parent_idx0 = l_parent_idx;
                 } else {
@@ -160,6 +148,27 @@ impl TagTree {
         }
         if node_idx < nodes.len() {
             nodes[node_idx].parent = TGT_NO_PARENT;
+        }
+    }
+
+    /// Points one row of `width` nodes, starting at `*node_idx`, at their
+    /// parents: each run of two horizontal siblings shares one parent,
+    /// starting at `*l_parent_idx`.
+    fn link_row(nodes: &mut [TgtNode], node_idx: &mut usize, l_parent_idx: &mut usize, width: i32) {
+        let mut k = width;
+        loop {
+            k -= 1;
+            if k < 0 {
+                break;
+            }
+            nodes[*node_idx].parent = *l_parent_idx as u32;
+            *node_idx += 1;
+            k -= 1;
+            if k >= 0 {
+                nodes[*node_idx].parent = *l_parent_idx as u32;
+                *node_idx += 1;
+            }
+            *l_parent_idx += 1;
         }
     }
 
@@ -197,33 +206,39 @@ impl TagTree {
         }
         let mut low = 0i32;
         loop {
-            {
-                let node = &mut self.nodes[node_idx];
-                if low > node.low {
-                    node.low = low;
-                } else {
-                    low = node.low;
-                }
-                while low < threshold {
-                    if low >= node.value {
-                        if node.known == 0 {
-                            bio.putbit(1);
-                            node.known = 1;
-                        }
-                        break;
-                    } else {
-                        bio.putbit(0);
-                        low += 1;
-                    }
-                }
-                node.low = low;
-            }
+            low = Self::encode_node(&mut self.nodes[node_idx], bio, low, threshold);
             if depth == 0 {
                 break;
             }
             depth -= 1;
             node_idx = stk[depth];
         }
+    }
+
+    /// Annex B.10.2 step for one node on the root-to-leaf path: writes a 0
+    /// for every value below the node's, then the terminating 1 once, until
+    /// `threshold`, starting from the larger of `low` and the node's stored
+    /// lower bound. Returns the lower bound to carry to the child.
+    fn encode_node(node: &mut TgtNode, bio: &mut PacketBio, mut low: i32, threshold: i32) -> i32 {
+        if low > node.low {
+            node.low = low;
+        } else {
+            low = node.low;
+        }
+        while low < threshold {
+            if low < node.value {
+                bio.putbit(0);
+                low += 1;
+                continue;
+            }
+            if node.known == 0 {
+                bio.putbit(1);
+                node.known = 1;
+            }
+            break;
+        }
+        node.low = low;
+        low
     }
 }
 
@@ -461,50 +476,50 @@ pub(crate) fn packet_order(
     component_count: usize,
     layers: u16,
 ) -> Vec<(u16, u8, usize)> {
-    let resolutions = 0..=max_resolution;
-    let components = 0..component_count;
-    let layers = 0..layers;
-    let mut packets =
-        Vec::with_capacity((usize::from(max_resolution) + 1) * component_count * layers.len());
+    let resolution_count = usize::from(max_resolution) + 1;
+    let layer_count = usize::from(layers);
+    let mut packets = Vec::with_capacity(resolution_count * component_count * layer_count);
+    // Each index is below its axis' extent, so the narrowing casts are exact.
     match order {
-        ProgressionOrder::Lrcp => {
-            for l in layers {
-                for r in resolutions.clone() {
-                    for c in components.clone() {
-                        packets.push((l, r, c));
-                    }
-                }
-            }
-        }
-        ProgressionOrder::Rlcp => {
-            for r in resolutions {
-                for l in layers.clone() {
-                    for c in components.clone() {
-                        packets.push((l, r, c));
-                    }
-                }
-            }
-        }
-        ProgressionOrder::Rpcl => {
-            for r in resolutions {
-                for c in components.clone() {
-                    for l in layers.clone() {
-                        packets.push((l, r, c));
-                    }
-                }
-            }
-        }
-        ProgressionOrder::Pcrl | ProgressionOrder::Cprl => {
-            for c in components {
-                for r in resolutions.clone() {
-                    for l in layers.clone() {
-                        packets.push((l, r, c));
-                    }
-                }
+        ProgressionOrder::Lrcp => push_loop_nest(
+            &mut packets,
+            [layer_count, resolution_count, component_count],
+            |l, r, c| (l as u16, r as u8, c),
+        ),
+        ProgressionOrder::Rlcp => push_loop_nest(
+            &mut packets,
+            [resolution_count, layer_count, component_count],
+            |r, l, c| (l as u16, r as u8, c),
+        ),
+        ProgressionOrder::Rpcl => push_loop_nest(
+            &mut packets,
+            [resolution_count, component_count, layer_count],
+            |r, c, l| (l as u16, r as u8, c),
+        ),
+        ProgressionOrder::Pcrl | ProgressionOrder::Cprl => push_loop_nest(
+            &mut packets,
+            [component_count, resolution_count, layer_count],
+            |c, r, l| (l as u16, r as u8, c),
+        ),
+    }
+    packets
+}
+
+/// Appends one entry per iteration of three nested loops with the given
+/// extents, outermost first; `triple` maps the loop indices, in the same
+/// order, to `(layer, resolution, component)`.
+fn push_loop_nest(
+    packets: &mut Vec<(u16, u8, usize)>,
+    [outer, middle, inner]: [usize; 3],
+    triple: impl Fn(usize, usize, usize) -> (u16, u8, usize),
+) {
+    for a in 0..outer {
+        for b in 0..middle {
+            for c in 0..inner {
+                packets.push(triple(a, b, c));
             }
         }
     }
-    packets
 }
 
 // ---------------------------------------------------------------------------
@@ -728,56 +743,66 @@ pub(crate) fn build_packet_sequence_for_tile_components_with_selections(
         // LRCP ordering with one tile and one precinct still emits packets per
         // component at each resolution (L=0 fixed): (R,C).
         for (component_index, component) in layouts.iter().enumerate() {
-            let bands: Vec<&NativeEncodedTier1Band> = component
-                .bands
-                .iter()
-                .filter(|b| b.resolution == resolution)
-                .collect();
-            let selected_bands: Option<Vec<_>> = selections
-                .and_then(|all| all.get(component_index))
-                .map(|selection| {
-                    selection
-                        .bands
-                        .iter()
-                        .filter(|b| b.resolution == resolution)
-                        .collect::<Vec<_>>()
-                });
-
-            if bands.is_empty() {
-                continue;
+            let selection = selections.and_then(|all| all.get(component_index));
+            if let Some(packet) = build_component_packet(resolution, component, selection) {
+                packets.push(packet);
             }
-
-            let header = build_packet_header(&bands, selected_bands.as_deref());
-            let mut body = Vec::new();
-            let mut codeblock_count = 0usize;
-            let mut pass_count = 0usize;
-            for (band_index, band) in bands.iter().enumerate() {
-                let selected_band = selected_bands
-                    .as_ref()
-                    .and_then(|bands| bands.get(band_index).copied());
-                body.extend_from_slice(&build_packet_body(band, selected_band));
-                codeblock_count += band.blocks.len();
-                pass_count += band
-                    .blocks
-                    .iter()
-                    .enumerate()
-                    .map(|(block_index, block)| {
-                        selected_pass_count(block, selected_band, block_index)
-                    })
-                    .sum::<usize>();
-            }
-
-            packets.push(NativePacket {
-                resolution,
-                codeblock_count,
-                pass_count,
-                header,
-                body,
-            });
         }
     }
 
     Ok(NativePacketSequence { packets })
+}
+
+/// The single-layer packet of one component at one resolution, or `None`
+/// when the component has no band there.
+#[cfg(test)]
+fn build_component_packet(
+    resolution: u8,
+    component: &NativeEncodedTier1Layout,
+    selection: Option<&NativeTier1SelectionLayout>,
+) -> Option<NativePacket> {
+    let bands: Vec<&NativeEncodedTier1Band> = component
+        .bands
+        .iter()
+        .filter(|b| b.resolution == resolution)
+        .collect();
+    let selected_bands: Option<Vec<_>> = selection.map(|selection| {
+        selection
+            .bands
+            .iter()
+            .filter(|b| b.resolution == resolution)
+            .collect::<Vec<_>>()
+    });
+
+    if bands.is_empty() {
+        return None;
+    }
+
+    let header = build_packet_header(&bands, selected_bands.as_deref());
+    let mut body = Vec::new();
+    let mut codeblock_count = 0usize;
+    let mut pass_count = 0usize;
+    for (band_index, band) in bands.iter().enumerate() {
+        let selected_band = selected_bands
+            .as_ref()
+            .and_then(|bands| bands.get(band_index).copied());
+        body.extend_from_slice(&build_packet_body(band, selected_band));
+        codeblock_count += band.blocks.len();
+        pass_count += band
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(block_index, block)| selected_pass_count(block, selected_band, block_index))
+            .sum::<usize>();
+    }
+
+    Some(NativePacket {
+        resolution,
+        codeblock_count,
+        pass_count,
+        header,
+        body,
+    })
 }
 
 /// Single-component convenience wrapper for tile 0. Only exercised by
@@ -856,71 +881,81 @@ pub(crate) fn build_tile_part_payload_for_tile_components_owned(
 
     let mut builder = PacketSequenceBuilder::new();
     for (_, resolution, component_index) in packet_order(order, max_resolution, layouts.len(), 1) {
-        {
-            let component = &mut layouts[component_index];
-            let band_indices = component
-                .bands
-                .iter()
-                .enumerate()
-                .filter_map(|(index, band)| (band.resolution == resolution).then_some(index))
-                .collect::<Vec<_>>();
-            if band_indices.is_empty() {
-                continue;
-            }
+        let component = &mut layouts[component_index];
+        let band_indices = component
+            .bands
+            .iter()
+            .enumerate()
+            .filter_map(|(index, band)| (band.resolution == resolution).then_some(index))
+            .collect::<Vec<_>>();
+        if band_indices.is_empty() {
+            continue;
+        }
 
-            let selected_band_indices =
-                selections
-                    .and_then(|all| all.get(component_index))
-                    .map(|selection| {
-                        selection
-                            .bands
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(index, band)| {
-                                (band.resolution == resolution).then_some(index)
-                            })
-                            .collect::<Vec<_>>()
-                    });
+        let selected_band_indices =
+            selections
+                .and_then(|all| all.get(component_index))
+                .map(|selection| {
+                    selection
+                        .bands
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, band)| {
+                            (band.resolution == resolution).then_some(index)
+                        })
+                        .collect::<Vec<_>>()
+                });
 
-            let header = {
-                let bands = band_indices
-                    .iter()
-                    .map(|&index| &component.bands[index])
-                    .collect::<Vec<_>>();
-                let selected_bands = selected_band_indices.as_ref().and_then(|indices| {
+        let header = owned_packet_header(
+            component,
+            &band_indices,
+            selections.and_then(|all| all.get(component_index)),
+            selected_band_indices.as_deref(),
+        );
+
+        let mut body_segments = Vec::new();
+        for (packet_band_index, &band_index) in band_indices.iter().enumerate() {
+            let selected_band = selected_band_indices
+                .as_ref()
+                .and_then(|indices| indices.get(packet_band_index).copied())
+                .and_then(|selection_band_index| {
                     selections
                         .and_then(|all| all.get(component_index))
-                        .map(|selection| {
-                            indices
-                                .iter()
-                                .map(|&index| &selection.bands[index])
-                                .collect::<Vec<_>>()
-                        })
+                        .and_then(|selection| selection.bands.get(selection_band_index))
                 });
-                build_packet_header(&bands, selected_bands.as_deref())
-            };
-
-            let mut body_segments = Vec::new();
-            for (packet_band_index, &band_index) in band_indices.iter().enumerate() {
-                let selected_band = selected_band_indices
-                    .as_ref()
-                    .and_then(|indices| indices.get(packet_band_index).copied())
-                    .and_then(|selection_band_index| {
-                        selections
-                            .and_then(|all| all.get(component_index))
-                            .and_then(|selection| selection.bands.get(selection_band_index))
-                    });
-                body_segments.extend(build_packet_body_segments(
-                    &mut component.bands[band_index],
-                    selected_band,
-                ));
-            }
-
-            builder = builder.push_header_body_segments(header, body_segments);
+            body_segments.extend(build_packet_body_segments(
+                &mut component.bands[band_index],
+                selected_band,
+            ));
         }
+
+        builder = builder.push_header_body_segments(header, body_segments);
     }
 
     Ok(builder.finish_payload())
+}
+
+/// Header of the packet that carries the bands at `band_indices` of
+/// `component`, with the selection's bands at `selected_band_indices`.
+fn owned_packet_header(
+    component: &NativeEncodedTier1Layout,
+    band_indices: &[usize],
+    selection: Option<&NativeTier1SelectionLayout>,
+    selected_band_indices: Option<&[usize]>,
+) -> Vec<u8> {
+    let bands = band_indices
+        .iter()
+        .map(|&index| &component.bands[index])
+        .collect::<Vec<_>>();
+    let selected_bands = selected_band_indices.and_then(|indices| {
+        selection.map(|selection| {
+            indices
+                .iter()
+                .map(|&index| &selection.bands[index])
+                .collect::<Vec<_>>()
+        })
+    });
+    build_packet_header(&bands, selected_bands.as_deref())
 }
 
 /// Build packet headers plus store-backed payload ranges for one tile, for
@@ -1037,37 +1072,12 @@ pub(crate) fn build_stored_tile_part_payload(
         let header = build_layer_packet_header(&bands, &starts, &ends, layer, state);
         let mut body = Vec::new();
         for (packet_band_index, &band_index) in band_indices.iter().enumerate() {
-            let band = &layout.bands[band_index];
-            for (block_index, block) in band.blocks.iter().enumerate() {
-                let start =
-                    usize::from(starts[packet_band_index][block_index]).min(block.passes.len());
-                let end = usize::from(ends[packet_band_index][block_index])
-                    .min(block.passes.len())
-                    .max(start);
-                if end == start {
-                    continue;
-                }
-                let byte_start = if start == 0 {
-                    0
-                } else {
-                    block.passes[start - 1].cumulative_length
-                };
-                let byte_end = block.passes[end - 1].cumulative_length;
-                if byte_end > block.payload.len() || byte_start > byte_end {
-                    return Err(Jp2LamError::EncodeFailed(format!(
-                        "stored block {:?} pass range {byte_start}..{byte_end} exceeds payload length {}",
-                        block.id,
-                        block.payload.len()
-                    )));
-                }
-                if byte_end > byte_start {
-                    body.push(StoredPayloadRange {
-                        payload: block.payload,
-                        start: byte_start,
-                        len: byte_end - byte_start,
-                    });
-                }
-            }
+            push_stored_band_ranges(
+                &mut body,
+                &layout.bands[band_index],
+                starts[packet_band_index],
+                ends[packet_band_index],
+            )?;
         }
         packets.push(StoredPacket { header, body });
     }
@@ -1075,16 +1085,58 @@ pub(crate) fn build_stored_tile_part_payload(
     Ok(TilePartPayload::from_stored_packets(store, packets))
 }
 
+/// Appends the stored payload ranges one packet carries for one band: for
+/// each block, the bytes of passes `starts[block]..ends[block]`.
+fn push_stored_band_ranges(
+    body: &mut Vec<StoredPayloadRange>,
+    band: &StoredBand,
+    starts: &[u16],
+    ends: &[u16],
+) -> Result<()> {
+    for (block_index, block) in band.blocks.iter().enumerate() {
+        let start = usize::from(starts[block_index]).min(block.passes.len());
+        let end = usize::from(ends[block_index])
+            .min(block.passes.len())
+            .max(start);
+        if end == start {
+            continue;
+        }
+        let byte_start = if start == 0 {
+            0
+        } else {
+            block.passes[start - 1].cumulative_length
+        };
+        let byte_end = block.passes[end - 1].cumulative_length;
+        if byte_end > block.payload.len() || byte_start > byte_end {
+            return Err(Jp2LamError::EncodeFailed(format!(
+                "stored block {:?} pass range {byte_start}..{byte_end} exceeds payload length {}",
+                block.id,
+                block.payload.len()
+            )));
+        }
+        if byte_end > byte_start {
+            body.push(StoredPayloadRange {
+                payload: block.payload,
+                start: byte_start,
+                len: byte_end - byte_start,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_layouts_for_tile(tile_index: u16, layouts: &[NativeEncodedTier1Layout]) -> Result<()> {
     for (component_index, layout) in layouts.iter().enumerate() {
         for band in &layout.bands {
-            for block in &band.blocks {
-                if block.tile_index != tile_index {
-                    return Err(Jp2LamError::EncodeFailed(format!(
-                        "component {component_index} resolution {} {:?} code-block ({},{}) belongs to tile {}, not tile {tile_index}",
-                        band.resolution, band.band, block.x0, block.y0, block.tile_index
-                    )));
-                }
+            if let Some(block) = band
+                .blocks
+                .iter()
+                .find(|block| block.tile_index != tile_index)
+            {
+                return Err(Jp2LamError::EncodeFailed(format!(
+                    "component {component_index} resolution {} {:?} code-block ({},{}) belongs to tile {}, not tile {tile_index}",
+                    band.resolution, band.band, block.x0, block.y0, block.tile_index
+                )));
             }
         }
     }

@@ -78,16 +78,8 @@ fn main() {
             let mut evals = 0u64;
             for pixels in &scaled {
                 let view = ImageView::from_rgb8_interleaved(w, h, pixels).expect("view");
-                let mut times = Vec::with_capacity(RUNS);
-                let mut out = Vec::new();
-                for _ in 0..RUNS {
-                    PERCEPTUAL_PROBES.store(0, Ordering::Relaxed);
-                    let start = Instant::now();
-                    out = encode_view(view.clone(), &options).expect("encode");
-                    times.push(start.elapsed().as_secs_f64() * 1000.0);
-                }
-                times.sort_by(f64::total_cmp);
-                ms += times[RUNS / 2];
+                let (median_ms, out) = median_encode(&view, &options);
+                ms += median_ms;
                 evals += PERCEPTUAL_PROBES.load(Ordering::Relaxed);
                 let (box_bytes, header_bytes) = split_jp2(&out);
                 bytes += out.len();
@@ -110,6 +102,21 @@ fn main() {
     jp2lam::print_timing_data();
     #[cfg(feature = "counters")]
     jp2lam::print();
+}
+
+/// Encodes `view` `RUNS` times and returns the median wall time in ms and the
+/// last run's output; the probe counter is left holding the last run's count.
+fn median_encode(view: &ImageView<'_>, options: &EncodeOptions) -> (f64, Vec<u8>) {
+    let mut times = Vec::with_capacity(RUNS);
+    let mut out = Vec::new();
+    for _ in 0..RUNS {
+        PERCEPTUAL_PROBES.store(0, Ordering::Relaxed);
+        let start = Instant::now();
+        out = encode_view(view.clone(), options).expect("encode");
+        times.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(f64::total_cmp);
+    (times[RUNS / 2], out)
 }
 
 fn modes() -> Vec<(&'static str, EncodeOptions)> {
@@ -177,15 +184,7 @@ fn box_downscale_rgb8(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8>
         let (y0, y1) = span(y, ys, sh);
         for x in 0..dw as usize {
             let (x0, x1) = span(x, xs, sw);
-            let mut acc = [0u32; 3];
-            for sy in y0..y1 {
-                for sx in x0..x1 {
-                    let i = (sy * sw as usize + sx) * 3;
-                    for c in 0..3 {
-                        acc[c] += u32::from(src[i + c]);
-                    }
-                }
-            }
+            let acc = sum_rgb_block(src, sw, y0..y1, x0..x1);
             let n = ((y1 - y0) * (x1 - x0)) as u32;
             for c in 0..3 {
                 out[(y * dw as usize + x) * 3 + c] = ((acc[c] + n / 2) / n) as u8;
@@ -193,6 +192,26 @@ fn box_downscale_rgb8(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8>
         }
     }
     out
+}
+
+/// Per-channel sums of the interleaved RGB8 samples in rows `ys` and
+/// columns `xs` of an image `sw` pixels wide.
+fn sum_rgb_block(
+    src: &[u8],
+    sw: u32,
+    ys: std::ops::Range<usize>,
+    xs: std::ops::Range<usize>,
+) -> [u32; 3] {
+    let mut acc = [0u32; 3];
+    for sy in ys {
+        for sx in xs.clone() {
+            let i = (sy * sw as usize + sx) * 3;
+            for c in 0..3 {
+                acc[c] += u32::from(src[i + c]);
+            }
+        }
+    }
+    acc
 }
 
 fn span(index: usize, scale: f64, extent: u32) -> (usize, usize) {

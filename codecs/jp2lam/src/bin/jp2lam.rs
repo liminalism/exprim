@@ -343,29 +343,7 @@ fn decode_zip_reader<R: Read + Seek>(
                 .read_to_end(&mut bytes)
                 .map_err(|err| format!("failed to read {}: {err}", entry_path.display()))?;
             let output_path = decoded_entry_output_path(output_dir, archive_prefix, &entry_path);
-            match decode_jp2(&bytes) {
-                Ok(image) => {
-                    if let Some(parent) = output_path.parent() {
-                        fs::create_dir_all(parent).map_err(|err| {
-                            format!(
-                                "failed to create output directory {}: {err}",
-                                parent.display()
-                            )
-                        })?;
-                    }
-                    write_image_png(&image, &output_path)?;
-                    stats.decoded += 1;
-                    println!(
-                        "decoded {} -> {}",
-                        entry_path.display(),
-                        output_path.display()
-                    );
-                }
-                Err(err) => {
-                    stats.failed += 1;
-                    eprintln!("decode failed {}: {err}", entry_path.display());
-                }
-            }
+            decode_entry_to_png(&bytes, &entry_path, &output_path, stats)?;
         } else if lower_name.ends_with(".zip") {
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes).map_err(|err| {
@@ -376,6 +354,41 @@ fn decode_zip_reader<R: Read + Seek>(
         }
     }
 
+    Ok(())
+}
+
+/// Decodes one archived JP2 entry to a PNG at `output_path`, counting it in
+/// `stats`. A decode failure is counted and reported, not returned; only a
+/// failure to write the output is an error.
+fn decode_entry_to_png(
+    bytes: &[u8],
+    entry_path: &Path,
+    output_path: &Path,
+    stats: &mut ZipDecodeStats,
+) -> Result<(), String> {
+    match decode_jp2(bytes) {
+        Ok(image) => {
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent).map_err(|err| {
+                    format!(
+                        "failed to create output directory {}: {err}",
+                        parent.display()
+                    )
+                })?;
+            }
+            write_image_png(&image, output_path)?;
+            stats.decoded += 1;
+            println!(
+                "decoded {} -> {}",
+                entry_path.display(),
+                output_path.display()
+            );
+        }
+        Err(err) => {
+            stats.failed += 1;
+            eprintln!("decode failed {}: {err}", entry_path.display());
+        }
+    }
     Ok(())
 }
 

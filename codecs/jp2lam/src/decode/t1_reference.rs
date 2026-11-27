@@ -13,7 +13,9 @@ use crate::tier1::helpers::{
 };
 
 use super::stats::StatsSink;
-use super::t1::{PassKind, invalid, pass_kind_and_bitplane, read_segmentation_symbol};
+use super::t1::{
+    PassKind, invalid, pass_kind_and_bitplane, read_segmentation_symbol, record_pass_time,
+};
 use super::t2::DecodedCodewordSegment;
 
 struct ReferenceScratch {
@@ -78,9 +80,15 @@ pub(super) fn decode_codeblock_segments_reference(
         )));
     }
     let max_passes = 1u32 + 3u32 * u32::from(magnitude_bitplanes.saturating_sub(1));
-    let pass_limit = pass_count.min(max_passes);
-
-    let top = magnitude_bitplanes - 1;
+    let block = ReferencePasses {
+        width,
+        height,
+        band,
+        style,
+        top: magnitude_bitplanes - 1,
+        pass_limit: pass_count.min(max_passes),
+        pass_count,
+    };
     let mut pass_index = 0u32;
     let mut contexts = None;
 
@@ -91,47 +99,8 @@ pub(super) fn decode_codeblock_segments_reference(
         // D.6: a raw segment holds significance and refinement passes of the
         // fifth and later significant bit-planes; MQ contexts are untouched.
         if style.pass_is_raw(pass_index) {
-            let mut raw = RawDecoder::new(&segment.data);
-            for _ in 0..segment.passes {
-                if pass_index == pass_limit {
-                    return Ok(scratch.coefficients.clone());
-                }
-                let (pass_kind, bitplane) = pass_kind_and_bitplane(pass_index, top)?;
-                let pass_start = stats.start();
-                match pass_kind {
-                    PassKind::Significance => sigpass_decode_raw(
-                        &mut raw,
-                        bitplane,
-                        &mut scratch.flags,
-                        &mut scratch.coefficients,
-                        width,
-                        height,
-                        style.vertical_causal,
-                    ),
-                    PassKind::Refinement => refpass_decode_raw(
-                        &mut raw,
-                        bitplane,
-                        &mut scratch.flags,
-                        &mut scratch.coefficients,
-                        width,
-                        height,
-                    ),
-                    PassKind::Cleanup => {
-                        return Err(invalid("cleanup pass inside a raw bypass codeword segment"));
-                    }
-                }
-                stats.finish(pass_start, |stats, elapsed| match pass_kind {
-                    PassKind::Significance => {
-                        stats.tier1_significance_ns =
-                            stats.tier1_significance_ns.saturating_add(elapsed);
-                    }
-                    PassKind::Refinement => {
-                        stats.tier1_refinement_ns =
-                            stats.tier1_refinement_ns.saturating_add(elapsed);
-                    }
-                    PassKind::Cleanup => {}
-                });
-                pass_index += 1;
+            if !block.decode_raw_segment(segment, &mut pass_index, scratch, stats)? {
+                return Ok(scratch.coefficients.clone());
             }
             continue;
         }
@@ -143,66 +112,16 @@ pub(super) fn decode_codeblock_segments_reference(
         };
 
         for _ in 0..segment.passes {
-            if pass_index == pass_limit {
+            if pass_index == block.pass_limit {
                 return Ok(scratch.coefficients.clone());
             }
-            let (pass_kind, bitplane) = pass_kind_and_bitplane(pass_index, top)?;
+            let (pass_kind, bitplane) = pass_kind_and_bitplane(pass_index, block.top)?;
             if style.pass_is_raw(pass_index) {
                 return Err(invalid("bypass-coded pass inside an MQ codeword segment"));
             }
             let pass_start = stats.start();
-            match pass_kind {
-                PassKind::Significance => sigpass_decode(
-                    &mut decoder,
-                    band,
-                    bitplane,
-                    &mut scratch.flags,
-                    &mut scratch.coefficients,
-                    width,
-                    height,
-                    style.vertical_causal,
-                ),
-                PassKind::Refinement => refpass_decode(
-                    &mut decoder,
-                    bitplane,
-                    &mut scratch.flags,
-                    &mut scratch.coefficients,
-                    width,
-                    height,
-                    style.vertical_causal,
-                ),
-                PassKind::Cleanup => {
-                    cleanup_decode(
-                        &mut decoder,
-                        band,
-                        bitplane,
-                        &mut scratch.flags,
-                        &mut scratch.coefficients,
-                        width,
-                        height,
-                        style.vertical_causal,
-                    );
-                    if style.segmentation_symbols {
-                        read_segmentation_symbol(&mut decoder, pass_index + 1 == pass_count)?;
-                    }
-                    debug_assert!(
-                        !scratch.flags.has_visited(),
-                        "cleanup pass must clear every visited flag"
-                    );
-                }
-            }
-            stats.finish(pass_start, |stats, elapsed| match pass_kind {
-                PassKind::Significance => {
-                    stats.tier1_significance_ns =
-                        stats.tier1_significance_ns.saturating_add(elapsed);
-                }
-                PassKind::Refinement => {
-                    stats.tier1_refinement_ns = stats.tier1_refinement_ns.saturating_add(elapsed);
-                }
-                PassKind::Cleanup => {
-                    stats.tier1_cleanup_ns = stats.tier1_cleanup_ns.saturating_add(elapsed);
-                }
-            });
+            block.decode_mq_pass(&mut decoder, pass_kind, bitplane, pass_index, scratch)?;
+            record_pass_time(stats, pass_start, pass_kind);
             pass_index += 1;
             if style.reset_contexts {
                 decoder.reset_contexts();
@@ -217,6 +136,117 @@ pub(super) fn decode_codeblock_segments_reference(
         }
     }
     Ok(scratch.coefficients.clone())
+}
+
+/// The parameters every coding pass of one reference-decoded block shares.
+#[derive(Clone, Copy)]
+struct ReferencePasses {
+    width: usize,
+    height: usize,
+    band: BandOrientation,
+    style: CodeBlockStyle,
+    top: u8,
+    pass_limit: u32,
+    pass_count: u32,
+}
+
+impl ReferencePasses {
+    /// Decodes the passes of one raw (bypass) codeword segment (D.6),
+    /// advancing `pass_index`. Returns `false` once the pass limit is reached.
+    fn decode_raw_segment(
+        &self,
+        segment: &DecodedCodewordSegment<'_>,
+        pass_index: &mut u32,
+        scratch: &mut ReferenceScratch,
+        stats: &mut StatsSink<'_>,
+    ) -> Result<bool> {
+        let mut raw = RawDecoder::new(&segment.data);
+        for _ in 0..segment.passes {
+            if *pass_index == self.pass_limit {
+                return Ok(false);
+            }
+            let (pass_kind, bitplane) = pass_kind_and_bitplane(*pass_index, self.top)?;
+            let pass_start = stats.start();
+            match pass_kind {
+                PassKind::Significance => sigpass_decode_raw(
+                    &mut raw,
+                    bitplane,
+                    &mut scratch.flags,
+                    &mut scratch.coefficients,
+                    self.width,
+                    self.height,
+                    self.style.vertical_causal,
+                ),
+                PassKind::Refinement => refpass_decode_raw(
+                    &mut raw,
+                    bitplane,
+                    &mut scratch.flags,
+                    &mut scratch.coefficients,
+                    self.width,
+                    self.height,
+                ),
+                PassKind::Cleanup => {
+                    return Err(invalid("cleanup pass inside a raw bypass codeword segment"));
+                }
+            }
+            record_pass_time(stats, pass_start, pass_kind);
+            *pass_index += 1;
+        }
+        Ok(true)
+    }
+
+    /// Decodes one MQ-coded pass, with the segmentation symbol that follows
+    /// a cleanup pass when the style signals it.
+    fn decode_mq_pass(
+        &self,
+        decoder: &mut MqDecoder<'_>,
+        pass_kind: PassKind,
+        bitplane: u8,
+        pass_index: u32,
+        scratch: &mut ReferenceScratch,
+    ) -> Result<()> {
+        match pass_kind {
+            PassKind::Significance => sigpass_decode(
+                decoder,
+                self.band,
+                bitplane,
+                &mut scratch.flags,
+                &mut scratch.coefficients,
+                self.width,
+                self.height,
+                self.style.vertical_causal,
+            ),
+            PassKind::Refinement => refpass_decode(
+                decoder,
+                bitplane,
+                &mut scratch.flags,
+                &mut scratch.coefficients,
+                self.width,
+                self.height,
+                self.style.vertical_causal,
+            ),
+            PassKind::Cleanup => {
+                cleanup_decode(
+                    decoder,
+                    self.band,
+                    bitplane,
+                    &mut scratch.flags,
+                    &mut scratch.coefficients,
+                    self.width,
+                    self.height,
+                    self.style.vertical_causal,
+                );
+                if self.style.segmentation_symbols {
+                    read_segmentation_symbol(decoder, pass_index + 1 == self.pass_count)?;
+                }
+                debug_assert!(
+                    !scratch.flags.has_visited(),
+                    "cleanup pass must clear every visited flag"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 fn sigpass_decode(

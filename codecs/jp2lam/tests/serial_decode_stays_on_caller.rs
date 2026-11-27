@@ -188,6 +188,20 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
+/// The thief: signals `started`, then runs every job it can steal from the
+/// pool, counting them in `stolen`, until `stop` is set.
+fn steal_until_stopped(started: &AtomicBool, stop: &AtomicBool, stolen: &AtomicUsize) {
+    started.store(true, Ordering::SeqCst);
+    while !stop.load(Ordering::SeqCst) {
+        match rayon::yield_now() {
+            Some(rayon::Yield::Executed) => {
+                stolen.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => std::thread::yield_now(),
+        }
+    }
+}
+
 /// Run `decode` on one worker of a two-thread pool while the other worker
 /// steals, and return its result with the number of jobs the thief ran.
 fn run_beside_thief<T: Send>(decode: impl FnOnce() -> T + Send) -> (T, usize) {
@@ -199,17 +213,7 @@ fn run_beside_thief<T: Send>(decode: impl FnOnce() -> T + Send) -> (T, usize) {
     let stop = AtomicBool::new(false);
     let stolen = AtomicUsize::new(0);
     let result = pool.scope(|scope| {
-        scope.spawn(|_| {
-            started.store(true, Ordering::SeqCst);
-            while !stop.load(Ordering::SeqCst) {
-                match rayon::yield_now() {
-                    Some(rayon::Yield::Executed) => {
-                        stolen.fetch_add(1, Ordering::SeqCst);
-                    }
-                    _ => std::thread::yield_now(),
-                }
-            }
-        });
+        scope.spawn(|_| steal_until_stopped(&started, &stop, &stolen));
         let _stop = StopOnDrop(&stop);
         // The thief must be running on the other worker before the decode
         // starts; this worker spins without touching Rayon, so it cannot run
