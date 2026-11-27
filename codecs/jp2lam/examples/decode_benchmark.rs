@@ -102,8 +102,22 @@ fn main() {
     // report it separately so it is not confused with production timing.
     let (profiled, stats) = decode_jp2_with_stats(&encoded).expect("profiled decode");
     println!("stats_note=stats_path_serializes_tier1_not_production_wall_time");
-    print_stats(&stats);
+    print_stats("stats", &stats);
     drop(profiled);
+    if !legacy {
+        // The request's own path (packed direct output, streaming inverse
+        // DWT), which `decode_jp2_with_stats` does not take.
+        let request = DecodeRequest {
+            resolution,
+            output,
+            concurrency,
+            ..Default::default()
+        };
+        print_stats(
+            "session_stats",
+            &session_stats(&encoded, iterations.min(5), &request),
+        );
+    }
 
     if let Some(levels) = reduce {
         benchmark_reduced(&encoded, iterations, levels, threads, output);
@@ -434,58 +448,67 @@ fn result_dims(result: &DecodeResult) -> (u32, u32) {
     }
 }
 
-fn print_stats(stats: &Jp2DecodeStats) {
+fn print_stats(prefix: &str, stats: &Jp2DecodeStats) {
     let ms = |ns: u64| ns as f64 / 1_000_000.0;
+    let timings = [
+        ("total", stats.total_ns),
+        ("container_parse", stats.container_parse_ns),
+        ("codestream_parse", stats.codestream_parse_ns),
+        ("tile_plan", stats.tile_plan_ns),
+        ("tier2_setup", stats.tier2_setup_ns),
+        ("tier2_packets", stats.tier2_packet_headers_ns),
+        ("tier2_concat", stats.tier2_concat_ns),
+        ("tier1", stats.tier1_total_ns),
+        ("tier1_significance", stats.tier1_significance_ns),
+        ("tier1_refinement", stats.tier1_refinement_ns),
+        ("tier1_cleanup", stats.tier1_cleanup_ns),
+        ("tier1_block_output", stats.tier1_block_output_ns),
+        ("dequantize", stats.dequantize_ns),
+        ("dwt", stats.dwt_total_ns),
+        ("dwt_horizontal", stats.dwt_horizontal_ns),
+        ("dwt_vertical", stats.dwt_vertical_ns),
+        ("inverse_mct", stats.inverse_mct_ns),
+        ("finalize", stats.finalize_ns),
+        ("tile_stitch", stats.tile_stitch_ns),
+        ("output_pack", stats.output_pack_ns),
+    ];
+    for (name, ns) in timings {
+        println!("{prefix}.{name}_ms={:.3}", ms(ns));
+    }
     println!(
-        "stats.container_parse_ms={:.3}",
-        ms(stats.container_parse_ns)
-    );
-    println!(
-        "stats.codestream_parse_ms={:.3}",
-        ms(stats.codestream_parse_ns)
-    );
-    println!("stats.tile_plan_ms={:.3}", ms(stats.tile_plan_ns));
-    println!("stats.tier2_setup_ms={:.3}", ms(stats.tier2_setup_ns));
-    println!(
-        "stats.tier2_packets_ms={:.3}",
-        ms(stats.tier2_packet_headers_ns)
-    );
-    println!("stats.tier2_concat_ms={:.3}", ms(stats.tier2_concat_ns));
-    println!("stats.tier1_ms={:.3}", ms(stats.tier1_total_ns));
-    println!(
-        "stats.tier1_significance_ms={:.3}",
-        ms(stats.tier1_significance_ns)
-    );
-    println!(
-        "stats.tier1_refinement_ms={:.3}",
-        ms(stats.tier1_refinement_ns)
-    );
-    println!("stats.tier1_cleanup_ms={:.3}", ms(stats.tier1_cleanup_ns));
-    println!(
-        "stats.tier1_block_output_ms={:.3}",
-        ms(stats.tier1_block_output_ns)
-    );
-    println!("stats.dequantize_ms={:.3}", ms(stats.dequantize_ns));
-    println!("stats.dwt_ms={:.3}", ms(stats.dwt_total_ns));
-    println!("stats.dwt_horizontal_ms={:.3}", ms(stats.dwt_horizontal_ns));
-    println!("stats.dwt_vertical_ms={:.3}", ms(stats.dwt_vertical_ns));
-    println!(
-        "stats.dwt_levels_ms={:?}",
+        "{prefix}.dwt_levels_ms={:?}",
         stats
             .dwt_level_ns
             .iter()
             .map(|&ns| ms(ns))
             .collect::<Vec<_>>()
     );
-    println!("stats.inverse_mct_ms={:.3}", ms(stats.inverse_mct_ns));
-    println!("stats.finalize_ms={:.3}", ms(stats.finalize_ns));
-    println!("stats.tile_stitch_ms={:.3}", ms(stats.tile_stitch_ns));
-    println!("stats.packets={}", stats.packets);
-    println!("stats.codeblocks={}", stats.codeblocks);
-    println!("stats.codeword_bytes={}", stats.codeword_bytes);
-    println!("stats.coefficient_pixels={}", stats.coefficient_pixels);
-    println!("stats.output_pixels={}", stats.output_pixels);
-    println!("stats.peak_scratch_bytes={}", stats.peak_scratch_bytes);
+    println!("{prefix}.packets={}", stats.packets);
+    println!("{prefix}.codeblocks={}", stats.codeblocks);
+    println!("{prefix}.codeword_bytes={}", stats.codeword_bytes);
+    println!("{prefix}.mq_symbols={}", stats.mq_symbols);
+    println!("{prefix}.coefficient_pixels={}", stats.coefficient_pixels);
+    println!("{prefix}.output_pixels={}", stats.output_pixels);
+    println!("{prefix}.peak_scratch_bytes={}", stats.peak_scratch_bytes);
+}
+
+/// Stage attribution on the benchmarked request's own path
+/// ([`Jp2Decoder::decode_with_stats`]): the fastest of `iterations` profiled
+/// runs, by total. Tier-1 runs serially under profiling; later stages keep the
+/// request's worker budget.
+fn session_stats(encoded: &[u8], iterations: usize, request: &DecodeRequest) -> Jp2DecodeStats {
+    let mut decoder = Jp2Decoder::new();
+    let mut best: Option<Jp2DecodeStats> = None;
+    for _ in 0..iterations.max(1) {
+        let (result, stats) = decoder
+            .decode_with_stats(black_box(encoded), request)
+            .expect("profiled session decode");
+        drop(black_box(result));
+        if best.as_ref().is_none_or(|b| stats.total_ns < b.total_ns) {
+            best = Some(stats);
+        }
+    }
+    best.expect("at least one profiled run")
 }
 
 fn benchmark_reduced(
