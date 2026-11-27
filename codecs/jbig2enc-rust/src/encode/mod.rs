@@ -14,6 +14,7 @@ pub mod comparator;
 pub mod context;
 pub mod cost;
 pub mod document;
+pub mod facade;
 pub mod halftone;
 pub mod shared;
 pub(crate) mod simd;

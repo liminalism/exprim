@@ -4,10 +4,15 @@
 //! It supports both standalone JBIG2 files and PDF-embedded fragments with proper
 //! global dictionary handling.
 
+// Deprecated since 0.7.0: this module duplicates the crate-root API, with its
+// own `Jbig2Error` and a weaker input check. Removed in 0.8.
+#![allow(deprecated)]
+
 // Re-export commonly used types
 pub use ndarray::Array2;
 
 /// Errors that can occur during JBIG2 encoding
+#[deprecated(since = "0.7.0", note = "use the crate-root API")]
 #[derive(Debug)]
 pub enum Jbig2Error {
     /// Input buffer size mismatch
@@ -118,12 +123,14 @@ pub use crate::jbig2structs::Jbig2Config;
 
 use crate::jbig2enc::Jbig2Encoder;
 
+#[deprecated(since = "0.7.0", note = "use the crate-root API")]
 #[derive(Debug, Clone)]
 pub struct Jbig2PdfSplitResult {
     pub global_segments: Option<Vec<u8>>,
     pub page_streams: Vec<Vec<u8>>,
 }
 
+#[deprecated(since = "0.7.0", note = "use the crate-root API")]
 #[derive(Debug, Clone)]
 pub struct Jbig2Context {
     config: Jbig2Config,
@@ -179,6 +186,7 @@ impl Jbig2Context {
     }
 }
 
+#[deprecated(since = "0.7.0", note = "use the crate-root API")]
 pub fn encode_single_image(
     input: &[u8],
     width: u32,
@@ -189,6 +197,7 @@ pub fn encode_single_image(
     encode_single_bitimage(bitimage, Jbig2Context::with_pdf_mode(pdf_mode))
 }
 
+#[deprecated(since = "0.7.0", note = "use the crate-root API")]
 pub fn encode_single_image_lossless(
     input: &[u8],
     width: u32,
@@ -199,6 +208,7 @@ pub fn encode_single_image_lossless(
     encode_single_bitimage(bitimage, Jbig2Context::with_lossless_config(pdf_mode))
 }
 
+#[deprecated(since = "0.7.0", note = "use the crate-root API")]
 pub fn encode_single_image_with_config(
     input: &[u8],
     width: u32,

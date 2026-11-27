@@ -107,7 +107,29 @@ pub fn usize_from_u32(value: u32, operation: &'static str) -> Result<usize, Deco
     usize::try_from(value).map_err(|_| DecodeError::Overflow { operation })
 }
 
+/// The broad class of a [`DecodeError`], for callers (bindings, logs) that
+/// need a stable category rather than the full variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DecodeErrorKind {
+    /// The bytes are not a well-formed JBIG2 stream.
+    Malformed,
+    /// The stream is well formed but uses a feature this decoder lacks.
+    Unsupported,
+    /// Decoding would exceed a configured [`DecodeLimits`](crate::shared::limits::DecodeLimits).
+    Limit,
+}
+
 impl DecodeError {
+    /// The broad class of this error.
+    pub fn kind(&self) -> DecodeErrorKind {
+        match self {
+            DecodeError::Limit(_) => DecodeErrorKind::Limit,
+            DecodeError::Unsupported(_) => DecodeErrorKind::Unsupported,
+            _ => DecodeErrorKind::Malformed,
+        }
+    }
+
     /// Convenience constructor threading a limit failure through the top-level
     /// error.
     pub fn limit(inner: LimitError) -> Self {

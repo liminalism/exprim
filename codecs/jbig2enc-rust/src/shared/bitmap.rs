@@ -24,6 +24,32 @@ pub enum CombinationOperator {
     Replace,
 }
 
+/// Which bit value means black in a caller's bilevel buffer.
+///
+/// JBIG2 (like PBM and Leptonica) stores 1 = black. TIFF `MinIsBlack`, most
+/// 1bpp DIBs with a black-first palette, and every grayscale format store
+/// 0 = black. Conflating the two produces a valid but fully inverted image,
+/// so every API that crosses a caller's buffer names its polarity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Polarity {
+    /// A set bit (or non-zero byte) is black: JBIG2's own convention.
+    #[default]
+    OneIsBlack,
+    /// A clear bit (or zero byte) is black.
+    ZeroIsBlack,
+}
+
+/// A caller-supplied buffer cannot hold the rows asked of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BufferLayoutError {
+    #[error("stride {stride} is shorter than a row ({row_bytes} bytes)")]
+    StrideTooShort { stride: usize, row_bytes: usize },
+    #[error("buffer has {len} bytes but needs {required}")]
+    BufferTooSmall { len: usize, required: usize },
+    #[error("buffer size overflows the address space")]
+    Overflow,
+}
+
 /// A packed one-bit-per-pixel bitmap with word-aligned rows.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct MonoBitmap {
@@ -454,6 +480,78 @@ impl MonoBitmap {
             dst_row_start += dst_stride;
             src_row_start += src_stride;
         }
+    }
+
+    /// Bytes per row in the packed MSB-first form: `ceil(width / 8)`.
+    #[inline]
+    pub fn packed_row_bytes(&self) -> usize {
+        (self.width as usize).div_ceil(8)
+    }
+
+    /// Copy the bitmap into a caller's buffer as MSB-first packed rows
+    /// `dst_stride` bytes apart, in the caller's `polarity`.
+    ///
+    /// `dst` needs `dst_stride * (height - 1) + packed_row_bytes()` bytes: the
+    /// last row need not be padded out to the stride. Bytes between the end of
+    /// a row and the next stride are left untouched. Bits past `width` in a
+    /// row's last byte are written as white in the requested polarity.
+    pub fn copy_packed_rows(
+        &self,
+        dst: &mut [u8],
+        dst_stride: usize,
+        polarity: Polarity,
+    ) -> Result<(), BufferLayoutError> {
+        let row_bytes = self.packed_row_bytes();
+        if dst_stride < row_bytes {
+            return Err(BufferLayoutError::StrideTooShort {
+                stride: dst_stride,
+                row_bytes,
+            });
+        }
+        let required = if self.height == 0 {
+            0
+        } else {
+            dst_stride
+                .checked_mul(self.height as usize - 1)
+                .and_then(|bytes| bytes.checked_add(row_bytes))
+                .ok_or(BufferLayoutError::Overflow)?
+        };
+        if dst.len() < required {
+            return Err(BufferLayoutError::BufferTooSmall {
+                len: dst.len(),
+                required,
+            });
+        }
+        let flip = match polarity {
+            Polarity::OneIsBlack => 0u8,
+            Polarity::ZeroIsBlack => 0xFF,
+        };
+        for y in 0..self.height {
+            let start = y as usize * dst_stride;
+            let out = &mut dst[start..start + row_bytes];
+            for (chunk, word) in out.chunks_mut(4).zip(self.row(y)) {
+                let bytes = word.to_be_bytes();
+                for (dst_byte, &src_byte) in chunk.iter_mut().zip(&bytes) {
+                    *dst_byte = src_byte ^ flip;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The bitmap as one byte per pixel, row-major, 1 = black: the layout the
+    /// encoder's byte-per-pixel entry points accept, so a round trip compares
+    /// equal.
+    pub fn to_bytes_per_pixel(&self) -> Vec<u8> {
+        let width = self.width as usize;
+        let mut out = Vec::with_capacity(width.saturating_mul(self.height as usize));
+        for y in 0..self.height {
+            let row = self.row(y);
+            for x in 0..width {
+                out.push(((row[x >> 5] >> (31 - (x & 31))) & 1) as u8);
+            }
+        }
+        out
     }
 
     /// A borrowed MSB-first byte view of the bitmap: each row is

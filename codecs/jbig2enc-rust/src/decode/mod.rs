@@ -31,7 +31,7 @@ pub mod symbol_dictionary;
 pub mod text_region;
 
 pub use context::{DecodeOptions, DecodeStrictness, DecoderContext, RecoveryEvent};
-pub use error::{DecodeError, LimitError, ParseError, UnsupportedFeature};
+pub use error::{DecodeError, DecodeErrorKind, LimitError, ParseError, UnsupportedFeature};
 pub use file::{FileOrganization, ParsedDocument, ParsedSegment};
 pub use globals::{DecodedGlobals, decode_globals};
 pub use page::{DecodedPage, PageInformation};

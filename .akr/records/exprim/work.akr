@@ -1,6 +1,56 @@
 akr 0.1
 project exprim
 
+record exprim.jbig2.ffi-facade/1 : work {
+    title "jbig2enc-rust: binding-neutral facade, jbig2enc-ffi C ABI, Python moved to its own crate"
+    state proposed
+    scope [ path "codecs/jbig2enc-rust/**" ]
+    intent """
+        Give non-Rust consumers a stable C ABI and make the Rust API suit FFI: packed and strided input, owned encoders, presets and typed errors. Python and C then share one implementation of polarity, packing, presets and error classification.
+        """
+    trace [
+        "Jbig2Encoder borrowed its config, so an owned C handle would be self-referential; a Cow config keeps new(&cfg) source-compatible and adds owned().",
+        "Legacy encode_single_image* now route through DocumentEncoder; want_full_headers only seeds flush(), so PDF output stays byte-identical (tests confirm).",
+        "Resource-limit refusals were anyhow strings; a typed ResourceLimitExceeded inside the anyhow error lets bindings report them distinctly without rewriting encoder internals.",
+        "#[deprecated] on a pub use is inert, so the duplicate encode::api items carry the attribute themselves; Lege never used that module.",
+        "cbindgen turns repr(transparent) wrappers into invalid typedefs of Rust types; the borrowed views (bitmap, PDF output, group) use zero-sized opaque markers cast to the real type.",
+        "Python reads C-contiguous buffers in place while holding the GIL, packing straight to BitImage; the GIL is released only for encoding the packed bitmap.",
+        "Existing Python kwargs keep their exact semantics; preset= is a new path and refuses mixing with symbol_mode/lossless rather than letting one silently win.",
+        "decode_alloc's steady-state test failed once in a workspace run and passed 8/8 alone: it counts allocations process-wide while sibling tests run in parallel.",
+        "Verified: 297 workspace tests pass; the C example builds clean at /W4 as C and C++ and round-trips; 26 Python tests pass; Lege's API surface compiles unchanged."
+    ]
+    acceptance {
+        check c-roundtrip {
+            statement """
+                The C example compiled against the built library round-trips a packed 1bpp image
+                """
+            method manual
+        }
+        check core-tests {
+            statement """
+                Core crate tests pass, including byte-identical encoder output
+                """
+            method command
+            command "cargo test --manifest-path codecs/jbig2enc-rust/Cargo.toml"
+        }
+        check ffi-tests {
+            statement """
+                FFI crate tests pass: exports, panic guard, header drift
+                """
+            method command
+            command "cargo test --manifest-path codecs/jbig2enc-rust/Cargo.toml -p jbig2enc-ffi"
+        }
+        check python-tests {
+            statement """
+                The Python suite passes against the relocated binding
+                """
+            method manual
+        }
+    }
+    implements [ @exprim.jbig2.binding-layout ]
+    author "dk"
+}
+
 record exprim.memory.image-decode-045/1 : work {
     title "0.4.5 image decode and memory optimizations"
     state completed

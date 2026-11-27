@@ -187,7 +187,7 @@ impl<'a> Jbig2Encoder<'a> {
                 .iter()
                 .map(|&index| &self.global_symbols[index])
                 .collect();
-            let layout = plan_symbol_dictionary_layout(&symbols, self.config, None)?;
+            let layout = plan_symbol_dictionary_layout(&symbols, &self.config, None)?;
             let encoded = self.symbol_dictionary_for(&globals, &layout)?;
             for (input, &position) in encoded.input_to_exported_pos.iter().enumerate() {
                 global_positions[globals[input]] = position;
@@ -288,7 +288,7 @@ impl<'a> Jbig2Encoder<'a> {
                     .iter()
                     .map(|&index| &self.global_symbols[index])
                     .collect();
-                Some(plan_symbol_dictionary_layout(&symbols, self.config, None)?)
+                Some(plan_symbol_dictionary_layout(&symbols, &self.config, None)?)
             };
             let local_dict_segment_numbers = if locals.is_empty() {
                 Vec::new()

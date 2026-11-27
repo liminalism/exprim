@@ -1837,7 +1837,7 @@ impl<'a> Jbig2Encoder<'a> {
                     let payload = if use_refinement_text_region {
                         encode_text_region_with_refinement(
                             &planned_instances,
-                            self.config,
+                            &self.config,
                             &self.global_symbols,
                             global_sym_to_dict_pos,
                             num_global_dict_symbols,
@@ -1847,7 +1847,7 @@ impl<'a> Jbig2Encoder<'a> {
                     } else {
                         encode_text_region_mapped(
                             &planned_instances,
-                            self.config,
+                            &self.config,
                             &self.global_symbols,
                             global_sym_to_dict_pos,
                             num_global_dict_symbols,

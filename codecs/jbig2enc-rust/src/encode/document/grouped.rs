@@ -1,7 +1,8 @@
 use super::resources::bitmap_bytes;
 use super::{EncoderMetrics, Jbig2Encoder, PdfSplitOutput};
-use crate::{Jbig2Config, jbig2sym::BitImage};
+use crate::{BilevelImage, Jbig2Config, jbig2sym::BitImage};
 use anyhow::{Result, bail};
+use std::borrow::Cow;
 
 /// Bounds one independently encoded PDF dictionary group. These bounds cover
 /// source-page retention, not total process RSS; symbols and trial streams also
@@ -31,7 +32,7 @@ pub struct EncodedPdfGroup {
 /// Sink or encoding errors are terminal: a sink may already have written data,
 /// so retrying it implicitly could duplicate PDF objects. Errors propagate.
 pub struct PdfGroupEncoder<'a, F: FnMut(EncodedPdfGroup) -> Result<()>> {
-    config: &'a Jbig2Config,
+    config: Cow<'a, Jbig2Config>,
     options: PdfGroupOptions,
     sink: F,
     encoder: Option<Jbig2Encoder<'a>>,
@@ -42,8 +43,25 @@ pub struct PdfGroupEncoder<'a, F: FnMut(EncodedPdfGroup) -> Result<()>> {
     failed: bool,
 }
 
+impl<F: FnMut(EncodedPdfGroup) -> Result<()>> PdfGroupEncoder<'static, F> {
+    /// A group encoder that owns its configuration, and so borrows nothing:
+    /// it can sit behind an opaque handle. Each group's encoder takes its own
+    /// copy of `config`.
+    pub fn owned(config: Jbig2Config, options: PdfGroupOptions, sink: F) -> Result<Self> {
+        Self::with_config(Cow::Owned(config), options, sink)
+    }
+}
+
 impl<'a, F: FnMut(EncodedPdfGroup) -> Result<()>> PdfGroupEncoder<'a, F> {
     pub fn new(config: &'a Jbig2Config, options: PdfGroupOptions, sink: F) -> Result<Self> {
+        Self::with_config(Cow::Borrowed(config), options, sink)
+    }
+
+    fn with_config(
+        config: Cow<'a, Jbig2Config>,
+        options: PdfGroupOptions,
+        sink: F,
+    ) -> Result<Self> {
         if options.max_pages == 0 || options.max_source_bitmap_bytes == Some(0) {
             bail!("PDF group limits must be positive");
         }
@@ -61,6 +79,12 @@ impl<'a, F: FnMut(EncodedPdfGroup) -> Result<()>> PdfGroupEncoder<'a, F> {
             group_index: 0,
             failed: false,
         })
+    }
+
+    /// Add the next page from the caller's own buffer.
+    pub fn push_image(&mut self, image: &BilevelImage<'_>) -> Result<()> {
+        let image = image.to_bit_image()?;
+        self.push_page(image)
     }
 
     pub fn push_page(&mut self, image: BitImage) -> Result<()> {
@@ -90,7 +114,7 @@ impl<'a, F: FnMut(EncodedPdfGroup) -> Result<()>> PdfGroupEncoder<'a, F> {
         }
         let encoder = self
             .encoder
-            .get_or_insert_with(|| Jbig2Encoder::new(self.config));
+            .get_or_insert_with(|| Jbig2Encoder::with_config(self.config.clone()));
         if let Err(error) = encoder.add_page_bitimage(image) {
             self.failed = true;
             return Err(error);

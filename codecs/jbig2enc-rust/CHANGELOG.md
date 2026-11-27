@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.7.0 — unreleased
+
+A binding-neutral API, a C ABI, and the Python binding moved into its own
+crate. Encoded output is byte-identical to 0.6.2 for every existing entry
+point.
+
+### Added
+
+- `BilevelImage`: a validated, borrowed view of the caller's pixels as
+  packed 1bpp rows (`PixelLayout::Packed1`), one byte per pixel (`Bytes`) or
+  thresholded 8-bit grayscale (`Gray8`), each with a row stride and, for the
+  first two, a `Polarity` (`OneIsBlack` / `ZeroIsBlack`). Packed rows are
+  copied into the encoder's bitmap word by word, with no unpacking.
+- `Preset` and `EncodeOptions`: the named configurations (`default`, `text`,
+  `generic`, `lossless`, `text_lossless`, `text_lossless_max_compression`,
+  `text_symbol_unify`, `text_symbol_unify_safe`) plus a `refine` override,
+  validated up front.
+- `DocumentEncoder`: a multi-page encoder that owns its configuration
+  (`'static`, `Send`), finishing as a file or as PDF fragments.
+- `Jbig2Encoder::owned` and `PdfGroupEncoder::owned`; `PdfGroupEncoder::push_image`.
+- `ErrorKind` and `Jbig2Error::kind()`; new variants `InvalidInput`,
+  `InvalidConfig` and `ResourceLimit`. `DecodeErrorKind` and `DecodeError::kind()`.
+  `ResourceLimitExceeded` is the typed error inside a refused encode.
+- `MonoBitmap::copy_packed_rows` (into a caller buffer, any stride and
+  polarity), `MonoBitmap::to_bytes_per_pixel`, `MonoBitmap::packed_row_bytes`.
+- `BitImage::from_packed_rows` and `BitImage::from_byte_rows`.
+- `VERSION`.
+- `jbig2enc-ffi` 0.1.0 (`ffi/`): the C ABI (`jbig2rs`, ABI 1.0).
+
+### Changed
+
+- `Jbig2Error` is `#[non_exhaustive]`. A refusal by `decoder_resource_limits`
+  is now `Jbig2Error::ResourceLimit` rather than `EncodingFailed`, and a
+  configuration the encoder rejects is `InvalidConfig`.
+- `encode_single_image*` and `encode_document_pdf_split` run through
+  `DocumentEncoder`; their output is unchanged.
+- The crate is a workspace with the bindings (`ffi/`, `python/`) as members.
+  `[profile.release]` states `panic = "unwind"`, which the C ABI relies on.
+
+### Removed
+
+- The `python` feature and the `pyo3` dependency. The wheel is now built from
+  the `jbig2enc-py` crate in `python/` (`maturin develop` there, as before);
+  its Python API is unchanged apart from additions (`preset=`,
+  `pixel_format=`, `stride=`, `polarity=`, `threshold=`, `presets()`).
+
+### Deprecated
+
+- `encode::api` (re-exported as `jbig2`): a duplicate of the crate-root API
+  with its own `Jbig2Error`. To be removed in 0.8.
+
 ## 0.6.2 — 2026-11-24
 
 Decoder-side optimisations, two decoder edge-case fixes, and README updates

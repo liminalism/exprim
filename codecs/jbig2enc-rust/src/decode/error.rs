@@ -7,5 +7,5 @@
 //! module re-exports them so decoder code keeps using `crate::decode::error::*`.
 
 pub use crate::shared::error::{
-    DecodeError, LimitError, ParseError, UnsupportedFeature, usize_from_u32,
+    DecodeError, DecodeErrorKind, LimitError, ParseError, UnsupportedFeature, usize_from_u32,
 };

@@ -1,6 +1,6 @@
 [package]
 name = "jbig2enc-rust"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2024"
 description = "JBIG2 encoder implementation in Rust with PDF fragment support"
 license = "MIT AND Apache-2.0"
@@ -17,10 +17,10 @@ categories = ["multimedia::encoding", "multimedia::images"]
 # benchmarks stay in the repository: `cargo package` drops the `[[bin]]`,
 # `[[test]]` and `[[bench]]` targets whose sources are not included, so
 # crates.io lists no installable binaries for this crate.
-# `python/` holds the wheel metadata and stubs for the PyO3 binding
-# (`src/python.rs`, feature `python`), built with maturin; it ships in the
-# crate package so the published source carries both APIs.
-include = ["Cargo.toml", "Cargo.lock", "/README.md", "NOTICE", "LICENSE-MIT", "LICENSE-APACHE", "build.rs", "src/lib.rs", "src/python.rs", "src/decode/**", "src/encode/**", "src/shared/**", "python/pyproject.toml", "python/README.md", "python/jbig2enc.pyi", "python/py.typed"]
+# The bindings are separate crates beside this one: `ffi/` (the C ABI,
+# `jbig2enc-ffi`) and `python/` (the PyO3 wheel, `jbig2enc-py`). Neither ships
+# in this package.
+include = ["Cargo.toml", "Cargo.lock", "/README.md", "NOTICE", "LICENSE-MIT", "LICENSE-APACHE", "build.rs", "src/lib.rs", "src/decode/**", "src/encode/**", "src/shared/**"]
 
 [lib]
 name = "jbig2enc_rust"
@@ -46,15 +46,6 @@ rayon = { version = "1.10", optional = true }
 # `djvulibrust`. Bumping it must move all three crates together, or the tree
 # compiles and links two copies of `wide`.
 wide = "=0.7.33"
-# The `python` feature builds the PyO3 extension module in `src/python.rs`.
-# `abi3-py311` yields one wheel per platform for every CPython from 3.11 up;
-# 3.11 is the floor because pyo3 gates the buffer protocol behind `Py_3_11`
-# under the limited API, and accepting NumPy/PIL buffers directly is most of
-# the binding's value. `extension-module` is NOT set here: it leaves the
-# Python symbols unresolved until import, which would break every Rust
-# consumer that links an executable. maturin enables it for wheel builds
-# (see `python/pyproject.toml`).
-pyo3 = { version = "0.29", features = ["abi3-py311"], optional = true }
 
 [target.'cfg(not(windows))'.dependencies]
 pprof = { version = "0.15", features = ["flamegraph"], optional = true }
@@ -87,9 +78,6 @@ symboldict = ["encode"]
 refine = []
 halftone_bin = ["dep:image"]
 parallel = ["dep:rayon"]
-# Python bindings (`src/python.rs`), built into a wheel with maturin from the
-# `python/` directory. Needs the encoder, the decoder and symbol mode.
-python = ["dep:pyo3", "encode", "decode", "symboldict"]
 profiling = ["dep:pprof"]
 # Opt-in benchmark that links the C jbig2enc bridge (tests/headsup_c_vs_rust.rs).
 # Empty because the bridge is provided via build-script/linker flags at bench
@@ -287,6 +275,16 @@ tempfile = "3.27.0"
 hex-literal = "1.0.0"
 criterion = "0.7"
 
+# The bindings live beside the codec: `ffi/` (the C ABI) and `python/` (the
+# PyO3 wheel) are members; `fuzz/` keeps its own workspace. The codec's `include` allowlist keeps both out of
+# its crates.io package.
+[workspace]
+members = [".", "ffi", "python"]
+exclude = ["fuzz"]
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Load-bearing for the C ABI: every `jbig2rs_*` export catches unwinds so a
+# panic cannot cross into C. With `abort` a codec bug kills the host process.
+panic = "unwind"

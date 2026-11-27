@@ -220,7 +220,7 @@ impl<'a> Jbig2Encoder<'a> {
         if self.trial_memo.is_none() || layout.refinements.iter().any(Option::is_some) {
             return super::dictionary::encode_symbol_dictionary_segments(
                 &refs,
-                self.config,
+                &self.config,
                 layout,
             );
         }
@@ -239,7 +239,7 @@ impl<'a> Jbig2Encoder<'a> {
                 super::dictionary::encode_symbol_dictionary_segments_resumed(
                     &refs,
                     Some((symbols, &mut memo.prefixes)),
-                    self.config,
+                    &self.config,
                     layout,
                 )
             })

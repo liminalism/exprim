@@ -7,7 +7,9 @@ mod grouped;
 mod resources;
 mod symbol;
 pub use grouped::{EncodedPdfGroup, PdfGroupEncoder, PdfGroupOptions};
-pub use resources::{DecoderResourceLimits, DocumentResourceMetrics, PageResourceMetrics};
+pub use resources::{
+    DecoderResourceLimits, DocumentResourceMetrics, PageResourceMetrics, ResourceLimitExceeded,
+};
 
 #[cfg(feature = "symboldict")]
 use symbol::types::*;
@@ -196,8 +198,10 @@ struct EncoderState {
 /// This struct manages the encoding state and configuration for JBIG2 documents.
 /// It supports both symbol-based and generic region encoding strategies.
 pub struct Jbig2Encoder<'a> {
-    /// Configuration for the encoder
-    config: &'a Jbig2Config,
+    /// Configuration for the encoder. Borrowed by [`Jbig2Encoder::new`], owned
+    /// by [`Jbig2Encoder::owned`] so an encoder can outlive its caller's config
+    /// (an opaque FFI handle, a long-lived document encoder).
+    config: std::borrow::Cow<'a, Jbig2Config>,
 
     /// Internal encoder state
     state: EncoderState,
@@ -248,11 +252,21 @@ impl<'a> Jbig2Encoder<'a> {
     /// # Arguments
     /// * `config` - Configuration for the encoder
     pub fn new(config: &'a Jbig2Config) -> Self {
+        Self::with_config(std::borrow::Cow::Borrowed(config))
+    }
+
+    /// Creates an encoder that owns its configuration, and so borrows nothing.
+    pub fn owned(config: Jbig2Config) -> Jbig2Encoder<'static> {
+        Jbig2Encoder::with_config(std::borrow::Cow::Owned(config))
+    }
+
+    pub(crate) fn with_config(config: std::borrow::Cow<'a, Jbig2Config>) -> Self {
+        let full_headers_remaining = config.want_full_headers;
         Self {
             config,
             state: EncoderState {
                 pdf_mode: false, // start in raw mode
-                full_headers_remaining: config.want_full_headers,
+                full_headers_remaining,
                 segment: true, // Default to using segments
                 lossy_symbol_mode_applied: false,
                 ingest_debug_lines: Vec::new(),

@@ -1,6 +1,28 @@
 use super::symbol::types::PlannedDocument;
 use crate::jbig2sym::BitImage;
-use anyhow::{Result, bail};
+use anyhow::Result;
+
+/// A [`DecoderResourceLimits`] budget the planned document would exceed.
+///
+/// Carried inside the encoder's `anyhow::Error` so callers can tell a refusal
+/// they configured from an encoding failure (`error.downcast_ref::<ResourceLimitExceeded>()`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceLimitExceeded(pub String);
+
+impl std::fmt::Display for ResourceLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ResourceLimitExceeded {}
+
+/// `bail!` with a typed [`ResourceLimitExceeded`].
+macro_rules! limit_exceeded {
+    ($($arg:tt)*) => {
+        return Err(ResourceLimitExceeded(format!($($arg)*)).into())
+    };
+}
 
 /// Explicit budgets supplied by the application after measuring its readers.
 /// Bitmap limits count word-aligned pixel storage, excluding allocator,
@@ -99,13 +121,13 @@ impl DecoderResourceLimits {
             .max_encoded_global_bytes
             .is_some_and(|limit| metrics.encoded_global_bytes > limit)
         {
-            bail!("encoded globals exceed caller resource limit");
+            limit_exceeded!("encoded globals exceed caller resource limit");
         }
         if self
             .max_global_bitmap_bytes
             .is_some_and(|limit| metrics.global_dictionary_bitmap_bytes > limit)
         {
-            bail!("global dictionary bitmap storage exceeds caller resource limit");
+            limit_exceeded!("global dictionary bitmap storage exceeds caller resource limit");
         }
         for (index, page) in metrics.pages.iter().enumerate() {
             let dictionary_bytes = metrics
@@ -115,7 +137,7 @@ impl DecoderResourceLimits {
                 .max_page_dictionary_bitmap_bytes
                 .is_some_and(|limit| dictionary_bytes > limit)
             {
-                bail!(
+                limit_exceeded!(
                     "page {} dictionary bitmap storage exceeds caller resource limit",
                     index + 1
                 );
@@ -124,7 +146,7 @@ impl DecoderResourceLimits {
                 .max_cold_page_work_pixels
                 .is_some_and(|limit| page.cold_work_pixels > limit)
             {
-                bail!(
+                limit_exceeded!(
                     "page {} cold decode work exceeds caller resource limit",
                     index + 1
                 );

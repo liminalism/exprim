@@ -54,9 +54,21 @@ has the full list.
   that records every recovery it performs. No panics on malformed input.
 - A pooled, allocation-free steady state for multi-page rendering.
 
-**Python**: `pip install jbig2enc` (built from this crate's `python` feature)
-gives `encode`, `encode_for_pdf`, `encode_document`, `decode`,
-`decode_document` and `decode_pdf_stream` over any buffer-protocol object.
+**Python**: `pip install jbig2enc` (built from `python/`) gives `encode`,
+`encode_for_pdf`, `encode_document`, `decode`, `decode_document` and
+`decode_pdf_stream` over any buffer-protocol object.
+
+**C ABI**: `jbig2enc-ffi` (in `ffi/`) builds `jbig2rs.dll` / `libjbig2rs.so` /
+`libjbig2rs.dylib` and a static library, with a checked-in header
+(`ffi/include/jbig2rs.h`). C, C++, C#, Java (jextract), Swift and Go consume
+it directly. See [ffi/README.md](ffi/README.md).
+
+All three (Rust, C and Python) share one binding-neutral API:
+`BilevelImage` takes the caller's pixels in whatever layout they already hold
+(packed 1bpp rows with a stride and either polarity, one byte per pixel, or
+8-bit grayscale with a threshold); `Preset` / `EncodeOptions` name the
+measured configurations; `DocumentEncoder` owns its configuration and so can
+sit behind an opaque handle; `Jbig2Error::kind()` gives a stable error class.
 
 ## Quick start (Rust)
 
@@ -214,12 +226,14 @@ decoded, width, height = jbig2enc.decode(data)
 assert decoded == pixels
 ```
 
-The binding exposes `symbol_mode`, `refine` and the `lossless` preset; the
-default `symbol_mode=True` is the lossy `text()` preset, so pass
-`symbol_mode=False` when exactness matters. Calls release the GIL. The
-binding lives in `src/python.rs` behind the `python` feature and is built
-with [maturin](https://www.maturin.rs) from the `python/` directory, which
-also holds the stubs and the test suite:
+The binding exposes the named presets (`preset="text_lossless"`, ...;
+`jbig2enc.presets()` lists them), `symbol_mode`, `refine` and `lossless`, and
+reads packed (`pixel_format="packed1"`) or grayscale (`"gray8"`) buffers
+directly. The default `symbol_mode=True` is lossy, so pass
+`symbol_mode=False` (or a bit-exact preset) when exactness matters. Calls
+release the GIL. The binding is its own crate, `python/` (`jbig2enc-py`), a
+thin layer over the codec built with [maturin](https://www.maturin.rs); the
+directory also holds the stubs and the test suite:
 
 ```sh
 cd python && pip install maturin && maturin develop --release && pytest tests
@@ -235,7 +249,6 @@ See [python/README.md](python/README.md).
 | `decode` | yes | The decoder half. Either half builds without the other; the PDF renderer uses `default-features = false, features = ["decode"]`. |
 | `symboldict` | yes | Symbol-dictionary encoding (implies `encode`). Without it the encoder is generic-only. |
 | `parallel` | no | Rayon in the measured symbol planner's trial encodes and page serialization. Never enabled implicitly; a document-parallel host should leave it off. |
-| `python` | no | The PyO3 extension module. Built by maturin, not by `cargo build`. |
 | `cli` | no | The `tester` and `halftone_tester` development binaries (`clap`, `env_logger`). They live in the repository only and are not part of the published crate, so `cargo install` does not offer them. |
 | `halftone_bin` | no | Image loading for the halftone tool. |
 | `refine` | no | Refinement-related configuration paths. |
@@ -327,9 +340,11 @@ src/
              planning, dictionaries, text regions, residuals, PDF groups)
   decode/    segment/page parsing, generic/text/halftone/refinement regions,
              symbol dictionaries, huffman, mmr, arith, context pooling
+  encode/facade.rs  the binding-neutral API (BilevelImage, Preset,
+             EncodeOptions, DocumentEncoder)
   shared/    protocol core used by both halves (MQ table, bitmaps, limits)
-  python.rs  the PyO3 module (feature `python`)
-python/      wheel metadata, type stubs and Python tests
+ffi/         jbig2enc-ffi: the C ABI, its generated header and a C example
+python/      jbig2enc-py: the PyO3 wheel, type stubs and Python tests
 tools/       corpus preparation, benchmark and audit scripts
 docs/        contracts, reports, benchmark data and validation logs
 ```
@@ -340,8 +355,9 @@ Project contributions are MIT. The arithmetic coder in `src/encode/arith.rs`
 and its extracted shared tables derive from `agl/jbig2enc` and remain
 Apache-2.0 with their Google/Adam Langley notices. Cargo records the package
 as `MIT AND Apache-2.0`: a mix of permissive terms, both texts included
-(`LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE`). The Python wheel is declared the
-same way because it links the crate. The DjVuLibre-derived component code
+(`LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE`). The Python wheel and the C
+library are declared the same way because they link the crate; distribute
+`NOTICE` with a binary build. The DjVuLibre-derived component code
 and its inherited tests have been replaced; there is no copyleft component.
 [PROVENANCE.md](PROVENANCE.md) records the source history and audits.
 

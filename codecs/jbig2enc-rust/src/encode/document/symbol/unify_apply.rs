@@ -216,7 +216,7 @@ impl<'a> Jbig2Encoder<'a> {
             build_symbol_context_model(&self.pages, &self.global_symbols, &self.symbol_signatures);
         let (classes, diagnostics) =
             crate::jbig2unify::build_symbol_unify_classes(SymbolUnifyInputs {
-                config: self.config,
+                config: &self.config,
                 global_symbols: &self.global_symbols,
                 symbol_usage: &self.symbol_usage,
                 symbol_page_count: &self.symbol_page_count,

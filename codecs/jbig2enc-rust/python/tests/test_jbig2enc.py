@@ -397,3 +397,71 @@ def test_decode_rejects_garbage():
 
     with pytest.raises(ValueError, match="decoding JBIG2"):
         jbig2enc.decode_pdf_stream(b"\x00\x01\x02\x03")
+
+
+# --- Input layouts and presets ---------------------------------------------
+#
+# These exercise the binding-neutral facade the C ABI shares: every layout of
+# the same image must encode to the same bytes, because the encoder sees the
+# same bitmap.
+
+
+def pack_rows(pixels, width, height, stride, zero_is_black=False):
+    """MSB-first packed rows `stride` bytes apart, as PBM or a TIFF strip."""
+    out = bytearray(stride * height)
+    for y in range(height):
+        for x in range(width):
+            if bool(pixels[y * width + x]) != zero_is_black:
+                out[y * stride + x // 8] |= 0x80 >> (x % 8)
+    return bytes(out)
+
+
+def test_packed_input_matches_byte_input_in_either_polarity():
+    pixels = text_like_page()
+    reference = jbig2enc.encode(pixels, WIDTH, HEIGHT)
+    tight = pack_rows(pixels, WIDTH, HEIGHT, (WIDTH + 7) // 8)
+    assert jbig2enc.encode(tight, WIDTH, HEIGHT, pixel_format="packed1") == reference
+
+    stride = (WIDTH + 7) // 8 + 5
+    padded = pack_rows(pixels, WIDTH, HEIGHT, stride, zero_is_black=True)
+    encoded = jbig2enc.encode(
+        padded, WIDTH, HEIGHT, pixel_format="packed1", stride=stride, polarity="zero_is_black"
+    )
+    assert encoded == reference
+
+
+def test_gray8_input_thresholds_like_pack_grayscale():
+    pixels = text_like_page()
+    gray = bytes(20 if value else 230 for value in pixels)
+    reference = jbig2enc.encode(jbig2enc.pack_grayscale(gray, WIDTH, HEIGHT), WIDTH, HEIGHT)
+    assert jbig2enc.encode(gray, WIDTH, HEIGHT, pixel_format="gray8") == reference
+
+
+def test_presets_are_listed_and_accepted():
+    names = jbig2enc.presets()
+    assert {"default", "generic", "lossless", "text", "text_lossless"} <= set(names)
+    pixels = text_like_page()
+    assert jbig2enc.encode(pixels, WIDTH, HEIGHT, preset="default") == jbig2enc.encode(
+        pixels, WIDTH, HEIGHT
+    )
+    assert jbig2enc.encode(pixels, WIDTH, HEIGHT, preset="lossless") == jbig2enc.encode(
+        pixels, WIDTH, HEIGHT, lossless=True
+    )
+    for name in names:
+        globals_, page = jbig2enc.encode_for_pdf(pixels, WIDTH, HEIGHT, preset=name)
+        decoded, _, _ = jbig2enc.decode_pdf_stream(page, globals_)
+        assert len(decoded) == WIDTH * HEIGHT, name
+
+
+def test_preset_options_are_validated():
+    pixels = text_like_page()
+    with pytest.raises(ValueError, match="unknown preset"):
+        jbig2enc.encode(pixels, WIDTH, HEIGHT, preset="fastest")
+    with pytest.raises(ValueError, match="cannot be combined"):
+        jbig2enc.encode(pixels, WIDTH, HEIGHT, preset="text", symbol_mode=False)
+    with pytest.raises(ValueError, match="refinement"):
+        jbig2enc.encode(pixels, WIDTH, HEIGHT, preset="generic", refine=True)
+    with pytest.raises(ValueError, match="unknown pixel_format"):
+        jbig2enc.encode(pixels, WIDTH, HEIGHT, pixel_format="rgb")
+    with pytest.raises(ValueError, match="stride"):
+        jbig2enc.encode(pixels, WIDTH, HEIGHT, pixel_format="packed1", stride=1)

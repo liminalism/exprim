@@ -22,13 +22,14 @@ Repository = "https://github.com/liminalism/exprim"
 Source = "https://github.com/liminalism/exprim/tree/main/codecs/jbig2enc-rust"
 
 [tool.maturin]
-# The extension is the `python` feature of the crate one directory up; its
-# manifest keeps `extension-module` off so Rust consumers can link
-# executables, and maturin turns it on here for the wheel only.
+# The extension is the `jbig2enc-py` crate in this directory, a thin layer
+# over the codec one directory up. Its manifest leaves pyo3's
+# `extension-module` off so `cargo build --workspace` can link it; maturin
+# turns it on here for the wheel only.
 bindings = "pyo3"
-manifest-path = "../Cargo.toml"
+manifest-path = "Cargo.toml"
 module-name = "jbig2enc"
-features = ["python", "pyo3/extension-module"]
+features = ["pyo3/extension-module"]
 # The encoder is the whole point of the wheel; LTO is worth the build time
 # because it is paid once per release, not per iteration.
 profile = "release"

@@ -325,6 +325,65 @@ impl BitImage {
         Self::from_contiguous(width, height, |idx| contiguous_bit(bytes, idx))
     }
 
+    /// Creates a bitmap from MSB-first packed rows `stride` bytes apart, the
+    /// layout of a PBM raster, a Leptonica `PIX`, a TIFF strip or a Windows
+    /// 1bpp DIB (top-down). A set bit is black unless `invert`, in which case a
+    /// clear bit is black. Bits past `width` in each row are ignored.
+    ///
+    /// Whole rows are copied as big-endian words: no per-pixel work.
+    pub fn from_packed_rows(
+        width: usize,
+        height: usize,
+        stride: usize,
+        data: &[u8],
+        invert: bool,
+    ) -> Result<Self, String> {
+        let mut image = Self::alloc(width, height)?;
+        let row_bytes = width.div_ceil(8);
+        required_strided_len(height, stride, row_bytes, data.len())?;
+        let flip = if invert { u32::MAX } else { 0 };
+        let stride_words = image.stride_words;
+        for (y, dst) in image.words.chunks_exact_mut(stride_words).enumerate() {
+            let start = y * stride;
+            let row = &data[start..start + row_bytes];
+            for (word, chunk) in dst.iter_mut().zip(row.chunks(4)) {
+                let mut bytes = [0u8; 4];
+                bytes[..chunk.len()].copy_from_slice(chunk);
+                *word = u32::from_be_bytes(bytes) ^ flip;
+            }
+        }
+        image.mask_row_padding();
+        Ok(image)
+    }
+
+    /// Creates a bitmap from one byte per pixel, rows `stride` bytes apart,
+    /// where `is_black` decides each pixel.
+    pub fn from_byte_rows(
+        width: usize,
+        height: usize,
+        stride: usize,
+        data: &[u8],
+        is_black: impl Fn(u8) -> bool,
+    ) -> Result<Self, String> {
+        let mut image = Self::alloc(width, height)?;
+        required_strided_len(height, stride, width, data.len())?;
+        let stride_words = image.stride_words;
+        for (y, dst) in image.words.chunks_exact_mut(stride_words).enumerate() {
+            let start = y * stride;
+            let row = &data[start..start + width];
+            for (word, pixels) in dst.iter_mut().zip(row.chunks(32)) {
+                let mut packed = 0u32;
+                for (i, &value) in pixels.iter().enumerate() {
+                    if is_black(value) {
+                        packed |= 0x8000_0000 >> i;
+                    }
+                }
+                *word = packed;
+            }
+        }
+        Ok(image)
+    }
+
     pub fn try_from_bytes(width: usize, height: usize, bytes: &[u8]) -> Result<Self, String> {
         Self::from_bytes(width, height, bytes)
     }
@@ -710,6 +769,31 @@ pub fn compute_glyph_hash(image: &BitImage) -> u64 {
     image.height.hash(&mut hasher);
     image.packed_words().hash(&mut hasher);
     hasher.finish()
+}
+
+/// Check that `len` bytes hold `height` rows of `row_bytes` bytes, `stride`
+/// bytes apart (the last row need not be padded out to `stride`).
+fn required_strided_len(
+    height: usize,
+    stride: usize,
+    row_bytes: usize,
+    len: usize,
+) -> Result<(), String> {
+    if stride < row_bytes {
+        return Err(format!(
+            "stride {stride} is shorter than a row ({row_bytes} bytes)"
+        ));
+    }
+    let required = stride
+        .checked_mul(height.saturating_sub(1))
+        .and_then(|bytes| bytes.checked_add(row_bytes))
+        .ok_or_else(|| "image size overflows the address space".to_string())?;
+    if len < required {
+        return Err(format!(
+            "buffer has {len} bytes but the image needs {required}"
+        ));
+    }
+    Ok(())
 }
 
 /// Converts an `ndarray::Array2<u8>` to a `BitImage`.

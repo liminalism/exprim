@@ -5,7 +5,7 @@ build {
     tool "akr 0.8.0"
     grammar "0.1"
     vocabulary "0.3"
-    source_graph "sha256:9d9d4d3d1b8fee991469b0d7249434ef45caf4231391eb0ebd8f95591255ee96"
+    source_graph "sha256:f82d7abd99b6b742755459d735c4c92fd52070932f38d41730e2d007785a0df1"
 }
 
 source ".akr/project.akr" {
@@ -14,8 +14,8 @@ source ".akr/project.akr" {
 }
 
 source ".akr/records/exprim/decisions.akr" {
-    hash "sha256:37ef469f2e79fd3484c29d3ff29e5f8799e1804a4ee24709ef052ed5c1ad4ca8"
-    records 9
+    hash "sha256:da80d55cda4604080928d5f00a7d988f30e130088270a266d4bc8494a1fd0349"
+    records 10
 }
 
 source ".akr/records/exprim/evidence.akr" {
@@ -44,8 +44,14 @@ source ".akr/records/exprim/questions.akr" {
 }
 
 source ".akr/records/exprim/work.akr" {
-    hash "sha256:7ca2c3433f8a14c27e5592c5b6e1a411adb3234bb84fd91c05ffae77b5604c7a"
-    records 8
+    hash "sha256:99f14a08eb6c0b5b76b03eda7790c3b360a853cc315663d504941e54a42a4b17"
+    records 9
+}
+
+resolution @exprim.jbig2.ffi-facade/1 {
+    slot implements
+    to @exprim.jbig2.binding-layout/1
+    hash "sha256:57480f880fc4575969463a6bac0c344051d953cfb9cd0704a88d186a14228aa9"
 }
 
 resolution @exprim.memory.chunked-lowering/1 {

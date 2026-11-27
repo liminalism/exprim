@@ -1,0 +1,29 @@
+# The PyO3 extension behind the `jbig2enc` wheel on PyPI. Built by maturin
+# from this directory (see pyproject.toml); not published to crates.io.
+#
+# It lives beside the C ABI (`../ffi`) rather than inside it: the wheel and
+# the C library have different stability contracts and toolchains, and the
+# Python idioms (buffer protocol, GIL release, exceptions) need more than a C
+# ABI expresses. Both are thin layers over the codec's binding-neutral facade.
+[package]
+name = "jbig2enc-py"
+# Kept equal to the codec's version: the wheel reports it as __version__.
+version = "0.7.0"
+edition = "2024"
+description = "Python bindings (PyO3) for the jbig2enc-rust JBIG2 encoder and decoder"
+license = "MIT AND Apache-2.0"
+repository = "https://github.com/liminalism/exprim"
+publish = false
+
+[lib]
+name = "jbig2enc"
+crate-type = ["cdylib"]
+
+[dependencies]
+jbig2enc-rust = { version = "0.7.0", path = "..", default-features = false, features = ["encode", "decode", "symboldict"] }
+# `abi3-py311` yields one wheel per platform for every CPython from 3.11 up;
+# 3.11 is the floor because pyo3 gates the buffer protocol behind `Py_3_11`
+# under the limited API, and accepting NumPy/PIL buffers directly is most of
+# the binding's value. maturin adds `extension-module` for wheel builds (see
+# pyproject.toml), which leaves the Python symbols to be resolved at import.
+pyo3 = { version = "0.29", features = ["abi3-py311"] }

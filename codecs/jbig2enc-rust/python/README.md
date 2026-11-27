@@ -12,10 +12,11 @@ Requires CPython 3.11 or newer.
 pip install jbig2enc
 ```
 
-The binding is the `python` Cargo feature of the `jbig2enc-rust` crate
-(`src/python.rs`, one directory up); this directory holds the wheel
-metadata, the type stubs and the tests. Building from a checkout needs a
-Rust toolchain and `maturin`, run from this directory:
+The binding is the `jbig2enc-py` crate in this directory (`src/lib.rs`), a
+thin layer over the `jbig2enc-rust` codec one directory up. The C ABI
+(`../ffi`) is built on the same layer, so pixel layouts, polarity and presets
+behave identically in both. Building from a checkout needs a Rust toolchain
+and `maturin`, run from this directory:
 
 ```sh
 pip install maturin
@@ -23,8 +24,9 @@ maturin develop --release
 pytest tests
 ```
 
-The crate's own manifest keeps pyo3's `extension-module` off so that Rust
-programs can link the library; `pyproject.toml` turns it on for the wheel.
+The crate's manifest keeps pyo3's `extension-module` off so that
+`cargo build --workspace` can link it; `pyproject.toml` turns it on for the
+wheel.
 
 ## Use
 
@@ -45,7 +47,29 @@ with open("scan.jb2", "wb") as handle:
 ```
 
 Any buffer works — `bytes`, `bytearray`, `memoryview`, or a contiguous
-`uint8` NumPy array.
+`uint8` NumPy array. A contiguous buffer is read in place, without a copy.
+
+Other layouts need no conversion pass:
+
+```python
+# 8-bit grayscale directly (black below the threshold):
+jbig2enc.encode(page.tobytes(), page.width, page.height, pixel_format="gray8", threshold=128)
+
+# Packed 1bpp rows, e.g. PIL mode "1" (which stores 0 = black):
+mono = page.convert("1")
+jbig2enc.encode(mono.tobytes(), mono.width, mono.height,
+                pixel_format="packed1", polarity="zero_is_black")
+```
+
+`stride=` gives the bytes between rows when they are padded.
+
+### Presets
+
+`preset=` names a whole configuration: `jbig2enc.presets()` lists them.
+`"generic"` and `"lossless"` are bit-exact; `"text_lossless"` is pixel-exact
+symbol coding; `"text_symbol_unify"` and `"text_symbol_unify_safe"` trade
+exactness for size. A preset cannot be combined with `symbol_mode` or
+`lossless`; `refine` still applies to symbol presets.
 
 ### Embedding in a PDF
 

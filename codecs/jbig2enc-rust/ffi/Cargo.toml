@@ -1,0 +1,45 @@
+# C ABI over jbig2enc-rust: one shared/static library (`jbig2rs`) plus a
+# checked-in header (`include/jbig2rs.h`) that C, C++, C#, Java (jextract),
+# Swift, Go and Zig consume directly. Python has its own PyO3 crate in
+# `../python`: its idioms (buffer protocol, GIL release, exceptions) need more
+# than a C ABI expresses.
+#
+# Licence: the same as the codec (MIT AND Apache-2.0). A binary build links
+# the codec's Apache-2.0 arithmetic-coder files, so distribute NOTICE with it.
+[package]
+name = "jbig2enc-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "Stable C ABI (jbig2rs.h) for the jbig2enc-rust JBIG2 encoder and decoder"
+license = "MIT AND Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/jbig2enc-ffi"
+homepage = "https://github.com/liminalism/exprim/tree/main/codecs/jbig2enc-rust/ffi"
+repository = "https://github.com/liminalism/exprim"
+keywords = ["jbig2", "ffi", "c-api", "pdf", "encoder"]
+categories = ["multimedia::encoding", "multimedia::images", "external-ffi-bindings"]
+include = [
+    "Cargo.toml", "/README.md", "/CHANGELOG.md", "NOTICE", "LICENSE-MIT", "LICENSE-APACHE",
+    "cbindgen.toml", "src/**", "include/**", "examples/*.c",
+]
+
+[lib]
+name = "jbig2rs"
+# `cdylib` for jbig2rs.dll / libjbig2rs.so / libjbig2rs.dylib; `staticlib`
+# for linking into a C or C++ program; `rlib` so the tests can call the
+# exports from Rust.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+jbig2enc-rust = { version = "0.7.0", path = "..", default-features = false, features = ["encode", "decode", "symboldict"] }
+anyhow = "1.0"
+
+[features]
+default = []
+# Rayon-parallel planning inside the codec. Off by default: a host that
+# already parallelises across documents or pages may not want a second pool.
+parallel = ["jbig2enc-rust/parallel"]
+
+[dev-dependencies]
+# Regenerates the header in `tests/header.rs` to catch drift.
+cbindgen = { version = "0.29", default-features = false }

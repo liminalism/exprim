@@ -3,14 +3,48 @@
 //! This crate provides functionality to encode binary images into the JBIG2 format.
 //! It supports both standalone JBIG2 files and PDF-embedded fragments with proper
 //! global dictionary handling.
+//!
+//! The binding-neutral entry points are [`BilevelImage`] (the caller's pixels
+//! in any common layout), [`EncodeOptions`] / [`Preset`] and
+//! [`DocumentEncoder`]. The C ABI (`jbig2enc-ffi`) and the Python wheel are
+//! thin translations of them.
 
 // Re-export commonly used types
 pub use ndarray::Array2;
 
+/// The crate version, for bindings that report the codec they link.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The broad class of a [`Jbig2Error`]: stable across releases, so bindings
+/// can map it to their own status codes or exception types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+#[cfg(feature = "encode")]
+pub enum ErrorKind {
+    /// The image or its buffer was invalid: dimensions, stride, length.
+    InvalidInput,
+    /// The configuration is not one the encoder accepts.
+    InvalidConfig,
+    /// The output would exceed a configured `DecoderResourceLimits` budget.
+    ResourceLimit,
+    /// Encoding itself failed.
+    Encode,
+}
+
 /// Errors that can occur during JBIG2 encoding
 #[derive(Debug)]
+#[non_exhaustive]
 #[cfg(feature = "encode")]
 pub enum Jbig2Error {
+    /// The image or its buffer was invalid (dimensions, stride, length).
+    InvalidInput { message: String },
+
+    /// The configuration is not one the encoder accepts.
+    InvalidConfig { message: String },
+
+    /// The output would exceed a configured decoder resource budget.
+    ResourceLimit { message: String },
+
     /// Input buffer size mismatch
     BufferSizeMismatch {
         expected: usize,
@@ -49,6 +83,13 @@ pub enum Jbig2Error {
 impl std::fmt::Display for Jbig2Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Jbig2Error::InvalidInput { message } => write!(f, "Invalid input: {}", message),
+            Jbig2Error::InvalidConfig { message } => {
+                write!(f, "Invalid configuration: {}", message)
+            }
+            Jbig2Error::ResourceLimit { message } => {
+                write!(f, "Resource limit exceeded: {}", message)
+            }
             Jbig2Error::BufferSizeMismatch {
                 expected,
                 actual,
@@ -98,6 +139,26 @@ impl std::fmt::Display for Jbig2Error {
 }
 
 #[cfg(feature = "encode")]
+impl Jbig2Error {
+    /// The broad class of this error.
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Jbig2Error::InvalidInput { .. }
+            | Jbig2Error::BufferSizeMismatch { .. }
+            | Jbig2Error::BufferTooSmall { .. }
+            | Jbig2Error::ArrayShapeError { .. }
+            | Jbig2Error::PackedDataDetected => ErrorKind::InvalidInput,
+            Jbig2Error::InvalidConfig { .. } => ErrorKind::InvalidConfig,
+            Jbig2Error::ResourceLimit { .. } => ErrorKind::ResourceLimit,
+            Jbig2Error::EncodingFailed { .. }
+            | Jbig2Error::DictionaryFailed { .. }
+            | Jbig2Error::StreamCountMismatch { .. }
+            | Jbig2Error::SegmentWriteFailed { .. } => ErrorKind::Encode,
+        }
+    }
+}
+
+#[cfg(feature = "encode")]
 impl std::error::Error for Jbig2Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -122,8 +183,6 @@ impl From<ndarray::ShapeError> for Jbig2Error {
 pub mod decode;
 #[cfg(feature = "encode")]
 pub mod encode;
-#[cfg(feature = "python")]
-pub mod python;
 pub mod shared;
 
 // Compatibility re-exports of the historical top-level module paths, so
@@ -131,6 +190,8 @@ pub mod shared;
 // Phase 0 module rename (Gap A). Remove once dependents migrate to the
 // `encode::` paths.
 #[cfg(feature = "encode")]
+// Deprecated since 0.7.0 (its items carry the attribute; one on a `use` is
+// inert): a duplicate of the crate-root API. Removed in 0.8.
 pub use encode::api as jbig2;
 #[cfg(feature = "encode")]
 pub use encode::arith as jbig2arith;
@@ -162,6 +223,10 @@ pub use encode::unify as jbig2unify;
 // Re-export the main encode functions and config
 #[cfg(feature = "encode")]
 pub use crate::jbig2arith::Jbig2ArithCoder;
+#[cfg(feature = "encode")]
+pub use encode::document::ResourceLimitExceeded;
+#[cfg(feature = "encode")]
+pub use encode::facade::{BilevelImage, DocumentEncoder, EncodeOptions, PixelLayout, Preset};
 #[cfg(feature = "symboldict")]
 pub use jbig2cc::{BBox, CC, CCImage, Run, analyze_page, extract_symbols_for_jbig2};
 #[cfg(feature = "encode")]
@@ -171,8 +236,9 @@ pub use jbig2enc::{
 };
 #[cfg(feature = "encode")]
 pub use jbig2structs::{Jbig2Config, PdfDictionaryPolicy};
+pub use shared::bitmap::{BufferLayoutError, MonoBitmap, Polarity};
 
-#[cfg(feature = "encode")]
+#[cfg(all(test, feature = "encode"))]
 use jbig2enc::Jbig2Encoder;
 #[cfg(feature = "encode")]
 use jbig2sym::binary_pixels_to_bitimage;
@@ -356,27 +422,25 @@ pub fn encode_document_pdf_split(
     images: &[Array2<u8>],
     config: &Jbig2Config,
 ) -> Result<PdfSplitOutput, Jbig2Error> {
-    let mut enc_config = config.clone();
-    enc_config.want_full_headers = false;
-    if !enc_config.symbol_mode {
-        enc_config.refine = false;
-        enc_config.text_refine = false;
-    }
-
-    let mut encoder = Jbig2Encoder::new(&enc_config);
+    let mut encoder = DocumentEncoder::new(legacy_config(config))?;
     for image in images {
-        encoder
-            .add_page(image)
-            .map_err(|e| Jbig2Error::EncodingFailed {
-                message: e.to_string(),
-            })?;
+        let bitimage = jbig2sym::array_to_bitimage(image)
+            .map_err(|message| Jbig2Error::InvalidInput { message })?;
+        encoder.add_bit_image(bitimage)?;
     }
+    encoder.finish_pdf()
+}
 
-    encoder
-        .flush_pdf_split()
-        .map_err(|e| Jbig2Error::EncodingFailed {
-            message: e.to_string(),
-        })
+/// The pre-0.7 entry points silently dropped refinement without symbol
+/// coding, where [`DocumentEncoder`] refuses it; keep their behaviour.
+#[cfg(feature = "encode")]
+fn legacy_config(config: &Jbig2Config) -> Jbig2Config {
+    let mut config = config.clone();
+    if !config.symbol_mode {
+        config.refine = false;
+        config.text_refine = false;
+    }
+    config
 }
 
 #[cfg(feature = "encode")]
@@ -418,19 +482,8 @@ fn encode_single_bitimage(
     bitimage: jbig2sym::BitImage,
     ctx: Jbig2Context,
 ) -> Result<Jbig2EncodeResult, Jbig2Error> {
-    let mut enc_config = ctx.config.clone();
-    enc_config.want_full_headers = !ctx.get_pdf_mode();
-    if !enc_config.symbol_mode {
-        enc_config.refine = false;
-        enc_config.text_refine = false;
-    }
-
-    let mut encoder = Jbig2Encoder::new(&enc_config);
-    encoder
-        .add_page_bitimage(bitimage)
-        .map_err(|e| Jbig2Error::EncodingFailed {
-            message: e.to_string(),
-        })?;
+    let mut encoder = DocumentEncoder::new(legacy_config(&ctx.config))?;
+    encoder.add_bit_image(bitimage)?;
 
     if ctx.get_pdf_mode() {
         // PDF embedding must use the same planning/serialization as tests/pdf_variants:
@@ -438,30 +491,23 @@ fn encode_single_bitimage(
         // segment references. The previous approach (dict_only().flush_dict() on one
         // encoder + flush() on a second) paired unrelated streams and broke decoders
         // (solid black/white pages, etc.).
-        let split = encoder
-            .flush_pdf_split()
-            .map_err(|e| Jbig2Error::EncodingFailed {
-                message: e.to_string(),
-            })?;
-        let n = split.page_streams.len();
-        if n != 1 {
-            return Err(Jbig2Error::StreamCountMismatch {
+        let split = encoder.finish_pdf()?;
+        let actual = split.page_streams.len();
+        let mut streams = split.page_streams.into_iter();
+        match (streams.next(), streams.next()) {
+            (Some(page_data), None) => Ok(Jbig2EncodeResult {
+                global_data: split.global_segments,
+                page_data,
+            }),
+            _ => Err(Jbig2Error::StreamCountMismatch {
                 expected: 1,
-                actual: n,
-            });
+                actual,
+            }),
         }
-        let page_data = split.page_streams.into_iter().next().unwrap();
-        Ok(Jbig2EncodeResult {
-            global_data: split.global_segments,
-            page_data,
-        })
     } else {
-        let page_data = encoder.flush().map_err(|e| Jbig2Error::EncodingFailed {
-            message: e.to_string(),
-        })?;
         Ok(Jbig2EncodeResult {
             global_data: None,
-            page_data,
+            page_data: encoder.finish_file()?,
         })
     }
 }

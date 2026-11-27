@@ -1,6 +1,22 @@
 akr 0.1
 project exprim
 
+record exprim.jbig2.binding-layout/1 : decision {
+    title "jbig2enc-rust bindings: C ABI in jbig2enc-ffi, Python as a sibling crate, core owns a binding-neutral facade"
+    state proposed
+    scope [ path "codecs/jbig2enc-rust/**" ]
+    decision """
+        Expose the codec to non-Rust callers through a separate jbig2enc-ffi crate (library jbig2rs, symbol prefix jbig2rs_). Move the PyO3 binding out of the core crate into its own sibling package. Both bindings sit on one binding-neutral core facade: BilevelImage, EncodeOptions/Preset, DocumentEncoder and ErrorKind.
+        """
+    context """
+        Outside advice proposed a C ABI so that C, C#, Java and Swift callers can use the codec. The core API took only unpacked bytes, used encoders that borrow their config (which rules out an owned C handle), exposed 50+ config fields and flattened every error to a string. Rejected: folding Python into the FFI crate, because the two have different stability contracts and toolchains. Rejected: rebuilding Python on the C ABI, which would lose the buffer protocol, GIL release and real exceptions. Rejected: a jbig2_ prefix, which collides with jbig2dec's exports.
+        """
+    consequences """
+        jbig2enc-rust 0.7.0 drops the python feature, and the PyPI wheel is now built from python/Cargo.toml. Core changes stay additive or deprecations, because Lege tracks git main. No codec logic lives in either binding.
+        """
+    author "dk"
+}
+
 record exprim.memory.chunked-lowering/1 : decision {
     title "A page is painted in chunks while it is lowered"
     state proposed
