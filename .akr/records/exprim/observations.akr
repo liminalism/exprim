@@ -143,7 +143,7 @@ record exprim.corpus.benchmark-20261109/2 : observation {
 
 record exprim.jp2.buffer-pool-20261127/1 : observation {
     title "Byte-capped JP2 plane pooling cuts colour scan decode time 22-34% and grayscale up to 50%"
-    state verified
+    state superseded
     scope [
         path "codecs/jp2lam/src/decode/**",
         path "codecs/jp2lam/src/dwt/**",
@@ -170,6 +170,39 @@ record exprim.jp2.buffer-pool-20261127/1 : observation {
         "src/image/jpx.rs"
     ]
     confidence high
+    author "dk"
+}
+
+record exprim.jp2.buffer-pool-20261127/2 : observation {
+    title "Byte-capped JP2 plane pooling cuts colour scan decode time 22-34% and grayscale up to 50%"
+    state verified
+    scope [
+        path "codecs/jp2lam/src/decode/**",
+        path "codecs/jp2lam/src/dwt/**",
+        path "src/image/jpx.rs",
+        path "src/render_cpu/mod.rs"
+    ]
+    statement """
+        Measured with `jp2lam`'s `decode_benchmark` (`Jp2Decoder::decode_into`, warm after one untimed warmup, best of 7 runs) on five real scanned-page JP2 codestreams before and after pooling Tier-1 subband planes and 9/7 + 5/3 streaming DWT buffers in `Jp2BufferPool` (128 MiB cap). Every output hash is unchanged:
+
+        - 9.2 MP 3-component 9/7 RGB colour scan: 109.68 -> 72.45 ms at t=1 (-33.9%; dwt 17.46 -> 7.32 ms, finalize 36.79 -> 17.70 ms, tier1_block_output 5.77 -> 0.85 ms) and 40.65 -> 27.45 ms at t=4 (-32.5%).
+        - 10.5 MP 3-component 9/7 RGB colour scan: 166.21 -> 129.17 ms at t=1 (-22.3%; dwt 19.19 -> 7.67 ms, finalize 43.24 -> 21.40 ms) and 58.44 -> 52.04 ms at t=4 (-10.9%).
+        - Medium 3-component 9/7 RGB colour scan: 59.26 -> 46.22 ms at t=1 (-22.0%) and 23.32 -> 15.56 ms at t=4 (-33.3%).
+        - Grayscale reversible 5/3 scan: 21.63 -> 14.95 ms at t=1 (-30.9%) and 11.56 -> 5.80 ms at t=4 (-49.9%).
+        - Tier-1-dense grayscale scan: 147.26 -> 143.58 ms at t=1 (-2.5%; dwt 3.89 -> 1.53 ms) and 47.74 -> 44.76 ms at t=4 (-6.2%).
+
+        On Windows, fresh allocations over ~1 MiB go directly to VirtualAlloc/VirtualFree: first touch faults zeroed OS pages into both the Tier-1 subband planes and the DWT prefix planes, and drop triggers TLB shootdowns across threads. Parking and reusing those planes under one byte-capped pool removes both costs while keeping idle retention bounded and releasable.
+        """
+    observed_at git:5b8fc4ab51b61bf21009780987dd1935e0ae9122
+    method command
+    watches [
+        "codecs/jp2lam/src/decode/pool.rs",
+        "codecs/jp2lam/src/decode/reconstruct.rs",
+        "codecs/jp2lam/src/decode/t1.rs",
+        "src/image/jpx.rs"
+    ]
+    confidence high
+    supersedes [ @exprim.jp2.buffer-pool-20261127/1 ]
     author "dk"
 }
 
