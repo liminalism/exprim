@@ -28,20 +28,49 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use jp2lam::{
-    ColorSpace, DecodeConcurrency, DecodeLimits as Jp2DecodeLimits, DecodeOutputFormat,
-    DecodeRequest, DecodeResolution, DecodeResult, DecodeTarget, PreparedJp2,
+    ColorSpace, DEFAULT_DECODE_BUFFER_POOL_BYTES, DecodeConcurrency,
+    DecodeLimits as Jp2DecodeLimits, DecodeOutputFormat, DecodeRequest, DecodeResolution,
+    DecodeResult, DecodeTarget, Jp2BufferPool, PreparedJp2,
 };
 
 use crate::image::codec::{DecodeLimits, DecodedFormat, DecodedImage, ImageCodec};
 use crate::image::{DecodeParameters, ImageDescriptor, ImageError, StreamFilter};
 
+/// Shared zero-capacity placeholder attached to idle thread-local decoders so
+/// worker threads never hold strong references to a dropped [`JpxCodec`]'s
+/// buffer pool.
+fn empty_jp2_pool() -> Arc<Jp2BufferPool> {
+    use std::sync::OnceLock;
+    static EMPTY: OnceLock<Arc<Jp2BufferPool>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(Jp2BufferPool::disabled())))
+}
+
 thread_local! {
     /// A reusable decoder session per render worker. `jp2lam::Jp2Decoder`
-    /// retains bounded Tier-1 scratch while jp2lam owns one shared Rayon pool,
-    /// so repeated JPX draws avoid re-allocating scratch and concurrent render
-    /// workers do not multiply decoder thread pools. The `ImageCodec`
-    /// trait is stateless-by-`&self`; the mutable session lives here.
-    static JPX_DECODER: RefCell<jp2lam::Jp2Decoder> = RefCell::new(jp2lam::Jp2Decoder::new());
+    /// retains small per-block Tier-1 scratch (~16 KiB) while large subband
+    /// planes are checked out of [`JpxCodec`]'s shared [`Jp2BufferPool`] for
+    /// the duration of each call and detached on return.
+    static JPX_DECODER: RefCell<jp2lam::Jp2Decoder> =
+        RefCell::new(jp2lam::Jp2Decoder::with_buffer_pool(empty_jp2_pool()));
+}
+
+///Temporarily attaches `pool` to `decoder` and detaches it on drop (including
+/// unwinding) so no worker thread retains a session's pool after a decode.
+struct ScopedDecoderPool<'a> {
+    decoder: &'a mut jp2lam::Jp2Decoder,
+}
+
+impl<'a> ScopedDecoderPool<'a> {
+    fn attach(decoder: &'a mut jp2lam::Jp2Decoder, pool: Arc<Jp2BufferPool>) -> Self {
+        decoder.set_buffer_pool(pool);
+        Self { decoder }
+    }
+}
+
+impl Drop for ScopedDecoderPool<'_> {
+    fn drop(&mut self) {
+        self.decoder.set_buffer_pool(empty_jp2_pool());
+    }
 }
 
 /// Reduced-resolution quality margin (Phase 2). When the renderer supplies a
@@ -166,9 +195,33 @@ fn load_aware_budget(in_flight: usize) -> DecodeConcurrency {
     DecodeConcurrency::Budgeted(budget)
 }
 
+/// Default byte ceiling for [`JpxCodec`]'s session-scoped coefficient buffer
+/// pool (128 MiB across all render workers).
+pub const DEFAULT_JPX_BUFFER_POOL_BYTES: usize = DEFAULT_DECODE_BUFFER_POOL_BYTES;
+
 /// The `/JPXDecode` codec for a [`crate::image::CodecRegistry`].
-#[derive(Debug, Default)]
-pub struct JpxCodec;
+///
+/// Owns one byte-capped [`Jp2BufferPool`] shared across every worker thread
+/// that decodes through this codec instance, mirroring `SurfacePool`: buffers
+/// stay warm between page decodes without multiplying memory per worker, are
+/// freed from any thread on [`ImageCodec::release_idle_memory`], and drop with
+/// the owning backend/session.
+#[derive(Debug)]
+pub struct JpxCodec {
+    pool: Arc<Jp2BufferPool>,
+}
+
+impl Default for JpxCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for JpxCodec {
+    fn drop(&mut self) {
+        self.pool.clear();
+    }
+}
 
 impl ImageCodec for JpxCodec {
     fn filter(&self) -> StreamFilter {
@@ -334,8 +387,9 @@ impl ImageCodec for JpxCodec {
     }
 
     fn release_idle_memory(&self) {
+        self.pool.clear();
         JPX_DECODER.with(|decoder| {
-            *decoder.borrow_mut() = jp2lam::Jp2Decoder::new();
+            *decoder.borrow_mut() = jp2lam::Jp2Decoder::with_buffer_pool(empty_jp2_pool());
         });
     }
 }
@@ -361,6 +415,26 @@ fn decode_resolution(params: &DecodeParameters) -> DecodeResolution {
 }
 
 impl JpxCodec {
+    /// Construct a `/JPXDecode` codec with the default 128 MiB shared
+    /// coefficient buffer pool.
+    pub fn new() -> Self {
+        Self::with_buffer_pool_bytes(DEFAULT_JPX_BUFFER_POOL_BYTES)
+    }
+
+    /// Construct a `/JPXDecode` codec whose shared coefficient buffer pool
+    /// retains at most `cap_bytes` when idle (`0` disables pooling).
+    pub fn with_buffer_pool_bytes(cap_bytes: usize) -> Self {
+        Self {
+            pool: Arc::new(Jp2BufferPool::new(cap_bytes)),
+        }
+    }
+
+    /// Bytes of idle coefficient plane capacity currently parked in this
+    /// codec's shared pool.
+    pub fn idle_buffer_bytes(&self) -> usize {
+        self.pool.idle_bytes()
+    }
+
     /// Decode straight into a packed 8-bit raster (the fast path for 8-bit
     /// components).
     #[allow(clippy::too_many_arguments)]
@@ -414,7 +488,9 @@ impl JpxCodec {
         let check_cancel = || limits.is_cancelled();
         let info = JPX_DECODER
             .with(|decoder| {
-                decoder.borrow_mut().decode_prepared_into_cancellable(
+                let mut decoder = decoder.borrow_mut();
+                let guard = ScopedDecoderPool::attach(&mut decoder, Arc::clone(&self.pool));
+                guard.decoder.decode_prepared_into_cancellable(
                     prepared,
                     &request,
                     DecodeTarget {
@@ -471,8 +547,10 @@ impl JpxCodec {
         let check_cancel = || limits.is_cancelled();
         let result = JPX_DECODER
             .with(|decoder| {
-                decoder
-                    .borrow_mut()
+                let mut decoder = decoder.borrow_mut();
+                let guard = ScopedDecoderPool::attach(&mut decoder, Arc::clone(&self.pool));
+                guard
+                    .decoder
                     .decode_prepared_cancellable(prepared, &request, &check_cancel)
             })
             .map_err(|e| {

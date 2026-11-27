@@ -8360,7 +8360,7 @@ mod image_cache_tests {
     fn registry() -> crate::image::CodecRegistry {
         crate::image::CodecRegistry::new([
             Arc::new(crate::image::JpegCodec) as Arc<dyn crate::image::ImageCodec>,
-            Arc::new(crate::image::JpxCodec),
+            Arc::new(crate::image::JpxCodec::default()),
         ])
     }
 

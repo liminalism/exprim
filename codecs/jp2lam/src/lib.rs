@@ -23,11 +23,12 @@ pub use batch::{
 };
 pub use content::{ContentClass, ContentStats, analyze as analyze_content, auto_quality};
 pub use decode::{
-    DecodeConcurrency, DecodeIntoInfo, DecodeLimits, DecodeMetadata, DecodeOutputFormat,
-    DecodeRegion, DecodeRequest, DecodeResolution, DecodeResult, DecodeTarget, DecodedRaster,
-    InDataAlpha, Jp2DecodeStats, Jp2Decoder, PreparedJp2, decode_from_reader,
-    decode_from_reader_request, decode_jp2, decode_jp2_request, decode_jp2_with_stats, inspect_jp2,
-    inspect_jp2_header_for_reduction, inspect_jp2_with_limits, prepare_jp2,
+    DEFAULT_DECODE_BUFFER_POOL_BYTES, DecodeConcurrency, DecodeIntoInfo, DecodeLimits,
+    DecodeMetadata, DecodeOutputFormat, DecodeRegion, DecodeRequest, DecodeResolution,
+    DecodeResult, DecodeTarget, DecodedRaster, InDataAlpha, Jp2BufferPool, Jp2DecodeStats,
+    Jp2Decoder, PreparedJp2, decode_from_reader, decode_from_reader_request, decode_jp2,
+    decode_jp2_request, decode_jp2_with_stats, inspect_jp2, inspect_jp2_header_for_reduction,
+    inspect_jp2_with_limits, prepare_jp2,
 };
 #[cfg(feature = "counters")]
 pub use encode::counters::{

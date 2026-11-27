@@ -5,6 +5,17 @@ exprim was developed inside the Lege repository as the renderer workspace
 `lege-pdf-print` and `lege-pdf-agent` crates over it. Versions below 0.4.0
 were internal and never published.
 
+## Unreleased
+
+### Image decoding and memory
+
+- Each `CpuBackend` (`JpxCodec`) owns one shared 128 MiB `jp2lam::Jp2BufferPool`
+  attached to worker-local `Jp2Decoder`s only for the duration of a decode and
+  emptied by `RenderSession::release_idle_memory` or session drop, avoiding
+  per-thread coefficient retention while cutting `/JPXDecode` wall time 22–34%
+  on large colour scans and up to 50% on grayscale scans with bit-identical
+  output.
+
 ## 0.4.5 — 2026-11-24
 
 Output is byte-identical throughout across the repository test suites and

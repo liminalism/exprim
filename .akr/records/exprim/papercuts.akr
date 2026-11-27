@@ -1,6 +1,17 @@
 akr 0.1
 project exprim
 
+record exprim.papercut.akr-change-begin-related-decision-rejects-non/1 : papercut {
+    title "akr change begin --related <decision> rejects non-work records as…"
+    state verified
+    statement """
+        akr change begin --related <decision> rejects non-work records as AKR-C032, yet akr change prepare --staged without --primary fails with AKR-C032 calling the staged decision, observation, and papercut 'work records' and asking for --primary.
+        """
+    observed_at git:a426fa7d98ee1ff1749aa6c9178ad34ffa7d6554
+    author "antigravity"
+    created_at 2026-11-27
+}
+
 record exprim.papercut.akr-propose-uses-a-specific-body-file-flag-not/1 : papercut {
     title "akr propose uses a specific body-file flag (not --file), causing…"
     state verified
@@ -76,6 +87,17 @@ record exprim.papercut.powershell-5-1-array-splatting-featargs-before/1 : paperc
     observed_at git:9cb999b02eeb7c82194757c2e5fdcdef46a32b50
     author "antigravity"
     created_at 2026-11-24
+}
+
+record exprim.papercut.ran-akr-context-goal-key-paths-a-b-and-got-akr/1 : papercut {
+    title "Ran 'akr context --goal <key> --paths a b' and got AKR-C005 ('context…"
+    state verified
+    statement """
+        Ran 'akr context --goal <key> --paths a b' and got AKR-C005 ('context takes either a positional <key> or --goal <key>') because --paths accepts one value per flag rather than space-separated paths.
+        """
+    observed_at git:a426fa7d98ee1ff1749aa6c9178ad34ffa7d6554
+    author "antigravity"
+    created_at 2026-11-27
 }
 
 record exprim.papercut.ran-akr-explain-plan-after-reading-agents-md/1 : papercut {

@@ -22,6 +22,7 @@ pub(crate) struct SplitSubbands<T> {
 }
 
 impl<T: Default + Clone> SplitSubbands<T> {
+    #[allow(dead_code)]
     pub(crate) fn new_zeroed(width: usize, height: usize) -> Self {
         let sn = width.div_ceil(2);
         let dn = width - sn;
@@ -33,6 +34,46 @@ impl<T: Default + Clone> SplitSubbands<T> {
             coarse: vec![T::default(); sn * sv],
             hl1: vec![T::default(); dn * sv],
             lh_hh1: vec![T::default(); width * dv],
+        }
+    }
+}
+
+impl SplitSubbands<f32> {
+    pub(crate) fn new_zeroed_with_pool(
+        width: usize,
+        height: usize,
+        pool: &crate::decode::Jp2BufferPool,
+    ) -> Self {
+        let sn = width.div_ceil(2);
+        let dn = width - sn;
+        let sv = height.div_ceil(2);
+        let dv = height - sv;
+        Self {
+            width,
+            height,
+            coarse: pool.take_zeroed_f32(sn * sv),
+            hl1: pool.take_zeroed_f32(dn * sv),
+            lh_hh1: pool.take_zeroed_f32(width * dv),
+        }
+    }
+}
+
+impl SplitSubbands<i32> {
+    pub(crate) fn new_zeroed_with_pool(
+        width: usize,
+        height: usize,
+        pool: &crate::decode::Jp2BufferPool,
+    ) -> Self {
+        let sn = width.div_ceil(2);
+        let dn = width - sn;
+        let sv = height.div_ceil(2);
+        let dv = height - sv;
+        Self {
+            width,
+            height,
+            coarse: pool.take_zeroed_i32(sn * sv),
+            hl1: pool.take_zeroed_i32(dn * sv),
+            lh_hh1: pool.take_zeroed_i32(width * dv),
         }
     }
 }
@@ -85,9 +126,11 @@ pub(crate) use rev53::inverse_53_2d_in_place_profiled;
 pub(crate) use rev53::inverse_53_2d_in_place_wide;
 pub(crate) use stream53::{
     LevelSynth53Scratch, SynthesisPrefix53, i32_lifting_is_safe, inverse_53_2d_even,
-    inverse_53_2d_even_but_last, inverse_53_2d_even_but_last_split, inverse_53_2d_even_split,
+    inverse_53_2d_even_but_last_split_with_pool, inverse_53_2d_even_but_last_with_pool,
+    inverse_53_2d_even_split_with_pool, inverse_53_2d_even_with_pool,
 };
 pub(crate) use stream97::{
-    LevelSynthScratch, SynthesisPrefix, inverse_97_2d_even, inverse_97_2d_even_but_last,
-    inverse_97_2d_even_but_last_split, inverse_97_2d_even_split,
+    LevelSynthScratch, SynthesisPrefix, inverse_97_2d_even,
+    inverse_97_2d_even_but_last_split_with_pool, inverse_97_2d_even_but_last_with_pool,
+    inverse_97_2d_even_split_with_pool, inverse_97_2d_even_with_pool,
 };

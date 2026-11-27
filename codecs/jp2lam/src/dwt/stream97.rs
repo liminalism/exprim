@@ -57,52 +57,113 @@ fn resolution_sizes(width: usize, height: usize, levels: usize) -> Vec<(usize, u
 /// the decomposition lattice) through `levels` levels. Returns the
 /// reconstructed plane; `data` is consumed and may be returned as-is when
 /// there is nothing to do.
+#[allow(dead_code)]
 pub(crate) fn inverse_97_2d_even(
     data: Vec<f32>,
     width: usize,
     height: usize,
     levels: u8,
     kernel: Kernel,
+    timing: Option<&mut InverseDwtTiming>,
+) -> Vec<f32> {
+    inverse_97_2d_even_with_pool(
+        data,
+        width,
+        height,
+        levels,
+        kernel,
+        timing,
+        &crate::decode::Jp2BufferPool::disabled(),
+    )
+}
+
+pub(crate) fn inverse_97_2d_even_with_pool(
+    data: Vec<f32>,
+    width: usize,
+    height: usize,
+    levels: u8,
+    kernel: Kernel,
     mut timing: Option<&mut InverseDwtTiming>,
+    pool: &crate::decode::Jp2BufferPool,
 ) -> Vec<f32> {
     debug_assert_eq!(data.len(), width * height);
     if width == 0 || height == 0 || levels == 0 {
         return data;
     }
-    let prefix =
-        inverse_97_2d_even_but_last(data, width, height, levels, kernel, timing.as_deref_mut());
+    let prefix = inverse_97_2d_even_but_last_with_pool(
+        data,
+        width,
+        height,
+        levels,
+        kernel,
+        timing.as_deref_mut(),
+        pool,
+    );
     let level_start = timing.as_ref().map(|_| std::time::Instant::now());
-    let mut synth = prefix.final_level(kernel, 0);
-    let mut out = vec![0f32; width * height];
-    for y in 0..height {
-        out[y * width..(y + 1) * width].copy_from_slice(synth.next_row());
-    }
+    let mut out = pool.take_for_overwrite_f32(width * height);
+    let horizontal_ns = {
+        let mut synth = prefix.final_level(kernel, 0);
+        for y in 0..height {
+            out[y * width..(y + 1) * width].copy_from_slice(synth.next_row());
+        }
+        synth.horizontal_ns
+    };
+    prefix.recycle(pool);
     if let (Some(timing), Some(start)) = (timing, level_start) {
-        record_level(timing, start, synth.horizontal_ns);
+        record_level(timing, start, horizontal_ns);
     }
     out
 }
 
 /// Inverse 9/7 synthesis from [`SplitSubbands<f32>`] to a full plane.
+#[allow(dead_code)]
 pub(crate) fn inverse_97_2d_even_split(
     split: SplitSubbands<f32>,
     levels: u8,
     kernel: Kernel,
+    timing: Option<&mut InverseDwtTiming>,
+) -> Vec<f32> {
+    inverse_97_2d_even_split_with_pool(
+        split,
+        levels,
+        kernel,
+        timing,
+        &crate::decode::Jp2BufferPool::disabled(),
+    )
+}
+
+pub(crate) fn inverse_97_2d_even_split_with_pool(
+    split: SplitSubbands<f32>,
+    levels: u8,
+    kernel: Kernel,
     mut timing: Option<&mut InverseDwtTiming>,
+    pool: &crate::decode::Jp2BufferPool,
 ) -> Vec<f32> {
     let (width, height) = (split.width, split.height);
     if width == 0 || height == 0 || levels == 0 {
+        pool.park_f32(split.hl1);
+        pool.park_f32(split.lh_hh1);
         return split.coarse;
     }
-    let prefix = inverse_97_2d_even_but_last_split(split, levels, kernel, timing.as_deref_mut());
+    let prefix = inverse_97_2d_even_but_last_split_with_pool(
+        split,
+        levels,
+        kernel,
+        timing.as_deref_mut(),
+        pool,
+    );
     let level_start = timing.as_ref().map(|_| std::time::Instant::now());
-    let mut synth = prefix.final_level(kernel, 0);
-    let mut out = vec![0f32; width * height];
-    for y in 0..height {
-        out[y * width..(y + 1) * width].copy_from_slice(synth.next_row());
-    }
+    let mut out = pool.take_for_overwrite_f32(width * height);
+    let horizontal_ns = {
+        let mut synth = prefix.final_level(kernel, 0);
+        for y in 0..height {
+            out[y * width..(y + 1) * width].copy_from_slice(synth.next_row());
+        }
+        synth.horizontal_ns
+    };
+    prefix.recycle(pool);
     if let (Some(timing), Some(start)) = (timing, level_start) {
-        record_level(timing, start, synth.horizontal_ns);
+        record_level(timing, start, horizontal_ns);
     }
     out
 }
@@ -139,13 +200,34 @@ pub(crate) struct SynthesisPrefix {
 
 /// Run all levels but the last. `levels` must be at least 1 and the plane
 /// non-empty.
+#[allow(dead_code)]
 pub(crate) fn inverse_97_2d_even_but_last(
     data: Vec<f32>,
     width: usize,
     height: usize,
     levels: u8,
     kernel: Kernel,
+    timing: Option<&mut InverseDwtTiming>,
+) -> SynthesisPrefix {
+    inverse_97_2d_even_but_last_with_pool(
+        data,
+        width,
+        height,
+        levels,
+        kernel,
+        timing,
+        &crate::decode::Jp2BufferPool::disabled(),
+    )
+}
+
+pub(crate) fn inverse_97_2d_even_but_last_with_pool(
+    data: Vec<f32>,
+    width: usize,
+    height: usize,
+    levels: u8,
+    kernel: Kernel,
     mut timing: Option<&mut InverseDwtTiming>,
+    pool: &crate::decode::Jp2BufferPool,
 ) -> SynthesisPrefix {
     debug_assert!(levels >= 1 && width > 0 && height > 0);
     debug_assert_eq!(data.len(), width * height);
@@ -155,6 +237,16 @@ pub(crate) fn inverse_97_2d_even_but_last(
     let mut spare: Vec<f32> = Vec::new();
     for level in 1..levels {
         let (rw, rh) = sizes[level];
+        let need = rw * rh;
+        let mut out = std::mem::take(&mut spare);
+        if out.capacity() < need {
+            pool.park_f32(out);
+            out = pool.take_for_overwrite_f32(need);
+        } else if out.len() < need {
+            out.resize(need, 0.0);
+        } else {
+            out.truncate(need);
+        }
         let source = match &prev {
             None => LlSource {
                 rows: &data,
@@ -166,10 +258,6 @@ pub(crate) fn inverse_97_2d_even_but_last(
             },
         };
         let level_start = timing.as_ref().map(|_| std::time::Instant::now());
-        let mut out = std::mem::take(&mut spare);
-        if out.len() < rw * rh {
-            out.resize(rw * rh, 0.0);
-        }
         let mut synth =
             LevelSynth::new_monolithic(source, &data, width, rw, rh, kernel, 0, timing.is_some());
         for y in 0..rh {
@@ -180,6 +268,7 @@ pub(crate) fn inverse_97_2d_even_but_last(
         }
         spare = prev.replace(out).unwrap_or_default();
     }
+    pool.park_f32(spare);
     let ll_width = sizes[levels - 1].0;
     SynthesisPrefix {
         bands: PrefixBands::Monolithic {
@@ -195,17 +284,34 @@ pub(crate) fn inverse_97_2d_even_but_last(
 /// Run all levels but the last on [`SplitSubbands<f32>`], consuming and
 /// freeing `split.coarse` so retained prefix storage stays `width * height`
 /// (`4 B/px`) instead of `5/4 * width * height` (`5 B/px`).
+#[allow(dead_code)]
 pub(crate) fn inverse_97_2d_even_but_last_split(
     split: SplitSubbands<f32>,
     levels: u8,
     kernel: Kernel,
     timing: Option<&mut InverseDwtTiming>,
 ) -> SynthesisPrefix {
+    inverse_97_2d_even_but_last_split_with_pool(
+        split,
+        levels,
+        kernel,
+        timing,
+        &crate::decode::Jp2BufferPool::disabled(),
+    )
+}
+
+pub(crate) fn inverse_97_2d_even_but_last_split_with_pool(
+    split: SplitSubbands<f32>,
+    levels: u8,
+    kernel: Kernel,
+    timing: Option<&mut InverseDwtTiming>,
+    pool: &crate::decode::Jp2BufferPool,
+) -> SynthesisPrefix {
     debug_assert!(levels >= 1 && split.width > 0 && split.height > 0);
     let sn = split.width.div_ceil(2);
     let sv = split.height.div_ceil(2);
     let ll1 = if levels > 1 {
-        inverse_97_2d_even(split.coarse, sn, sv, levels - 1, kernel, timing)
+        inverse_97_2d_even_with_pool(split.coarse, sn, sv, levels - 1, kernel, timing, pool)
     } else {
         split.coarse
     };
@@ -221,6 +327,22 @@ pub(crate) fn inverse_97_2d_even_but_last_split(
 }
 
 impl SynthesisPrefix {
+    /// Return all owned subband planes to `pool` once synthesis has finished.
+    pub(crate) fn recycle(self, pool: &crate::decode::Jp2BufferPool) {
+        match self.bands {
+            PrefixBands::Monolithic { data, ll, .. } => {
+                if let Some(ll) = ll {
+                    pool.park_f32(ll);
+                }
+                pool.park_f32(data);
+            }
+            PrefixBands::Split { ll1, hl1, lh_hh1 } => {
+                pool.park_f32(ll1);
+                pool.park_f32(hl1);
+                pool.park_f32(lh_hh1);
+            }
+        }
+    }
     /// A producer for the finest level's rows, starting at output row
     /// `first_row`.
     pub(crate) fn final_level(&self, kernel: Kernel, first_row: usize) -> LevelSynth<'_> {

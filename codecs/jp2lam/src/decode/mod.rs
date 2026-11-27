@@ -6,6 +6,7 @@
 
 mod codestream;
 mod jp2_parse;
+mod pool;
 pub(crate) mod reconstruct;
 mod stats;
 pub(crate) mod t1;
@@ -16,8 +17,9 @@ pub(crate) mod t2;
 use crate::error::Result;
 use crate::model::{ColorEncoding, ColorSpace, Image};
 use std::io::{Read, Write};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+pub use pool::{DEFAULT_DECODE_BUFFER_POOL_BYTES, Jp2BufferPool};
 pub use stats::Jp2DecodeStats;
 use stats::StatsSink;
 
@@ -322,16 +324,28 @@ struct DecodeScratch {
     /// Persistent per-worker Tier-1 scratch buffers reused across tiles and
     /// across calls on the same [`Jp2Decoder`].
     tier1_workers: Vec<t1::Tier1Scratch>,
+    pool: Arc<Jp2BufferPool>,
     workers: usize,
 }
 
 impl DecodeScratch {
     fn new() -> Self {
+        Self::with_pool(Arc::new(Jp2BufferPool::default()))
+    }
+
+    fn with_pool(pool: Arc<Jp2BufferPool>) -> Self {
         Self {
             tier1: t1::Tier1Scratch::new(),
             tier1_workers: Vec::new(),
+            pool,
             workers: 1,
         }
+    }
+
+    fn clear_idle(&mut self) {
+        self.tier1 = t1::Tier1Scratch::new();
+        self.tier1_workers = Vec::new();
+        self.pool.clear();
     }
 }
 
@@ -466,11 +480,39 @@ impl Default for Jp2Decoder {
 }
 
 impl Jp2Decoder {
-    /// Construct a decoder session with reusable, lazily grown working memory.
+    /// Construct a decoder session with reusable, lazily grown working memory
+    /// and a default byte-capped [`Jp2BufferPool`].
     pub fn new() -> Self {
         Self {
             scratch: DecodeScratch::new(),
         }
+    }
+
+    /// Construct a decoder session sharing an external [`Jp2BufferPool`] (for
+    /// example one session-scoped pool shared across render workers).
+    pub fn with_buffer_pool(pool: Arc<Jp2BufferPool>) -> Self {
+        Self {
+            scratch: DecodeScratch::with_pool(pool),
+        }
+    }
+
+    /// Replace the [`Jp2BufferPool`] this session checks planes out of and
+    /// parks finished planes into.
+    pub fn set_buffer_pool(&mut self, pool: Arc<Jp2BufferPool>) {
+        if !Arc::ptr_eq(&self.scratch.pool, &pool) {
+            self.scratch.pool = pool;
+        }
+    }
+
+    /// The [`Jp2BufferPool`] currently attached to this decoder session.
+    pub fn buffer_pool(&self) -> &Arc<Jp2BufferPool> {
+        &self.scratch.pool
+    }
+
+    /// Drop retained Tier-1 code-block scratch and clear the attached
+    /// [`Jp2BufferPool`].
+    pub fn release_idle_memory(&mut self) {
+        self.scratch.clear_idle();
     }
 
     /// Decode one image while retaining bounded Tier-1 scratch for later calls.
@@ -1313,6 +1355,7 @@ fn decode_packed_direct_to_target(
                     &mut scratch.tier1,
                     &mut scratch.tier1_workers,
                     scratch.workers,
+                    &scratch.pool,
                     cancel,
                 )?;
                 stats.finish(tier1_start, |stats, elapsed| {
@@ -1334,6 +1377,7 @@ fn decode_packed_direct_to_target(
                     dst_channel,
                     &mut target,
                     scratch.workers,
+                    &scratch.pool,
                     cancel,
                     stats,
                 )?;
@@ -1368,6 +1412,7 @@ fn decode_packed_direct_to_target(
             &mut scratch.tier1,
             &mut scratch.tier1_workers,
             scratch.workers,
+            &scratch.pool,
             cancel,
         )?;
         stats.finish(tier1_start, |stats, elapsed| {
@@ -1394,6 +1439,7 @@ fn decode_packed_direct_to_target(
                 layout: parameters.layout,
             },
             scratch.workers,
+            &scratch.pool,
             cancel,
             stats,
         )?;
@@ -1723,7 +1769,13 @@ fn decode_tile(
         limits,
         cancel,
     )?;
-    reconstruct::reconstruct_image_profiled(&reconstruction_header, colorspace, components, stats)
+    reconstruct::reconstruct_image_profiled_with_pool(
+        &reconstruction_header,
+        colorspace,
+        components,
+        &scratch.pool,
+        stats,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1889,6 +1941,7 @@ fn decode_tile_components(
         &mut scratch.tier1,
         &mut scratch.tier1_workers,
         scratch.workers,
+        &scratch.pool,
         cancel,
     )?;
     stats.finish(tier1_start, |stats, elapsed| {

@@ -1143,7 +1143,7 @@ impl Default for CpuBackendOptions {
         let codecs = crate::image::CodecRegistry::new([
             std::sync::Arc::new(crate::image::JpegCodec)
                 as std::sync::Arc<dyn crate::image::ImageCodec>,
-            std::sync::Arc::new(crate::image::JpxCodec),
+            std::sync::Arc::new(crate::image::JpxCodec::default()),
             std::sync::Arc::new(crate::image::Jbig2Codec::default()),
             std::sync::Arc::new(crate::image::CcittCodec),
         ]);

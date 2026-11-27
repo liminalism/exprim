@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Decoding performance and memory
+
+- `Jp2BufferPool` (`DEFAULT_DECODE_BUFFER_POOL_BYTES` = 128 MiB) parks and
+  reuses large Tier-1 subband (`SplitSubbands` and monolithic coefficient
+  planes) and streaming 9/7 and 5/3 inverse-DWT intermediate buffers across
+  `Jp2Decoder` calls (`Jp2Decoder::with_buffer_pool`, `buffer_pool`,
+  `set_buffer_pool`, `release_idle_memory`). Reused Tier-1 planes are zeroed in
+  user space without OS page unmap/soft-fault churn, while fully overwritten
+  DWT planes skip zeroing. Measured bit-identical across five scanned-page
+  codestreams: wall time drops 22–34% on 9–10.5 MP colour 9/7 scans (for
+  example 109.7 → 72.4 ms single-threaded, 40.7 → 27.4 ms at four threads) and
+  31–50% on a grayscale 5/3 scan (21.6 → 15.0 ms single-threaded, 11.6 → 5.8 ms
+  at four threads).
+
 ## 0.4.0 — 2026-11-24
 
 Decoded output is bit-identical to 0.3.1 on every stream 0.3.1 decoded; the

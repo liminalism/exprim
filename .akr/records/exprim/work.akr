@@ -51,6 +51,31 @@ record exprim.jbig2.ffi-facade/1 : work {
     author "dk"
 }
 
+record exprim.jp2.plane-pool/1 : work {
+    title "Session-scoped byte-capped pool for JPEG 2000 subband and DWT planes"
+    state proposed
+    scope [
+        path "codecs/jp2lam/src/decode/**",
+        path "codecs/jp2lam/src/dwt/**",
+        path "src/image/jpx.rs",
+        path "src/render_cpu/mod.rs",
+        path "src/render_cpu/prepared.rs"
+    ]
+    intent """
+        Eliminate multi-megabyte OS page allocation, first-touch soft faults, and TLB shootdown churn across JPEG 2000 Tier-1 subband planes and streaming 9/7 and 5/3 inverse-DWT intermediate planes while bounding idle memory per session rather than per worker thread.
+        """
+    trace [
+        "Stage attribution on scanned-page codestreams showed first-touch page faults and VirtualFree shootdowns across subband and DWT prefix planes accounted for 22-34% of RGB 9/7 decode time and up to 50% of grayscale 5/3 decode time.",
+        "Implemented Jp2BufferPool (128 MiB default, 64 KiB minimum buffer size, 12 size-bucket cap, zero unsafe code) in jp2lam::decode::pool, zeroing reused Tier-1 planes in user space outside the mutex and skipping zeroing on fully overwritten DWT planes.",
+        "Wired SplitSubbands, monolithic CoefficientPlane, and streaming 9/7 and 5/3 prefix and intermediate buffers to check out from and return to the pool, including early cancellation and error paths.",
+        "JpxCodec owns one shared 128 MiB pool per CpuBackend/RenderSession and attaches it to thread-local Jp2Decoders via a ScopedDecoderPool drop guard so idle threads hold no reference and release_idle_memory empties the pool.",
+        "Verified: 411 jp2lam unit tests, exprim lib and integration suites pass; all five scanned-page benchmark hashes are bit-identical with 22-34% RGB and 31-50% grayscale wall-time reductions."
+    ]
+    implements [ @exprim.jp2.session-buffer-pool ]
+    supported_by [ @exprim.jp2.buffer-pool-20261127 ]
+    author "dk"
+}
+
 record exprim.memory.image-decode-045/1 : work {
     title "0.4.5 image decode and memory optimizations"
     state completed

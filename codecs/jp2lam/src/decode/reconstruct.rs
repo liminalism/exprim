@@ -103,10 +103,27 @@ fn for_each_chunk_budgeted<T: Send, S>(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn reconstruct_image_profiled(
     header: &CodestreamHeader,
     colorspace: ColorSpace,
     tiles: Vec<DecodedTileCoefficients>,
+    stats: &mut StatsSink<'_>,
+) -> Result<Image> {
+    reconstruct_image_profiled_with_pool(
+        header,
+        colorspace,
+        tiles,
+        &super::Jp2BufferPool::disabled(),
+        stats,
+    )
+}
+
+pub(crate) fn reconstruct_image_profiled_with_pool(
+    header: &CodestreamHeader,
+    colorspace: ColorSpace,
+    tiles: Vec<DecodedTileCoefficients>,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<Image> {
     match colorspace {
@@ -119,11 +136,11 @@ pub(crate) fn reconstruct_image_profiled(
                     "grayscale JP2 must decode one component (plus an optional alpha)",
                 ));
             }
-            reconstruct_grayscale_image_with_alpha(header, tiles, stats)
+            reconstruct_grayscale_image_with_alpha(header, tiles, pool, stats)
         }
-        ColorSpace::Srgb => reconstruct_srgb_image(header, tiles, stats),
-        ColorSpace::YCbCr => reconstruct_ycbcr_image(header, tiles, stats),
-        ColorSpace::Cmyk => reconstruct_cmyk_image(header, tiles, stats),
+        ColorSpace::Srgb => reconstruct_srgb_image(header, tiles, pool, stats),
+        ColorSpace::YCbCr => reconstruct_ycbcr_image(header, tiles, pool, stats),
+        ColorSpace::Cmyk => reconstruct_cmyk_image(header, tiles, pool, stats),
         _ => Err(invalid(format!(
             "unsupported JP2 colorspace for reconstruction: {colorspace:?}"
         ))),
@@ -137,6 +154,7 @@ pub(crate) fn reconstruct_image_profiled(
 fn reconstruct_ycbcr_image(
     header: &CodestreamHeader,
     mut tiles: Vec<DecodedTileCoefficients>,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<Image> {
     if tiles.len() != 3 || header.siz.components.len() != 3 {
@@ -159,7 +177,7 @@ fn reconstruct_ycbcr_image(
     let component_dims = (0..header.siz.components.len())
         .map(|c| header.tile_component_dims(c))
         .collect::<Result<Vec<_>>>()?;
-    let mut planes = reconstruct_color_planes_finalized(header, tiles, stats)?;
+    let mut planes = reconstruct_color_planes_finalized(header, tiles, pool, stats)?;
     let start = stats.start();
     // Nearest-neighbour (2x2 replication) chroma upsampling, matching OpenJPEG's
     // `sycc420_to_rgb` for images whose origin is (0, 0) (validated). Each chroma
@@ -284,6 +302,7 @@ fn sycc_to_rgb_in_place(planes: &mut [Vec<i32>], precision: u8) {
 fn reconstruct_color_planes_finalized(
     header: &CodestreamHeader,
     tiles: Vec<DecodedTileCoefficients>,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<Vec<Vec<i32>>> {
     let apply_mct = header.cod.use_mct && tiles.len() == 3;
@@ -292,7 +311,7 @@ fn reconstruct_color_planes_finalized(
             let mut planes = Vec::with_capacity(tiles.len());
             for tile in tiles {
                 planes.push(reconstruct_reversible_53_tile_centered(
-                    header, tile, stats,
+                    header, tile, pool, stats,
                 )?);
             }
             if apply_mct {
@@ -315,7 +334,7 @@ fn reconstruct_color_planes_finalized(
             let mut planes = Vec::with_capacity(tiles.len());
             for tile in tiles {
                 planes.push(reconstruct_irreversible_97_tile_centered(
-                    header, tile, stats,
+                    header, tile, pool, stats,
                 )?);
             }
             if apply_mct {
@@ -328,7 +347,11 @@ fn reconstruct_color_planes_finalized(
                 .into_iter()
                 .enumerate()
                 .map(|(index, plane)| {
-                    finalize_f32_samples(plane, header.siz.components[index].precision)
+                    finalize_f32_samples_with_pool(
+                        plane,
+                        header.siz.components[index].precision,
+                        pool,
+                    )
                 })
                 .collect();
             record_finalize_time(stats, start);
@@ -343,17 +366,18 @@ fn reconstruct_color_planes_finalized(
 fn reconstruct_aux_component_finalized(
     header: &CodestreamHeader,
     tile: DecodedTileCoefficients,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<Vec<i32>> {
     let component = tile.component;
     let precision = header.siz.components[component].precision;
     Ok(match header.transform_for(component) {
         WaveletTransform::Irreversible97 => {
-            let centered = reconstruct_irreversible_97_tile_centered(header, tile, stats)?;
-            finalize_f32_samples(centered, precision)
+            let centered = reconstruct_irreversible_97_tile_centered(header, tile, pool, stats)?;
+            finalize_f32_samples_with_pool(centered, precision, pool)
         }
         WaveletTransform::Reversible53 => {
-            let centered = reconstruct_reversible_53_tile_centered(header, tile, stats)?;
+            let centered = reconstruct_reversible_53_tile_centered(header, tile, pool, stats)?;
             finalize_i32_samples(centered, precision)
         }
     })
@@ -362,6 +386,7 @@ fn reconstruct_aux_component_finalized(
 fn reconstruct_cmyk_image(
     header: &CodestreamHeader,
     mut tiles: Vec<DecodedTileCoefficients>,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<Image> {
     if tiles.len() != 4 || header.siz.components.len() != 4 {
@@ -384,8 +409,10 @@ fn reconstruct_cmyk_image(
     let k_tile = tiles
         .pop()
         .ok_or_else(|| invalid("CMYK JP2 must decode exactly four components"))?;
-    let mut planes = reconstruct_color_planes_finalized(header, tiles, stats)?;
-    planes.push(reconstruct_aux_component_finalized(header, k_tile, stats)?);
+    let mut planes = reconstruct_color_planes_finalized(header, tiles, pool, stats)?;
+    planes.push(reconstruct_aux_component_finalized(
+        header, k_tile, pool, stats,
+    )?);
 
     let width = header.siz.width;
     let height = header.siz.height;
@@ -426,6 +453,7 @@ fn reconstruct_cmyk_image(
 fn reconstruct_grayscale_image_with_alpha(
     header: &CodestreamHeader,
     mut tiles: Vec<DecodedTileCoefficients>,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<Image> {
     tiles.sort_by_key(|tile| tile.component);
@@ -438,9 +466,9 @@ fn reconstruct_grayscale_image_with_alpha(
     let gray = tiles
         .pop()
         .ok_or_else(|| invalid("missing decoded grayscale component"))?;
-    let mut image = reconstruct_grayscale_image(header, gray, stats)?;
+    let mut image = reconstruct_grayscale_image_with_pool(header, gray, pool, stats)?;
     if let Some(alpha) = alpha_tile {
-        let plane = reconstruct_aux_component_finalized(header, alpha, stats)?;
+        let plane = reconstruct_aux_component_finalized(header, alpha, pool, stats)?;
         let component = header
             .siz
             .components
@@ -459,9 +487,19 @@ fn reconstruct_grayscale_image_with_alpha(
     Ok(image)
 }
 
+#[allow(dead_code)]
 pub(crate) fn reconstruct_grayscale_image(
     header: &CodestreamHeader,
     tile: DecodedTileCoefficients,
+    stats: &mut StatsSink<'_>,
+) -> Result<Image> {
+    reconstruct_grayscale_image_with_pool(header, tile, &super::Jp2BufferPool::disabled(), stats)
+}
+
+fn reconstruct_grayscale_image_with_pool(
+    header: &CodestreamHeader,
+    tile: DecodedTileCoefficients,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<Image> {
     let component = header
@@ -481,29 +519,16 @@ pub(crate) fn reconstruct_grayscale_image(
 
     let samples = match header.transform_for(0) {
         WaveletTransform::Reversible53 => {
-            let centered = reconstruct_reversible_53_centered(
-                header,
-                tile.into_integer()?,
-                0,
-                width,
-                height,
-                stats,
-            )?;
+            let centered = reconstruct_reversible_53_tile_centered(header, tile, pool, stats)?;
             let start = stats.start();
             let output = finalize_i32_samples(centered, component.precision);
             record_finalize_time(stats, start);
             output
         }
         WaveletTransform::Irreversible97 => {
-            let centered = reconstruct_irreversible_97_centered(
-                header,
-                tile.into_real()?,
-                width,
-                height,
-                stats,
-            )?;
+            let centered = reconstruct_irreversible_97_tile_centered(header, tile, pool, stats)?;
             let start = stats.start();
-            let output = finalize_f32_samples(centered, component.precision);
+            let output = finalize_f32_samples_with_pool(centered, component.precision, pool);
             record_finalize_time(stats, start);
             output
         }
@@ -634,6 +659,7 @@ pub(crate) fn reconstruct_packed_u8_into(
     tiles: Vec<DecodedTileCoefficients>,
     target: PackedWriteTarget<'_>,
     workers: usize,
+    pool: &super::Jp2BufferPool,
     cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
@@ -658,7 +684,7 @@ pub(crate) fn reconstruct_packed_u8_into(
     }
     match colorspace {
         ColorSpace::Gray if channels == 1 => {
-            reconstruct_grayscale_u8_into(header, tiles, target, workers, cancel, stats)
+            reconstruct_grayscale_u8_into(header, tiles, target, workers, pool, cancel, stats)
         }
         ColorSpace::Gray | ColorSpace::Srgb | ColorSpace::Cmyk => reconstruct_interleaved_u8_into(
             header,
@@ -669,11 +695,12 @@ pub(crate) fn reconstruct_packed_u8_into(
             tiles,
             target,
             workers,
+            pool,
             cancel,
             stats,
         ),
         ColorSpace::YCbCr => {
-            reconstruct_sycc_packed_into(header, channels, layout, tiles, target, stats)
+            reconstruct_sycc_packed_into(header, channels, layout, tiles, target, pool, stats)
         }
         other => Err(invalid(format!(
             "unsupported packed output colorspace: {other:?}"
@@ -691,6 +718,7 @@ pub(crate) fn reconstruct_component_channel_u8_into(
     dst_channel: usize,
     target: &mut PackedWriteTarget<'_>,
     workers: usize,
+    pool: &super::Jp2BufferPool,
     cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
@@ -719,7 +747,7 @@ pub(crate) fn reconstruct_component_channel_u8_into(
         {
             let kernel = PRIMITIVES.kernel;
             let dwt_start = stats.start();
-            let prefix = build_prefix_53(tile, levels, kernel, stats)?;
+            let prefix = build_prefix_53(tile, levels, kernel, pool, stats)?;
             record_dwt_time(stats, dwt_start);
             stats.update(|s| {
                 s.reconstructed_pixels = s
@@ -728,7 +756,7 @@ pub(crate) fn reconstruct_component_channel_u8_into(
             });
             let shift = 1i32 << (component.precision - 1);
             let max_sample = ((1i32 << component.precision) - 1) as u32;
-            for_each_row_band_cancellable(
+            let band_res = for_each_row_band_cancellable(
                 target,
                 workers,
                 cancel,
@@ -748,13 +776,15 @@ pub(crate) fn reconstruct_component_channel_u8_into(
                         );
                     }
                 },
-            )?;
+            );
+            prefix.recycle(pool);
+            band_res?;
         }
         WaveletTransform::Reversible53 => {
-            let centered = reconstruct_reversible_53_tile_centered(header, tile, stats)?;
+            let centered = reconstruct_reversible_53_tile_centered(header, tile, pool, stats)?;
             let shift = 1i32 << (component.precision - 1);
             let max_sample = ((1i32 << component.precision) - 1) as u32;
-            for_each_row_band_cancellable(
+            let band_res = for_each_row_band_cancellable(
                 target,
                 workers,
                 cancel,
@@ -772,12 +802,14 @@ pub(crate) fn reconstruct_component_channel_u8_into(
                         );
                     }
                 },
-            )?;
+            );
+            pool.park_i32(centered);
+            band_res?;
         }
         WaveletTransform::Irreversible97 if common_even => {
             let kernel = PRIMITIVES.kernel;
             let dwt_start = stats.start();
-            let prefix = build_prefix_97(tile, levels, kernel, stats)?;
+            let prefix = build_prefix_97(tile, levels, kernel, pool, stats)?;
             record_dwt_time(stats, dwt_start);
             stats.update(|s| {
                 s.reconstructed_pixels = s
@@ -786,7 +818,7 @@ pub(crate) fn reconstruct_component_channel_u8_into(
             });
             let shift = (1u32 << (component.precision - 1)) as f32;
             let max_sample = (1u32 << component.precision) - 1;
-            for_each_row_band_cancellable(
+            let band_res = for_each_row_band_cancellable(
                 target,
                 workers,
                 cancel,
@@ -806,13 +838,15 @@ pub(crate) fn reconstruct_component_channel_u8_into(
                         );
                     }
                 },
-            )?;
+            );
+            prefix.recycle(pool);
+            band_res?;
         }
         WaveletTransform::Irreversible97 => {
-            let centered = reconstruct_irreversible_97_tile_centered(header, tile, stats)?;
+            let centered = reconstruct_irreversible_97_tile_centered(header, tile, pool, stats)?;
             let shift = (1u32 << (component.precision - 1)) as f32;
             let max_sample = (1u32 << component.precision) - 1;
-            for_each_row_band_cancellable(
+            let band_res = for_each_row_band_cancellable(
                 target,
                 workers,
                 cancel,
@@ -830,7 +864,9 @@ pub(crate) fn reconstruct_component_channel_u8_into(
                         );
                     }
                 },
-            )?;
+            );
+            pool.park_f32(centered);
+            band_res?;
         }
     }
     record_finalize_time(stats, start);
@@ -884,6 +920,7 @@ fn reconstruct_grayscale_u8_into(
     mut tiles: Vec<DecodedTileCoefficients>,
     mut target: PackedWriteTarget<'_>,
     workers: usize,
+    pool: &super::Jp2BufferPool,
     cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
@@ -925,12 +962,13 @@ fn reconstruct_grayscale_u8_into(
                 component.precision,
                 &mut target,
                 workers,
+                pool,
                 cancel,
                 stats,
             )?;
         }
         WaveletTransform::Reversible53 => {
-            let centered = reconstruct_reversible_53_tile_centered(header, tile, stats)?;
+            let centered = reconstruct_reversible_53_tile_centered(header, tile, pool, stats)?;
             let shift = 1i32 << (component.precision - 1);
             let max_sample = (1i32 << component.precision) - 1;
             write_gray_plane_i32(
@@ -941,6 +979,7 @@ fn reconstruct_grayscale_u8_into(
                 &mut target,
                 workers,
             );
+            pool.park_i32(centered);
         }
         WaveletTransform::Irreversible97 if levels >= 1 && use_common_even_dwt(header) => {
             reconstruct_gray_97_fused_plane_into(
@@ -951,15 +990,17 @@ fn reconstruct_grayscale_u8_into(
                 component.precision,
                 &mut target,
                 workers,
+                pool,
                 cancel,
                 stats,
             )?;
         }
         WaveletTransform::Irreversible97 => {
-            let centered = reconstruct_irreversible_97_tile_centered(header, tile, stats)?;
+            let centered = reconstruct_irreversible_97_tile_centered(header, tile, pool, stats)?;
             let shift = (1u32 << (component.precision - 1)) as f32;
             let max_sample = (1u32 << component.precision) - 1;
             write_gray_plane_f32(&centered, width, shift, max_sample, &mut target, workers);
+            pool.park_f32(centered);
         }
     }
     record_finalize_time(stats, start);
@@ -1022,6 +1063,7 @@ fn build_prefix_97(
     tile: DecodedTileCoefficients,
     levels: u8,
     kernel: Kernel,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<SynthesisPrefix> {
     let (w, h) = (tile.width, tile.height);
@@ -1029,33 +1071,39 @@ fn build_prefix_97(
         CoefficientPlane::SplitReal(split) => {
             if stats.is_enabled() {
                 let mut timing = crate::dwt::InverseDwtTiming::default();
-                let p = crate::dwt::inverse_97_2d_even_but_last_split(
+                let p = crate::dwt::inverse_97_2d_even_but_last_split_with_pool(
                     split,
                     levels,
                     kernel,
                     Some(&mut timing),
+                    pool,
                 );
                 record_dwt_breakdown(stats, timing);
                 p
             } else {
-                crate::dwt::inverse_97_2d_even_but_last_split(split, levels, kernel, None)
+                crate::dwt::inverse_97_2d_even_but_last_split_with_pool(
+                    split, levels, kernel, None, pool,
+                )
             }
         }
         CoefficientPlane::Real(data) => {
             if stats.is_enabled() {
                 let mut timing = crate::dwt::InverseDwtTiming::default();
-                let p = crate::dwt::inverse_97_2d_even_but_last(
+                let p = crate::dwt::inverse_97_2d_even_but_last_with_pool(
                     data,
                     w,
                     h,
                     levels,
                     kernel,
                     Some(&mut timing),
+                    pool,
                 );
                 record_dwt_breakdown(stats, timing);
                 p
             } else {
-                crate::dwt::inverse_97_2d_even_but_last(data, w, h, levels, kernel, None)
+                crate::dwt::inverse_97_2d_even_but_last_with_pool(
+                    data, w, h, levels, kernel, None, pool,
+                )
             }
         }
         CoefficientPlane::Integer(_) | CoefficientPlane::SplitInteger(_) => {
@@ -1070,6 +1118,7 @@ fn build_prefix_53(
     tile: DecodedTileCoefficients,
     levels: u8,
     kernel: Kernel,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<SynthesisPrefix53> {
     let (w, h) = (tile.width, tile.height);
@@ -1077,33 +1126,39 @@ fn build_prefix_53(
         CoefficientPlane::SplitInteger(split) => {
             if stats.is_enabled() {
                 let mut timing = crate::dwt::InverseDwtTiming::default();
-                let p = crate::dwt::inverse_53_2d_even_but_last_split(
+                let p = crate::dwt::inverse_53_2d_even_but_last_split_with_pool(
                     split,
                     levels,
                     kernel,
                     Some(&mut timing),
+                    pool,
                 );
                 record_dwt_breakdown(stats, timing);
                 p
             } else {
-                crate::dwt::inverse_53_2d_even_but_last_split(split, levels, kernel, None)
+                crate::dwt::inverse_53_2d_even_but_last_split_with_pool(
+                    split, levels, kernel, None, pool,
+                )
             }
         }
         CoefficientPlane::Integer(data) => {
             if stats.is_enabled() {
                 let mut timing = crate::dwt::InverseDwtTiming::default();
-                let p = crate::dwt::inverse_53_2d_even_but_last(
+                let p = crate::dwt::inverse_53_2d_even_but_last_with_pool(
                     data,
                     w,
                     h,
                     levels,
                     kernel,
                     Some(&mut timing),
+                    pool,
                 );
                 record_dwt_breakdown(stats, timing);
                 p
             } else {
-                crate::dwt::inverse_53_2d_even_but_last(data, w, h, levels, kernel, None)
+                crate::dwt::inverse_53_2d_even_but_last_with_pool(
+                    data, w, h, levels, kernel, None, pool,
+                )
             }
         }
         CoefficientPlane::Real(_) | CoefficientPlane::SplitReal(_) => {
@@ -1123,13 +1178,14 @@ fn reconstruct_gray_97_fused_plane_into(
     precision: u8,
     target: &mut PackedWriteTarget<'_>,
     workers: usize,
+    pool: &super::Jp2BufferPool,
     cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
     let levels = header.cod.decomposition_levels;
     let kernel = PRIMITIVES.kernel;
     let dwt_start = stats.start();
-    let prefix = build_prefix_97(tile, levels, kernel, stats)?;
+    let prefix = build_prefix_97(tile, levels, kernel, pool, stats)?;
     record_dwt_time(stats, dwt_start);
     stats.update(|stats| {
         stats.reconstructed_pixels = stats
@@ -1141,7 +1197,7 @@ fn reconstruct_gray_97_fused_plane_into(
     let max_sample = (1u32 << precision) - 1;
     let (w, sx, sy) = (target.width, target.source_x, target.source_y);
     let (x0, stride) = (target.origin_x, target.stride);
-    for_each_row_band_cancellable(
+    let res = for_each_row_band_cancellable(
         target,
         workers,
         cancel,
@@ -1153,7 +1209,9 @@ fn reconstruct_gray_97_fused_plane_into(
                 finalize_gray_row_f32(&mut out[x0..x0 + w], &row[sx..sx + w], shift, max_sample);
             }
         },
-    )
+    );
+    prefix.recycle(pool);
+    res
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1165,6 +1223,7 @@ fn reconstruct_gray_53_fused_plane_into(
     precision: u8,
     target: &mut PackedWriteTarget<'_>,
     workers: usize,
+    pool: &super::Jp2BufferPool,
     cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
@@ -1176,7 +1235,7 @@ fn reconstruct_gray_53_fused_plane_into(
     let levels = header.cod.decomposition_levels;
     let kernel = PRIMITIVES.kernel;
     let dwt_start = stats.start();
-    let prefix = build_prefix_53(tile, levels, kernel, stats)?;
+    let prefix = build_prefix_53(tile, levels, kernel, pool, stats)?;
     record_dwt_time(stats, dwt_start);
     stats.update(|stats| {
         stats.reconstructed_pixels = stats
@@ -1188,7 +1247,7 @@ fn reconstruct_gray_53_fused_plane_into(
     let max_sample = ((1i32 << precision) - 1) as u32;
     let (w, sx, sy) = (target.width, target.source_x, target.source_y);
     let (x0, stride) = (target.origin_x, target.stride);
-    for_each_row_band_cancellable(
+    let res = for_each_row_band_cancellable(
         target,
         workers,
         cancel,
@@ -1200,7 +1259,9 @@ fn reconstruct_gray_53_fused_plane_into(
                 finalize_gray_row_i32(&mut out[x0..x0 + w], &row[sx..sx + w], shift, max_sample);
             }
         },
-    )
+    );
+    prefix.recycle(pool);
+    res
 }
 
 #[cfg(test)]
@@ -1229,6 +1290,7 @@ fn reconstruct_gray_97_fused_into(
         precision,
         target,
         workers,
+        &super::Jp2BufferPool::disabled(),
         None,
         stats,
     )
@@ -1322,6 +1384,7 @@ fn reconstruct_interleaved_u8_into(
     mut tiles: Vec<DecodedTileCoefficients>,
     mut target: PackedWriteTarget<'_>,
     workers: usize,
+    pool: &super::Jp2BufferPool,
     cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
@@ -1361,6 +1424,7 @@ fn reconstruct_interleaved_u8_into(
             pixel_count,
             &mut target,
             workers,
+            pool,
             cancel,
             stats,
         );
@@ -1369,9 +1433,9 @@ fn reconstruct_interleaved_u8_into(
     let mut tiles_iter = tiles.into_iter();
     let colour_tiles: Vec<DecodedTileCoefficients> =
         tiles_iter.by_ref().take(colour_count).collect();
-    let mut component_u8 = reconstruct_colour_u8(header, colour_tiles, stats)?;
+    let mut component_u8 = reconstruct_colour_u8(header, colour_tiles, pool, stats)?;
     for tile in tiles_iter {
-        component_u8.push(reconstruct_aux_component_u8(header, tile, stats)?);
+        component_u8.push(reconstruct_aux_component_u8(header, tile, pool, stats)?);
     }
 
     let start = stats.start();
@@ -1461,6 +1525,7 @@ fn reconstruct_fused_packed_into(
     pixel_count: usize,
     target: &mut PackedWriteTarget<'_>,
     workers: usize,
+    pool: &super::Jp2BufferPool,
     cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
@@ -1477,7 +1542,7 @@ fn reconstruct_fused_packed_into(
                 return Err(Jp2LamError::Cancelled);
             }
             let aux_u8 = match aux_tile {
-                Some(tile) => Some(reconstruct_aux_component_u8(header, tile, stats)?),
+                Some(tile) => Some(reconstruct_aux_component_u8(header, tile, pool, stats)?),
                 None => None,
             };
             if fused_final_level_applies(header, &colour_tiles, pixel_count, target) {
@@ -1490,6 +1555,7 @@ fn reconstruct_fused_packed_into(
                     channels,
                     target,
                     workers,
+                    pool,
                     cancel,
                     stats,
                 );
@@ -1497,14 +1563,17 @@ fn reconstruct_fused_packed_into(
             let mut planes = Vec::with_capacity(3);
             for tile in colour_tiles {
                 if cancel.is_some_and(|f| f()) {
+                    for plane in planes {
+                        pool.park_f32(plane);
+                    }
                     return Err(Jp2LamError::Cancelled);
                 }
                 planes.push(reconstruct_irreversible_97_tile_centered(
-                    header, tile, stats,
+                    header, tile, pool, stats,
                 )?);
             }
             let start = stats.start();
-            fuse_pack_f32_into_cancellable(
+            let res = fuse_pack_f32_into_cancellable(
                 &planes[0],
                 &planes[1],
                 &planes[2],
@@ -1517,7 +1586,11 @@ fn reconstruct_fused_packed_into(
                 target,
                 workers,
                 cancel,
-            )?;
+            );
+            for plane in planes {
+                pool.park_f32(plane);
+            }
+            res?;
             record_finalize_time(stats, start);
         }
         WaveletTransform::Reversible53 => {
@@ -1527,7 +1600,7 @@ fn reconstruct_fused_packed_into(
             // Convert any auxiliary (alpha / CMYK K) plane to 1 B/px first so
             // its 4 B/px coefficient buffer drops before colour synthesis.
             let aux_u8 = match aux_tile {
-                Some(tile) => Some(reconstruct_aux_component_u8(header, tile, stats)?),
+                Some(tile) => Some(reconstruct_aux_component_u8(header, tile, pool, stats)?),
                 None => None,
             };
             if fused_final_level_53_applies(header, &colour_tiles, pixel_count, target, apply_mct) {
@@ -1540,6 +1613,7 @@ fn reconstruct_fused_packed_into(
                     channels,
                     target,
                     workers,
+                    pool,
                     cancel,
                     stats,
                 );
@@ -1547,14 +1621,17 @@ fn reconstruct_fused_packed_into(
             let mut planes = Vec::with_capacity(3);
             for tile in colour_tiles {
                 if cancel.is_some_and(|f| f()) {
+                    for plane in planes {
+                        pool.park_i32(plane);
+                    }
                     return Err(Jp2LamError::Cancelled);
                 }
                 planes.push(reconstruct_reversible_53_tile_centered(
-                    header, tile, stats,
+                    header, tile, pool, stats,
                 )?);
             }
             let start = stats.start();
-            fuse_pack_i32_into_cancellable(
+            let res = fuse_pack_i32_into_cancellable(
                 &planes[0],
                 &planes[1],
                 &planes[2],
@@ -1567,7 +1644,11 @@ fn reconstruct_fused_packed_into(
                 target,
                 workers,
                 cancel,
-            )?;
+            );
+            for plane in planes {
+                pool.park_i32(plane);
+            }
+            res?;
             record_finalize_time(stats, start);
         }
     }
@@ -2393,6 +2474,7 @@ fn reconstruct_sycc_packed_into(
     layout: PackedLayout,
     mut tiles: Vec<DecodedTileCoefficients>,
     target: PackedWriteTarget<'_>,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
     let _ = channels; // used via target.channels / store_rgb_layout
@@ -2432,20 +2514,13 @@ fn reconstruct_sycc_packed_into(
         let precision = header.siz.components[c].precision;
         let data = match header.transform_for(c) {
             WaveletTransform::Reversible53 => {
-                let centered = reconstruct_reversible_53_centered(
-                    header,
-                    tile.into_integer()?,
-                    c,
-                    cw,
-                    ch,
-                    stats,
-                )?;
+                let centered = reconstruct_reversible_53_tile_centered(header, tile, pool, stats)?;
                 finalize_i32_samples(centered, precision)
             }
             WaveletTransform::Irreversible97 => {
                 let centered =
-                    reconstruct_irreversible_97_centered(header, tile.into_real()?, cw, ch, stats)?;
-                finalize_f32_samples(centered, precision)
+                    reconstruct_irreversible_97_tile_centered(header, tile, pool, stats)?;
+                finalize_f32_samples_with_pool(centered, precision, pool)
             }
         };
         if data.len() != cw * ch {
@@ -2489,6 +2564,9 @@ fn reconstruct_sycc_packed_into(
             );
         }
     }
+    for (plane, _, _) in native {
+        pool.park_i32(plane);
+    }
     record_finalize_time(stats, start);
     stats.update(|stats| {
         stats.output_pixels = stats
@@ -2499,31 +2577,35 @@ fn reconstruct_sycc_packed_into(
 }
 
 /// Scale one centered `i32` (reversible 5/3) component to unsigned u8 samples.
-fn centered_i32_to_u8(centered: Vec<i32>, precision: u8) -> Vec<u8> {
+fn centered_i32_to_u8(centered: Vec<i32>, precision: u8, pool: &super::Jp2BufferPool) -> Vec<u8> {
     let shift = 1i32 << (precision - 1);
     let max_sample = (1i32 << precision) - 1;
-    centered
-        .into_iter()
-        .map(|sample| {
+    let out: Vec<u8> = centered
+        .iter()
+        .map(|&sample| {
             scale_unsigned_to_u8(
                 sample.saturating_add(shift).clamp(0, max_sample) as u32,
                 max_sample as u32,
             )
         })
-        .collect()
+        .collect();
+    pool.park_i32(centered);
+    out
 }
 
 /// Scale one centered `f32` (irreversible 9/7) component to unsigned u8 samples.
-fn centered_f32_to_u8(centered: Vec<f32>, precision: u8) -> Vec<u8> {
+fn centered_f32_to_u8(centered: Vec<f32>, precision: u8, pool: &super::Jp2BufferPool) -> Vec<u8> {
     let shift = (1u32 << (precision - 1)) as f32;
     let max_sample = (1u32 << precision) - 1;
-    centered
-        .into_iter()
-        .map(|sample| {
+    let out: Vec<u8> = centered
+        .iter()
+        .map(|&sample| {
             let value = (sample + shift + 0.5).clamp(0.0, max_sample as f32) as u32;
             scale_unsigned_to_u8(value, max_sample)
         })
-        .collect()
+        .collect();
+    pool.park_f32(centered);
+    out
 }
 
 /// Reconstruct the MCT colour components to per-component u8 planes: inverse DWT
@@ -2532,6 +2614,7 @@ fn centered_f32_to_u8(centered: Vec<f32>, precision: u8) -> Vec<u8> {
 fn reconstruct_colour_u8(
     header: &CodestreamHeader,
     tiles: Vec<DecodedTileCoefficients>,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<Vec<Vec<u8>>> {
     let apply_mct = header.cod.use_mct && tiles.len() == 3;
@@ -2539,15 +2622,8 @@ fn reconstruct_colour_u8(
         WaveletTransform::Reversible53 => {
             let mut planes = Vec::with_capacity(tiles.len());
             for tile in tiles {
-                let component = tile.component;
-                let (w, h) = (tile.width, tile.height);
-                planes.push(reconstruct_reversible_53_centered(
-                    header,
-                    tile.into_integer()?,
-                    component,
-                    w,
-                    h,
-                    stats,
+                planes.push(reconstruct_reversible_53_tile_centered(
+                    header, tile, pool, stats,
                 )?);
             }
             if apply_mct {
@@ -2559,20 +2635,15 @@ fn reconstruct_colour_u8(
                 .into_iter()
                 .enumerate()
                 .map(|(index, plane)| {
-                    centered_i32_to_u8(plane, header.siz.components[index].precision)
+                    centered_i32_to_u8(plane, header.siz.components[index].precision, pool)
                 })
                 .collect()
         }
         WaveletTransform::Irreversible97 => {
             let mut planes = Vec::with_capacity(tiles.len());
             for tile in tiles {
-                let (w, h) = (tile.width, tile.height);
-                planes.push(reconstruct_irreversible_97_centered(
-                    header,
-                    tile.into_real()?,
-                    w,
-                    h,
-                    stats,
+                planes.push(reconstruct_irreversible_97_tile_centered(
+                    header, tile, pool, stats,
                 )?);
             }
             if apply_mct {
@@ -2584,7 +2655,7 @@ fn reconstruct_colour_u8(
                 .into_iter()
                 .enumerate()
                 .map(|(index, plane)| {
-                    centered_f32_to_u8(plane, header.siz.components[index].precision)
+                    centered_f32_to_u8(plane, header.siz.components[index].precision, pool)
                 })
                 .collect()
         }
@@ -2595,18 +2666,19 @@ fn reconstruct_colour_u8(
 fn reconstruct_aux_component_u8(
     header: &CodestreamHeader,
     tile: DecodedTileCoefficients,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<Vec<u8>> {
     let component = tile.component;
     let precision = header.siz.components[component].precision;
     Ok(match header.transform_for(component) {
         WaveletTransform::Irreversible97 => {
-            let centered = reconstruct_irreversible_97_tile_centered(header, tile, stats)?;
-            centered_f32_to_u8(centered, precision)
+            let centered = reconstruct_irreversible_97_tile_centered(header, tile, pool, stats)?;
+            centered_f32_to_u8(centered, precision, pool)
         }
         WaveletTransform::Reversible53 => {
-            let centered = reconstruct_reversible_53_tile_centered(header, tile, stats)?;
-            centered_i32_to_u8(centered, precision)
+            let centered = reconstruct_reversible_53_tile_centered(header, tile, pool, stats)?;
+            centered_i32_to_u8(centered, precision, pool)
         }
     })
 }
@@ -2623,6 +2695,7 @@ fn scale_unsigned_to_u8(sample: u32, max_sample: u32) -> u8 {
 fn reconstruct_srgb_image(
     header: &CodestreamHeader,
     mut tiles: Vec<DecodedTileCoefficients>,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<Image> {
     // An sRGB stream may carry a 4th `cdef` opacity plane (an RGBA image): the
@@ -2643,9 +2716,11 @@ fn reconstruct_srgb_image(
     }
 
     let alpha_tile = if ncomp == 4 { tiles.pop() } else { None };
-    let mut planes = reconstruct_color_planes_finalized(header, tiles, stats)?;
+    let mut planes = reconstruct_color_planes_finalized(header, tiles, pool, stats)?;
     if let Some(alpha) = alpha_tile {
-        planes.push(reconstruct_aux_component_finalized(header, alpha, stats)?);
+        planes.push(reconstruct_aux_component_finalized(
+            header, alpha, pool, stats,
+        )?);
     }
 
     let width = header.siz.width;
@@ -2681,6 +2756,7 @@ fn reconstruct_srgb_image(
 fn reconstruct_reversible_53_tile_centered(
     header: &CodestreamHeader,
     tile: DecodedTileCoefficients,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<Vec<i32>> {
     let component = tile.component;
@@ -2698,33 +2774,39 @@ fn reconstruct_reversible_53_tile_centered(
             CoefficientPlane::SplitInteger(split) => {
                 if stats.is_enabled() {
                     let mut timing = crate::dwt::InverseDwtTiming::default();
-                    let out = crate::dwt::inverse_53_2d_even_split(
+                    let out = crate::dwt::inverse_53_2d_even_split_with_pool(
                         split,
                         levels,
                         kernel,
                         Some(&mut timing),
+                        pool,
                     );
                     record_dwt_breakdown(stats, timing);
                     out
                 } else {
-                    crate::dwt::inverse_53_2d_even_split(split, levels, kernel, None)
+                    crate::dwt::inverse_53_2d_even_split_with_pool(
+                        split, levels, kernel, None, pool,
+                    )
                 }
             }
             CoefficientPlane::Integer(data) => {
                 if stats.is_enabled() {
                     let mut timing = crate::dwt::InverseDwtTiming::default();
-                    let out = crate::dwt::inverse_53_2d_even(
+                    let out = crate::dwt::inverse_53_2d_even_with_pool(
                         data,
                         width,
                         height,
                         levels,
                         kernel,
                         Some(&mut timing),
+                        pool,
                     );
                     record_dwt_breakdown(stats, timing);
                     out
                 } else {
-                    crate::dwt::inverse_53_2d_even(data, width, height, levels, kernel, None)
+                    crate::dwt::inverse_53_2d_even_with_pool(
+                        data, width, height, levels, kernel, None, pool,
+                    )
                 }
             }
             CoefficientPlane::Real(_) | CoefficientPlane::SplitReal(_) => {
@@ -2742,7 +2824,7 @@ fn reconstruct_reversible_53_tile_centered(
     }
     reconstruct_reversible_53_centered(
         header,
-        tile.into_integer()?,
+        tile.into_integer_with_pool(pool)?,
         component,
         width,
         height,
@@ -2753,6 +2835,7 @@ fn reconstruct_reversible_53_tile_centered(
 fn reconstruct_irreversible_97_tile_centered(
     header: &CodestreamHeader,
     tile: DecodedTileCoefficients,
+    pool: &super::Jp2BufferPool,
     stats: &mut StatsSink<'_>,
 ) -> Result<Vec<f32>> {
     let (width, height) = (tile.width, tile.height);
@@ -2764,33 +2847,39 @@ fn reconstruct_irreversible_97_tile_centered(
             CoefficientPlane::SplitReal(split) => {
                 if stats.is_enabled() {
                     let mut timing = crate::dwt::InverseDwtTiming::default();
-                    let out = crate::dwt::inverse_97_2d_even_split(
+                    let out = crate::dwt::inverse_97_2d_even_split_with_pool(
                         split,
                         levels,
                         kernel,
                         Some(&mut timing),
+                        pool,
                     );
                     record_dwt_breakdown(stats, timing);
                     out
                 } else {
-                    crate::dwt::inverse_97_2d_even_split(split, levels, kernel, None)
+                    crate::dwt::inverse_97_2d_even_split_with_pool(
+                        split, levels, kernel, None, pool,
+                    )
                 }
             }
             CoefficientPlane::Real(data) => {
                 if stats.is_enabled() {
                     let mut timing = crate::dwt::InverseDwtTiming::default();
-                    let out = crate::dwt::inverse_97_2d_even(
+                    let out = crate::dwt::inverse_97_2d_even_with_pool(
                         data,
                         width,
                         height,
                         levels,
                         kernel,
                         Some(&mut timing),
+                        pool,
                     );
                     record_dwt_breakdown(stats, timing);
                     out
                 } else {
-                    crate::dwt::inverse_97_2d_even(data, width, height, levels, kernel, None)
+                    crate::dwt::inverse_97_2d_even_with_pool(
+                        data, width, height, levels, kernel, None, pool,
+                    )
                 }
             }
             CoefficientPlane::Integer(_) | CoefficientPlane::SplitInteger(_) => {
@@ -2806,7 +2895,13 @@ fn reconstruct_irreversible_97_tile_centered(
         });
         return Ok(out);
     }
-    reconstruct_irreversible_97_centered(header, tile.into_real()?, width, height, stats)
+    reconstruct_irreversible_97_centered(
+        header,
+        tile.into_real_with_pool(pool)?,
+        width,
+        height,
+        stats,
+    )
 }
 /// True when the tile-component origin is aligned to the full decomposition
 /// lattice (`2^levels`). Every synthesis step then has even phase, so the
@@ -2966,6 +3061,7 @@ fn reconstruct_irreversible_97_fused_pack(
     channels: usize,
     target: &mut PackedWriteTarget<'_>,
     workers: usize,
+    pool: &super::Jp2BufferPool,
     cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
@@ -2974,12 +3070,15 @@ fn reconstruct_irreversible_97_fused_pack(
     let dwt_start = stats.start();
     let plane_width = header.siz.width as usize;
     let prefixes: Vec<SynthesisPrefix> = if stats.is_enabled() {
-        let mut prefixes = Vec::with_capacity(3);
+        let mut prefixes: Vec<SynthesisPrefix> = Vec::with_capacity(3);
         for tile in colour_tiles {
             if cancel.is_some_and(|f| f()) {
+                for p in prefixes {
+                    p.recycle(pool);
+                }
                 return Err(Jp2LamError::Cancelled);
             }
-            prefixes.push(build_prefix_97(tile, levels, kernel, stats)?);
+            prefixes.push(build_prefix_97(tile, levels, kernel, pool, stats)?);
         }
         prefixes
     } else {
@@ -2988,7 +3087,7 @@ fn reconstruct_irreversible_97_fused_pack(
                 return Err(Jp2LamError::Cancelled);
             }
             let mut disabled = StatsSink::disabled();
-            build_prefix_97(tile, levels, kernel, &mut disabled)
+            build_prefix_97(tile, levels, kernel, pool, &mut disabled)
         };
         if workers > 1 {
             colour_tiles
@@ -3032,7 +3131,7 @@ fn reconstruct_irreversible_97_fused_pack(
         && stride == w * channels
         && pixel_count >= FUSED_PACK_PARALLEL_SAMPLES
         && workers > 1;
-    if tight {
+    let pack_res = if tight {
         let rows_per_band = h.div_ceil(workers.max(1) * 2).max(16);
         for_each_chunk_budgeted(
             &mut target.data[..h * stride],
@@ -3065,7 +3164,7 @@ fn reconstruct_irreversible_97_fused_pack(
                     );
                 }
             },
-        )?;
+        )
     } else {
         let mut sy_s = LevelSynthScratch::new();
         let mut scb_s = LevelSynthScratch::new();
@@ -3073,9 +3172,11 @@ fn reconstruct_irreversible_97_fused_pack(
         let mut sy_ = py.final_level_with_scratch(kernel, sy, &mut sy_s);
         let mut scb = pcb.final_level_with_scratch(kernel, sy, &mut scb_s);
         let mut scr = pcr.final_level_with_scratch(kernel, sy, &mut scr_s);
+        let mut loop_res = Ok(());
         for py_ in 0..h {
             if (py_ & 63) == 0 && cancel.is_some_and(|f| f()) {
-                return Err(Jp2LamError::Cancelled);
+                loop_res = Err(Jp2LamError::Cancelled);
+                break;
             }
             let off = target.pixel_offset(0, py_);
             let y_row = sy_.next_row();
@@ -3090,7 +3191,12 @@ fn reconstruct_irreversible_97_fused_pack(
                 &mut target.data[off..off + w * channels],
             );
         }
-    }
+        loop_res
+    };
+    py.recycle(pool);
+    pcb.recycle(pool);
+    pcr.recycle(pool);
+    pack_res?;
     record_finalize_time(stats, start);
     stats.update(|stats| {
         stats.output_pixels = stats.output_pixels.saturating_add((w * h) as u64);
@@ -3113,6 +3219,7 @@ fn reconstruct_reversible_53_fused_pack(
     channels: usize,
     target: &mut PackedWriteTarget<'_>,
     workers: usize,
+    pool: &super::Jp2BufferPool,
     cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stats: &mut StatsSink<'_>,
 ) -> Result<()> {
@@ -3121,12 +3228,15 @@ fn reconstruct_reversible_53_fused_pack(
     let dwt_start = stats.start();
     let plane_width = header.siz.width as usize;
     let prefixes: Vec<SynthesisPrefix53> = if stats.is_enabled() {
-        let mut prefixes = Vec::with_capacity(3);
+        let mut prefixes: Vec<SynthesisPrefix53> = Vec::with_capacity(3);
         for tile in colour_tiles {
             if cancel.is_some_and(|f| f()) {
+                for p in prefixes {
+                    p.recycle(pool);
+                }
                 return Err(Jp2LamError::Cancelled);
             }
-            prefixes.push(build_prefix_53(tile, levels, kernel, stats)?);
+            prefixes.push(build_prefix_53(tile, levels, kernel, pool, stats)?);
         }
         prefixes
     } else {
@@ -3135,7 +3245,7 @@ fn reconstruct_reversible_53_fused_pack(
                 return Err(Jp2LamError::Cancelled);
             }
             let mut disabled = StatsSink::disabled();
-            build_prefix_53(tile, levels, kernel, &mut disabled)
+            build_prefix_53(tile, levels, kernel, pool, &mut disabled)
         };
         if workers > 1 {
             colour_tiles
@@ -3179,7 +3289,7 @@ fn reconstruct_reversible_53_fused_pack(
         && stride == w * channels
         && pixel_count >= FUSED_PACK_PARALLEL_SAMPLES
         && workers > 1;
-    if tight {
+    let pack_res = if tight {
         let rows_per_band = h.div_ceil(workers.max(1) * 2).max(16);
         for_each_chunk_budgeted(
             &mut target.data[..h * stride],
@@ -3212,7 +3322,7 @@ fn reconstruct_reversible_53_fused_pack(
                     );
                 }
             },
-        )?;
+        )
     } else {
         let mut sy_s = LevelSynth53Scratch::new();
         let mut sdb_s = LevelSynth53Scratch::new();
@@ -3220,9 +3330,11 @@ fn reconstruct_reversible_53_fused_pack(
         let mut sy_ = py.final_level_with_scratch(kernel, sy, &mut sy_s);
         let mut sdb = pdb.final_level_with_scratch(kernel, sy, &mut sdb_s);
         let mut sdr = pdr.final_level_with_scratch(kernel, sy, &mut sdr_s);
+        let mut loop_res = Ok(());
         for py_ in 0..h {
             if (py_ & 63) == 0 && cancel.is_some_and(|f| f()) {
-                return Err(Jp2LamError::Cancelled);
+                loop_res = Err(Jp2LamError::Cancelled);
+                break;
             }
             let off = target.pixel_offset(0, py_);
             let y_row = sy_.next_row();
@@ -3237,7 +3349,12 @@ fn reconstruct_reversible_53_fused_pack(
                 &mut target.data[off..off + w * channels],
             );
         }
-    }
+        loop_res
+    };
+    py.recycle(pool);
+    pdb.recycle(pool);
+    pdr.recycle(pool);
+    pack_res?;
     record_finalize_time(stats, start);
     stats.update(|stats| {
         stats.output_pixels = stats.output_pixels.saturating_add((w * h) as u64);
@@ -3304,16 +3421,27 @@ fn finalize_i32_samples(samples: Vec<i32>, precision: u8) -> Vec<i32> {
         .collect()
 }
 
+#[cfg(test)]
 fn finalize_f32_samples(samples: Vec<f32>, precision: u8) -> Vec<i32> {
+    finalize_f32_samples_with_pool(samples, precision, &super::Jp2BufferPool::disabled())
+}
+
+fn finalize_f32_samples_with_pool(
+    samples: Vec<f32>,
+    precision: u8,
+    pool: &super::Jp2BufferPool,
+) -> Vec<i32> {
     let shift = (1u32 << (precision - 1)) as f32;
     let max_sample = ((1u32 << precision) - 1) as f32;
-    samples
-        .into_iter()
+    let out: Vec<i32> = samples
+        .iter()
         // The level shift and clamp make the converted domain non-negative,
         // so round-to-nearest is exactly truncation after adding 0.5. This
         // avoids a scalar libm `roundf` call for every reconstructed sample.
-        .map(|sample| (sample + shift + 0.5).clamp(0.0, max_sample) as i32)
-        .collect()
+        .map(|&sample| (sample + shift + 0.5).clamp(0.0, max_sample) as i32)
+        .collect();
+    pool.park_f32(samples);
+    out
 }
 
 pub(crate) fn quant_step(precision: u32, band: BandOrientation, quant: QuantizationStep) -> f32 {

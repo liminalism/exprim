@@ -56,13 +56,16 @@ pub(crate) struct DecodedTileCoefficients {
     pub(crate) plane: CoefficientPlane,
 }
 
-fn flatten_split<T: Copy + Default>(split: crate::dwt::SplitSubbands<T>) -> Vec<T> {
+fn flatten_split_i32(
+    split: crate::dwt::SplitSubbands<i32>,
+    pool: &super::Jp2BufferPool,
+) -> Vec<i32> {
     let (width, height) = (split.width, split.height);
     let sn = width.div_ceil(2);
     let dn = width - sn;
     let sv = height.div_ceil(2);
     let dv = height - sv;
-    let mut out = vec![T::default(); width * height];
+    let mut out = pool.take_for_overwrite_i32(width * height);
     for y in 0..sv {
         out[y * width..y * width + sn].copy_from_slice(&split.coarse[y * sn..(y + 1) * sn]);
         if dn > 0 {
@@ -72,16 +75,50 @@ fn flatten_split<T: Copy + Default>(split: crate::dwt::SplitSubbands<T>) -> Vec<
     if dv > 0 {
         out[sv * width..].copy_from_slice(&split.lh_hh1);
     }
+    pool.park_i32(split.coarse);
+    pool.park_i32(split.hl1);
+    pool.park_i32(split.lh_hh1);
+    out
+}
+
+fn flatten_split_f32(
+    split: crate::dwt::SplitSubbands<f32>,
+    pool: &super::Jp2BufferPool,
+) -> Vec<f32> {
+    let (width, height) = (split.width, split.height);
+    let sn = width.div_ceil(2);
+    let dn = width - sn;
+    let sv = height.div_ceil(2);
+    let dv = height - sv;
+    let mut out = pool.take_for_overwrite_f32(width * height);
+    for y in 0..sv {
+        out[y * width..y * width + sn].copy_from_slice(&split.coarse[y * sn..(y + 1) * sn]);
+        if dn > 0 {
+            out[y * width + sn..(y + 1) * width].copy_from_slice(&split.hl1[y * dn..(y + 1) * dn]);
+        }
+    }
+    if dv > 0 {
+        out[sv * width..].copy_from_slice(&split.lh_hh1);
+    }
+    pool.park_f32(split.coarse);
+    pool.park_f32(split.hl1);
+    pool.park_f32(split.lh_hh1);
     out
 }
 
 impl DecodedTileCoefficients {
     /// Take the reversible integer plane, erroring if this tile was decoded as
     /// an irreversible (dequantized `f32`) plane.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn into_integer(self) -> Result<Vec<i32>> {
+        self.into_integer_with_pool(&super::Jp2BufferPool::disabled())
+    }
+
+    pub(crate) fn into_integer_with_pool(self, pool: &super::Jp2BufferPool) -> Result<Vec<i32>> {
         match self.plane {
             CoefficientPlane::Integer(values) => Ok(values),
-            CoefficientPlane::SplitInteger(split) => Ok(flatten_split(split)),
+            CoefficientPlane::SplitInteger(split) => Ok(flatten_split_i32(split, pool)),
             CoefficientPlane::Real(_) | CoefficientPlane::SplitReal(_) => Err(invalid(
                 "reversible reconstruction requested for an irreversible coefficient plane",
             )),
@@ -90,10 +127,16 @@ impl DecodedTileCoefficients {
 
     /// Take the irreversible, already-dequantized `f32` plane, erroring if this
     /// tile was decoded as a reversible integer plane.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn into_real(self) -> Result<Vec<f32>> {
+        self.into_real_with_pool(&super::Jp2BufferPool::disabled())
+    }
+
+    pub(crate) fn into_real_with_pool(self, pool: &super::Jp2BufferPool) -> Result<Vec<f32>> {
         match self.plane {
             CoefficientPlane::Real(values) => Ok(values),
-            CoefficientPlane::SplitReal(split) => Ok(flatten_split(split)),
+            CoefficientPlane::SplitReal(split) => Ok(flatten_split_f32(split, pool)),
             CoefficientPlane::Integer(_) | CoefficientPlane::SplitInteger(_) => Err(invalid(
                 "irreversible reconstruction requested for a reversible coefficient plane",
             )),
@@ -188,6 +231,7 @@ pub(crate) fn decode_tile_components_with_scratch(
     worker_count: usize,
 ) -> Result<Vec<DecodedTileCoefficients>> {
     let mut worker_scratches = Vec::new();
+    let disabled = super::Jp2BufferPool::disabled();
     decode_tile_component_range_with_scratch(
         header,
         packets,
@@ -197,6 +241,7 @@ pub(crate) fn decode_tile_components_with_scratch(
         scratch,
         &mut worker_scratches,
         worker_count,
+        &disabled,
         None,
     )
 }
@@ -211,6 +256,7 @@ pub(crate) fn decode_tile_component_range_with_scratch(
     scratch: &mut Tier1Scratch,
     worker_scratches: &mut Vec<Tier1Scratch>,
     worker_count: usize,
+    pool: &super::Jp2BufferPool,
     cancel: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> Result<Vec<DecodedTileCoefficients>> {
     let component_count = header.siz.components.len();
@@ -227,17 +273,17 @@ pub(crate) fn decode_tile_component_range_with_scratch(
         let (cw, ch) = header.tile_component_dims(component)?;
         let use_split = split_ok && cw > 0 && ch > 0;
         let plane = match (header.transform_for(component), use_split) {
-            (WaveletTransform::Irreversible97, true) => {
-                CoefficientPlane::SplitReal(crate::dwt::SplitSubbands::new_zeroed(cw, ch))
-            }
+            (WaveletTransform::Irreversible97, true) => CoefficientPlane::SplitReal(
+                crate::dwt::SplitSubbands::<f32>::new_zeroed_with_pool(cw, ch, pool),
+            ),
             (WaveletTransform::Irreversible97, false) => {
-                CoefficientPlane::Real(vec![0.0f32; cw * ch])
+                CoefficientPlane::Real(pool.take_zeroed_f32(cw * ch))
             }
-            (WaveletTransform::Reversible53, true) => {
-                CoefficientPlane::SplitInteger(crate::dwt::SplitSubbands::new_zeroed(cw, ch))
-            }
+            (WaveletTransform::Reversible53, true) => CoefficientPlane::SplitInteger(
+                crate::dwt::SplitSubbands::<i32>::new_zeroed_with_pool(cw, ch, pool),
+            ),
             (WaveletTransform::Reversible53, false) => {
-                CoefficientPlane::Integer(vec![0i32; cw * ch])
+                CoefficientPlane::Integer(pool.take_zeroed_i32(cw * ch))
             }
         };
         components.push(DecodedTileCoefficients {

@@ -17,6 +17,29 @@ record exprim.jbig2.binding-layout/1 : decision {
     author "dk"
 }
 
+record exprim.jp2.session-buffer-pool/1 : decision {
+    title "JPEG 2000 coefficient and DWT planes reuse one byte-capped pool per session"
+    state proposed
+    scope [
+        path "codecs/jp2lam/src/decode/**",
+        path "codecs/jp2lam/src/dwt/**",
+        path "src/image/jpx.rs",
+        path "src/render_cpu/mod.rs",
+        path "src/render_cpu/prepared.rs"
+    ]
+    decision """
+        Pool large Tier-1 subband and inverse-DWT planes inside a byte-capped `jp2lam::Jp2BufferPool` (128 MiB default), owned once per `JpxCodec` (`CpuBackend` / `RenderSession`), attached to worker-local `Jp2Decoder`s only for the duration of a decode via an RAII guard, and emptied by `release_idle_memory` or session drop.
+        """
+    context """
+        Fresh allocation and deallocation of multi-megabyte coefficient and DWT prefix planes cost 22-34% of decode wall time on colour scans and up to 50% on grayscale scans on Windows because OS mappings soft-fault on first write and shoot down TLBs on free. Rejected: keeping buffers directly on each thread-local `Jp2Decoder`, which retains up to ~110 MB times the worker thread count after a document closes and cannot be emptied from another thread. Rejected: switching host binaries to `mimalloc`, which was previously disabled in Lege for cross-target build friction, does not benefit library or FFI consumers of `exprim` and `jp2lam`, and holds global OS segments outside `RenderSession::release_idle_memory`. Rejected: leaving fresh allocation in place, which leaves a one-third speedup on scanned books on the table.
+        """
+    consequences """
+        All render workers of a session share one 128 MiB pool cap (matching `SurfacePool`'s ownership model), idle worker threads retain no reference to the pool once a decode returns or unwinds, and `RenderSession::release_idle_memory` drops all parked coefficient planes immediately. Standalone `Jp2Decoder::new()` callers also get a bounded pool automatically and can share one across workers with `Jp2Decoder::with_buffer_pool`. Decoded pixels are bit-identical across all 411 `jp2lam` unit tests, `exprim` integration suites, and five benchmark codestreams.
+        """
+    supported_by [ @exprim.jp2.buffer-pool-20261127 ]
+    author "dk"
+}
+
 record exprim.memory.chunked-lowering/1 : decision {
     title "A page is painted in chunks while it is lowered"
     state proposed

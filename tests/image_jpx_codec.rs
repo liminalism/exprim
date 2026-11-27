@@ -47,7 +47,7 @@ fn rgb_jp2_decodes_interleaved() {
     let image = jp2lam::Image::from_rgb_bytes(w, h, &src).expect("build image");
     let jp2 = jp2lam::encode(&image, &lossless()).expect("encode");
 
-    let out = JpxCodec
+    let out = JpxCodec::default()
         .decode(
             &jp2,
             &descriptor(w, h),
@@ -72,7 +72,7 @@ fn codestream_geometry_wins_over_the_dictionary() {
     let jp2 = jp2lam::encode(&image, &lossless()).expect("encode");
 
     let lying = descriptor(999, 999);
-    let out = JpxCodec
+    let out = JpxCodec::default()
         .decode(
             &jp2,
             &lying,
@@ -96,7 +96,7 @@ fn pixel_limit_is_enforced() {
         ..DecodeLimits::default()
     };
     assert!(
-        JpxCodec
+        JpxCodec::default()
             .decode(
                 &jp2,
                 &descriptor(w, h),
@@ -110,7 +110,7 @@ fn pixel_limit_is_enforced() {
 
 #[test]
 fn garbage_is_a_typed_error_not_a_panic() {
-    let out = JpxCodec.decode(
+    let out = JpxCodec::default().decode(
         b"definitely not a jp2 codestream",
         &descriptor(4, 4),
         &DecodeParameters::default(),
@@ -126,7 +126,7 @@ fn gray_jp2_decodes_packed_gray8() {
     let image = jp2lam::Image::from_gray_bytes(w, h, &src).expect("build gray image");
     let jp2 = jp2lam::encode(&image, &lossless()).expect("encode");
 
-    let out = JpxCodec
+    let out = JpxCodec::default()
         .decode(
             &jp2,
             &descriptor(w, h),
@@ -158,7 +158,7 @@ fn high_bit_depth_falls_back_to_native_interleave() {
     // between input and output byte is the adapter's `>> 8`.
     let jp2 = jp2lam::encode_view(view, &lossless()).expect("encode");
 
-    let out = JpxCodec
+    let out = JpxCodec::default()
         .decode(
             &jp2,
             &descriptor(w, h),
@@ -188,7 +188,7 @@ fn target_size_hint_reduces_decode_resolution() {
     let jp2 = jp2lam::encode(&image, &lossless()).expect("encode");
 
     // No hint: full resolution.
-    let full = JpxCodec
+    let full = JpxCodec::default()
         .decode(
             &jp2,
             &descriptor(w, h),
@@ -204,7 +204,7 @@ fn target_size_hint_reduces_decode_resolution() {
         target_size: Some((32, 32)),
         ..DecodeParameters::default()
     };
-    let reduced = JpxCodec
+    let reduced = JpxCodec::default()
         .decode(&jp2, &descriptor(w, h), &params, &DecodeLimits::default())
         .expect("decode reduced");
     assert!(
@@ -231,18 +231,17 @@ fn reduction_level_is_the_level_the_decode_drops() {
     let jp2 = jp2lam::encode(&image, &lossless()).expect("encode");
     let limits = DecodeLimits::default();
     let desc = descriptor(w, h);
+    let codec = JpxCodec::default();
 
     let decode = |target_size| {
         let params = DecodeParameters {
             target_size,
             ..DecodeParameters::default()
         };
-        let level = JpxCodec
+        let level = codec
             .reduction_level(&jp2, &desc, &params, &limits)
             .expect("level");
-        let out = JpxCodec
-            .decode(&jp2, &desc, &params, &limits)
-            .expect("decode");
+        let out = codec.decode(&jp2, &desc, &params, &limits).expect("decode");
         (level, out)
     };
 
@@ -289,7 +288,8 @@ fn rgba_jp2_ignore_alpha_decodes_rgb8_directly() {
     let image = jp2lam::Image::from_rgba_bytes(w, h, &rgba).expect("build rgba image");
     let jp2 = jp2lam::encode(&image, &lossless()).expect("encode");
 
-    let with_alpha = JpxCodec
+    let codec = JpxCodec::default();
+    let with_alpha = codec
         .decode(
             &jp2,
             &descriptor(w, h),
@@ -301,7 +301,7 @@ fn rgba_jp2_ignore_alpha_decodes_rgb8_directly() {
     assert_eq!(with_alpha.stride, w as usize * 4);
     assert_eq!(&*with_alpha.data, &rgba[..]);
 
-    let without_alpha = JpxCodec
+    let without_alpha = codec
         .decode(
             &jp2,
             &descriptor(w, h),
@@ -316,7 +316,7 @@ fn rgba_jp2_ignore_alpha_decodes_rgb8_directly() {
     assert_eq!(without_alpha.stride, w as usize * 3);
     assert_eq!(&*without_alpha.data, &expected_rgb[..]);
 
-    JpxCodec.release_idle_memory();
+    codec.release_idle_memory();
 }
 
 #[test]
@@ -336,7 +336,8 @@ fn gray_alpha_jp2_ignore_alpha_decodes_gray8_directly() {
         jp2lam::Image::from_gray_alpha_bytes(w, h, &gray_alpha).expect("build gray+alpha image");
     let jp2 = jp2lam::encode(&image, &lossless()).expect("encode");
 
-    let with_alpha = JpxCodec
+    let codec = JpxCodec::default();
+    let with_alpha = codec
         .decode(
             &jp2,
             &descriptor(w, h),
@@ -348,7 +349,7 @@ fn gray_alpha_jp2_ignore_alpha_decodes_gray8_directly() {
     assert_eq!(with_alpha.stride, w as usize * 2);
     assert_eq!(&*with_alpha.data, &gray_alpha[..]);
 
-    let without_alpha = JpxCodec
+    let without_alpha = codec
         .decode(
             &jp2,
             &descriptor(w, h),
@@ -383,13 +384,14 @@ fn jpx_decode_respects_cooperative_cancellation() {
         ..Default::default()
     };
     let jp2 = jp2lam::encode(&image, &options).expect("encode");
+    let codec = JpxCodec::default();
 
     // Pre-cancelled token trips before work begins.
     let immediate = DecodeLimits {
         should_cancel: Some(Arc::new(|| true)),
         ..DecodeLimits::default()
     };
-    let err = JpxCodec
+    let err = codec
         .decode(
             &jp2,
             &descriptor(w, h),
@@ -411,7 +413,7 @@ fn jpx_decode_respects_cooperative_cancellation() {
         })),
         ..DecodeLimits::default()
     };
-    let err = JpxCodec
+    let err = codec
         .decode(
             &jp2,
             &descriptor(w, h),
@@ -424,4 +426,59 @@ fn jpx_decode_respects_cooperative_cancellation() {
         "expected Cancelled, got {err:?}"
     );
     assert!(polls.load(Ordering::Relaxed) >= 5);
+}
+
+#[test]
+fn shared_buffer_pool_reuses_planes_and_releases_cross_thread() {
+    use std::sync::Arc;
+
+    // 512x512 RGB exceeds the 64 KiB pooling floor on both coarse and detail bands.
+    let (w, h) = (512u32, 512u32);
+    let src: Vec<u8> = (0..w * h * 3)
+        .map(|i| ((i.wrapping_mul(37) ^ (i >> 5)) & 0xFF) as u8)
+        .collect();
+    let image = jp2lam::Image::from_rgb_bytes(w, h, &src).expect("build rgb image");
+    let jp2 = Arc::new(jp2lam::encode(&image, &lossless()).expect("encode"));
+
+    let codec = Arc::new(JpxCodec::with_buffer_pool_bytes(16 * 1024 * 1024));
+    assert_eq!(codec.idle_buffer_bytes(), 0);
+
+    // Decode on a worker thread, then exit that thread or keep it idle and
+    // verify the main thread can release the parked planes immediately.
+    let codec_worker = Arc::clone(&codec);
+    let jp2_worker = Arc::clone(&jp2);
+    let first = std::thread::spawn(move || {
+        codec_worker
+            .decode(
+                &jp2_worker,
+                &descriptor(w, h),
+                &DecodeParameters::default(),
+                &DecodeLimits::default(),
+            )
+            .expect("worker decode")
+    })
+    .join()
+    .expect("join worker");
+
+    assert_eq!(&*first.data, &src[..]);
+    assert!(
+        codec.idle_buffer_bytes() > 0,
+        "large decode must park subband buffers in the shared codec pool"
+    );
+
+    // Second decode on the main thread reuses the parked buffers and stays bit-exact.
+    let second = codec
+        .decode(
+            &jp2,
+            &descriptor(w, h),
+            &DecodeParameters::default(),
+            &DecodeLimits::default(),
+        )
+        .expect("second decode");
+    assert_eq!(&*second.data, &src[..]);
+    assert!(codec.idle_buffer_bytes() <= 16 * 1024 * 1024);
+
+    // Cross-thread release_idle_memory empties the shared pool immediately.
+    codec.release_idle_memory();
+    assert_eq!(codec.idle_buffer_bytes(), 0);
 }

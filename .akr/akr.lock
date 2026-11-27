@@ -5,7 +5,7 @@ build {
     tool "akr 0.8.0"
     grammar "0.1"
     vocabulary "0.3"
-    source_graph "sha256:f82d7abd99b6b742755459d735c4c92fd52070932f38d41730e2d007785a0df1"
+    source_graph "sha256:a8b773618491e2b6e356f9692be64ac0c6b3e7f8a6fc59f77e7b0cdf3b90a18c"
 }
 
 source ".akr/project.akr" {
@@ -14,8 +14,8 @@ source ".akr/project.akr" {
 }
 
 source ".akr/records/exprim/decisions.akr" {
-    hash "sha256:da80d55cda4604080928d5f00a7d988f30e130088270a266d4bc8494a1fd0349"
-    records 10
+    hash "sha256:cb4ee6ed8659e04df432a9d3860c32d99b7638bdebd7fb6924aabb935f327598"
+    records 11
 }
 
 source ".akr/records/exprim/evidence.akr" {
@@ -24,13 +24,13 @@ source ".akr/records/exprim/evidence.akr" {
 }
 
 source ".akr/records/exprim/observations.akr" {
-    hash "sha256:66c24d8397959a686b860560d055967d98021c36fd151b1827654428b2a5334d"
-    records 12
+    hash "sha256:7c1f3520ed0565afd43f051f9364d3f39005f923dbbdda75654d4e97e4f51417"
+    records 13
 }
 
 source ".akr/records/exprim/papercuts.akr" {
-    hash "sha256:92cfc6c9f312a55cfcaaf9e2526fa41aedc8ea97bf581d50d5a477224f31d25f"
-    records 8
+    hash "sha256:5d7e7e0d197cde178a76f894e854779b05396e59c30d3af860a282dca07c100e"
+    records 10
 }
 
 source ".akr/records/exprim/policies.akr" {
@@ -44,14 +44,32 @@ source ".akr/records/exprim/questions.akr" {
 }
 
 source ".akr/records/exprim/work.akr" {
-    hash "sha256:99f14a08eb6c0b5b76b03eda7790c3b360a853cc315663d504941e54a42a4b17"
-    records 9
+    hash "sha256:98df22ac876ca18f698c23de45a455aa439dbcc8bbf5cd209527de0e1daf2328"
+    records 10
 }
 
 resolution @exprim.jbig2.ffi-facade/1 {
     slot implements
     to @exprim.jbig2.binding-layout/1
     hash "sha256:57480f880fc4575969463a6bac0c344051d953cfb9cd0704a88d186a14228aa9"
+}
+
+resolution @exprim.jp2.plane-pool/1 {
+    slot implements
+    to @exprim.jp2.session-buffer-pool/1
+    hash "sha256:7c751d79edd458dccd149ea8a9133bd607230347e9fdf237698d24bec8f617fa"
+}
+
+resolution @exprim.jp2.plane-pool/1 {
+    slot supported_by
+    to @exprim.jp2.buffer-pool-20261127/1
+    hash "sha256:ebf40846e6d3f44f15414fee2736afd6767229f1fe8bcbf4aa4e2d7061f11d8e"
+}
+
+resolution @exprim.jp2.session-buffer-pool/1 {
+    slot supported_by
+    to @exprim.jp2.buffer-pool-20261127/1
+    hash "sha256:ebf40846e6d3f44f15414fee2736afd6767229f1fe8bcbf4aa4e2d7061f11d8e"
 }
 
 resolution @exprim.memory.chunked-lowering/1 {
@@ -230,6 +248,11 @@ seal @exprim.corpus.benchmark-20261109/2 {
     hash "sha256:c7c569fb1d784ad06e01cef47f9ff6a6264d4ae38632a8b0aef59d1e9f2651da"
 }
 
+seal @exprim.jp2.buffer-pool-20261127/1 {
+    state verified
+    hash "sha256:ebf40846e6d3f44f15414fee2736afd6767229f1fe8bcbf4aa4e2d7061f11d8e"
+}
+
 seal @exprim.memory.image-decode-045/1 {
     state completed
     hash "sha256:2722f95bbd2a578e34437afa765be7b4134b9c4112de584d598d0970c43236e0"
@@ -265,6 +288,11 @@ seal @exprim.observation.xref-rebuild-touches-whole-mmap/2 {
     hash "sha256:6689b0d41fcc3ea644d681272353845c082c1324892cf1fd300f56ab91a32ad7"
 }
 
+seal @exprim.papercut.akr-change-begin-related-decision-rejects-non/1 {
+    state verified
+    hash "sha256:7a28e55dc91bd18e0a66a70707652fae7ed96dd7c904734ad74b60220eb6cf96"
+}
+
 seal @exprim.papercut.akr-propose-uses-a-specific-body-file-flag-not/1 {
     state verified
     hash "sha256:e156a1445c24930d30f51fc75f9d09c48a472ae3c7d29f6112630216eb309ac8"
@@ -298,6 +326,11 @@ seal @exprim.papercut.jp2lam-inspect-jp2-with-limits-returns-jp2lam/1 {
 seal @exprim.papercut.powershell-5-1-array-splatting-featargs-before/1 {
     state verified
     hash "sha256:79a3fd39fbb26bce1ca472538cc6c97fe2b50a11702439e4c0865cf80f836cdb"
+}
+
+seal @exprim.papercut.ran-akr-context-goal-key-paths-a-b-and-got-akr/1 {
+    state verified
+    hash "sha256:91bbb3d966f3ecd73fdd0fab26b4f74184980073ddbac352cf13940439ea2d08"
 }
 
 seal @exprim.papercut.ran-akr-explain-plan-after-reading-agents-md/1 {
