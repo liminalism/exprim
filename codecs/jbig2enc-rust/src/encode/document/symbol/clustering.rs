@@ -1,7 +1,10 @@
 use super::super::Jbig2Encoder;
 use super::text_region::{uf_find, uf_union};
 use crate::debug;
-use crate::jbig2comparator::{Comparator, NarrowProfile, narrow_alignment_impossible};
+use crate::jbig2comparator::{
+    Comparator, NARROW_BOUND_MAX_DX, NARROW_BOUND_MAX_DY, NarrowProfile,
+    narrow_alignment_impossible,
+};
 use crate::jbig2sym::BitImage;
 use anyhow::Result;
 use rustc_hash::FxHashMap;
@@ -92,11 +95,14 @@ impl<'a> Jbig2Encoder<'a> {
 
             let dy_limit = if self.config.text_refine { 1 } else { 0 };
             // Cheap ink-count bounds settle most rejections without a search.
-            if dy_limit == 0
-                && dim_limit <= 1
+            // With `text_refine` nearly every pair that reaches this point is
+            // a rejection, and the search it would otherwise run covers 15
+            // offsets rather than 3.
+            if dim_limit <= NARROW_BOUND_MAX_DX
+                && dy_limit <= NARROW_BOUND_MAX_DY
                 && let (Some(a_profile), Some(b_profile)) = (&profiles[a_idx], &profiles[b_idx])
                 && narrow_alignment_impossible(
-                    a_sym, a_profile, b_sym, b_profile, max_err, dim_limit, 0,
+                    a_sym, a_profile, b_sym, b_profile, max_err, dim_limit, dy_limit,
                 )
             {
                 return;

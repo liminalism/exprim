@@ -587,13 +587,22 @@ fn best_alignment_narrow<const AW: usize, const BW: usize>(
     }
 }
 
+/// Largest horizontal shift [`narrow_alignment_impossible`] can bound.
+pub(crate) const NARROW_BOUND_MAX_DX: i32 = 2;
+/// Largest vertical shift [`narrow_alignment_impossible`] can bound.
+pub(crate) const NARROW_BOUND_MAX_DY: i32 = 1;
+
+const NARROW_COLUMN_PAD: usize = NARROW_BOUND_MAX_DX as usize;
+const NARROW_COLUMNS: usize = 32 + 2 * NARROW_COLUMN_PAD;
+
 /// Row and column ink counts of a bitmap at most 32 pixels wide, for
-/// [`narrow_alignment_impossible`]. Column `c` is stored at `columns[c + 1]`
-/// so that one-pixel shifts read zero past either edge.
+/// [`narrow_alignment_impossible`]. Column `c` is stored at
+/// `columns[c + NARROW_COLUMN_PAD]` so that shifts of up to
+/// [`NARROW_BOUND_MAX_DX`] pixels read zero past either edge.
 #[derive(Debug, Clone)]
 pub(crate) struct NarrowProfile {
     rows: Vec<u8>,
-    columns: [u16; 34],
+    columns: [u16; NARROW_COLUMNS],
 }
 
 impl NarrowProfile {
@@ -602,7 +611,7 @@ impl NarrowProfile {
             return None;
         }
         let words = image.packed_words();
-        let mut columns = [0u16; 34];
+        let mut columns = [0u16; NARROW_COLUMNS];
         let mut rows = Vec::with_capacity(words.len());
         for &word in words {
             rows.push(word.count_ones() as u8);
@@ -613,17 +622,23 @@ impl NarrowProfile {
 }
 
 #[inline]
-fn add_columns(columns: &mut [u16; 34], word: u32, sign: i16) {
+fn add_columns(columns: &mut [u16; NARROW_COLUMNS], word: u32, sign: i16) {
     let mut bits = word;
     while bits != 0 {
         let column = bits.leading_zeros() as usize;
-        columns[column + 1] = columns[column + 1].wrapping_add_signed(sign);
+        let slot = column + NARROW_COLUMN_PAD;
+        columns[slot] = columns[slot].wrapping_add_signed(sign);
         bits &= !(1u32 << (31 - column));
     }
 }
 
 /// Column counts of `profile`'s bitmap over rows `start..end`.
-fn columns_over(profile: &NarrowProfile, image: &BitImage, start: usize, end: usize) -> [u16; 34] {
+fn columns_over(
+    profile: &NarrowProfile,
+    image: &BitImage,
+    start: usize,
+    end: usize,
+) -> [u16; NARROW_COLUMNS] {
     let words = image.packed_words();
     let mut columns = profile.columns;
     for &word in words[..start].iter().chain(&words[end..]) {
@@ -632,11 +647,12 @@ fn columns_over(profile: &NarrowProfile, image: &BitImage, start: usize, end: us
     columns
 }
 
-/// Whether every alignment with `|dx| <= max_dx` and `|dy| <= max_dy` (both
-/// at most 1) has an XOR error above `max_err`, judged from ink counts alone.
-/// Then `Comparator::compare_for_refine_family(a, b, max_err, max_dx, max_dy)`
+/// Whether every alignment with `|dx| <= max_dx` and `|dy| <= max_dy` has an
+/// XOR error above `max_err`, judged from ink counts alone. Then
+/// `Comparator::compare_for_refine_family(a, b, max_err, max_dx, max_dy)`
 /// returns `None`. Both bitmaps must be at most 32 pixels wide, with profiles
-/// built from them.
+/// built from them, and the limits at most [`NARROW_BOUND_MAX_DX`] and
+/// [`NARROW_BOUND_MAX_DY`].
 ///
 /// For each offset the search pairs row `r` of `a`, shifted by `dx` with zero
 /// fill inside one word, with row `r - dy` of `b` over the rows both have.
@@ -644,7 +660,9 @@ fn columns_over(profile: &NarrowProfile, image: &BitImage, start: usize, end: us
 /// - the sum over row pairs of the ink-count difference, where `a` loses at
 ///   most `|dx|` pixels per row to the shift, and
 /// - the sum over the 32 word columns of the difference between the column
-///   counts of `a` (moved by `dx`) and of `b` over the paired rows.
+///   counts of `a` (moved by `dx`, so column `j` holds column `j + dx` of `a`
+///   and nothing where that falls outside the word) and of `b` over the
+///   paired rows.
 pub(crate) fn narrow_alignment_impossible(
     a: &BitImage,
     a_profile: &NarrowProfile,
@@ -655,7 +673,30 @@ pub(crate) fn narrow_alignment_impossible(
     max_dy: i32,
 ) -> bool {
     debug_assert!(a.width <= 32 && b.width <= 32);
-    debug_assert!((0..=1).contains(&max_dx) && (0..=1).contains(&max_dy));
+    debug_assert!((0..=NARROW_BOUND_MAX_DX).contains(&max_dx));
+    debug_assert!((0..=NARROW_BOUND_MAX_DY).contains(&max_dy));
+    // One row sum per shift in use. Shifts of at most one pixel are the hot
+    // path of `text` clustering, so they do not pay for the wider case.
+    if max_dx <= 1 {
+        narrow_alignment_impossible_within::<2>(a, a_profile, b, b_profile, max_err, max_dx, max_dy)
+    } else {
+        narrow_alignment_impossible_within::<{ NARROW_BOUND_MAX_DX as usize + 1 }>(
+            a, a_profile, b, b_profile, max_err, max_dx, max_dy,
+        )
+    }
+}
+
+/// [`narrow_alignment_impossible`] for `max_dx < SHIFTS`.
+#[inline(always)]
+fn narrow_alignment_impossible_within<const SHIFTS: usize>(
+    a: &BitImage,
+    a_profile: &NarrowProfile,
+    b: &BitImage,
+    b_profile: &NarrowProfile,
+    max_err: u32,
+    max_dx: i32,
+    max_dy: i32,
+) -> bool {
     for dy in -max_dy..=max_dy {
         let top = dy.max(0);
         let bottom = (dy + b.height as i32).min(a.height as i32);
@@ -664,16 +705,21 @@ pub(crate) fn narrow_alignment_impossible(
         }
         let (a_start, a_end) = (top as usize, bottom as usize);
         let (b_start, b_end) = ((top - dy) as usize, (bottom - dy) as usize);
-        let (mut b_gain, mut a_gain, mut a_gain_after_loss) = (0u32, 0u32, 0u32);
+        // `a_gain[k]`: ink `a` still has over `b`, row by row, after losing
+        // up to `k` pixels of each row to a shift of `k`.
+        let mut b_gain = 0u32;
+        let mut a_gain = [0u32; SHIFTS];
         for (&a_ink, &b_ink) in a_profile.rows[a_start..a_end]
             .iter()
             .zip(&b_profile.rows[b_start..b_end])
         {
             b_gain += u32::from(b_ink.saturating_sub(a_ink));
-            a_gain += u32::from(a_ink.saturating_sub(b_ink));
-            a_gain_after_loss += u32::from(a_ink.saturating_sub(b_ink).saturating_sub(1));
+            let excess = a_ink.saturating_sub(b_ink);
+            for (lost, gain) in a_gain.iter_mut().enumerate() {
+                *gain += u32::from(excess.saturating_sub(lost as u8));
+            }
         }
-        let row_bound = [b_gain + a_gain, b_gain + a_gain_after_loss];
+        let row_bound = a_gain.map(|gain| b_gain + gain);
         if row_bound[max_dx as usize] > max_err {
             continue;
         }
@@ -683,10 +729,10 @@ pub(crate) fn narrow_alignment_impossible(
             if row_bound[dx.unsigned_abs() as usize] > max_err {
                 continue;
             }
-            let start = (1 + dx) as usize;
+            let start = (NARROW_COLUMN_PAD as i32 + dx) as usize;
             let column_bound: u32 = a_columns[start..start + 32]
                 .iter()
-                .zip(&b_columns[1..33])
+                .zip(&b_columns[NARROW_COLUMN_PAD..NARROW_COLUMN_PAD + 32])
                 .map(|(&a_ink, &b_ink)| u32::from(a_ink.abs_diff(b_ink)))
                 .sum();
             if column_bound <= max_err {
@@ -779,21 +825,41 @@ mod tests {
             state ^= state << 17;
             state
         };
-        let mut rejected = 0usize;
-        let mut found = 0usize;
-        for case in 0..3000u64 {
+        let limits = [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (2, 1)];
+        assert!(
+            limits
+                .iter()
+                .all(|&(dx, dy)| dx <= NARROW_BOUND_MAX_DX && dy <= NARROW_BOUND_MAX_DY)
+        );
+        let mut rejected = [0usize; 6];
+        let mut found = [0usize; 6];
+        for case in 0..6000u64 {
             let wa = 1 + (next() % 32) as usize;
             let ha = 1 + (next() % 36) as usize;
             let wb = (wa as i64 + (next() % 5) as i64 - 2).clamp(1, 32) as usize;
             let hb = (ha as i64 + (next() % 5) as i64 - 2).max(1) as usize;
             let density = 10 + next() % 70;
+            let flips = next() % 6;
+            // `b` is a noisy copy of `a` moved by up to two pixels across and
+            // one down, so that matches exist at every offset under test.
+            let (shift_x, shift_y) = ((next() % 5) as i64 - 2, (next() % 3) as i64 - 1);
+            let mut source = [[false; 38]; 42];
+            for row in &mut source {
+                for cell in row.iter_mut() {
+                    *cell = next() % 100 < density;
+                }
+            }
             let mut a = BitImage::new(wa as u32, ha as u32).unwrap();
             let mut b = BitImage::new(wb as u32, hb as u32).unwrap();
-            let flips = next() % 6;
-            for y in 0..ha.max(hb) {
-                for x in 0..wa.max(wb) {
-                    let ink = next() % 100 < density;
-                    a.set_usize(x, y, ink);
+            for y in 0..ha {
+                for x in 0..wa {
+                    a.set_usize(x, y, source[y + 2][x + 2]);
+                }
+            }
+            for y in 0..hb {
+                for x in 0..wb {
+                    let ink = source[(y as i64 + 2 + shift_y) as usize]
+                        [(x as i64 + 2 + shift_x) as usize];
                     b.set_usize(x, y, ink ^ (next() % 97 < flips));
                 }
             }
@@ -802,7 +868,7 @@ mod tests {
                 NarrowProfile::new(&b).unwrap(),
             );
             for max_err in [0, 1, 2, 4, 8, 12, 20] {
-                for (max_dx, max_dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                for (slot, &(max_dx, max_dy)) in limits.iter().enumerate() {
                     let impossible = narrow_alignment_impossible(
                         &a, &a_profile, &b, &b_profile, max_err, max_dx, max_dy,
                     );
@@ -810,14 +876,20 @@ mod tests {
                         .compare_for_refine_family(&a, &b, max_err, max_dx, max_dy);
                     assert!(
                         !(impossible && result.is_some()),
-                        "case {case}: bound rejected an alignment {result:?}"
+                        "case {case}, limits ({max_dx}, {max_dy}): bound rejected an alignment {result:?}"
                     );
-                    rejected += usize::from(impossible);
-                    found += usize::from(result.is_some());
+                    rejected[slot] += usize::from(impossible);
+                    found[slot] += usize::from(result.is_some());
                 }
             }
         }
-        assert!(rejected > 0 && found > 0);
+        // Every limit pair must both reject pairs and leave matches standing,
+        // or the test would pass without exercising the bound.
+        assert!(
+            rejected.iter().all(|&count| count > 100),
+            "rejected {rejected:?}"
+        );
+        assert!(found.iter().all(|&count| count > 100), "found {found:?}");
     }
 
     #[test]
